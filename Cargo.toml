@@ -1,0 +1,3 @@
+[workspace]
+members = ["whereamid", "whereami-client"]
+resolver = "2"
