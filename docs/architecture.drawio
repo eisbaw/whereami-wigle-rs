@@ -1,196 +1,139 @@
-<mxfile host="app.diagrams.net" modified="2026-05-04T00:00:00.000Z" agent="whereami" version="21.0.0">
+<mxfile host="Electron" agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/29.0.3 Chrome/140.0.7339.249 Electron/38.8.4 Safari/537.36" version="29.0.3">
   <diagram name="Architecture" id="arch1">
-    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1000" math="0" shadow="0">
+    <mxGraphModel dx="1426" dy="981" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1000" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
-
-        <!-- Title -->
-        <mxCell id="title" value="whereami — Internal Architecture &amp; Dataflow" style="text;html=1;align=center;verticalAlign=middle;fontSize=18;fontStyle=1;fillColor=none;strokeColor=none;" vertex="1" parent="1">
+        <mxCell id="title" value="whereami — Internal Architecture &amp; Dataflow" style="text;html=1;align=center;verticalAlign=middle;fontSize=18;fontStyle=1;fillColor=none;strokeColor=none;" parent="1" vertex="1">
           <mxGeometry x="500" y="20" width="600" height="40" as="geometry" />
         </mxCell>
-
-        <!-- External: Wi-Fi Radio -->
-        <mxCell id="radio" value="Wi-Fi Radio&#xa;(kernel)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=10;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+        <mxCell id="radio" value="Wi-Fi Radio&#xa;(kernel)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=10;fillColor=#dae8fc;strokeColor=#6c8ebf;" parent="1" vertex="1">
           <mxGeometry x="40" y="200" width="100" height="80" as="geometry" />
         </mxCell>
-
-        <!-- Scanner module -->
-        <mxCell id="scanner" value="scanner.rs&#xa;&#xa;nmcli rescan + list&#xa;(fallback: iw trigger/dump)&#xa;&#xa;Parse output →&#xa;Vec&lt;ScannedNetwork&gt;&#xa;(bssid, ssid, signal, ch)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" vertex="1" parent="1">
+        <mxCell id="scanner" value="scanner.rs&#xa;&#xa;nmcli rescan + list&#xa;(fallback: iw trigger/dump)&#xa;&#xa;Parse output →&#xa;Vec&lt;ScannedNetwork&gt;&#xa;(bssid, ssid, signal, ch)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" parent="1" vertex="1">
           <mxGeometry x="200" y="170" width="220" height="130" as="geometry" />
         </mxCell>
-
-        <!-- Arrow: radio -> scanner -->
-        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="radio" target="scanner" parent="1">
+        <mxCell id="e1" style="" parent="1" source="radio" target="scanner" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e1label" value="scan results" style="edgeLabel;html=1;align=center;fontSize=9;" vertex="1" connectable="0" parent="e1">
+        <mxCell id="e1label" value="scan results" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e1" vertex="1" connectable="0">
           <mxGeometry x="-0.2" relative="1" as="geometry" />
         </mxCell>
-
-        <!-- Debounce module -->
-        <mxCell id="debounce" value="debounce.rs&#xa;&#xa;Ring buffer (last N scans)&#xa;&#xa;is_stable(bssid):&#xa;  count ≥ M in N samples&#xa;&#xa;Filters: buses, phones,&#xa;hotspots (transient)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" vertex="1" parent="1">
-          <mxGeometry x="200" y="360" width="220" height="140" as="geometry" />
+        <mxCell id="debounce" value="debounce.rs&#xa;&#xa;Ring buffer (last N scans)&#xa;&#xa;is_stable(bssid):&#xa;  count ≥ M in N samples&#xa;&#xa;Filters: buses, phones,&#xa;hotspots (transient)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" parent="1" vertex="1">
+          <mxGeometry x="200" y="355" width="220" height="140" as="geometry" />
         </mxCell>
-
-        <!-- Arrow: scanner -> debounce -->
-        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="scanner" target="debounce" parent="1">
+        <mxCell id="e2" style="" parent="1" source="scanner" target="debounce" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e2label" value="all APs&#xa;(push_scan)" style="edgeLabel;html=1;align=center;fontSize=9;" vertex="1" connectable="0" parent="e2">
-          <mxGeometry x="-0.2" relative="1" as="geometry" />
-        </mxCell>
-
-        <!-- Background scan loop -->
-        <mxCell id="scanloop" value="main.rs&#xa;scan loop&#xa;&#xa;fast: every 10s&#xa;slow: every 60s" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;dashed=1;" vertex="1" parent="1">
-          <mxGeometry x="40" y="380" width="120" height="100" as="geometry" />
-        </mxCell>
-        <mxCell id="e_loop" style="edgeStyle=orthogonalEdgeStyle;dashed=1;" edge="1" source="scanloop" target="scanner" parent="1">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="100" y="340" />
-              <mxPoint x="310" y="340" />
-            </Array>
+        <mxCell id="e2label" value="all APs&#xa;(push_scan)" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e2" vertex="1" connectable="0">
+          <mxGeometry x="-0.2" relative="1" as="geometry">
+            <mxPoint y="-14" as="offset" />
           </mxGeometry>
         </mxCell>
-        <mxCell id="e_loop_label" value="triggers" style="edgeLabel;html=1;fontSize=9;" vertex="1" connectable="0" parent="e_loop">
+        <mxCell id="scanloop" value="main.rs&#xa;scan loop&#xa;&#xa;fast: every 10s&#xa;slow: every 60s" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;dashed=1;" parent="1" vertex="1">
+          <mxGeometry x="40" y="319" width="120" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="e_loop" style="dashed=1;" parent="1" source="scanloop" target="scanner" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-
-        <!-- Resolver module -->
-        <mxCell id="resolver" value="resolver.rs&#xa;&#xa;1. Check aps cache&#xa;2. Check not_found cache&#xa;3. Query WiGLE (on miss)&#xa;4. On 404 → not_found&#xa;5. On error → pending&#xa;6. Return positioned APs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" vertex="1" parent="1">
+        <mxCell id="e_loop_label" value="triggers" style="edgeLabel;html=1;fontSize=9;" parent="e_loop" vertex="1" connectable="0">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="resolver" value="resolver.rs&#xa;&#xa;1. Check aps cache&#xa;2. Check not_found cache&#xa;3. Query WiGLE (on miss)&#xa;4. On 404 → not_found&#xa;5. On error → pending&#xa;6. Return positioned APs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" parent="1" vertex="1">
           <mxGeometry x="500" y="350" width="220" height="150" as="geometry" />
         </mxCell>
-
-        <!-- Arrow: debounce -> resolver -->
-        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="debounce" target="resolver" parent="1">
+        <mxCell id="e3" style="" parent="1" source="debounce" target="resolver" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e3label" value="stable BSSIDs&#xa;(top-N by RSSI)" style="edgeLabel;html=1;align=center;fontSize=9;" vertex="1" connectable="0" parent="e3">
+        <mxCell id="e3label" value="stable BSSIDs&#xa;(top-N by RSSI)" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e3" vertex="1" connectable="0">
           <mxGeometry x="-0.2" relative="1" as="geometry" />
         </mxCell>
-
-        <!-- SQLite DB -->
-        <mxCell id="sqlite" value="SQLite (WAL)&#xa;&#xa;• aps (resolved positions)&#xa;• not_found (negative cache)&#xa;• pending (offline queue)&#xa;• metadata (rate limit)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#d5e8d4;strokeColor=#82b366;align=left;spacingLeft=8;" vertex="1" parent="1">
+        <mxCell id="sqlite" value="SQLite (WAL)&#xa;&#xa;• aps (resolved positions)&#xa;• not_found (negative cache)&#xa;• pending (offline queue)&#xa;• metadata (rate limit)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#d5e8d4;strokeColor=#82b366;align=left;spacingLeft=8;" parent="1" vertex="1">
           <mxGeometry x="500" y="580" width="220" height="130" as="geometry" />
         </mxCell>
-
-        <!-- Arrow: resolver <-> sqlite -->
-        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="resolver" target="sqlite" parent="1">
+        <mxCell id="e4" style="" parent="1" source="resolver" target="sqlite" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e4label" value="read/write" style="edgeLabel;html=1;align=center;fontSize=9;" vertex="1" connectable="0" parent="e4">
+        <mxCell id="e4label" value="read/write" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e4" vertex="1" connectable="0">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-
-        <!-- WiGLE API -->
-        <mxCell id="wigle" value="WiGLE API&#xa;api.wigle.net&#xa;&#xa;GET /v2/network/search&#xa;?netid=MAC&#xa;&#xa;→ trilat, trilong, ssid" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;" vertex="1" parent="1">
-          <mxGeometry x="800" y="350" width="200" height="130" as="geometry" />
+        <mxCell id="wigle" value="WiGLE API&#xa;api.wigle.net&#xa;&#xa;GET /v2/network/search&#xa;?netid=MAC&#xa;&#xa;→ trilat, trilong, ssid" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;" parent="1" vertex="1">
+          <mxGeometry x="800" y="360" width="200" height="130" as="geometry" />
         </mxCell>
-
-        <!-- Arrow: resolver -> wigle -->
-        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="resolver" target="wigle" parent="1">
+        <mxCell id="e5" style="" parent="1" source="resolver" target="wigle" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e5label" value="cache miss&#xa;(HTTP Basic)" style="edgeLabel;html=1;align=center;fontSize=9;" vertex="1" connectable="0" parent="e5">
+        <mxCell id="e5label" value="cache miss&#xa;(HTTP Basic)" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e5" vertex="1" connectable="0">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-
-        <!-- Trilaterate module -->
-        <mxCell id="trilat" value="trilaterate.rs&#xa;&#xa;1. filter_outliers()&#xa;   median pos → reject&#xa;   &gt; max(200m, 3×median_dist)&#xa;&#xa;2. weighted centroid&#xa;   weight = 10^(dBm/20)&#xa;&#xa;→ (lat, lon, accuracy_m)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" vertex="1" parent="1">
-          <mxGeometry x="500" y="140" width="220" height="160" as="geometry" />
+        <mxCell id="trilat" value="trilaterate.rs&#xa;&#xa;1. filter_outliers()&#xa;   median pos → reject&#xa;   &gt; max(200m, 3×median_dist)&#xa;&#xa;2. weighted centroid&#xa;   weight = 10^(dBm/20)&#xa;&#xa;→ (lat, lon, accuracy_m)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" parent="1" vertex="1">
+          <mxGeometry x="500" y="130" width="220" height="160" as="geometry" />
         </mxCell>
-
-        <!-- Arrow: resolver -> trilaterate -->
-        <mxCell id="e6" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="resolver" target="trilat" parent="1">
+        <mxCell id="e6" style="" parent="1" source="resolver" target="trilat" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6label" value="positioned APs&#xa;+ signals" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e6" vertex="1" connectable="0">
           <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="470" y="420" />
-              <mxPoint x="470" y="220" />
-            </Array>
+            <mxPoint y="-12" as="offset" />
           </mxGeometry>
         </mxCell>
-        <mxCell id="e6label" value="positioned APs&#xa;+ signals" style="edgeLabel;html=1;align=center;fontSize=9;" vertex="1" connectable="0" parent="e6">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-
-        <!-- TCP Server -->
-        <mxCell id="server" value="server.rs&#xa;&#xa;TCP 127.0.0.1:4747&#xa;JSON-lines, one-shot&#xa;&#xa;Commands:&#xa;• locate&#xa;• scan&#xa;• resolve&#xa;• stats" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" vertex="1" parent="1">
+        <mxCell id="server" value="server.rs&#xa;&#xa;TCP 127.0.0.1:4747&#xa;JSON-lines, one-shot&#xa;&#xa;Commands:&#xa;• locate&#xa;• scan&#xa;• resolve&#xa;• stats" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" parent="1" vertex="1">
           <mxGeometry x="800" y="120" width="180" height="180" as="geometry" />
         </mxCell>
-
-        <!-- Arrow: trilaterate -> server -->
-        <mxCell id="e7" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="trilat" target="server" parent="1">
+        <mxCell id="e7" style="" parent="1" source="trilat" target="server" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e7label" value="Position&#xa;result" style="edgeLabel;html=1;align=center;fontSize=9;" vertex="1" connectable="0" parent="e7">
+        <mxCell id="e7label" value="Position&#xa;result" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e7" vertex="1" connectable="0">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-
-        <!-- Nominatim -->
-        <mxCell id="nominatim" value="OSM Nominatim&#xa;(opt-in)&#xa;&#xa;reverse geocode&#xa;lat,lon → address" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;" vertex="1" parent="1">
+        <mxCell id="nominatim" value="OSM Nominatim&#xa;(opt-in)&#xa;&#xa;reverse geocode&#xa;lat,lon → address" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;" parent="1" vertex="1">
           <mxGeometry x="1060" y="120" width="170" height="100" as="geometry" />
         </mxCell>
-
-        <!-- Arrow: server -> nominatim -->
-        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="server" target="nominatim" parent="1">
+        <mxCell id="e8" style="" parent="1" source="server" target="nominatim" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e8label" value="--address-approx" style="edgeLabel;html=1;align=center;fontSize=9;" vertex="1" connectable="0" parent="e8">
+        <mxCell id="e8label" value="--address-approx" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e8" vertex="1" connectable="0">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-
-        <!-- Client -->
-        <mxCell id="client" value="Any TCP client&#xa;&#xa;• whereami-client (Rust)&#xa;• echo | socat&#xa;• Python, Go, etc." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=8;" vertex="1" parent="1">
+        <mxCell id="client" value="Any TCP client&#xa;&#xa;• whereami-client (Rust)&#xa;• echo | socat&#xa;• Python, Go, etc." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=8;" parent="1" vertex="1">
           <mxGeometry x="1060" y="270" width="180" height="100" as="geometry" />
         </mxCell>
-
-        <!-- Arrow: client -> server -->
-        <mxCell id="e9" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="client" target="server" parent="1">
+        <mxCell id="e9" style="" parent="1" source="client" target="server" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e9label" value="JSON request" style="edgeLabel;html=1;align=center;fontSize=9;" vertex="1" connectable="0" parent="e9">
+        <mxCell id="e9label" value="JSON request" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e9" vertex="1" connectable="0">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-
-        <!-- Pending drain -->
-        <mxCell id="pending" value="pending.rs&#xa;&#xa;Background drain&#xa;every 300s&#xa;&#xa;Retry failed lookups&#xa;max 20 attempts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=left;spacingLeft=8;dashed=1;" vertex="1" parent="1">
-          <mxGeometry x="800" y="560" width="180" height="120" as="geometry" />
+        <mxCell id="pending" value="pending.rs&#xa;&#xa;Background drain&#xa;every 300s&#xa;&#xa;Retry failed lookups&#xa;max 20 attempts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=left;spacingLeft=8;dashed=1;" parent="1" vertex="1">
+          <mxGeometry x="810" y="585" width="180" height="120" as="geometry" />
         </mxCell>
-
-        <!-- Arrow: pending -> sqlite -->
-        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;dashed=1;" edge="1" source="pending" target="sqlite" parent="1">
+        <mxCell id="e10" style="dashed=1;" parent="1" source="pending" target="sqlite" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e10label" value="drain → aps&#xa;or delete" style="edgeLabel;html=1;align=center;fontSize=9;" vertex="1" connectable="0" parent="e10">
+        <mxCell id="e10label" value="drain → aps&#xa;or delete" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e10" vertex="1" connectable="0">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-
-        <!-- Arrow: pending -> wigle -->
-        <mxCell id="e11" style="edgeStyle=orthogonalEdgeStyle;dashed=1;" edge="1" source="pending" target="wigle" parent="1">
+        <mxCell id="e11" style="dashed=1;" parent="1" source="pending" target="wigle" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e11label" value="retry lookup" style="edgeLabel;html=1;align=center;fontSize=9;" vertex="1" connectable="0" parent="e11">
+        <mxCell id="e11label" value="retry lookup" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e11" vertex="1" connectable="0">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-
-        <!-- Legend -->
-        <mxCell id="leg1" value="Yellow = code modules" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;" vertex="1" parent="1">
+        <mxCell id="leg1" value="Yellow = code modules" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;" parent="1" vertex="1">
           <mxGeometry x="40" y="560" width="130" height="25" as="geometry" />
         </mxCell>
-        <mxCell id="leg2" value="Red = external APIs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=9;" vertex="1" parent="1">
+        <mxCell id="leg2" value="Red = external APIs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=9;" parent="1" vertex="1">
           <mxGeometry x="40" y="590" width="130" height="25" as="geometry" />
         </mxCell>
-        <mxCell id="leg3" value="Green = storage" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=9;size=5;" vertex="1" parent="1">
+        <mxCell id="leg3" value="Green = storage" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=9;size=5;" parent="1" vertex="1">
           <mxGeometry x="40" y="620" width="130" height="30" as="geometry" />
         </mxCell>
-        <mxCell id="leg4" value="Blue = external I/O" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=9;" vertex="1" parent="1">
+        <mxCell id="leg4" value="Blue = external I/O" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=9;" parent="1" vertex="1">
           <mxGeometry x="40" y="655" width="130" height="25" as="geometry" />
         </mxCell>
-        <mxCell id="leg5" value="Dashed = background tasks" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=9;dashed=1;" vertex="1" parent="1">
+        <mxCell id="leg5" value="Dashed = background tasks" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=9;dashed=1;" parent="1" vertex="1">
           <mxGeometry x="40" y="685" width="130" height="25" as="geometry" />
         </mxCell>
-
       </root>
     </mxGraphModel>
   </diagram>

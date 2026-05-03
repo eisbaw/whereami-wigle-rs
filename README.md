@@ -112,6 +112,8 @@ The systemd service runs with `CAP_NET_ADMIN`, `DynamicUser=true`, and hardened 
 
 ## Architecture
 
+![Architecture Diagram](docs/architecture.svg)
+
 See [docs/adr/](docs/adr/) for Architecture Decision Records covering all major design choices.
 
 Key design decisions:
