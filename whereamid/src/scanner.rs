@@ -353,17 +353,17 @@ BSS 11:22:33:44:55:66(on wlan0)
     #[test]
     fn test_parse_nmcli_output() {
         // nmcli -t escapes colons in BSSIDs as \:
-        let output = "F6\\:B1\\:9C\\:0A\\:3A\\:60:Neighbor_2G:65:11:2462\n80\\:69\\:1A\\:1E\\:FC\\:EA:TestRouter_5G:49:100:5500\n";
+        let output = "AA\\:BB\\:CC\\:DD\\:EE\\:01:TestNet_2G:65:11:2462\nAA\\:BB\\:CC\\:DD\\:EE\\:02:TestNet_5G:49:100:5500\n";
         let networks = parse_nmcli_output(output);
         assert_eq!(networks.len(), 2);
-        assert_eq!(networks[0].bssid, "AA:BB:CC:11:22:01");
-        assert_eq!(networks[0].ssid, Some("Neighbor_2G".to_string()));
+        assert_eq!(networks[0].bssid, "AA:BB:CC:DD:EE:01");
+        assert_eq!(networks[0].ssid, Some("TestNet_2G".to_string()));
         assert_eq!(networks[0].channel, Some(11));
         assert_eq!(networks[0].frequency, Some(2462));
         // signal: 65% -> -90 + (65*60/100) = -90 + 39 = -51
         assert_eq!(networks[0].signal_dbm, -51);
-        assert_eq!(networks[1].bssid, "AA:BB:CC:11:22:02");
-        assert_eq!(networks[1].ssid, Some("TestRouter_5G".to_string()));
+        assert_eq!(networks[1].bssid, "AA:BB:CC:DD:EE:02");
+        assert_eq!(networks[1].ssid, Some("TestNet_5G".to_string()));
     }
 
     #[test]

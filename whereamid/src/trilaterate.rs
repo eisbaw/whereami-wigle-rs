@@ -192,19 +192,19 @@ mod tests {
         // Two APs ~100m apart (within 200m radius, so no outlier rejection)
         let aps = vec![
             PositionedAp {
-                lat: 55.7070,
-                lon: 12.5850,
+                lat: 48.8570,
+                lon: 2.3510,
                 signal_dbm: None,
             },
             PositionedAp {
-                lat: 55.7080,
-                lon: 12.5860,
+                lat: 48.8580,
+                lon: 2.3520,
                 signal_dbm: None,
             },
         ];
         let pos = trilaterate(&aps).unwrap();
-        assert!((pos.lat - 55.7075).abs() < 1e-4);
-        assert!((pos.lon - 12.5855).abs() < 1e-4);
+        assert!((pos.lat - 48.8575).abs() < 1e-4);
+        assert!((pos.lon - 2.3515).abs() < 1e-4);
     }
 
     #[test]
@@ -241,82 +241,73 @@ mod tests {
 
     #[test]
     fn test_outlier_rejected() {
-        // 5 APs in Copenhagen cluster + 1 in Brazil
+        // 5 APs in tight cluster + 1 far away (stale/moved router)
         let aps = vec![
             PositionedAp {
-                lat: 55.707,
-                lon: 12.585,
+                lat: 48.857,
+                lon: 2.351,
                 signal_dbm: Some(-60),
             },
             PositionedAp {
-                lat: 55.707,
-                lon: 12.586,
+                lat: 48.857,
+                lon: 2.352,
                 signal_dbm: Some(-65),
             },
             PositionedAp {
-                lat: 55.708,
-                lon: 12.585,
+                lat: 48.858,
+                lon: 2.351,
                 signal_dbm: Some(-70),
             },
             PositionedAp {
-                lat: 55.706,
-                lon: 12.586,
+                lat: 48.856,
+                lon: 2.352,
                 signal_dbm: Some(-75),
             },
             PositionedAp {
-                lat: 55.707,
-                lon: 12.584,
+                lat: 48.857,
+                lon: 2.350,
                 signal_dbm: Some(-68),
             },
             PositionedAp {
                 lat: -12.894,
                 lon: -38.292,
                 signal_dbm: Some(-60),
-            }, // Brazil outlier
+            }, // distant outlier
         ];
         let pos = trilaterate(&aps).unwrap();
-        // Result should be in Copenhagen, not pulled toward Brazil
-        assert!(
-            pos.lat > 55.0,
-            "lat should be in Copenhagen, got {}",
-            pos.lat
-        );
-        assert!(
-            pos.lon > 12.0,
-            "lon should be in Copenhagen, got {}",
-            pos.lon
-        );
+        assert!(pos.lat > 48.0, "lat should be in cluster, got {}", pos.lat);
+        assert!(pos.lon > 2.0, "lon should be in cluster, got {}", pos.lon);
     }
 
     #[test]
     fn test_outlier_moved_router() {
-        // 4 APs in tight cluster + 1 that moved 2.5km away (stale WiGLE data)
+        // 4 APs in tight cluster + 1 that moved ~2km away
         let aps = vec![
             PositionedAp {
-                lat: 55.707,
-                lon: 12.585,
+                lat: 48.857,
+                lon: 2.351,
                 signal_dbm: Some(-60),
             },
             PositionedAp {
-                lat: 55.707,
-                lon: 12.586,
+                lat: 48.857,
+                lon: 2.352,
                 signal_dbm: Some(-65),
             },
             PositionedAp {
-                lat: 55.708,
-                lon: 12.585,
+                lat: 48.858,
+                lon: 2.351,
                 signal_dbm: Some(-70),
             },
             PositionedAp {
-                lat: 55.707,
-                lon: 12.584,
+                lat: 48.857,
+                lon: 2.350,
                 signal_dbm: Some(-68),
             },
             PositionedAp {
-                lat: 55.715,
-                lon: 12.559,
+                lat: 48.875,
+                lon: 2.325,
                 signal_dbm: Some(-62),
-            }, // ~2km away (RouterX)
+            }, // ~2km away
         ];
         let filtered = filter_outliers(&aps);
         assert_eq!(filtered.len(), 4, "outlier 2km away should be rejected");
@@ -327,18 +318,18 @@ mod tests {
         // All APs within 200m — none should be rejected
         let aps = vec![
             PositionedAp {
-                lat: 55.7070,
-                lon: 12.5850,
+                lat: 48.8570,
+                lon: 2.3510,
                 signal_dbm: Some(-60),
             },
             PositionedAp {
-                lat: 55.7071,
-                lon: 12.5855,
+                lat: 48.8571,
+                lon: 2.3515,
                 signal_dbm: Some(-65),
             },
             PositionedAp {
-                lat: 55.7069,
-                lon: 12.5852,
+                lat: 48.8569,
+                lon: 2.3512,
                 signal_dbm: Some(-70),
             },
         ];
