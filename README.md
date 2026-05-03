@@ -11,7 +11,15 @@ Wi-Fi geolocation daemon for Linux. Scans nearby access points, resolves their p
 5. Weighted centroid trilateration computes your location
 6. Optional reverse geocoding via OSM Nominatim adds a street address
 
-Once the cache is warm for your area, the daemon works fully offline.
+## Accuracy
+
+In urban areas with good WiGLE coverage, expect ~10-30m accuracy with 5+ resolved APs. Suburban areas with fewer mapped APs may see 50-100m. Rural areas with sparse coverage will be less precise or may not resolve at all.
+
+## Caching and offline operation
+
+The daemon resolves AP positions via the WiGLE API, but only on first encounter. Results are cached permanently in a local SQLite database. Once your area is cached, all queries are answered locally with zero network traffic.
+
+When offline (no internet, airplane mode, WiGLE rate-limited), unknown APs are queued in a pending table. A background task automatically drains this queue when connectivity returns, so the cache fills in opportunistically over time without manual intervention.
 
 ## Quick start
 
