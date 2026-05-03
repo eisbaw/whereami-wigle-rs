@@ -67,11 +67,12 @@ pub fn filter_outliers(aps: &[PositionedAp]) -> Vec<PositionedAp> {
     kept
 }
 
+#[allow(clippy::manual_is_multiple_of)]
 fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = sorted.len();
-    if n.is_multiple_of(2) {
+    if n % 2 == 0 {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
     } else {
         sorted[n / 2]

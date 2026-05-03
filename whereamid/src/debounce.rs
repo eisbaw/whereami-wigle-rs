@@ -16,9 +16,15 @@ pub struct ScanEntry {
 /// A single scan sample: maps BSSID -> scan entry.
 pub type ScanSample = HashMap<String, ScanEntry>;
 
+/// A timestamped scan sample.
+pub struct TimestampedScan {
+    pub sample: ScanSample,
+    pub at: std::time::Instant,
+}
+
 /// Debounce ring buffer for stable AP detection.
 pub struct Debouncer {
-    ring: VecDeque<ScanSample>,
+    ring: VecDeque<TimestampedScan>,
     window: usize,
     threshold: usize,
 }
@@ -39,22 +45,28 @@ impl Debouncer {
         if self.ring.len() >= self.window {
             self.ring.pop_front();
         }
-        self.ring.push_back(sample);
+        self.ring.push_back(TimestampedScan {
+            sample,
+            at: std::time::Instant::now(),
+        });
     }
 
     /// Check if a specific BSSID is stable (appears in >= threshold samples).
     #[allow(dead_code)]
     pub fn is_stable(&self, bssid: &str) -> bool {
-        let count = self.ring.iter().filter(|s| s.contains_key(bssid)).count();
+        let count = self
+            .ring
+            .iter()
+            .filter(|s| s.sample.contains_key(bssid))
+            .count();
         count >= self.threshold
     }
 
     /// Return all currently stable BSSIDs.
     pub fn stable_bssids(&self) -> HashSet<String> {
-        // Count appearances of each BSSID across all samples
         let mut counts: HashMap<&str, usize> = HashMap::new();
-        for sample in &self.ring {
-            for bssid in sample.keys() {
+        for ts in &self.ring {
+            for bssid in ts.sample.keys() {
                 *counts.entry(bssid.as_str()).or_insert(0) += 1;
             }
         }
@@ -71,13 +83,13 @@ impl Debouncer {
     pub fn latest_signal(&self, bssid: &str) -> Option<i32> {
         self.ring
             .back()
-            .and_then(|sample| sample.get(bssid).map(|e| e.signal_dbm))
+            .and_then(|ts| ts.sample.get(bssid).map(|e| e.signal_dbm))
     }
 
     /// Get the full scan entry for a BSSID from the most recent scan.
     #[allow(dead_code)]
     pub fn latest_entry(&self, bssid: &str) -> Option<&ScanEntry> {
-        self.ring.back().and_then(|sample| sample.get(bssid))
+        self.ring.back().and_then(|ts| ts.sample.get(bssid))
     }
 
     /// How many samples are currently in the ring buffer.
@@ -87,7 +99,14 @@ impl Debouncer {
 
     /// Get the most recent scan sample.
     pub fn latest_scan(&self) -> Option<&ScanSample> {
-        self.ring.back()
+        self.ring.back().map(|ts| &ts.sample)
+    }
+
+    /// Age of the most recent scan in milliseconds. None if no scans yet.
+    pub fn latest_scan_age_ms(&self) -> Option<u64> {
+        self.ring
+            .back()
+            .map(|ts| ts.at.elapsed().as_millis() as u64)
     }
 }
 

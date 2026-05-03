@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
         args: args.clone(),
         wigle: wigle_client,
         beacondb: beacondb_client,
+        nominatim: nominatim::NominatimClient::new(),
     });
 
     // Spawn background scan loop

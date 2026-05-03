@@ -155,7 +155,7 @@ in {
         LockPersonality = true;
         MemoryDenyWriteExecute = true;
         RestrictRealtime = true;
-        SystemCallFilter = [ "@system-service" "~@privileged" "@network-io" ];
+        SystemCallFilter = [ "@system-service" "@network-io" ];
       };
     };
   };

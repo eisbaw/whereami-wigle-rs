@@ -12,10 +12,19 @@ use crate::beacondb::BeaconDbClient;
 use crate::config::Args;
 use crate::db::Database;
 use crate::debounce::Debouncer;
+use crate::nominatim::NominatimClient;
 use crate::wigle::WigleClient;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BYTES: u64 = 64 * 1024; // 64 KiB max request size
+
+/// Acquire the DB lock, logging a warning if the mutex was poisoned.
+pub fn lock_db(state: &DaemonState) -> std::sync::MutexGuard<'_, crate::db::Database> {
+    state.db.lock().unwrap_or_else(|e| {
+        tracing::error!("DB mutex was poisoned (a thread panicked while holding it) — recovering");
+        e.into_inner()
+    })
+}
 
 /// Shared daemon state, accessible from connection handlers.
 /// Database uses std::sync::Mutex because rusqlite::Connection is !Send.
@@ -27,6 +36,7 @@ pub struct DaemonState {
     pub wigle: WigleClient,
     #[allow(dead_code)] // kept for future BeaconDB integration
     pub beacondb: BeaconDbClient,
+    pub nominatim: NominatimClient,
 }
 
 // --- Protocol types ---
@@ -83,6 +93,7 @@ struct ScanResponse {
     ok: bool,
     v: u32,
     networks: Vec<NetworkInfo>,
+    scan_age_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -198,11 +209,16 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
         return error_json("no stable APs detected yet (debounce warming up)");
     }
 
-    // Get top-N by signal strength from latest scan only
+    // Get top-N by signal strength. Use latest scan signal if available,
+    // otherwise use a weak default (-90 dBm) so stable BSSIDs not in the
+    // latest scan can still contribute from cache (just at lower weight).
     let stable_count = stable.len(); // PRD: count before top-N truncation
     let mut stable_with_signal: Vec<(String, i32)> = stable
         .iter()
-        .filter_map(|b| debouncer.latest_signal(b).map(|s| (b.clone(), s)))
+        .map(|b| {
+            let signal = debouncer.latest_signal(b).unwrap_or(-90);
+            (b.clone(), signal)
+        })
         .collect();
     stable_with_signal.sort_by(|a, b| b.1.cmp(&a.1));
     stable_with_signal.truncate(state.args.top_n);
@@ -234,7 +250,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
     match trilaterate(&positioned_aps) {
         Ok(pos) => {
             let address = if state.args.address_approx {
-                match crate::nominatim::reverse_geocode(pos.lat, pos.lon).await {
+                match state.nominatim.reverse_geocode(pos.lat, pos.lon).await {
                     Ok(addr) => Some(addr.display),
                     Err(e) => {
                         warn!("reverse geocode failed: {e}");
@@ -316,6 +332,7 @@ async fn handle_resolve(bssids: &[String], state: &Arc<DaemonState>) -> String {
 
 async fn handle_scan(state: &Arc<DaemonState>) -> String {
     let debouncer = state.debouncer.lock().await;
+    let scan_age_ms = debouncer.latest_scan_age_ms();
     let networks = match debouncer.latest_scan() {
         Some(sample) => {
             let mut nets: Vec<NetworkInfo> = sample
@@ -337,15 +354,13 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
         ok: true,
         v: 1,
         networks,
+        scan_age_ms,
     };
     serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
 }
 
 async fn handle_stats(state: &Arc<DaemonState>) -> String {
-    let db = match state.db.lock() {
-        Ok(db) => db,
-        Err(e) => return error_json(&format!("database lock poisoned: {e}")),
-    };
+    let db = lock_db(state);
     let cached = db.cached_ap_count().unwrap_or(0);
     let pending = db.pending_ap_count().unwrap_or(0);
     let not_found = db.not_found_ap_count().unwrap_or(0);

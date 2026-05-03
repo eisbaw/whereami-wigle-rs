@@ -26,7 +26,7 @@ pub async fn run_pending_drain(state: Arc<DaemonState>) {
 async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
     // Clean up entries that exceeded max attempts
     {
-        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let db = crate::server::lock_db(state);
         match db.delete_expired_pending(max_attempts) {
             Ok(deleted) if deleted > 0 => {
                 info!("deleted {deleted} pending entries exceeding {max_attempts} attempts");
@@ -38,7 +38,7 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
 
     // Re-check expired not_found entries (30 day TTL)
     {
-        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let db = crate::server::lock_db(state);
         match db.get_expired_not_found(state.args.not_found_ttl_days, 5) {
             Ok(expired) => {
                 for bssid in expired {
@@ -57,7 +57,7 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
 
     // Pick up to 10 pending MACs
     let pending = {
-        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let db = crate::server::lock_db(state);
         match db.get_pending(10) {
             Ok(p) => p,
             Err(e) => {
@@ -76,7 +76,7 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
     for entry in &pending {
         // Check rate limit
         let can_call = {
-            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let db = crate::server::lock_db(state);
             db.can_call_api(state.args.daily_limit).unwrap_or(false)
         };
         if !can_call {
@@ -95,7 +95,7 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
                     "pending drain: resolved {} -> ({}, {})",
                     entry.bssid, ap.lat, ap.lon
                 );
-                let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                let db = crate::server::lock_db(state);
                 if let Err(e) = db.record_api_call() {
                     warn!("failed to record API call: {e}");
                 }
@@ -108,7 +108,7 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
             }
             Err(WigleError::NotFound) => {
                 debug!("pending drain: {} not found in WiGLE", entry.bssid);
-                let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                let db = crate::server::lock_db(state);
                 if let Err(e) = db.record_api_call() {
                     warn!("failed to record API call: {e}");
                 }
@@ -125,7 +125,7 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
             }
             Err(WigleError::Network(e)) => {
                 warn!("pending drain: network error for {}: {e}", entry.bssid);
-                let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                let db = crate::server::lock_db(state);
                 if let Err(e) = db.increment_pending_attempts(&entry.bssid) {
                     warn!("failed to increment attempts for {}: {e}", entry.bssid);
                 }

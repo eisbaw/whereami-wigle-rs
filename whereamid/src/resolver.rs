@@ -31,7 +31,7 @@ pub async fn resolve_for_locate(bssids: &[String], state: &Arc<DaemonState>) -> 
     for bssid in bssids {
         // Check aps cache (lock/unlock quickly)
         let cache_hit = {
-            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let db = crate::server::lock_db(state);
             match db.get_ap(bssid) {
                 Ok(Some(ap)) => {
                     if let Err(e) = db.touch_ap(bssid) {
@@ -56,7 +56,7 @@ pub async fn resolve_for_locate(bssids: &[String], state: &Arc<DaemonState>) -> 
 
         // Check not_found cache
         let is_not_found = {
-            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let db = crate::server::lock_db(state);
             db.is_not_found(bssid, state.args.not_found_ttl_days)
                 .unwrap_or(false)
         };
@@ -72,7 +72,7 @@ pub async fn resolve_for_locate(bssids: &[String], state: &Arc<DaemonState>) -> 
 
         // Check rate limit
         let can_call = {
-            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let db = crate::server::lock_db(state);
             db.can_call_api(state.args.daily_limit).unwrap_or(false)
         };
         if !can_call || !state.wigle.is_configured() {
@@ -86,7 +86,7 @@ pub async fn resolve_for_locate(bssids: &[String], state: &Arc<DaemonState>) -> 
             Ok(ap) => {
                 info!("WiGLE resolved {bssid} -> ({}, {})", ap.lat, ap.lon);
                 {
-                    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                    let db = crate::server::lock_db(state);
                     if let Err(e) = db.record_api_call() {
                         warn!("failed to record API call: {e}");
                     }
@@ -100,7 +100,7 @@ pub async fn resolve_for_locate(bssids: &[String], state: &Arc<DaemonState>) -> 
             }
             Err(WigleError::NotFound) => {
                 debug!("WiGLE: {bssid} not found");
-                let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                let db = crate::server::lock_db(state);
                 if let Err(e) = db.record_api_call() {
                     warn!("failed to record API call: {e}");
                 }
@@ -115,7 +115,7 @@ pub async fn resolve_for_locate(bssids: &[String], state: &Arc<DaemonState>) -> 
             }
             Err(WigleError::Network(e)) => {
                 warn!("WiGLE network error for {bssid}: {e}");
-                let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                let db = crate::server::lock_db(state);
                 if let Err(e) = db.insert_pending(bssid, None, None, None, None) {
                     warn!("failed to insert pending {bssid}: {e}");
                 }
@@ -128,7 +128,7 @@ pub async fn resolve_for_locate(bssids: &[String], state: &Arc<DaemonState>) -> 
     if !uncached_bssids.is_empty() {
         // BeaconDB cannot resolve individual AP positions (it returns an aggregate),
         // so we skip it for trilateration and queue everything to pending for WiGLE later.
-        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let db = crate::server::lock_db(state);
         for bssid in &uncached_bssids {
             if let Err(e) = db.insert_pending(bssid, None, None, None, None) {
                 warn!("failed to insert pending {bssid}: {e}");
@@ -156,7 +156,7 @@ pub async fn resolve_readonly(bssids: &[String], state: &Arc<DaemonState>) -> Re
     for bssid in bssids {
         // Check aps cache
         let cache_hit = {
-            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let db = crate::server::lock_db(state);
             db.get_ap(bssid).ok().flatten()
         };
         if let Some(ap) = cache_hit {
@@ -167,7 +167,7 @@ pub async fn resolve_readonly(bssids: &[String], state: &Arc<DaemonState>) -> Re
 
         // Check not_found cache
         let is_nf = {
-            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let db = crate::server::lock_db(state);
             db.is_not_found(bssid, state.args.not_found_ttl_days)
                 .unwrap_or(false)
         };
@@ -177,7 +177,7 @@ pub async fn resolve_readonly(bssids: &[String], state: &Arc<DaemonState>) -> Re
 
         // Check rate limit
         let can_call = {
-            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let db = crate::server::lock_db(state);
             db.can_call_api(state.args.daily_limit).unwrap_or(false)
         };
         if !can_call || !state.wigle.is_configured() {
@@ -187,7 +187,7 @@ pub async fn resolve_readonly(bssids: &[String], state: &Arc<DaemonState>) -> Re
         // Query WiGLE -- ephemeral, do NOT write to aps cache
         match state.wigle.lookup_bssid(bssid).await {
             Ok(ap) => {
-                let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                let db = crate::server::lock_db(state);
                 if let Err(e) = db.record_api_call() {
                     warn!("failed to record API call: {e}");
                 }
@@ -197,9 +197,13 @@ pub async fn resolve_readonly(bssids: &[String], state: &Arc<DaemonState>) -> Re
                 fetched_count += 1;
             }
             Err(WigleError::NotFound) => {
-                let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+                let db = crate::server::lock_db(state);
                 if let Err(e) = db.record_api_call() {
                     warn!("failed to record API call: {e}");
+                }
+                // Write to not_found to avoid burning quota on repeated lookups
+                if let Err(e) = db.insert_not_found(bssid) {
+                    warn!("failed to insert not_found {bssid}: {e}");
                 }
             }
             Err(WigleError::RateLimited) => {
