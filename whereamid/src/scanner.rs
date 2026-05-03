@@ -80,7 +80,7 @@ async fn wifi_scan_nmcli(interface: &str) -> Result<Vec<ScannedNetwork>> {
 /// The field separator is an unescaped ':'.
 /// Fields: BSSID:SSID:SIGNAL:CHAN:FREQ
 /// Signal is 0-100 percentage, convert to approximate dBm.
-fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
+pub fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
     let mut networks = Vec::new();
     for line in output.lines() {
         let line = line.trim();
@@ -122,7 +122,7 @@ fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
 
 /// Split an nmcli -t line on unescaped ':' characters.
 /// In nmcli terse mode, literal colons in values are escaped as '\:'.
-fn split_nmcli_fields(line: &str) -> Vec<String> {
+pub fn split_nmcli_fields(line: &str) -> Vec<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
     let mut chars = line.chars().peekable();
@@ -205,7 +205,7 @@ async fn wifi_scan_iw(interface: &str) -> Result<Vec<ScannedNetwork>> {
 }
 
 /// Parse the output of `iw dev <iface> scan dump`.
-fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
+pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
     let mut networks = Vec::new();
     let mut current_bssid: Option<String> = None;
     let mut current_ssid: Option<String> = None;
