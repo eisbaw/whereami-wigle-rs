@@ -64,6 +64,10 @@ pub struct Args {
     /// Days before re-checking a not-found BSSID
     #[arg(long, default_value_t = 30)]
     pub not_found_ttl_days: i64,
+
+    /// Include approximate street address in locate responses (via OSM Nominatim)
+    #[arg(long)]
+    pub address_approx: bool,
 }
 
 /// TOML config file structure (secrets only).

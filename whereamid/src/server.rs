@@ -58,6 +58,8 @@ struct LocateResponse {
     pending: usize,
     visible: usize,
     stable: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -231,6 +233,18 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
 
     match trilaterate(&positioned_aps) {
         Ok(pos) => {
+            let address = if state.args.address_approx {
+                match crate::nominatim::reverse_geocode(pos.lat, pos.lon).await {
+                    Ok(addr) => Some(addr.display),
+                    Err(e) => {
+                        warn!("reverse geocode failed: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let resp = LocateResponse {
                 ok: true,
                 v: 1,
@@ -243,6 +257,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                 pending: resolve_result.pending_count,
                 visible,
                 stable: stable_count,
+                address,
             };
             serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
         }

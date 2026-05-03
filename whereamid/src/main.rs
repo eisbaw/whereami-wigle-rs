@@ -8,6 +8,7 @@ mod beacondb;
 mod config;
 mod db;
 mod debounce;
+mod nominatim;
 mod pending;
 mod resolver;
 mod scanner;
