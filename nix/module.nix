@@ -25,17 +25,20 @@ in {
       description = "Path to the SQLite database.";
     };
 
-    wigle = {
-      apiUser = lib.mkOption {
-        type = lib.types.str;
-        default = "";
-        description = "WiGLE API user ID.";
-      };
-      apiKey = lib.mkOption {
-        type = lib.types.str;
-        default = "";
-        description = "WiGLE API key.";
-      };
+    credentialsFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Path to a TOML file containing WiGLE credentials.
+        This file is NOT copied to the nix store — it is read at runtime.
+        Expected format:
+          [wigle]
+          api_user = "AID..."
+          api_key = "..."
+
+          [beacondb]
+          enabled = true
+      '';
     };
 
     dailyLimit = lib.mkOption {
@@ -91,41 +94,48 @@ in {
       default = 20;
       description = "Drop from pending after this many failed attempts.";
     };
+
+    notFoundTtlDays = lib.mkOption {
+      type = lib.types.int;
+      default = 30;
+      description = "Days before re-checking a not-found BSSID.";
+    };
+
+    addressApprox = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Include approximate street address in locate responses via OSM Nominatim.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
-    # Generate config file with secrets
-    environment.etc."whereami/config.toml".text = ''
-      [wigle]
-      api_user = "${cfg.wigle.apiUser}"
-      api_key = "${cfg.wigle.apiKey}"
-
-      [beacondb]
-      enabled = true
-    '';
-
     systemd.services.whereamid = {
       description = "whereami Wi-Fi geolocation daemon";
-      after = [ "network.target" ];
+      after = [ "network.target" "NetworkManager.service" ];
       wantedBy = [ "multi-user.target" ];
 
       serviceConfig = {
-        ExecStart = lib.concatStringsSep " " [
+        ExecStart = let
+          configArg = lib.optionalString (cfg.credentialsFile != null)
+            "--config ${cfg.credentialsFile}";
+          addressArg = lib.optionalString cfg.addressApprox "--address-approx";
+        in lib.concatStringsSep " " ([
           "${whereamid}/bin/whereamid"
-          "--bind ${cfg.bind}"
-          "--db ${cfg.dbPath}"
-          "--interface ${cfg.wifiInterface}"
-          "--config /etc/whereami/config.toml"
-          "--scan-interval-fast ${toString cfg.scanIntervalFast}"
-          "--scan-fast-duration ${toString cfg.scanFastDuration}"
-          "--scan-interval-slow ${toString cfg.scanIntervalSlow}"
-          "--debounce-window ${toString cfg.debounceWindow}"
-          "--debounce-threshold ${toString cfg.debounceThreshold}"
-          "--top-n ${toString cfg.topN}"
-          "--pending-interval ${toString cfg.pendingInterval}"
-          "--pending-max-attempts ${toString cfg.pendingMaxAttempts}"
-          "--daily-limit ${toString cfg.dailyLimit}"
-        ];
+          "--bind" cfg.bind
+          "--db" cfg.dbPath
+          "--interface" cfg.wifiInterface
+          "--scan-interval-fast" (toString cfg.scanIntervalFast)
+          "--scan-fast-duration" (toString cfg.scanFastDuration)
+          "--scan-interval-slow" (toString cfg.scanIntervalSlow)
+          "--debounce-window" (toString cfg.debounceWindow)
+          "--debounce-threshold" (toString cfg.debounceThreshold)
+          "--top-n" (toString cfg.topN)
+          "--pending-interval" (toString cfg.pendingInterval)
+          "--pending-max-attempts" (toString cfg.pendingMaxAttempts)
+          "--daily-limit" (toString cfg.dailyLimit)
+          "--not-found-ttl-days" (toString cfg.notFoundTtlDays)
+        ] ++ lib.optional (configArg != "") configArg
+          ++ lib.optional (addressArg != "") addressArg);
 
         DynamicUser = true;
         StateDirectory = "whereami";

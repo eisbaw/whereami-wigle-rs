@@ -5,6 +5,7 @@
 , openssl
 , sqlite
 , iw
+, networkmanager
 }:
 
 rustPlatform.buildRustPackage {
@@ -27,7 +28,7 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     wrapProgram $out/bin/whereamid \
-      --prefix PATH : ${lib.makeBinPath [ iw ]}
+      --prefix PATH : ${lib.makeBinPath [ iw networkmanager ]}
   '';
 
   meta = with lib; {
