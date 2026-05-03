@@ -22,7 +22,7 @@ pub struct Args {
     pub interface: String,
 
     /// Path to TOML config file (API secrets)
-    #[arg(long, default_value = "~/.whereami.toml")]
+    #[arg(long, default_value = "~/.config/whereami/config.toml")]
     pub config: String,
 
     /// Scan interval during fast phase (seconds)
