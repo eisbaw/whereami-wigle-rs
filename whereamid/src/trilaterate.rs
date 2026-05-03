@@ -18,80 +18,60 @@ pub struct Position {
     pub accuracy_m: f64,
 }
 
-/// Maximum distance (meters) between APs that can plausibly be in the same location.
-/// APs further than this from the cluster median are outliers (moved routers, stale WiGLE data).
-const OUTLIER_RADIUS_M: f64 = 200.0;
-
 /// Filter out outlier APs that are implausibly far from the cluster.
-/// Uses iterative median approach: compute median position, reject APs > 200m from it,
-/// recompute until stable.
+///
+/// Algorithm:
+/// 1. Compute median lat/lon (robust center estimate)
+/// 2. Compute each AP's distance from that median
+/// 3. Compute the median of those distances (MAD-like measure of cluster spread)
+/// 4. Reject APs whose distance from median exceeds max(200m, 3 * median_distance)
+///
+/// The 200m floor reflects the physical assumption that APs in a neighborhood
+/// are within ~200m. The 3x median_distance handles cases where all APs are
+/// further apart (e.g. rural, or all have somewhat stale positions) — it adapts
+/// to the actual data spread rather than rejecting everything.
 pub fn filter_outliers(aps: &[PositionedAp]) -> Vec<PositionedAp> {
-    if aps.len() <= 1 {
+    if aps.len() <= 2 {
         return aps.to_vec();
     }
 
-    let mut kept: Vec<PositionedAp> = aps.to_vec();
+    // Compute median lat/lon
+    let median_lat = median(&aps.iter().map(|a| a.lat).collect::<Vec<_>>());
+    let median_lon = median(&aps.iter().map(|a| a.lon).collect::<Vec<_>>());
 
-    // Iterate until stable (max 3 rounds to avoid infinite loops)
-    for _ in 0..3 {
-        if kept.is_empty() {
-            break;
-        }
+    // Compute each AP's distance from the median
+    let distances: Vec<f64> = aps
+        .iter()
+        .map(|ap| haversine_m(median_lat, median_lon, ap.lat, ap.lon))
+        .collect();
 
-        // Compute median lat/lon (robust to outliers unlike mean)
-        let median_lat = median(&kept.iter().map(|a| a.lat).collect::<Vec<_>>());
-        let median_lon = median(&kept.iter().map(|a| a.lon).collect::<Vec<_>>());
+    // Compute median distance (the typical spread)
+    let median_dist = median(&distances);
 
-        let before = kept.len();
-        kept.retain(|ap| haversine_m(median_lat, median_lon, ap.lat, ap.lon) <= OUTLIER_RADIUS_M);
+    // Threshold: max(200m physical floor, 3x the median spread)
+    let threshold = f64::max(200.0, 3.0 * median_dist);
 
-        if kept.len() == before {
-            break; // No change, converged
-        }
-    }
+    // Keep APs within threshold of the median position
+    let kept: Vec<PositionedAp> = aps
+        .iter()
+        .zip(distances.iter())
+        .filter(|(_, d)| **d <= threshold)
+        .map(|(ap, _)| ap.clone())
+        .collect();
 
-    // If filtering removed everything (e.g. all APs > 200m apart), return the largest cluster
+    // If somehow nothing survived (shouldn't happen with 3x median), return all
     if kept.is_empty() {
-        return find_largest_cluster(aps);
+        return aps.to_vec();
     }
 
     kept
-}
-
-/// Find the largest cluster of APs where all members are within 200m of each other.
-/// Simple greedy: for each AP, count how many others are within 200m. Pick the AP
-/// with the most neighbors as the cluster center, return it + its neighbors.
-fn find_largest_cluster(aps: &[PositionedAp]) -> Vec<PositionedAp> {
-    if aps.is_empty() {
-        return Vec::new();
-    }
-
-    let mut best_center = 0;
-    let mut best_count = 0;
-
-    for (i, ap) in aps.iter().enumerate() {
-        let count = aps
-            .iter()
-            .filter(|other| haversine_m(ap.lat, ap.lon, other.lat, other.lon) <= OUTLIER_RADIUS_M)
-            .count();
-        if count > best_count {
-            best_count = count;
-            best_center = i;
-        }
-    }
-
-    let center = &aps[best_center];
-    aps.iter()
-        .filter(|ap| haversine_m(center.lat, center.lon, ap.lat, ap.lon) <= OUTLIER_RADIUS_M)
-        .cloned()
-        .collect()
 }
 
 fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = sorted.len();
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
     } else {
         sorted[n / 2]
