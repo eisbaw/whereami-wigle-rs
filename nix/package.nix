@@ -31,6 +31,8 @@ rustPlatform.buildRustPackage {
       --prefix PATH : ${lib.makeBinPath [ iw networkmanager ]}
   '';
 
+  # Both whereamid (daemon) and whereami (CLI) are built by the workspace
+
   meta = with lib; {
     description = "Wi-Fi geolocation daemon for NixOS";
     license = licenses.mit;

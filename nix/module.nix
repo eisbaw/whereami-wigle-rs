@@ -155,8 +155,9 @@ in {
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
 
-    # User-level service
+    # User-level service + CLI in PATH
     (lib.mkIf (cfg.user != null) {
+      users.users.${cfg.user}.packages = [ whereamid ];
       systemd.user.services.whereamid = {
         description = "whereami Wi-Fi geolocation daemon";
         after = [ "network.target" ];
