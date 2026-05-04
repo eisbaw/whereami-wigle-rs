@@ -205,40 +205,74 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
     let stable = debouncer.stable_bssids();
     let visible = debouncer.latest_scan().map(|s| s.len()).unwrap_or(0);
 
-    if stable.is_empty() {
-        return error_json("no stable APs detected yet (debounce warming up)");
-    }
-
-    // Get top-N by signal strength. Use latest scan signal if available,
-    // otherwise use a weak default (-90 dBm) so stable BSSIDs not in the
-    // latest scan can still contribute from cache (just at lower weight).
-    let stable_count = stable.len(); // PRD: count before top-N truncation
-    let mut stable_with_signal: Vec<(String, i32)> = stable
+    // Build candidate list: stable APs with signal, sorted by RSSI, top-N
+    let stable_count = stable.len();
+    let mut candidates: Vec<(String, i32)> = stable
         .iter()
         .map(|b| {
             let signal = debouncer.latest_signal(b).unwrap_or(-90);
             (b.clone(), signal)
         })
         .collect();
-    stable_with_signal.sort_by(|a, b| b.1.cmp(&a.1));
-    stable_with_signal.truncate(state.args.top_n);
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.truncate(state.args.top_n);
 
-    drop(debouncer); // Release lock before doing IO
+    // Cold-start fallback: if no stable APs have cached positions,
+    // use ALL visible APs from latest scan (bypass debounce for the query).
+    // They won't be committed to cache — just used for this one response.
+    let fallback_candidates: Vec<(String, i32)> = if candidates.is_empty() {
+        debouncer
+            .latest_scan()
+            .map(|scan| {
+                let mut v: Vec<(String, i32)> = scan
+                    .iter()
+                    .map(|(b, e)| (b.clone(), e.signal_dbm))
+                    .collect();
+                v.sort_by(|a, b| b.1.cmp(&a.1));
+                v.truncate(state.args.top_n);
+                v
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
-    let bssids: Vec<String> = stable_with_signal.iter().map(|(b, _)| b.clone()).collect();
+    drop(debouncer);
+
+    // Try stable candidates first, fall back to raw visible APs
+    let using_fallback = candidates.is_empty() && !fallback_candidates.is_empty();
+    let active_candidates = if candidates.is_empty() {
+        &fallback_candidates
+    } else {
+        &candidates
+    };
+
+    if active_candidates.is_empty() {
+        return error_json("no APs detected yet");
+    }
+
+    let bssids: Vec<String> = active_candidates.iter().map(|(b, _)| b.clone()).collect();
     let signal_map: std::collections::HashMap<String, i32> =
-        stable_with_signal.into_iter().collect();
+        active_candidates.iter().cloned().collect();
 
-    // Resolve positions
-    let resolve_result = resolver::resolve_for_locate(&bssids, state).await;
+    // Cache-only lookup — never blocks on WiGLE. Instant response.
+    let cached_aps = resolver::lookup_cached(&bssids, state);
+    let cached_count = cached_aps.len();
 
-    if resolve_result.positioned.is_empty() {
-        return error_json("no APs with known positions");
+    if cached_aps.is_empty() {
+        // Nothing cached. If using fallback, queue all for background resolution.
+        if using_fallback {
+            let resolve_state = Arc::clone(state);
+            let bssids_clone = bssids.clone();
+            tokio::spawn(async move {
+                resolver::resolve_background(&bssids_clone, &resolve_state).await;
+            });
+        }
+        return error_json("no APs with known positions (resolving in background)");
     }
 
     // Build trilateration input
-    let positioned_aps: Vec<PositionedAp> = resolve_result
-        .positioned
+    let positioned_aps: Vec<PositionedAp> = cached_aps
         .iter()
         .map(|ap| PositionedAp {
             lat: ap.lat,
@@ -267,10 +301,10 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                 lat: pos.lat,
                 lon: pos.lon,
                 accuracy_m: pos.accuracy_m,
-                sources: resolve_result.positioned.len(),
-                cached: resolve_result.cached_count,
-                fetched: resolve_result.fetched_count,
-                pending: resolve_result.pending_count,
+                sources: cached_count,
+                cached: cached_count,
+                fetched: 0,
+                pending: 0,
                 visible,
                 stable: stable_count,
                 address,

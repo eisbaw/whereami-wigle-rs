@@ -11,14 +11,18 @@ use crate::wigle::WigleError;
 /// Result of a resolution operation.
 pub struct ResolveResult {
     pub positioned: Vec<ApInfo>,
+    #[allow(dead_code)]
     pub cached_count: usize,
+    #[allow(dead_code)]
     pub fetched_count: usize,
+    #[allow(dead_code)]
     pub pending_count: usize,
     pub fetched_bssids: HashSet<String>,
 }
 
-/// Resolve BSSIDs for the `locate` command.
-/// Writes results to the aps cache and pending queue.
+/// Resolve BSSIDs synchronously with WiGLE calls. Used by resolve command.
+/// Writes to aps cache and pending queue.
+#[allow(dead_code)]
 pub async fn resolve_for_locate(bssids: &[String], state: &Arc<DaemonState>) -> ResolveResult {
     let mut positioned = Vec::new();
     let mut cached_count = 0;
@@ -222,5 +226,109 @@ pub async fn resolve_readonly(bssids: &[String], state: &Arc<DaemonState>) -> Re
         fetched_count,
         pending_count: 0,
         fetched_bssids,
+    }
+}
+
+/// Cache-only lookup: returns positions from the aps table, no API calls.
+/// Used by `locate` to give instant responses.
+pub fn lookup_cached(bssids: &[String], state: &Arc<DaemonState>) -> Vec<ApInfo> {
+    let db = crate::server::lock_db(state);
+    let mut result = Vec::new();
+    for bssid in bssids {
+        match db.get_ap(bssid) {
+            Ok(Some(ap)) => {
+                if let Err(e) = db.touch_ap(bssid) {
+                    warn!("failed to touch AP {bssid}: {e}");
+                }
+                result.push(ap);
+            }
+            Ok(None) => {}
+            Err(e) => warn!("db error looking up {bssid}: {e}"),
+        }
+    }
+    result
+}
+
+/// Background resolution: resolve uncached stable BSSIDs proactively.
+/// Called from the scan loop after each scan. Writes to aps cache on success.
+/// Skips BSSIDs already cached or in not_found.
+pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
+    for bssid in bssids {
+        // Already cached?
+        let known = {
+            let db = crate::server::lock_db(state);
+            db.get_ap(bssid).ok().flatten().is_some()
+                || db
+                    .is_not_found(bssid, state.args.not_found_ttl_days)
+                    .unwrap_or(false)
+        };
+        if known {
+            continue;
+        }
+
+        // Already pending?
+        // (avoid duplicate work if pending drain is also running)
+        let in_pending = {
+            let db = crate::server::lock_db(state);
+            db.get_pending(1000)
+                .unwrap_or_default()
+                .iter()
+                .any(|p| p.bssid == *bssid)
+        };
+        if in_pending {
+            continue;
+        }
+
+        // Check rate limit
+        let can_call = {
+            let db = crate::server::lock_db(state);
+            db.can_call_api(state.args.daily_limit).unwrap_or(false)
+        };
+        if !can_call || !state.wigle.is_configured() {
+            // Queue for later
+            let db = crate::server::lock_db(state);
+            if let Err(e) = db.insert_pending(bssid, None, None, None, None) {
+                warn!("failed to insert pending {bssid}: {e}");
+            }
+            continue;
+        }
+
+        match state.wigle.lookup_bssid(bssid).await {
+            Ok(ap) => {
+                info!("background resolved {bssid} -> ({}, {})", ap.lat, ap.lon);
+                let db = crate::server::lock_db(state);
+                if let Err(e) = db.record_api_call() {
+                    warn!("failed to record API call: {e}");
+                }
+                if let Err(e) = db.upsert_ap(&ap) {
+                    warn!("failed to cache AP {bssid}: {e}");
+                }
+            }
+            Err(WigleError::NotFound) => {
+                debug!("background: {bssid} not found in WiGLE");
+                let db = crate::server::lock_db(state);
+                if let Err(e) = db.record_api_call() {
+                    warn!("failed to record API call: {e}");
+                }
+                if let Err(e) = db.insert_not_found(bssid) {
+                    warn!("failed to insert not_found {bssid}: {e}");
+                }
+            }
+            Err(WigleError::RateLimited) => {
+                warn!("background: WiGLE rate limited, stopping");
+                let db = crate::server::lock_db(state);
+                if let Err(e) = db.insert_pending(bssid, None, None, None, None) {
+                    warn!("failed to insert pending {bssid}: {e}");
+                }
+                break;
+            }
+            Err(WigleError::Network(e)) => {
+                warn!("background: network error for {bssid}: {e}");
+                let db = crate::server::lock_db(state);
+                if let Err(e) = db.insert_pending(bssid, None, None, None, None) {
+                    warn!("failed to insert pending {bssid}: {e}");
+                }
+            }
+        }
     }
 }

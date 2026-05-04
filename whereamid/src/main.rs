@@ -129,13 +129,24 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
                 let sample = scanner::scan_to_sample(&networks);
                 let mut debouncer = state.debouncer.lock().await;
                 debouncer.push_scan(sample);
-                let stable_count = debouncer.stable_bssids().len();
+                let stable = debouncer.stable_bssids();
+                let stable_count = stable.len();
+                let sample_count = debouncer.sample_count();
+                drop(debouncer);
+
                 info!(
                     "scan: {} networks, {} stable ({} samples in buffer)",
-                    count,
-                    stable_count,
-                    debouncer.sample_count()
+                    count, stable_count, sample_count
                 );
+
+                // Proactively resolve newly-stable APs in the background
+                if !stable.is_empty() {
+                    let resolve_state = Arc::clone(&state);
+                    let stable_vec: Vec<String> = stable.into_iter().collect();
+                    tokio::spawn(async move {
+                        resolver::resolve_background(&stable_vec, &resolve_state).await;
+                    });
+                }
             }
             Err(e) => {
                 tracing::warn!("wifi scan failed: {e}");
