@@ -34,7 +34,7 @@ struct SimpleRequest {
 // --- Response types ---
 
 /// Response from the `locate` command.
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct LocateResponse {
     pub ok: bool,
     pub v: u32,
@@ -56,6 +56,8 @@ pub struct LocateResponse {
     pub visible: usize,
     #[serde(default)]
     pub stable: usize,
+    #[serde(default)]
+    pub address: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -82,7 +84,7 @@ pub struct ResolveResponse {
 }
 
 /// A single network from the `scan` command.
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct NetworkEntry {
     pub bssid: String,
     pub ssid: Option<String>,
@@ -91,7 +93,7 @@ pub struct NetworkEntry {
 }
 
 /// Response from the `scan` command.
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ScanResponse {
     pub ok: bool,
     pub v: u32,
@@ -102,7 +104,7 @@ pub struct ScanResponse {
 }
 
 /// Response from the `stats` command.
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct StatsResponse {
     pub ok: bool,
     pub v: u32,
