@@ -178,6 +178,7 @@ fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
 }
 
 /// Parse a Location submessage — fields 1 (lat) and 2 (lon) are varint int64.
+/// Apple encodes these as plain signed varints (not zigzag), so we cast directly.
 fn parse_location(data: &[u8]) -> Result<(i64, i64)> {
     let mut lat: i64 = 0;
     let mut lon: i64 = 0;
@@ -190,11 +191,10 @@ fn parse_location(data: &[u8]) -> Result<(i64, i64)> {
         if wire_type == 0 {
             let (val, new_pos) = decode_varint(data, pos)?;
             pos = new_pos;
-            let signed = zigzag_decode(val);
             match field_num {
-                1 => lat = signed,
-                2 => lon = signed,
-                _ => {} // skip unknown fields
+                1 => lat = val as i64,
+                2 => lon = val as i64,
+                _ => {}
             }
         } else {
             pos = skip_field(data, pos, wire_type)?;
