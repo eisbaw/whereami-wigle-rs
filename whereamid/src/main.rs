@@ -3,6 +3,7 @@
 //! Scans Wi-Fi in the background, caches AP positions in SQLite,
 //! and answers "where am I?" queries over TCP + JSON-lines.
 
+mod apple;
 #[allow(dead_code)]
 mod beacondb;
 mod config;
@@ -67,6 +68,7 @@ async fn main() -> Result<()> {
         args: args.clone(),
         wigle: wigle_client,
         beacondb: beacondb_client,
+        apple: apple::AppleClient::new(),
         nominatim: nominatim::NominatimClient::new(),
     });
 

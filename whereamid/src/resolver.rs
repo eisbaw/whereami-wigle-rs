@@ -250,32 +250,52 @@ pub fn lookup_cached(bssids: &[String], state: &Arc<DaemonState>) -> Vec<ApInfo>
 }
 
 /// Background resolution: resolve uncached stable BSSIDs proactively.
-/// Called from the scan loop after each scan. Writes to aps cache on success.
-/// Skips BSSIDs already cached or in not_found.
+/// Queries all providers (Apple first as batch, then WiGLE for remaining).
+/// Takes the union of results. Writes to aps cache on success.
 pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
-    for bssid in bssids {
-        // Already cached?
-        let known = {
+    // Filter to only uncached, unknown BSSIDs
+    let to_resolve: Vec<String> = bssids
+        .iter()
+        .filter(|bssid| {
             let db = crate::server::lock_db(state);
-            db.get_ap(bssid).ok().flatten().is_some()
-                || db
-                    .is_not_found(bssid, state.args.not_found_ttl_days)
-                    .unwrap_or(false)
-        };
-        if known {
-            continue;
-        }
+            let cached = db.get_ap(bssid).ok().flatten().is_some();
+            let not_found = db
+                .is_not_found(bssid, state.args.not_found_ttl_days)
+                .unwrap_or(false);
+            !cached && !not_found
+        })
+        .cloned()
+        .collect();
 
-        // Already pending?
-        // (avoid duplicate work if pending drain is also running)
-        let in_pending = {
+    if to_resolve.is_empty() {
+        return;
+    }
+
+    let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Apple WPS — batch lookup, no auth, no rate limit
+    match state.apple.lookup_bssids(&to_resolve).await {
+        Ok(aps) => {
             let db = crate::server::lock_db(state);
-            db.get_pending(1000)
-                .unwrap_or_default()
-                .iter()
-                .any(|p| p.bssid == *bssid)
-        };
-        if in_pending {
+            for ap in aps {
+                info!(
+                    "Apple resolved {} -> ({}, {})",
+                    ap.bssid, ap.lat, ap.lon
+                );
+                if let Err(e) = db.upsert_ap(&ap) {
+                    warn!("failed to cache AP {}: {e}", ap.bssid);
+                }
+                resolved.insert(ap.bssid);
+            }
+        }
+        Err(e) => {
+            warn!("Apple WPS batch lookup failed: {e}");
+        }
+    }
+
+    // 2. WiGLE — one-by-one for remaining unresolved BSSIDs
+    for bssid in &to_resolve {
+        if resolved.contains(bssid) {
             continue;
         }
 
@@ -285,7 +305,6 @@ pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
             db.can_call_api(state.args.daily_limit).unwrap_or(false)
         };
         if !can_call || !state.wigle.is_configured() {
-            // Queue for later
             let db = crate::server::lock_db(state);
             if let Err(e) = db.insert_pending(bssid, None, None, None, None) {
                 warn!("failed to insert pending {bssid}: {e}");
@@ -295,7 +314,10 @@ pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
 
         match state.wigle.lookup_bssid(bssid).await {
             Ok(ap) => {
-                info!("background resolved {bssid} -> ({}, {})", ap.lat, ap.lon);
+                info!(
+                    "WiGLE resolved {} -> ({}, {})",
+                    bssid, ap.lat, ap.lon
+                );
                 let db = crate::server::lock_db(state);
                 if let Err(e) = db.record_api_call() {
                     warn!("failed to record API call: {e}");
@@ -303,19 +325,18 @@ pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
                 if let Err(e) = db.upsert_ap(&ap) {
                     warn!("failed to cache AP {bssid}: {e}");
                 }
+                resolved.insert(bssid.clone());
             }
             Err(WigleError::NotFound) => {
-                debug!("background: {bssid} not found in WiGLE");
+                debug!("WiGLE: {bssid} not found");
                 let db = crate::server::lock_db(state);
                 if let Err(e) = db.record_api_call() {
                     warn!("failed to record API call: {e}");
                 }
-                if let Err(e) = db.insert_not_found(bssid) {
-                    warn!("failed to insert not_found {bssid}: {e}");
-                }
+                // Don't insert not_found — Apple might know it even if WiGLE doesn't
             }
             Err(WigleError::RateLimited) => {
-                warn!("background: WiGLE rate limited, stopping");
+                warn!("WiGLE rate limited, stopping");
                 let db = crate::server::lock_db(state);
                 if let Err(e) = db.insert_pending(bssid, None, None, None, None) {
                     warn!("failed to insert pending {bssid}: {e}");
@@ -323,11 +344,31 @@ pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
                 break;
             }
             Err(WigleError::Network(e)) => {
-                warn!("background: network error for {bssid}: {e}");
+                warn!("WiGLE network error for {bssid}: {e}");
                 let db = crate::server::lock_db(state);
                 if let Err(e) = db.insert_pending(bssid, None, None, None, None) {
                     warn!("failed to insert pending {bssid}: {e}");
                 }
+            }
+        }
+    }
+
+    // BSSIDs not resolved by any provider — only mark not_found if neither found them
+    for bssid in &to_resolve {
+        if resolved.contains(bssid) {
+            continue;
+        }
+        // Check if it's already pending (from WiGLE errors above)
+        let db = crate::server::lock_db(state);
+        let in_pending = db
+            .get_pending(1000)
+            .unwrap_or_default()
+            .iter()
+            .any(|p| p.bssid == *bssid);
+        if !in_pending {
+            // Neither provider found it and no network error — genuinely unknown
+            if let Err(e) = db.insert_not_found(bssid) {
+                warn!("failed to insert not_found {bssid}: {e}");
             }
         }
     }

@@ -8,6 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
+use crate::apple::AppleClient;
 use crate::beacondb::BeaconDbClient;
 use crate::config::Args;
 use crate::db::Database;
@@ -36,6 +37,7 @@ pub struct DaemonState {
     pub wigle: WigleClient,
     #[allow(dead_code)] // kept for future BeaconDB integration
     pub beacondb: BeaconDbClient,
+    pub apple: AppleClient,
     pub nominatim: NominatimClient,
 }
 
