@@ -278,10 +278,7 @@ pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
         Ok(aps) => {
             let db = crate::server::lock_db(state);
             for ap in aps {
-                info!(
-                    "Apple resolved {} -> ({}, {})",
-                    ap.bssid, ap.lat, ap.lon
-                );
+                info!("Apple resolved {} -> ({}, {})", ap.bssid, ap.lat, ap.lon);
                 if let Err(e) = db.upsert_ap(&ap) {
                     warn!("failed to cache AP {}: {e}", ap.bssid);
                 }
@@ -314,10 +311,7 @@ pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
 
         match state.wigle.lookup_bssid(bssid).await {
             Ok(ap) => {
-                info!(
-                    "WiGLE resolved {} -> ({}, {})",
-                    bssid, ap.lat, ap.lon
-                );
+                info!("WiGLE resolved {} -> ({}, {})", bssid, ap.lat, ap.lon);
                 let db = crate::server::lock_db(state);
                 if let Err(e) = db.record_api_call() {
                     warn!("failed to record API call: {e}");

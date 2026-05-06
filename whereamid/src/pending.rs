@@ -73,7 +73,38 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
 
     debug!("draining {} pending entries", pending.len());
 
+    // 1. Try Apple WPS first — batch, no rate limit
+    let bssids: Vec<String> = pending.iter().map(|e| e.bssid.clone()).collect();
+    let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    match state.apple.lookup_bssids(&bssids).await {
+        Ok(aps) => {
+            let db = crate::server::lock_db(state);
+            for ap in aps {
+                info!(
+                    "pending drain: Apple resolved {} -> ({}, {})",
+                    ap.bssid, ap.lat, ap.lon
+                );
+                if let Err(e) = db.upsert_ap(&ap) {
+                    warn!("failed to upsert AP {}: {e}", ap.bssid);
+                }
+                if let Err(e) = db.delete_pending(&ap.bssid) {
+                    warn!("failed to delete pending {}: {e}", ap.bssid);
+                }
+                resolved.insert(ap.bssid);
+            }
+        }
+        Err(e) => {
+            warn!("pending drain: Apple batch lookup failed: {e}");
+        }
+    }
+
+    // 2. WiGLE for remaining unresolved
     for entry in &pending {
+        if resolved.contains(&entry.bssid) {
+            continue;
+        }
+
         // Check rate limit
         let can_call = {
             let db = crate::server::lock_db(state);
@@ -85,14 +116,14 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
         }
 
         if !state.wigle.is_configured() {
-            debug!("WiGLE not configured, cannot drain pending");
+            debug!("WiGLE not configured, skipping WiGLE drain");
             break;
         }
 
         match state.wigle.lookup_bssid(&entry.bssid).await {
             Ok(ap) => {
                 info!(
-                    "pending drain: resolved {} -> ({}, {})",
+                    "pending drain: WiGLE resolved {} -> ({}, {})",
                     entry.bssid, ap.lat, ap.lon
                 );
                 let db = crate::server::lock_db(state);
@@ -105,6 +136,7 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
                 if let Err(e) = db.delete_pending(&entry.bssid) {
                     warn!("failed to delete pending {}: {e}", entry.bssid);
                 }
+                resolved.insert(entry.bssid.clone());
             }
             Err(WigleError::NotFound) => {
                 debug!("pending drain: {} not found in WiGLE", entry.bssid);
@@ -112,12 +144,7 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
                 if let Err(e) = db.record_api_call() {
                     warn!("failed to record API call: {e}");
                 }
-                if let Err(e) = db.insert_not_found(&entry.bssid) {
-                    warn!("failed to insert not_found {}: {e}", entry.bssid);
-                }
-                if let Err(e) = db.delete_pending(&entry.bssid) {
-                    warn!("failed to delete pending {}: {e}", entry.bssid);
-                }
+                // Don't mark not_found yet — only if neither provider found it
             }
             Err(WigleError::RateLimited) => {
                 warn!("pending drain: WiGLE rate limited, stopping");

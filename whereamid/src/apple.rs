@@ -256,10 +256,6 @@ fn decode_varint(data: &[u8], mut pos: usize) -> Result<(u64, usize)> {
     Ok((val, pos))
 }
 
-fn zigzag_decode(val: u64) -> i64 {
-    ((val >> 1) as i64) ^ -((val & 1) as i64)
-}
-
 fn decode_tag(data: &[u8], pos: usize) -> Result<(u32, u8, usize)> {
     let (val, new_pos) = decode_varint(data, pos)?;
     let field_num = (val >> 3) as u32;
