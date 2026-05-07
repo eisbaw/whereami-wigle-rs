@@ -75,6 +75,41 @@ fn main() {
                 process::exit(1);
             }
         },
+        "debug" | "d" => {
+            let client_raw = WhereAmIClient::default_addr();
+            match client_raw.raw_command(r#"{"cmd":"debug"}"#) {
+                Ok(resp) if json => println!("{resp}"),
+                Ok(resp) => {
+                    // Parse and pretty-print
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+                        let age = v["scan_age_ms"].as_u64().unwrap_or(0);
+                        let visible = v["visible"].as_u64().unwrap_or(0);
+                        let stable = v["stable"].as_u64().unwrap_or(0);
+                        println!(
+                            "scan age: {}ms  visible: {}  stable: {}",
+                            age, visible, stable
+                        );
+                        println!();
+                        if let Some(bssids) = v["bssids"].as_array() {
+                            for b in bssids {
+                                println!(
+                                    "{:17}  {:>4} dBm  {}",
+                                    b["bssid"].as_str().unwrap_or("?"),
+                                    b["signal_dbm"].as_i64().unwrap_or(0),
+                                    b["status"].as_str().unwrap_or("?"),
+                                );
+                            }
+                        }
+                    } else {
+                        println!("{resp}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+        }
         "help" | "-h" | "--help" => {
             println!("whereami — Wi-Fi geolocation CLI");
             println!();
@@ -84,6 +119,7 @@ fn main() {
             println!("  locate (default)  Where am I?");
             println!("  scan              Visible Wi-Fi networks");
             println!("  stats             Cache statistics");
+            println!("  debug             Daemon debug state");
             println!();
             println!("Flags:");
             println!("  --json            Output raw JSON");

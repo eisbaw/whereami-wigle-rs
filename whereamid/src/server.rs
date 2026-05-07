@@ -195,6 +195,7 @@ async fn dispatch_command(req: &Request, state: &Arc<DaemonState>) -> String {
         "resolve" => handle_resolve(&req.bssids, state).await,
         "scan" => handle_scan(state).await,
         "stats" => handle_stats(state).await,
+        "debug" => handle_debug(state).await,
         other => error_json(&format!("unknown command: {other}")),
     }
 }
@@ -270,7 +271,14 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                 resolver::resolve_background(&bssids_clone, &resolve_state).await;
             });
         }
-        return error_json("no APs with known positions (resolving in background)");
+        let db = lock_db(state);
+        let pending_count = db.pending_ap_count().unwrap_or(0);
+        let cached_count = db.cached_ap_count().unwrap_or(0);
+        drop(db);
+        return error_json(&format!(
+            "no cached positions for {} visible APs (db has {} cached, {} pending — resolving in background)",
+            bssids.len(), cached_count, pending_count
+        ));
     }
 
     // Build trilateration input
@@ -391,6 +399,80 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
         v: 1,
         networks,
         scan_age_ms,
+    };
+    serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+}
+
+#[derive(Serialize)]
+struct DebugBssid {
+    bssid: String,
+    signal_dbm: i32,
+    status: String, // "cached", "pending", "not_found", "unknown"
+}
+
+#[derive(Serialize)]
+struct DebugResponse {
+    ok: bool,
+    v: u32,
+    scan_age_ms: Option<u64>,
+    visible: usize,
+    stable: usize,
+    bssids: Vec<DebugBssid>,
+}
+
+async fn handle_debug(state: &Arc<DaemonState>) -> String {
+    let debouncer = state.debouncer.lock().await;
+    let scan_age_ms = debouncer.latest_scan_age_ms();
+    let stable = debouncer.stable_bssids();
+    let visible = debouncer.latest_scan().map(|s| s.len()).unwrap_or(0);
+
+    // For each stable BSSID, check its status
+    let mut bssids: Vec<DebugBssid> = stable
+        .iter()
+        .map(|b| {
+            let signal = debouncer.latest_signal(b).unwrap_or(-90);
+            (b.clone(), signal)
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|(bssid, signal)| {
+            let db = lock_db(state);
+            let status = if db.get_ap(&bssid).ok().flatten().is_some() {
+                "cached"
+            } else if db
+                .is_not_found(&bssid, state.args.not_found_ttl_days)
+                .unwrap_or(false)
+            {
+                "not_found"
+            } else if db
+                .get_pending(1000)
+                .unwrap_or_default()
+                .iter()
+                .any(|p| p.bssid == bssid)
+            {
+                "pending"
+            } else {
+                "unknown"
+            };
+            DebugBssid {
+                bssid,
+                signal_dbm: signal,
+                status: status.to_string(),
+            }
+        })
+        .collect();
+    bssids.sort_by(|a, b| b.signal_dbm.cmp(&a.signal_dbm));
+
+    drop(debouncer);
+
+    let stable_count = bssids.len();
+    let resp = DebugResponse {
+        ok: true,
+        v: 1,
+        scan_age_ms,
+        visible,
+        stable: stable_count,
+        bssids,
     };
     serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
 }

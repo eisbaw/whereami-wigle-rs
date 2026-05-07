@@ -135,6 +135,26 @@ impl WhereAmIClient {
         Self::new("127.0.0.1:4747")
     }
 
+    /// Send a raw JSON command and return the raw response string.
+    pub fn raw_command(&self, json: &str) -> Result<String> {
+        let mut stream = TcpStream::connect(&self.addr)
+            .with_context(|| format!("connecting to whereamid at {}", self.addr))?;
+        stream
+            .write_all(json.as_bytes())
+            .context("sending request")?;
+        stream.write_all(b"\n").context("sending newline")?;
+        stream.flush().context("flushing")?;
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .context("shutdown write")?;
+        let mut reader = BufReader::new(stream);
+        let mut response_line = String::new();
+        reader
+            .read_line(&mut response_line)
+            .context("reading response")?;
+        Ok(response_line.trim().to_string())
+    }
+
     /// Send a request and read the response. One-shot TCP connection.
     fn request<T: for<'de> Deserialize<'de>>(&self, json: &str) -> Result<T> {
         let mut stream = TcpStream::connect(&self.addr)
