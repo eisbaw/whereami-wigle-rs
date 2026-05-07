@@ -3,9 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, crane }:
     let
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
@@ -13,7 +14,9 @@
     in {
       packages = forAllSystems (system:
         let pkgs = pkgsFor system; in {
-          default = pkgs.callPackage ./nix/package.nix {};
+          default = pkgs.callPackage ./nix/package.nix {
+            craneLib = crane.mkLib pkgs;
+          };
         }
       );
 
@@ -38,6 +41,11 @@
         }
       );
 
-      nixosModules.default = import ./nix/module.nix;
+      nixosModules.default = { pkgs, lib, ... }: {
+        imports = [ ./nix/module.nix ];
+        services.whereami.package = lib.mkDefault (pkgs.callPackage ./nix/package.nix {
+          craneLib = (crane.mkLib pkgs);
+        });
+      };
     };
 }

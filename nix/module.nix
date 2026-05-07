@@ -2,7 +2,7 @@
 
 let
   cfg = config.services.whereami;
-  whereamid = pkgs.callPackage ./package.nix {};
+  whereamid = cfg.package;
 
   execStart = let
     configArg = lib.optionalString (cfg.credentialsFile != null)
@@ -28,6 +28,11 @@ let
 in {
   options.services.whereami = {
     enable = lib.mkEnableOption "whereami Wi-Fi geolocation daemon";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      description = "The whereami package to use.";
+    };
 
     user = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
