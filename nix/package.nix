@@ -6,12 +6,14 @@
 , sqlite
 , iw
 , networkmanager
-, gitRev ? "unknown"
 }:
 
+let
+  cargoToml = builtins.fromTOML (builtins.readFile ../whereamid/Cargo.toml);
+in
 rustPlatform.buildRustPackage {
   pname = "whereamid";
-  version = "0.2.1";
+  version = cargoToml.package.version;
 
   src = lib.cleanSource ./..;
 
@@ -27,19 +29,13 @@ rustPlatform.buildRustPackage {
     sqlite
   ];
 
-  # Write git rev file for build.rs to pick up (no .git in nix sandbox)
-  preBuild = ''
-    echo "${gitRev}" > whereamid/GIT_REV
-    echo "${gitRev}" > whereami-client/GIT_REV
-  '';
-
   postInstall = ''
     wrapProgram $out/bin/whereamid \
       --prefix PATH : ${lib.makeBinPath [ iw networkmanager ]}
   '';
 
   meta = with lib; {
-    description = "Wi-Fi geolocation daemon for NixOS";
+    description = "Wi-Fi geolocation daemon";
     license = licenses.mit;
     mainProgram = "whereamid";
   };

@@ -2,7 +2,7 @@
 
 let
   cfg = config.services.whereami;
-  whereamid = pkgs.callPackage ./package.nix {}; # gitRev defaults to "unknown" for submodule imports
+  whereamid = pkgs.callPackage ./package.nix {};
 
   execStart = let
     configArg = lib.optionalString (cfg.credentialsFile != null)
