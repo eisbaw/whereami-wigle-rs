@@ -80,25 +80,38 @@ fn main() {
             match client_raw.raw_command(r#"{"cmd":"debug"}"#) {
                 Ok(resp) if json => println!("{resp}"),
                 Ok(resp) => {
-                    // Parse and pretty-print
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+                        let daemon_rev = v["daemon_rev"].as_str().unwrap_or("?");
+                        let cli_rev = env!("GIT_REV");
+                        println!("cli: {}  daemon: {}", cli_rev, daemon_rev);
+                        println!();
                         let age = v["scan_age_ms"].as_u64().unwrap_or(0);
+                        let samples = v["samples_in_buffer"].as_u64().unwrap_or(0);
                         let visible = v["visible"].as_u64().unwrap_or(0);
                         let stable = v["stable"].as_u64().unwrap_or(0);
                         println!(
-                            "scan age: {}ms  visible: {}  stable: {}",
-                            age, visible, stable
+                            "scan age: {}ms  samples: {}  visible: {}  stable: {}",
+                            age, samples, visible, stable
                         );
                         println!();
                         if let Some(bssids) = v["bssids"].as_array() {
                             for b in bssids {
+                                let seen = b["seen"].as_u64().unwrap_or(0);
+                                let needed = b["needed"].as_u64().unwrap_or(0);
+                                let is_stable = b["is_stable"].as_bool().unwrap_or(false);
+                                let marker = if is_stable { "*" } else { " " };
                                 println!(
-                                    "{:17}  {:>4} dBm  {}",
+                                    "{}{:17}  {:>4} dBm  {}/{}  {}",
+                                    marker,
                                     b["bssid"].as_str().unwrap_or("?"),
                                     b["signal_dbm"].as_i64().unwrap_or(0),
-                                    b["status"].as_str().unwrap_or("?"),
+                                    seen,
+                                    needed,
+                                    b["db_status"].as_str().unwrap_or("?"),
                                 );
                             }
+                            println!();
+                            println!("* = stable  seen/needed = debounce count/threshold");
                         }
                     } else {
                         println!("{resp}");

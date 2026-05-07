@@ -92,6 +92,19 @@ impl Debouncer {
         self.ring.back().and_then(|ts| ts.sample.get(bssid))
     }
 
+    /// Count how many of the last N samples contain this BSSID.
+    pub fn count(&self, bssid: &str) -> usize {
+        self.ring
+            .iter()
+            .filter(|ts| ts.sample.contains_key(bssid))
+            .count()
+    }
+
+    /// Get the threshold needed for stability.
+    pub fn threshold(&self) -> usize {
+        self.threshold
+    }
+
     /// How many samples are currently in the ring buffer.
     pub fn sample_count(&self) -> usize {
         self.ring.len()

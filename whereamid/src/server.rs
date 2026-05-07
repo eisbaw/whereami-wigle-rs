@@ -407,14 +407,19 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
 struct DebugBssid {
     bssid: String,
     signal_dbm: i32,
-    status: String, // "cached", "pending", "not_found", "unknown"
+    seen: usize,   // times seen in debounce window
+    needed: usize, // threshold to be stable
+    is_stable: bool,
+    db_status: String, // "cached", "pending", "not_found", "new"
 }
 
 #[derive(Serialize)]
 struct DebugResponse {
     ok: bool,
     v: u32,
+    daemon_rev: &'static str,
     scan_age_ms: Option<u64>,
+    samples_in_buffer: usize,
     visible: usize,
     stable: usize,
     bssids: Vec<DebugBssid>,
@@ -423,24 +428,34 @@ struct DebugResponse {
 async fn handle_debug(state: &Arc<DaemonState>) -> String {
     let debouncer = state.debouncer.lock().await;
     let scan_age_ms = debouncer.latest_scan_age_ms();
-    let stable = debouncer.stable_bssids();
+    let samples = debouncer.sample_count();
+    let threshold = debouncer.threshold();
+    let stable_set = debouncer.stable_bssids();
+
+    // Collect ALL BSSIDs ever seen in the ring buffer
+    let mut all_bssids: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    if let Some(scan) = debouncer.latest_scan() {
+        for (bssid, entry) in scan {
+            all_bssids.insert(bssid.clone(), entry.signal_dbm);
+        }
+    }
+    // Also include stable ones not in latest scan
+    for b in &stable_set {
+        all_bssids.entry(b.clone()).or_insert(-90);
+    }
+
     let visible = debouncer.latest_scan().map(|s| s.len()).unwrap_or(0);
 
-    // For each stable BSSID, check its status
-    let mut bssids: Vec<DebugBssid> = stable
+    let mut bssids: Vec<DebugBssid> = all_bssids
         .iter()
-        .map(|b| {
-            let signal = debouncer.latest_signal(b).unwrap_or(-90);
-            (b.clone(), signal)
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .map(|(bssid, signal)| {
+        .map(|(bssid, &signal)| {
+            let seen = debouncer.count(bssid);
+            let is_stable = stable_set.contains(bssid);
             let db = lock_db(state);
-            let status = if db.get_ap(&bssid).ok().flatten().is_some() {
+            let db_status = if db.get_ap(bssid).ok().flatten().is_some() {
                 "cached"
             } else if db
-                .is_not_found(&bssid, state.args.not_found_ttl_days)
+                .is_not_found(bssid, state.args.not_found_ttl_days)
                 .unwrap_or(false)
             {
                 "not_found"
@@ -448,16 +463,19 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
                 .get_pending(1000)
                 .unwrap_or_default()
                 .iter()
-                .any(|p| p.bssid == bssid)
+                .any(|p| p.bssid == *bssid)
             {
                 "pending"
             } else {
-                "unknown"
+                "new"
             };
             DebugBssid {
-                bssid,
+                bssid: bssid.clone(),
                 signal_dbm: signal,
-                status: status.to_string(),
+                seen,
+                needed: threshold,
+                is_stable,
+                db_status: db_status.to_string(),
             }
         })
         .collect();
@@ -465,11 +483,13 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
 
     drop(debouncer);
 
-    let stable_count = bssids.len();
+    let stable_count = stable_set.len();
     let resp = DebugResponse {
         ok: true,
         v: 1,
+        daemon_rev: env!("GIT_REV"),
         scan_age_ms,
+        samples_in_buffer: samples,
         visible,
         stable: stable_count,
         bssids,
