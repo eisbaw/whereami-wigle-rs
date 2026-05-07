@@ -6,6 +6,7 @@
 , sqlite
 , iw
 , networkmanager
+, gitRev ? "unknown"
 }:
 
 rustPlatform.buildRustPackage {
@@ -26,12 +27,16 @@ rustPlatform.buildRustPackage {
     sqlite
   ];
 
+  # Write git rev file for build.rs to pick up (no .git in nix sandbox)
+  preBuild = ''
+    echo "${gitRev}" > whereamid/GIT_REV
+    echo "${gitRev}" > whereami-client/GIT_REV
+  '';
+
   postInstall = ''
     wrapProgram $out/bin/whereamid \
       --prefix PATH : ${lib.makeBinPath [ iw networkmanager ]}
   '';
-
-  # Both whereamid (daemon) and whereami (CLI) are built by the workspace
 
   meta = with lib; {
     description = "Wi-Fi geolocation daemon for NixOS";

@@ -13,7 +13,9 @@
     in {
       packages = forAllSystems (system:
         let pkgs = pkgsFor system; in {
-          default = pkgs.callPackage ./nix/package.nix {};
+          default = pkgs.callPackage ./nix/package.nix {
+            gitRev = self.shortRev or self.dirtyShortRev or "unknown";
+          };
           whereamid = self.packages.${system}.default;
         }
       );
