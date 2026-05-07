@@ -273,20 +273,23 @@ pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
 
     let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // 1. Apple WPS — batch lookup, no auth, no rate limit
-    match state.apple.lookup_bssids(&to_resolve).await {
-        Ok(aps) => {
-            let db = crate::server::lock_db(state);
-            for ap in aps {
+    // 1. Apple WPS — one-by-one, no auth, no rate limit
+    for bssid in &to_resolve {
+        match state.apple.lookup_bssid(bssid).await {
+            Ok(Some(ap)) => {
                 info!("Apple resolved {} -> ({}, {})", ap.bssid, ap.lat, ap.lon);
+                let db = crate::server::lock_db(state);
                 if let Err(e) = db.upsert_ap(&ap) {
                     warn!("failed to cache AP {}: {e}", ap.bssid);
                 }
                 resolved.insert(ap.bssid);
             }
-        }
-        Err(e) => {
-            warn!("Apple WPS batch lookup failed: {e}");
+            Ok(None) => {
+                debug!("Apple: {bssid} not found");
+            }
+            Err(e) => {
+                warn!("Apple lookup failed for {bssid}: {e}");
+            }
         }
     }
 

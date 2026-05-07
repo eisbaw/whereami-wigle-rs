@@ -73,18 +73,17 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
 
     debug!("draining {} pending entries", pending.len());
 
-    // 1. Try Apple WPS first — batch, no rate limit
-    let bssids: Vec<String> = pending.iter().map(|e| e.bssid.clone()).collect();
+    // 1. Try Apple WPS first — one-by-one, no rate limit
     let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    match state.apple.lookup_bssids(&bssids).await {
-        Ok(aps) => {
-            let db = crate::server::lock_db(state);
-            for ap in aps {
+    for entry in &pending {
+        match state.apple.lookup_bssid(&entry.bssid).await {
+            Ok(Some(ap)) => {
                 info!(
                     "pending drain: Apple resolved {} -> ({}, {})",
                     ap.bssid, ap.lat, ap.lon
                 );
+                let db = crate::server::lock_db(state);
                 if let Err(e) = db.upsert_ap(&ap) {
                     warn!("failed to upsert AP {}: {e}", ap.bssid);
                 }
@@ -93,9 +92,15 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
                 }
                 resolved.insert(ap.bssid);
             }
-        }
-        Err(e) => {
-            warn!("pending drain: Apple batch lookup failed: {e}");
+            Ok(None) => {
+                debug!("pending drain: Apple doesn't know {}", entry.bssid);
+            }
+            Err(e) => {
+                warn!(
+                    "pending drain: Apple lookup failed for {}: {e}",
+                    entry.bssid
+                );
+            }
         }
     }
 
