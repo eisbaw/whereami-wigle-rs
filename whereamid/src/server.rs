@@ -96,6 +96,8 @@ struct ScanResponse {
     v: u32,
     networks: Vec<NetworkInfo>,
     scan_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scanned_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -377,6 +379,7 @@ async fn handle_resolve(bssids: &[String], state: &Arc<DaemonState>) -> String {
 async fn handle_scan(state: &Arc<DaemonState>) -> String {
     let debouncer = state.debouncer.lock().await;
     let scan_age_ms = debouncer.latest_scan_age_ms();
+    let scanned_at = debouncer.latest_scan_time().map(|t| t.to_rfc3339());
     let networks = match debouncer.latest_scan() {
         Some(sample) => {
             let mut nets: Vec<NetworkInfo> = sample
@@ -399,6 +402,7 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
         v: 1,
         networks,
         scan_age_ms,
+        scanned_at,
     };
     serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
 }

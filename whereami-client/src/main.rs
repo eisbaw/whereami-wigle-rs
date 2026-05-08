@@ -5,6 +5,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("locate");
     let json = args.iter().any(|a| a == "--json");
+    let no_scan_time = args.iter().any(|a| a == "--scan-time=no");
 
     let client = WhereAmIClient::default_addr();
 
@@ -31,23 +32,37 @@ fn main() {
                 process::exit(1);
             }
         },
-        "scan" | "s" => match client.scan() {
-            Ok(resp) if json => {
-                println!("{}", serde_json::to_string(&resp).unwrap());
-            }
-            Ok(resp) if !resp.ok => {
-                eprintln!("{}", resp.error.as_deref().unwrap_or("unknown error"));
-                process::exit(1);
-            }
+        "scan" | "s" => match client.raw_command(r#"{"cmd":"scan"}"#) {
+            Ok(resp) if json => println!("{resp}"),
             Ok(resp) => {
-                for net in &resp.networks {
-                    println!(
-                        "{:17}  {:>4} dBm  ch{:<3}  {}",
-                        net.bssid,
-                        net.signal_dbm,
-                        net.channel.map(|c| c.to_string()).unwrap_or("-".into()),
-                        net.ssid.as_deref().unwrap_or("<hidden>")
-                    );
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+                    if v["ok"].as_bool() != Some(true) {
+                        eprintln!("{}", v["error"].as_str().unwrap_or("unknown error"));
+                        process::exit(1);
+                    }
+                    if !no_scan_time {
+                        let age_ms = v["scan_age_ms"].as_u64().unwrap_or(0);
+                        let age_s = age_ms / 1000;
+                        let scanned_at = v["scanned_at"].as_str().unwrap_or("?");
+                        println!("scanned: {}  ({}s ago)", scanned_at, age_s);
+                        println!();
+                    }
+                    if let Some(nets) = v["networks"].as_array() {
+                        for net in nets {
+                            println!(
+                                "{:17}  {:>4} dBm  ch{:<3}  {}",
+                                net["bssid"].as_str().unwrap_or("?"),
+                                net["signal_dbm"].as_i64().unwrap_or(0),
+                                net["channel"]
+                                    .as_i64()
+                                    .map(|c| c.to_string())
+                                    .unwrap_or("-".into()),
+                                net["ssid"].as_str().unwrap_or("<hidden>")
+                            );
+                        }
+                    }
+                } else {
+                    println!("{resp}");
                 }
             }
             Err(e) => {

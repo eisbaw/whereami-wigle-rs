@@ -20,6 +20,7 @@ pub type ScanSample = HashMap<String, ScanEntry>;
 pub struct TimestampedScan {
     pub sample: ScanSample,
     pub at: std::time::Instant,
+    pub wall_clock: chrono::DateTime<chrono::Utc>,
 }
 
 /// Debounce ring buffer for stable AP detection.
@@ -48,6 +49,7 @@ impl Debouncer {
         self.ring.push_back(TimestampedScan {
             sample,
             at: std::time::Instant::now(),
+            wall_clock: chrono::Utc::now(),
         });
     }
 
@@ -120,6 +122,11 @@ impl Debouncer {
         self.ring
             .back()
             .map(|ts| ts.at.elapsed().as_millis() as u64)
+    }
+
+    /// Wall-clock UTC time of the most recent scan.
+    pub fn latest_scan_time(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.ring.back().map(|ts| ts.wall_clock)
     }
 }
 
