@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
         beacondb: beacondb_client,
         apple: apple::AppleClient::new(),
         nominatim: nominatim::NominatimClient::new(),
+        last_fix: tokio::sync::Mutex::new(None),
     });
 
     // Spawn background scan loop

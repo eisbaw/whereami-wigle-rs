@@ -10,22 +10,42 @@ fn main() {
     let client = WhereAmIClient::default_addr();
 
     match cmd {
-        "locate" | "l" => match client.locate() {
-            Ok(resp) if json => {
-                println!("{}", serde_json::to_string(&resp).unwrap());
-            }
-            Ok(resp) if !resp.ok => {
-                eprintln!("{}", resp.error.as_deref().unwrap_or("unknown error"));
-                process::exit(1);
-            }
+        "locate" | "l" => match client.raw_command(r#"{"cmd":"locate"}"#) {
+            Ok(resp) if json => println!("{resp}"),
             Ok(resp) => {
-                if let Some(addr) = &resp.address {
-                    println!("{}", addr);
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+                    if v["ok"].as_bool() != Some(true) {
+                        eprintln!("{}", v["error"].as_str().unwrap_or("unknown error"));
+                        process::exit(1);
+                    }
+                    let stale = v["stale"].as_bool().unwrap_or(false);
+                    if stale {
+                        let age_s = v["age_s"].as_u64().unwrap_or(0);
+                        let age_str = if age_s < 60 {
+                            format!("{}s", age_s)
+                        } else if age_s < 3600 {
+                            format!("{}m", age_s / 60)
+                        } else {
+                            format!("{}h", age_s / 3600)
+                        };
+                        eprint!("[last known, {} ago] ", age_str);
+                    }
+                    if let Some(addr) = v["address"].as_str() {
+                        if !addr.is_empty() {
+                            println!("{}", addr);
+                        }
+                    }
+                    println!(
+                        "{:.6}, {:.6}  ±{}m  ({} sources)",
+                        v["lat"].as_f64().unwrap_or(0.0),
+                        v["lon"].as_f64().unwrap_or(0.0),
+                        v["accuracy_m"].as_f64().unwrap_or(0.0) as i64,
+                        v["sources"].as_u64().unwrap_or(0),
+                    );
+                } else {
+                    eprintln!("{resp}");
+                    process::exit(1);
                 }
-                println!(
-                    "{:.6}, {:.6}  ±{}m  ({} sources, {} cached)",
-                    resp.lat, resp.lon, resp.accuracy_m as i64, resp.sources, resp.cached
-                );
             }
             Err(e) => {
                 eprintln!("error: {e}");
@@ -148,10 +168,7 @@ fn main() {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
                         if v["ok"].as_bool() != Some(true) {
                             println!("cli:    {} ({})", cli_version, cli_rev);
-                            eprintln!(
-                                "daemon: {}",
-                                v["error"].as_str().unwrap_or("unknown error")
-                            );
+                            eprintln!("daemon: {}", v["error"].as_str().unwrap_or("unknown error"));
                             process::exit(1);
                         }
                         let daemon_version = v["version"].as_str().unwrap_or("?");

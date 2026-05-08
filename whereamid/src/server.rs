@@ -39,6 +39,17 @@ pub struct DaemonState {
     pub beacondb: BeaconDbClient,
     pub apple: AppleClient,
     pub nominatim: NominatimClient,
+    pub last_fix: tokio::sync::Mutex<Option<LastFix>>,
+}
+
+/// A cached last-known position with timestamp.
+pub struct LastFix {
+    pub lat: f64,
+    pub lon: f64,
+    pub accuracy_m: f64,
+    pub address: Option<String>,
+    pub at: std::time::Instant,
+    pub sources: usize,
 }
 
 // --- Protocol types ---
@@ -72,6 +83,12 @@ struct LocateResponse {
     stable: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     address: Option<String>,
+    /// True if this is a stale last-known position (no current fix)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stale: bool,
+    /// Age of the last-known position in seconds (only set when stale)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age_s: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -254,7 +271,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
     };
 
     if active_candidates.is_empty() {
-        return error_json("no APs detected yet");
+        return return_last_fix_or_error(state, "no APs detected yet", visible, stable_count).await;
     }
 
     let bssids: Vec<String> = active_candidates.iter().map(|(b, _)| b.clone()).collect();
@@ -274,14 +291,13 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                 resolver::resolve_background(&bssids_clone, &resolve_state).await;
             });
         }
-        let db = lock_db(state);
-        let pending_count = db.pending_ap_count().unwrap_or(0);
-        let cached_count = db.cached_ap_count().unwrap_or(0);
-        drop(db);
-        return error_json(&format!(
-            "no cached positions for {} visible APs (db has {} cached, {} pending — resolving in background)",
-            bssids.len(), cached_count, pending_count
-        ));
+        return return_last_fix_or_error(
+            state,
+            "no cached positions for visible APs (resolving in background)",
+            visible,
+            stable_count,
+        )
+        .await;
     }
 
     // Build trilateration input
@@ -308,6 +324,19 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                 None
             };
 
+            // Save as last-known fix
+            {
+                let mut last = state.last_fix.lock().await;
+                *last = Some(LastFix {
+                    lat: pos.lat,
+                    lon: pos.lon,
+                    accuracy_m: pos.accuracy_m,
+                    address: address.clone(),
+                    at: std::time::Instant::now(),
+                    sources: cached_count,
+                });
+            }
+
             let resp = LocateResponse {
                 ok: true,
                 v: 1,
@@ -321,10 +350,52 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                 visible,
                 stable: stable_count,
                 address,
+                stale: false,
+                age_s: None,
             };
             serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
         }
-        Err(e) => error_json(&format!("trilateration failed: {e}")),
+        Err(e) => {
+            return_last_fix_or_error(
+                state,
+                &format!("trilateration failed: {e}"),
+                visible,
+                stable_count,
+            )
+            .await
+        }
+    }
+}
+
+/// Return last-known position if available, otherwise return error.
+async fn return_last_fix_or_error(
+    state: &Arc<DaemonState>,
+    error_msg: &str,
+    visible: usize,
+    stable: usize,
+) -> String {
+    let last = state.last_fix.lock().await;
+    if let Some(fix) = last.as_ref() {
+        let age_s = fix.at.elapsed().as_secs();
+        let resp = LocateResponse {
+            ok: true,
+            v: 1,
+            lat: fix.lat,
+            lon: fix.lon,
+            accuracy_m: fix.accuracy_m,
+            sources: fix.sources,
+            cached: 0,
+            fetched: 0,
+            pending: 0,
+            visible,
+            stable,
+            address: fix.address.clone(),
+            stale: true,
+            age_s: Some(age_s),
+        };
+        serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+    } else {
+        error_json(error_msg)
     }
 }
 
