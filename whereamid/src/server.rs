@@ -198,6 +198,7 @@ async fn dispatch_command(req: &Request, state: &Arc<DaemonState>) -> String {
         "scan" => handle_scan(state).await,
         "stats" => handle_stats(state).await,
         "debug" => handle_debug(state).await,
+        "version" => handle_version(),
         other => error_json(&format!("unknown command: {other}")),
     }
 }
@@ -497,6 +498,24 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
         visible,
         stable: stable_count,
         bssids,
+    };
+    serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+}
+
+#[derive(Serialize)]
+struct VersionResponse {
+    ok: bool,
+    v: u32,
+    version: &'static str,
+    git_rev: &'static str,
+}
+
+fn handle_version() -> String {
+    let resp = VersionResponse {
+        ok: true,
+        v: 1,
+        version: env!("CARGO_PKG_VERSION"),
+        git_rev: env!("GIT_REV"),
     };
     serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
 }

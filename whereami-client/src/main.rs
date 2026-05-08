@@ -138,6 +138,38 @@ fn main() {
                 }
             }
         }
+        "version" | "v" | "--version" | "-V" => {
+            let cli_version = env!("CARGO_PKG_VERSION");
+            let cli_rev = env!("GIT_REV");
+            let client_raw = WhereAmIClient::default_addr();
+            match client_raw.raw_command(r#"{"cmd":"version"}"#) {
+                Ok(resp) if json => println!("{resp}"),
+                Ok(resp) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+                        if v["ok"].as_bool() != Some(true) {
+                            println!("cli:    {} ({})", cli_version, cli_rev);
+                            eprintln!(
+                                "daemon: {}",
+                                v["error"].as_str().unwrap_or("unknown error")
+                            );
+                            process::exit(1);
+                        }
+                        let daemon_version = v["version"].as_str().unwrap_or("?");
+                        let daemon_rev = v["git_rev"].as_str().unwrap_or("?");
+                        println!("cli:    {} ({})", cli_version, cli_rev);
+                        println!("daemon: {} ({})", daemon_version, daemon_rev);
+                    } else {
+                        println!("cli:    {} ({})", cli_version, cli_rev);
+                        println!("daemon: {resp}");
+                    }
+                }
+                Err(e) => {
+                    println!("cli:    {} ({})", cli_version, cli_rev);
+                    eprintln!("daemon: error: {e}");
+                    process::exit(1);
+                }
+            }
+        }
         "help" | "-h" | "--help" => {
             println!("whereami — Wi-Fi geolocation CLI");
             println!();
@@ -148,6 +180,7 @@ fn main() {
             println!("  scan              Visible Wi-Fi networks");
             println!("  stats             Cache statistics");
             println!("  debug             Daemon debug state");
+            println!("  version           Print CLI and daemon versions");
             println!();
             println!("Flags:");
             println!("  --json            Output raw JSON");
