@@ -19,6 +19,59 @@ use crate::wigle::WigleClient;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BYTES: u64 = 64 * 1024; // 64 KiB max request size
 
+/// Address-cache parameters.
+///
+/// Key precision: 4 decimal degrees ~ 11 m at the equator. Locate fixes
+/// drift by more than that scan-to-scan, so we don't gain anything from
+/// finer keys. Coarser keys would alias adjacent buildings.
+const ADDRESS_CACHE_DECIMALS: i32 = 4;
+/// Capacity is a soft bound; eviction is naive (drop oldest entry by
+/// insertion order) because the access pattern is "small set of locations
+/// you actually visit". A real LRU would be overkill for one user.
+const ADDRESS_CACHE_CAP: usize = 256;
+
+/// Round (lat, lon) to a fixed-precision integer key. We use
+/// `(i32, i32)` rather than floats so equality is bit-exact and we
+/// don't have to worry about NaN comparisons. Negative coordinates
+/// round toward zero via `as i32`, which is what we want for keying.
+fn address_cache_key(lat: f64, lon: f64) -> (i32, i32) {
+    let scale = 10f64.powi(ADDRESS_CACHE_DECIMALS);
+    ((lat * scale).round() as i32, (lon * scale).round() as i32)
+}
+
+/// Tiny bounded cache mapping rounded (lat, lon) -> resolved address.
+/// `order` tracks insertion order so we can evict the oldest entry when
+/// capacity is exceeded. Not LRU; access doesn't promote.
+pub struct AddressCache {
+    map: std::collections::HashMap<(i32, i32), String>,
+    order: std::collections::VecDeque<(i32, i32)>,
+}
+
+impl AddressCache {
+    pub fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub fn get(&self, lat: f64, lon: f64) -> Option<String> {
+        self.map.get(&address_cache_key(lat, lon)).cloned()
+    }
+
+    pub fn insert(&mut self, lat: f64, lon: f64, addr: String) {
+        let key = address_cache_key(lat, lon);
+        if self.map.insert(key, addr).is_none() {
+            self.order.push_back(key);
+            while self.order.len() > ADDRESS_CACHE_CAP {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.map.remove(&oldest);
+                }
+            }
+        }
+    }
+}
+
 /// Acquire the DB lock, logging a warning if the mutex was poisoned.
 pub fn lock_db(state: &DaemonState) -> std::sync::MutexGuard<'_, crate::db::Database> {
     state.db.lock().unwrap_or_else(|e| {
@@ -47,6 +100,11 @@ pub struct DaemonState {
     /// it for an insert or a remove, never across await points, and that
     /// makes Drop-based cleanup viable for future RAII guards.
     pub inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Reverse-geocoded street addresses keyed by rounded (lat, lon).
+    /// Populated lazily in the background after a `locate` returns; the
+    /// next call at the same rounded position gets the address for free
+    /// without blocking on Nominatim's 1 req/s rate limit.
+    pub address_cache: std::sync::Mutex<AddressCache>,
 }
 
 /// A cached last-known position with timestamp.
@@ -319,14 +377,64 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
 
     match trilaterate(&positioned_aps) {
         Ok(pos) => {
+            // Address resolution is decoupled from the locate response.
+            //
+            // Hot path: probe the in-memory address cache by rounded
+            // (lat, lon). Hit -> attach immediately. Miss -> attach
+            // None and spawn a background task that calls Nominatim;
+            // the next locate at this rounded position will hit.
+            //
+            // This keeps the locate latency at trilateration time
+            // (~ms) instead of Nominatim time (~1s, with a 1 req/s
+            // rate-limit mutex that previously also serialised
+            // concurrent locate calls).
             let address = if state.args.address_approx {
-                match state.nominatim.reverse_geocode(pos.lat, pos.lon).await {
-                    Ok(addr) => Some(addr.display),
-                    Err(e) => {
-                        warn!("reverse geocode failed: {e}");
-                        None
-                    }
+                let cached = {
+                    let cache = state.address_cache.lock().unwrap_or_else(|e| {
+                        warn!("address cache mutex poisoned — recovering");
+                        e.into_inner()
+                    });
+                    cache.get(pos.lat, pos.lon)
+                };
+                if cached.is_none() {
+                    let bg_state = Arc::clone(state);
+                    let bg_lat = pos.lat;
+                    let bg_lon = pos.lon;
+                    tokio::spawn(async move {
+                        match bg_state.nominatim.reverse_geocode(bg_lat, bg_lon).await {
+                            Ok(addr) => {
+                                let display = addr.display;
+                                {
+                                    let mut cache =
+                                        bg_state.address_cache.lock().unwrap_or_else(|e| {
+                                            warn!(
+                                                "address cache mutex poisoned on insert \
+                                                 — recovering"
+                                            );
+                                            e.into_inner()
+                                        });
+                                    cache.insert(bg_lat, bg_lon, display.clone());
+                                }
+                                // Backfill last_fix.address if it still
+                                // matches the position we just resolved.
+                                // If a newer fix has overwritten it we
+                                // leave it alone (the newer one will
+                                // resolve its own address).
+                                let mut last = bg_state.last_fix.lock().await;
+                                if let Some(fix) = last.as_mut() {
+                                    if address_cache_key(fix.lat, fix.lon)
+                                        == address_cache_key(bg_lat, bg_lon)
+                                        && fix.address.is_none()
+                                    {
+                                        fix.address = Some(display);
+                                    }
+                                }
+                            }
+                            Err(e) => warn!("background reverse geocode failed: {e}"),
+                        }
+                    });
                 }
+                cached
             } else {
                 None
             };
@@ -611,4 +719,52 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
         api_calls_today: api_calls,
     };
     serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two positions within the same ~10m grid cell must collide on the
+    /// rounded key. The 4-decimal scale corresponds to ~11m at the equator;
+    /// 1e-5 deg is well inside that.
+    #[test]
+    fn address_cache_key_rounds_to_grid() {
+        let a = address_cache_key(55.668412, 12.554123);
+        let b = address_cache_key(55.668415, 12.554118); // sub-meter offset
+        assert_eq!(a, b);
+
+        // Two clearly distinct positions must NOT collide.
+        let c = address_cache_key(55.6684, 12.5541);
+        let d = address_cache_key(55.6700, 12.5541);
+        assert_ne!(c, d);
+    }
+
+    /// Cache returns the inserted value at the same rounded position
+    /// and `None` for a never-seen position. We don't test the eviction
+    /// numerics exhaustively — just that the cap is respected.
+    #[test]
+    fn address_cache_get_insert_and_eviction() {
+        let mut cache = AddressCache::new();
+        assert!(cache.get(0.0, 0.0).is_none());
+
+        cache.insert(55.6684, 12.5541, "Copenhagen".to_string());
+        assert_eq!(cache.get(55.6684, 12.5541).as_deref(), Some("Copenhagen"));
+
+        // Fill past capacity and verify size stays bounded.
+        for i in 0..(ADDRESS_CACHE_CAP as i32 + 50) {
+            // shift each insertion into a distinct grid cell
+            let lat = (i as f64) * 0.001 + 60.0;
+            cache.insert(lat, 12.0, format!("addr-{i}"));
+        }
+        assert!(
+            cache.map.len() <= ADDRESS_CACHE_CAP,
+            "cache must respect capacity, got {}",
+            cache.map.len()
+        );
+        assert!(
+            cache.order.len() <= ADDRESS_CACHE_CAP,
+            "order must respect capacity"
+        );
+    }
 }

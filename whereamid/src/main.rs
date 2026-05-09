@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
         nominatim: nominatim::NominatimClient::new(),
         last_fix: tokio::sync::Mutex::new(None),
         inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        address_cache: std::sync::Mutex::new(server::AddressCache::new()),
     });
 
     // Spawn background scan loop
