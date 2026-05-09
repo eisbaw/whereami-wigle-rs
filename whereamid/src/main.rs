@@ -10,6 +10,7 @@ mod db;
 mod debounce;
 mod nominatim;
 mod pending;
+mod provider;
 mod resolver;
 mod scanner;
 mod server;

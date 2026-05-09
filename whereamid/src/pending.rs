@@ -4,8 +4,9 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
 
+use crate::provider::Provider;
+use crate::resolver::{resolve_chain, ChainPolicy, HardStopAction, NetErrorAction, SkipAction};
 use crate::server::DaemonState;
-use crate::wigle::WigleError;
 
 /// Spawn the pending queue drain loop. Runs every `pending_interval` seconds.
 pub async fn run_pending_drain(state: Arc<DaemonState>) {
@@ -73,95 +74,22 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
 
     debug!("draining {} pending entries", pending.len());
 
-    // 1. Try Apple WPS first — one-by-one, no rate limit
-    let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for entry in &pending {
-        match state.apple.lookup_bssid(&entry.bssid).await {
-            Ok(Some(ap)) => {
-                info!(
-                    "pending drain: Apple resolved {} -> ({}, {})",
-                    ap.bssid, ap.lat, ap.lon
-                );
-                let db = crate::server::lock_db(state);
-                if let Err(e) = db.upsert_ap(&ap) {
-                    warn!("failed to upsert AP {}: {e}", ap.bssid);
-                }
-                if let Err(e) = db.delete_pending(&ap.bssid) {
-                    warn!("failed to delete pending {}: {e}", ap.bssid);
-                }
-                resolved.insert(ap.bssid);
-            }
-            Ok(None) => {
-                debug!("pending drain: Apple doesn't know {}", entry.bssid);
-            }
-            Err(e) => {
-                warn!(
-                    "pending drain: Apple lookup failed for {}: {e}",
-                    entry.bssid
-                );
-            }
-        }
-    }
-
-    // 2. WiGLE for remaining unresolved
-    for entry in &pending {
-        if resolved.contains(&entry.bssid) {
-            continue;
-        }
-
-        // Check rate limit
-        let can_call = {
-            let db = crate::server::lock_db(state);
-            db.can_call_api(state.args.daily_limit).unwrap_or(false)
-        };
-        if !can_call {
-            debug!("daily API limit reached, stopping drain");
-            break;
-        }
-
-        if !state.wigle.is_configured() {
-            debug!("WiGLE not configured, skipping WiGLE drain");
-            break;
-        }
-
-        match state.wigle.lookup_bssid(&entry.bssid).await {
-            Ok(ap) => {
-                info!(
-                    "pending drain: WiGLE resolved {} -> ({}, {})",
-                    entry.bssid, ap.lat, ap.lon
-                );
-                let db = crate::server::lock_db(state);
-                if let Err(e) = db.record_api_call() {
-                    warn!("failed to record API call: {e}");
-                }
-                if let Err(e) = db.upsert_ap(&ap) {
-                    warn!("failed to upsert AP {}: {e}", entry.bssid);
-                }
-                if let Err(e) = db.delete_pending(&entry.bssid) {
-                    warn!("failed to delete pending {}: {e}", entry.bssid);
-                }
-                resolved.insert(entry.bssid.clone());
-            }
-            Err(WigleError::NotFound) => {
-                debug!("pending drain: {} not found in WiGLE", entry.bssid);
-                let db = crate::server::lock_db(state);
-                if let Err(e) = db.record_api_call() {
-                    warn!("failed to record API call: {e}");
-                }
-                // Don't mark not_found yet — only if neither provider found it
-            }
-            Err(WigleError::RateLimited) => {
-                warn!("pending drain: WiGLE rate limited, stopping");
-                break;
-            }
-            Err(WigleError::Network(e)) => {
-                warn!("pending drain: network error for {}: {e}", entry.bssid);
-                let db = crate::server::lock_db(state);
-                if let Err(e) = db.increment_pending_attempts(&entry.bssid) {
-                    warn!("failed to increment attempts for {}: {e}", entry.bssid);
-                }
-            }
-        }
-    }
+    // The pending list IS the input — they're already known to need
+    // resolution, so don't pre-filter on cache or not_found. On WiGLE
+    // network errors, increment the existing pending row's attempts. Don't
+    // mark not_found here (drain runs periodically; let the chain
+    // succeed eventually or expire via max_attempts).
+    let bssids: Vec<String> = pending.iter().map(|p| p.bssid.clone()).collect();
+    let policy = ChainPolicy {
+        skip_cached: false,
+        skip_not_found: false,
+        write_through: true,
+        delete_pending_on_success: true,
+        mark_not_found_per_provider: false,
+        mark_not_found_at_chain_end: false,
+        on_skipped: SkipAction::NextProvider,
+        on_network_error: NetErrorAction::IncrementPending,
+        on_hard_stop: HardStopAction::Stop,
+    };
+    let _ = resolve_chain(&bssids, state, &[Provider::Apple, Provider::Wigle], &policy).await;
 }
