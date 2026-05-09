@@ -11,6 +11,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::http::{client_with_timeout, REQUEST_TIMEOUT_FAST};
+
 /// Result from BeaconDB geolocation.
 #[derive(Debug, Clone)]
 pub struct BeaconDbResult {
@@ -52,7 +54,7 @@ struct Location {
 impl BeaconDbClient {
     pub fn new(enabled: bool) -> Self {
         Self {
-            client: Client::new(),
+            client: client_with_timeout(REQUEST_TIMEOUT_FAST),
             enabled,
         }
     }

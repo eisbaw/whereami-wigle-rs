@@ -5,6 +5,7 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::db::ApInfo;
+use crate::http::{client_with_timeout, REQUEST_TIMEOUT_FAST};
 
 /// Error variants specific to WiGLE lookups.
 #[derive(Debug)]
@@ -60,7 +61,7 @@ struct WigleResult {
 
 impl WigleClient {
     pub fn new(api_user: &str, api_key: &str) -> Self {
-        let client = Client::new();
+        let client = client_with_timeout(REQUEST_TIMEOUT_FAST);
         Self {
             client,
             api_user: api_user.to_string(),

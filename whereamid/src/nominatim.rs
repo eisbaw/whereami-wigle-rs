@@ -7,6 +7,8 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
+use crate::http::{client_with_timeout, REQUEST_TIMEOUT_NOMINATIM};
+
 #[derive(Deserialize, Debug)]
 struct NominatimResponse {
     display_name: Option<String>,
@@ -43,7 +45,7 @@ pub struct NominatimClient {
 impl NominatimClient {
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            client: client_with_timeout(REQUEST_TIMEOUT_NOMINATIM),
             // Initialize to the past so first request goes through immediately
             last_request: Mutex::new(Instant::now() - Duration::from_secs(2)),
         }

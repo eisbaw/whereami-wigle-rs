@@ -10,6 +10,7 @@ use reqwest::Client;
 use tracing::debug;
 
 use crate::db::ApInfo;
+use crate::http::{client_with_timeout, REQUEST_TIMEOUT_FAST};
 
 pub struct AppleClient {
     client: Client,
@@ -18,7 +19,7 @@ pub struct AppleClient {
 impl Default for AppleClient {
     fn default() -> Self {
         Self {
-            client: Client::new(),
+            client: client_with_timeout(REQUEST_TIMEOUT_FAST),
         }
     }
 }
