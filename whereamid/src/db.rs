@@ -513,6 +513,24 @@ impl Database {
         Ok(result)
     }
 
+    /// Cheap existence check: is this BSSID currently in the pending queue?
+    ///
+    /// Uses an indexed PRIMARY KEY probe. Prefer this over
+    /// `get_pending(N).iter().any(...)` — that pattern is O(N) per call and
+    /// scans rows we never inspect. For per-BSSID checks (debug rendering,
+    /// not_found end-of-chain logic) this is the right primitive.
+    pub fn is_pending(&self, bssid: &str) -> Result<bool> {
+        let exists: Option<i32> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM pending WHERE bssid = ?1 LIMIT 1",
+                params![bssid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
     /// Increment attempts for a pending BSSID.
     pub fn increment_pending_attempts(&self, bssid: &str) -> Result<()> {
         self.conn.execute(
@@ -1025,6 +1043,31 @@ mod tests {
         db.delete_pending("AA:BB:CC:DD:EE:FF").unwrap();
         let pending = db.get_pending(10).unwrap();
         assert!(pending.is_empty());
+    }
+
+    /// `is_pending` must reflect the same state as `get_pending` but cheaply.
+    /// We exercise the three transitions: insert, delete, and a never-seen
+    /// BSSID. The indexed PRIMARY KEY probe means this stays O(log n) even
+    /// with a large pending queue.
+    #[test]
+    fn is_pending_reflects_queue_membership() {
+        let db = Database::open_memory().unwrap();
+        let bssid = "AA:BB:CC:DD:EE:FF";
+        let other = "11:22:33:44:55:66";
+
+        // Empty queue: neither BSSID is pending.
+        assert!(!db.is_pending(bssid).unwrap());
+        assert!(!db.is_pending(other).unwrap());
+
+        // After insert: only the inserted one is pending.
+        db.insert_pending(bssid, Some("Test"), Some(6), Some(2437), Some(-65))
+            .unwrap();
+        assert!(db.is_pending(bssid).unwrap());
+        assert!(!db.is_pending(other).unwrap());
+
+        // After delete: pending again returns false.
+        db.delete_pending(bssid).unwrap();
+        assert!(!db.is_pending(bssid).unwrap());
     }
 
     #[test]

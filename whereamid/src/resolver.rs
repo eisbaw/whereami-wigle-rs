@@ -317,17 +317,13 @@ pub async fn resolve_chain(
 
     // End-of-chain not_found marking: only mark if no provider found it
     // AND it isn't already pending (queued from a network/skipped case).
+    //
+    // Previously we slurped up to 1000 pending rows into a HashSet to
+    // answer membership questions for the (typically few) BSSIDs in this
+    // batch. That bounded the cost but silently misclassified pending
+    // BSSIDs that fell outside the first 1000 rows. Use the indexed
+    // is_pending probe instead — it is O(log n) per BSSID and never lies.
     if policy.mark_not_found_at_chain_end {
-        // Read pending list once for the whole batch (cheap and avoids
-        // repeated full scans).
-        let pending_bssids: HashSet<String> = {
-            let db = crate::server::lock_db(state);
-            db.get_pending(1000)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|p| p.bssid)
-                .collect()
-        };
         let db = crate::server::lock_db(state);
         for bssid in bssids {
             if resolved.contains(bssid) {
@@ -338,8 +334,13 @@ pub async fn resolve_chain(
                 // for this BSSID; we must not double-write or race it.
                 continue;
             }
-            if pending_bssids.contains(bssid) {
-                continue;
+            match db.is_pending(bssid) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    warn!("is_pending probe failed for {bssid}: {e}; skipping not_found mark");
+                    continue;
+                }
             }
             if let Err(e) = db.insert_not_found(bssid) {
                 warn!("failed to insert not_found {bssid}: {e}");

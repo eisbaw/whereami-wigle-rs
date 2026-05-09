@@ -542,12 +542,7 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
                 .unwrap_or(false)
             {
                 "not_found"
-            } else if db
-                .get_pending(1000)
-                .unwrap_or_default()
-                .iter()
-                .any(|p| p.bssid == *bssid)
-            {
+            } else if db.is_pending(bssid).unwrap_or(false) {
                 "pending"
             } else {
                 "new"
