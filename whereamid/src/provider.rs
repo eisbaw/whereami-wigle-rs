@@ -71,37 +71,47 @@ async fn apple_lookup(state: &Arc<DaemonState>, bssid: &str) -> ProviderOutcome 
 }
 
 async fn wigle_lookup(state: &Arc<DaemonState>, bssid: &str) -> ProviderOutcome {
-    // Precondition: credentials and daily quota.
+    // Precondition: credentials configured.
     if !state.wigle.is_configured() {
         return ProviderOutcome::Skipped;
     }
-    let can_call = {
-        let db = crate::server::lock_db(state);
-        db.can_call_api(state.args.daily_limit).unwrap_or(false)
+
+    // Atomically reserve a quota slot BEFORE the network call. This closes the
+    // TOCTOU race where two concurrent lookups could both observe count<limit
+    // and both proceed, exceeding daily_limit by N.
+    let reserved = {
+        let mut db = crate::server::lock_db(state);
+        match db.try_reserve_api_call(state.args.daily_limit) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("failed to reserve API slot: {e}");
+                return ProviderOutcome::Skipped;
+            }
+        }
     };
-    if !can_call {
+    if !reserved {
         return ProviderOutcome::Skipped;
     }
 
-    // NOTE: There is a known TOCTOU race between can_call_api and the
-    // record_api_call below — this is tracked as a separate task and is
-    // intentionally left unchanged in this refactor.
     match state.wigle.lookup_bssid(bssid).await {
-        Ok(ap) => {
-            let db = crate::server::lock_db(state);
-            if let Err(e) = db.record_api_call() {
-                warn!("failed to record API call: {e}");
+        Ok(ap) => ProviderOutcome::Found(ap),
+        Err(WigleError::NotFound) => ProviderOutcome::NotFound,
+        // For RateLimited / Network we did not consume a real WiGLE quota
+        // unit (or it was rejected upstream), so refund the local slot to
+        // preserve prior accounting behavior.
+        Err(WigleError::RateLimited) => {
+            let mut db = crate::server::lock_db(state);
+            if let Err(e) = db.refund_api_call() {
+                warn!("failed to refund API slot after RateLimited: {e}");
             }
-            ProviderOutcome::Found(ap)
+            ProviderOutcome::HardStop
         }
-        Err(WigleError::NotFound) => {
-            let db = crate::server::lock_db(state);
-            if let Err(e) = db.record_api_call() {
-                warn!("failed to record API call: {e}");
+        Err(WigleError::Network(e)) => {
+            let mut db = crate::server::lock_db(state);
+            if let Err(re) = db.refund_api_call() {
+                warn!("failed to refund API slot after Network error: {re}");
             }
-            ProviderOutcome::NotFound
+            ProviderOutcome::NetworkError(e)
         }
-        Err(WigleError::RateLimited) => ProviderOutcome::HardStop,
-        Err(WigleError::Network(e)) => ProviderOutcome::NetworkError(e),
     }
 }

@@ -338,28 +338,102 @@ impl Database {
         Ok(result)
     }
 
-    /// Set a metadata value.
-    pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+    /// Atomically reserve an API call slot for today.
+    ///
+    /// Performs daily-counter reset, current-count read, and increment in a
+    /// single IMMEDIATE transaction. Returns `Ok(true)` if a slot was reserved
+    /// (caller may proceed with the network call) or `Ok(false)` if the
+    /// daily limit is already exhausted.
+    ///
+    /// On any transient failure of the network call afterwards, the caller
+    /// SHOULD call [`Database::refund_api_call`] to give the slot back.
+    /// Slots that map to actual completed lookups (Found / NotFound) should
+    /// not be refunded.
+    pub fn try_reserve_api_call(&mut self, daily_limit: u32) -> Result<bool> {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let tx = self.conn.transaction()?;
+
+        // Reset counter if the stored date is not today.
+        let stored_date: Option<String> = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'api_calls_date'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let count: u32 = if stored_date.as_deref() == Some(&today) {
+            tx.query_row(
+                "SELECT value FROM metadata WHERE key = 'api_calls_today'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+        } else {
+            tx.execute(
+                "INSERT INTO metadata (key, value) VALUES ('api_calls_date', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![&today],
+            )?;
+            0
+        };
+
+        if count >= daily_limit {
+            // Persist the date reset (if any) without bumping the counter.
+            tx.execute(
+                "INSERT INTO metadata (key, value) VALUES ('api_calls_today', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![count.to_string()],
+            )?;
+            tx.commit()?;
+            return Ok(false);
+        }
+
+        let new_count = count + 1;
+        tx.execute(
+            "INSERT INTO metadata (key, value) VALUES ('api_calls_today', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
+            params![new_count.to_string()],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(true)
     }
 
-    /// Check if we can make an API call today (under daily limit).
-    pub fn can_call_api(&self, daily_limit: u32) -> Result<bool> {
-        self.maybe_reset_daily_counter()?;
-        let count = self.api_calls_today()?;
-        Ok(count < daily_limit)
-    }
-
-    /// Record an API call. Increments the daily counter.
-    pub fn record_api_call(&self) -> Result<()> {
-        self.maybe_reset_daily_counter()?;
-        let count = self.api_calls_today()?;
-        self.set_metadata("api_calls_today", &(count + 1).to_string())?;
+    /// Refund a previously reserved API slot. Clamped at 0. Only meaningful
+    /// when called on the same calendar day; if the day has rolled over the
+    /// refund is silently ignored (counter has already been reset to 0).
+    pub fn refund_api_call(&mut self) -> Result<()> {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let tx = self.conn.transaction()?;
+        let stored_date: Option<String> = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'api_calls_date'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored_date.as_deref() != Some(&today) {
+            // Day rolled over since reservation; counter already reset.
+            tx.commit()?;
+            return Ok(());
+        }
+        let count: u32 = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'api_calls_today'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let new_count = count.saturating_sub(1);
+        tx.execute(
+            "INSERT INTO metadata (key, value) VALUES ('api_calls_today', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![new_count.to_string()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -369,16 +443,6 @@ impl Database {
             Some(v) => Ok(v.parse().unwrap_or(0)),
             None => Ok(0),
         }
-    }
-
-    fn maybe_reset_daily_counter(&self) -> Result<()> {
-        let today = Utc::now().format("%Y-%m-%d").to_string();
-        let stored_date = self.get_metadata("api_calls_date")?;
-        if stored_date.as_deref() != Some(&today) {
-            self.set_metadata("api_calls_date", &today)?;
-            self.set_metadata("api_calls_today", "0")?;
-        }
-        Ok(())
     }
 
     // --- stats ---
@@ -502,14 +566,70 @@ mod tests {
 
     #[test]
     fn test_rate_limiting() {
-        let db = Database::open_memory().unwrap();
-        assert!(db.can_call_api(100).unwrap());
+        let mut db = Database::open_memory().unwrap();
         assert_eq!(db.api_calls_today().unwrap(), 0);
 
-        db.record_api_call().unwrap();
+        // First reservation under generous limit succeeds.
+        assert!(db.try_reserve_api_call(100).unwrap());
         assert_eq!(db.api_calls_today().unwrap(), 1);
 
-        assert!(!db.can_call_api(1).unwrap());
-        assert!(db.can_call_api(2).unwrap());
+        // Limit-of-1 path: already at 1, so further reservation denied.
+        assert!(!db.try_reserve_api_call(1).unwrap());
+        // Counter unchanged after a denied reservation.
+        assert_eq!(db.api_calls_today().unwrap(), 1);
+
+        // Limit-of-2 path: still room for one more.
+        assert!(db.try_reserve_api_call(2).unwrap());
+        assert_eq!(db.api_calls_today().unwrap(), 2);
+
+        // Refund returns the slot.
+        db.refund_api_call().unwrap();
+        assert_eq!(db.api_calls_today().unwrap(), 1);
+
+        // Refund clamps at 0.
+        db.refund_api_call().unwrap();
+        db.refund_api_call().unwrap();
+        assert_eq!(db.api_calls_today().unwrap(), 0);
+    }
+
+    /// Concurrent reservations must not exceed the daily limit even when
+    /// many threads race on the same Database. Database is !Send-shareable
+    /// across threads (rusqlite Connection), so we wrap it in a Mutex,
+    /// matching the daemon's runtime invariant (DaemonState::db is a Mutex).
+    /// The interesting property is: if two threads both held the lock long
+    /// enough to read the counter independently, they could both decide to
+    /// proceed. With try_reserve_api_call doing its read+increment under a
+    /// single SQL transaction (and held under the outer Mutex), that cannot
+    /// happen.
+    #[test]
+    fn test_rate_limiting_concurrent() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let db = Arc::new(Mutex::new(Database::open_memory().unwrap()));
+        let limit: u32 = 10;
+        let threads = 64;
+
+        let reserved = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let db = Arc::clone(&db);
+            let reserved = Arc::clone(&reserved);
+            handles.push(thread::spawn(move || {
+                let ok = {
+                    let mut g = db.lock().unwrap();
+                    g.try_reserve_api_call(limit).unwrap()
+                };
+                if ok {
+                    reserved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let total = reserved.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(total, limit, "total reservations must equal daily_limit");
+        assert_eq!(db.lock().unwrap().api_calls_today().unwrap(), limit);
     }
 }
