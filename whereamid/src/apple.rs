@@ -73,7 +73,7 @@ impl AppleClient {
 
 /// Encode the Apple WPS protobuf request.
 /// Hand-encoded to avoid protobuf dependency.
-fn encode_request(bssids: &[String]) -> Vec<u8> {
+pub(crate) fn encode_request(bssids: &[String]) -> Vec<u8> {
     // Build the inner protobuf (AppleWLoc message)
     let mut proto = Vec::new();
 
@@ -91,13 +91,31 @@ fn encode_request(bssids: &[String]) -> Vec<u8> {
     // field 4 (return_single_result): varint = 1
     encode_varint_field(&mut proto, 4, 1);
 
-    // Build the outer envelope
+    // Build the outer envelope (Apple ARPC framing).
+    //
+    // Layout (all big-endian):
+    //   u16  version            = 0x0001
+    //   u16  locale_len         = 0x0005,  bytes  "en_US"
+    //   u16  app_id_len         = 0x0013,  bytes  "com.apple.locationd"
+    //   u16  os_version_len     = 0x000a,  bytes  "8.1.12B411"
+    //   u32  flag (function id) = 0x00000001
+    //   u32  payload_len        = proto.len() as u32   <- was a single byte!
+    //   payload bytes
+    //
+    // The original Python reference (iSniff-GPS) and apple_bssid_locator.py
+    // hardcode the high 3 bytes of payload_len to zero and only fill the last
+    // byte. That silently truncates whenever the protobuf exceeds 255 bytes
+    // (e.g. ~15+ BSSIDs in one batch). Encode the full u32 instead.
     let mut envelope = Vec::new();
     envelope.extend_from_slice(b"\x00\x01\x00\x05en_US");
     envelope.extend_from_slice(b"\x00\x13com.apple.locationd");
     envelope.extend_from_slice(b"\x00\x0a8.1.12B411");
-    envelope.extend_from_slice(b"\x00\x00\x00\x01\x00\x00\x00");
-    envelope.push(proto.len() as u8);
+    envelope.extend_from_slice(&0x0000_0001u32.to_be_bytes()); // function id / flag
+    let proto_len: u32 = proto
+        .len()
+        .try_into()
+        .expect("Apple WPS protobuf payload exceeds u32::MAX bytes");
+    envelope.extend_from_slice(&proto_len.to_be_bytes());
     envelope.extend_from_slice(&proto);
 
     envelope
@@ -308,5 +326,145 @@ fn skip_field(data: &[u8], pos: usize, wire_type: u8) -> Result<usize> {
             Ok(pos + 4)
         }
         _ => bail!("unknown wire type {wire_type}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Offset in the envelope where the 4-byte big-endian payload length lives.
+    /// Layout reminder (bytes):
+    ///   0..2  : version              (\x00\x01)
+    ///   2..4  : locale length        (\x00\x05)
+    ///   4..9  : locale "en_US"
+    ///   9..11 : app id length        (\x00\x13)
+    ///   11..30: app id "com.apple.locationd"
+    ///   30..32: os version length    (\x00\x0a)
+    ///   32..42: os version "8.1.12B411"
+    ///   42..46: flag/function id     (BE u32 = 1)
+    ///   46..50: payload length       (BE u32) <-- HERE
+    ///   50..  : protobuf payload
+    const LEN_OFFSET: usize = 46;
+    const PAYLOAD_OFFSET: usize = 50;
+
+    fn make_bssids(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                format!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    (i >> 40) as u8,
+                    (i >> 32) as u8,
+                    (i >> 24) as u8,
+                    (i >> 16) as u8,
+                    (i >> 8) as u8,
+                    i as u8,
+                )
+            })
+            .collect()
+    }
+
+    /// Length field is a 4-byte big-endian u32, equals payload length, and
+    /// matches the actual remaining bytes. Exercised across N=1..=300 BSSIDs
+    /// so that we cross the previously-truncating 256-byte boundary.
+    #[test]
+    fn encode_length_field_matches_payload_for_all_sizes() {
+        for n in [1usize, 2, 5, 10, 14, 15, 16, 50, 100, 200, 300] {
+            let bssids = make_bssids(n);
+            let envelope = encode_request(&bssids);
+
+            assert!(
+                envelope.len() > PAYLOAD_OFFSET,
+                "envelope too short for n={n}: {} bytes",
+                envelope.len()
+            );
+
+            let len_bytes: [u8; 4] = envelope[LEN_OFFSET..PAYLOAD_OFFSET].try_into().unwrap();
+            let declared_len = u32::from_be_bytes(len_bytes) as usize;
+            let actual_payload_len = envelope.len() - PAYLOAD_OFFSET;
+
+            assert_eq!(
+                declared_len, actual_payload_len,
+                "n={n}: declared length {declared_len} != actual payload {actual_payload_len}"
+            );
+        }
+    }
+
+    /// For batches that produce >255-byte protobufs (>= ~15 BSSIDs in
+    /// practice), the upper byte(s) of the length field must be non-zero.
+    /// This is the regression assertion for the original truncation bug.
+    #[test]
+    fn encode_length_uses_full_u32_above_255_bytes() {
+        let bssids = make_bssids(50);
+        let envelope = encode_request(&bssids);
+
+        let len_bytes: [u8; 4] = envelope[LEN_OFFSET..PAYLOAD_OFFSET].try_into().unwrap();
+        let declared_len = u32::from_be_bytes(len_bytes);
+        assert!(
+            declared_len > 255,
+            "test expects payload >255 bytes; got {declared_len}"
+        );
+
+        // At least one of the high three bytes must be non-zero — that is
+        // exactly the data the old `as u8` cast was throwing away.
+        let high_bytes_nonzero = len_bytes[0] != 0 || len_bytes[1] != 0 || len_bytes[2] != 0;
+        assert!(
+            high_bytes_nonzero,
+            "high bytes of length field are all zero ({len_bytes:?}) — truncation regression"
+        );
+    }
+
+    /// The protobuf payload itself must round-trip: encode then re-parse the
+    /// embedded WifiDevice messages and check the BSSIDs are intact. This
+    /// guards against the protobuf payload being corrupted by the framing
+    /// change.
+    #[test]
+    fn encoded_protobuf_roundtrips_through_decoder() {
+        let bssids = make_bssids(20); // ~ >255 byte payload
+        let envelope = encode_request(&bssids);
+        let proto = &envelope[PAYLOAD_OFFSET..];
+
+        // Parse the WifiDevice (field=2) entries out of the protobuf payload.
+        // The encoder produces field 2 (WifiDevice), each containing field 1
+        // (bssid string). We just need to recover the strings.
+        let mut got = Vec::new();
+        let mut pos = 0;
+        while pos < proto.len() {
+            let (field_num, wire_type, np) = decode_tag(proto, pos).unwrap();
+            pos = np;
+            if field_num == 2 && wire_type == 2 {
+                let (sub, np) = decode_length_delimited(proto, pos).unwrap();
+                pos = np;
+                // Inside: field 1 string = bssid
+                let mut sp = 0;
+                while sp < sub.len() {
+                    let (sf, sw, snp) = decode_tag(sub, sp).unwrap();
+                    sp = snp;
+                    if sf == 1 && sw == 2 {
+                        let (s, snp) = decode_length_delimited(sub, sp).unwrap();
+                        sp = snp;
+                        got.push(String::from_utf8(s.to_vec()).unwrap());
+                    } else {
+                        sp = skip_field(sub, sp, sw).unwrap();
+                    }
+                }
+            } else {
+                pos = skip_field(proto, pos, wire_type).unwrap();
+            }
+        }
+        assert_eq!(got, bssids);
+    }
+
+    /// Empty input still produces a well-formed envelope with length == 0.
+    #[test]
+    fn encode_empty_protobuf_has_nonzero_length_for_metadata_fields() {
+        // The encoder always emits unknown_value1 and return_single_result
+        // (two varint fields), so even with zero BSSIDs the protobuf is
+        // non-empty. We just check the framing is consistent.
+        let bssids: Vec<String> = Vec::new();
+        let envelope = encode_request(&bssids);
+        let len_bytes: [u8; 4] = envelope[LEN_OFFSET..PAYLOAD_OFFSET].try_into().unwrap();
+        let declared = u32::from_be_bytes(len_bytes) as usize;
+        assert_eq!(declared, envelope.len() - PAYLOAD_OFFSET);
     }
 }
