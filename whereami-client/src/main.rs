@@ -1,6 +1,12 @@
 use std::process;
 use whereami_client::WhereAmIClient;
 
+/// Print a fatal error and exit with code 1.
+fn fatal(msg: &str) -> ! {
+    eprintln!("{msg}");
+    process::exit(1);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("locate");
@@ -10,93 +16,72 @@ fn main() {
     let client = WhereAmIClient::default_addr();
 
     match cmd {
-        "locate" | "l" => match client.raw_command(r#"{"cmd":"locate"}"#) {
-            Ok(resp) if json => println!("{resp}"),
+        "locate" | "l" => match client.locate() {
+            Ok(resp) if json => {
+                println!("{}", serde_json::to_string(&resp).unwrap());
+            }
+            Ok(resp) if !resp.ok => {
+                fatal(resp.error.as_deref().unwrap_or("unknown error"));
+            }
             Ok(resp) => {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
-                    if v["ok"].as_bool() != Some(true) {
-                        eprintln!("{}", v["error"].as_str().unwrap_or("unknown error"));
-                        process::exit(1);
-                    }
-                    let stale = v["stale"].as_bool().unwrap_or(false);
-                    if stale {
-                        let age_s = v["age_s"].as_u64().unwrap_or(0);
-                        let age_str = if age_s < 60 {
-                            format!("{}s", age_s)
-                        } else if age_s < 3600 {
-                            format!("{}m", age_s / 60)
-                        } else {
-                            format!("{}h", age_s / 3600)
-                        };
-                        eprint!("[last known, {} ago] ", age_str);
-                    }
-                    if let Some(addr) = v["address"].as_str() {
-                        if !addr.is_empty() {
-                            println!("{}", addr);
-                        }
-                    }
-                    println!(
-                        "{:.6}, {:.6}  ±{}m  ({} sources)",
-                        v["lat"].as_f64().unwrap_or(0.0),
-                        v["lon"].as_f64().unwrap_or(0.0),
-                        v["accuracy_m"].as_f64().unwrap_or(0.0) as i64,
-                        v["sources"].as_u64().unwrap_or(0),
-                    );
-                } else {
-                    eprintln!("{resp}");
-                    process::exit(1);
+                if resp.stale {
+                    let age_s = resp.age_s.unwrap_or(0);
+                    let age_str = if age_s < 60 {
+                        format!("{age_s}s")
+                    } else if age_s < 3600 {
+                        format!("{}m", age_s / 60)
+                    } else {
+                        format!("{}h", age_s / 3600)
+                    };
+                    eprint!("[last known, {age_str} ago] ");
                 }
+                if let Some(addr) = resp.address.as_deref() {
+                    if !addr.is_empty() {
+                        println!("{addr}");
+                    }
+                }
+                println!(
+                    "{:.6}, {:.6}  ±{}m  ({} sources)",
+                    resp.lat, resp.lon, resp.accuracy_m as i64, resp.sources,
+                );
             }
-            Err(e) => {
-                eprintln!("error: {e}");
-                process::exit(1);
-            }
+            Err(e) => fatal(&format!("error: {e}")),
         },
-        "scan" | "s" => match client.raw_command(r#"{"cmd":"scan"}"#) {
-            Ok(resp) if json => println!("{resp}"),
+        "scan" | "s" => match client.scan() {
+            Ok(resp) if json => {
+                println!("{}", serde_json::to_string(&resp).unwrap());
+            }
+            Ok(resp) if !resp.ok => {
+                fatal(resp.error.as_deref().unwrap_or("unknown error"));
+            }
             Ok(resp) => {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
-                    if v["ok"].as_bool() != Some(true) {
-                        eprintln!("{}", v["error"].as_str().unwrap_or("unknown error"));
-                        process::exit(1);
-                    }
-                    if !no_scan_time {
-                        let age_ms = v["scan_age_ms"].as_u64().unwrap_or(0);
-                        let age_s = age_ms / 1000;
-                        let scanned_at = v["scanned_at"].as_str().unwrap_or("?");
-                        println!("scanned: {}  ({}s ago)", scanned_at, age_s);
-                        println!();
-                    }
-                    if let Some(nets) = v["networks"].as_array() {
-                        for net in nets {
-                            println!(
-                                "{:17}  {:>4} dBm  ch{:<3}  {}",
-                                net["bssid"].as_str().unwrap_or("?"),
-                                net["signal_dbm"].as_i64().unwrap_or(0),
-                                net["channel"]
-                                    .as_i64()
-                                    .map(|c| c.to_string())
-                                    .unwrap_or("-".into()),
-                                net["ssid"].as_str().unwrap_or("<hidden>")
-                            );
-                        }
-                    }
-                } else {
-                    println!("{resp}");
+                if !no_scan_time {
+                    let age_ms = resp.scan_age_ms.unwrap_or(0);
+                    let age_s = age_ms / 1000;
+                    let scanned_at = resp.scanned_at.as_deref().unwrap_or("?");
+                    println!("scanned: {scanned_at}  ({age_s}s ago)");
+                    println!();
+                }
+                for net in &resp.networks {
+                    println!(
+                        "{:17}  {:>4} dBm  ch{:<3}  {}",
+                        net.bssid,
+                        net.signal_dbm,
+                        net.channel
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        net.ssid.as_deref().unwrap_or("<hidden>")
+                    );
                 }
             }
-            Err(e) => {
-                eprintln!("error: {e}");
-                process::exit(1);
-            }
+            Err(e) => fatal(&format!("error: {e}")),
         },
         "stats" | "st" => match client.stats() {
             Ok(resp) if json => {
                 println!("{}", serde_json::to_string(&resp).unwrap());
             }
             Ok(resp) if !resp.ok => {
-                eprintln!("{}", resp.error.as_deref().unwrap_or("unknown error"));
-                process::exit(1);
+                fatal(resp.error.as_deref().unwrap_or("unknown error"));
             }
             Ok(resp) => {
                 println!("cached:    {}", resp.cached_aps);
@@ -105,83 +90,61 @@ fn main() {
                 println!("db size:   {} KB", resp.db_size_bytes / 1024);
                 println!("API today: {}", resp.api_calls_today);
             }
-            Err(e) => {
-                eprintln!("error: {e}");
-                process::exit(1);
-            }
+            Err(e) => fatal(&format!("error: {e}")),
         },
-        "debug" | "d" => {
-            let client_raw = WhereAmIClient::default_addr();
-            match client_raw.raw_command(r#"{"cmd":"debug"}"#) {
-                Ok(resp) if json => println!("{resp}"),
-                Ok(resp) => {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
-                        let daemon_rev = v["daemon_rev"].as_str().unwrap_or("?");
-                        let cli_rev = env!("GIT_REV");
-                        println!("cli: {}  daemon: {}", cli_rev, daemon_rev);
-                        println!();
-                        let age = v["scan_age_ms"].as_u64().unwrap_or(0);
-                        let samples = v["samples_in_buffer"].as_u64().unwrap_or(0);
-                        let visible = v["visible"].as_u64().unwrap_or(0);
-                        let stable = v["stable"].as_u64().unwrap_or(0);
-                        println!(
-                            "scan age: {}ms  samples: {}  visible: {}  stable: {}",
-                            age, samples, visible, stable
-                        );
-                        println!();
-                        if let Some(bssids) = v["bssids"].as_array() {
-                            for b in bssids {
-                                let seen = b["seen"].as_u64().unwrap_or(0);
-                                let needed = b["needed"].as_u64().unwrap_or(0);
-                                let is_stable = b["is_stable"].as_bool().unwrap_or(false);
-                                let marker = if is_stable { "*" } else { " " };
-                                println!(
-                                    "{}{:17}  {:>4} dBm  {}/{}  {}",
-                                    marker,
-                                    b["bssid"].as_str().unwrap_or("?"),
-                                    b["signal_dbm"].as_i64().unwrap_or(0),
-                                    seen,
-                                    needed,
-                                    b["db_status"].as_str().unwrap_or("?"),
-                                );
-                            }
-                            println!();
-                            println!("* = stable  seen/needed = debounce count/threshold");
-                        }
-                    } else {
-                        println!("{resp}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
+        "debug" | "d" => match client.debug() {
+            Ok(resp) if json => {
+                println!("{}", serde_json::to_string(&resp).unwrap());
             }
-        }
+            Ok(resp) if !resp.ok => {
+                fatal(resp.error.as_deref().unwrap_or("unknown error"));
+            }
+            Ok(resp) => {
+                let cli_rev = env!("GIT_REV");
+                let daemon_rev = resp.daemon_rev.as_deref().unwrap_or("?");
+                println!("cli: {cli_rev}  daemon: {daemon_rev}");
+                println!();
+                let age = resp.scan_age_ms.unwrap_or(0);
+                println!(
+                    "scan age: {}ms  samples: {}  visible: {}  stable: {}",
+                    age, resp.samples_in_buffer, resp.visible, resp.stable
+                );
+                println!();
+                for b in &resp.bssids {
+                    let marker = if b.is_stable { "*" } else { " " };
+                    println!(
+                        "{}{:17}  {:>4} dBm  {}/{}  {}",
+                        marker, b.bssid, b.signal_dbm, b.seen, b.needed, b.db_status,
+                    );
+                }
+                println!();
+                println!("* = stable  seen/needed = debounce count/threshold");
+            }
+            Err(e) => fatal(&format!("error: {e}")),
+        },
         "version" | "v" | "--version" | "-V" => {
             let cli_version = env!("CARGO_PKG_VERSION");
             let cli_rev = env!("GIT_REV");
-            let client_raw = WhereAmIClient::default_addr();
-            match client_raw.raw_command(r#"{"cmd":"version"}"#) {
-                Ok(resp) if json => println!("{resp}"),
+            match client.version() {
+                Ok(resp) if json => {
+                    println!("{}", serde_json::to_string(&resp).unwrap());
+                }
+                Ok(resp) if !resp.ok => {
+                    println!("cli:    {cli_version} ({cli_rev})");
+                    eprintln!(
+                        "daemon: {}",
+                        resp.error.as_deref().unwrap_or("unknown error")
+                    );
+                    process::exit(1);
+                }
                 Ok(resp) => {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
-                        if v["ok"].as_bool() != Some(true) {
-                            println!("cli:    {} ({})", cli_version, cli_rev);
-                            eprintln!("daemon: {}", v["error"].as_str().unwrap_or("unknown error"));
-                            process::exit(1);
-                        }
-                        let daemon_version = v["version"].as_str().unwrap_or("?");
-                        let daemon_rev = v["git_rev"].as_str().unwrap_or("?");
-                        println!("cli:    {} ({})", cli_version, cli_rev);
-                        println!("daemon: {} ({})", daemon_version, daemon_rev);
-                    } else {
-                        println!("cli:    {} ({})", cli_version, cli_rev);
-                        println!("daemon: {resp}");
-                    }
+                    let daemon_version = resp.version.as_deref().unwrap_or("?");
+                    let daemon_rev = resp.git_rev.as_deref().unwrap_or("?");
+                    println!("cli:    {cli_version} ({cli_rev})");
+                    println!("daemon: {daemon_version} ({daemon_rev})");
                 }
                 Err(e) => {
-                    println!("cli:    {} ({})", cli_version, cli_rev);
+                    println!("cli:    {cli_version} ({cli_rev})");
                     eprintln!("daemon: error: {e}");
                     process::exit(1);
                 }

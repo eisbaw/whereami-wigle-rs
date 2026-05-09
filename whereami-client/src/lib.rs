@@ -58,6 +58,13 @@ pub struct LocateResponse {
     pub stable: usize,
     #[serde(default)]
     pub address: Option<String>,
+    /// True when the daemon could not produce a current fix and is
+    /// returning the previous known position. Defaults to false.
+    #[serde(default)]
+    pub stale: bool,
+    /// Age of the stale fix, in seconds. Only meaningful when `stale`.
+    #[serde(default)]
+    pub age_s: Option<u64>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -99,6 +106,58 @@ pub struct ScanResponse {
     pub v: u32,
     #[serde(default)]
     pub networks: Vec<NetworkEntry>,
+    /// Age of the most recent scan in milliseconds. None if no scan
+    /// has completed yet.
+    #[serde(default)]
+    pub scan_age_ms: Option<u64>,
+    /// RFC 3339 timestamp of the most recent scan, if any.
+    #[serde(default)]
+    pub scanned_at: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// One BSSID's debug state, as the daemon returns it under `bssids`.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DebugBssid {
+    pub bssid: String,
+    pub signal_dbm: i32,
+    pub seen: usize,
+    pub needed: usize,
+    pub is_stable: bool,
+    pub db_status: String,
+}
+
+/// Response from the `debug` command.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DebugResponse {
+    pub ok: bool,
+    pub v: u32,
+    #[serde(default)]
+    pub daemon_rev: Option<String>,
+    #[serde(default)]
+    pub scan_age_ms: Option<u64>,
+    #[serde(default)]
+    pub samples_in_buffer: usize,
+    #[serde(default)]
+    pub visible: usize,
+    #[serde(default)]
+    pub stable: usize,
+    #[serde(default)]
+    pub bssids: Vec<DebugBssid>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Response from the `version` command.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct VersionResponse {
+    pub ok: bool,
+    pub v: u32,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub git_rev: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -209,6 +268,19 @@ impl WhereAmIClient {
     /// Get cache and API statistics.
     pub fn stats(&self) -> Result<StatsResponse> {
         let req = serde_json::to_string(&SimpleRequest { cmd: "stats" })?;
+        self.request(&req)
+    }
+
+    /// Get the daemon's debug snapshot: scan buffer state, per-BSSID
+    /// debounce counters, DB classification.
+    pub fn debug(&self) -> Result<DebugResponse> {
+        let req = serde_json::to_string(&SimpleRequest { cmd: "debug" })?;
+        self.request(&req)
+    }
+
+    /// Get the daemon's version string and git revision.
+    pub fn version(&self) -> Result<VersionResponse> {
+        let req = serde_json::to_string(&SimpleRequest { cmd: "version" })?;
         self.request(&req)
     }
 }
