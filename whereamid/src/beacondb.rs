@@ -1,6 +1,10 @@
 //! BeaconDB API client: batch geolocation lookup (no auth required).
 //! Currently not used in trilateration (it returns aggregate positions, not per-AP),
 //! but kept for future use as a fallback when WiGLE is unavailable.
+//!
+//! The whole module is intentionally unused at runtime; suppress dead-code
+//! warnings module-wide rather than annotating every item.
+#![allow(dead_code)]
 
 use anyhow::Result;
 use reqwest::Client;

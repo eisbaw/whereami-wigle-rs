@@ -4,7 +4,6 @@
 //! and answers "where am I?" queries over TCP + JSON-lines.
 
 mod apple;
-#[allow(dead_code)]
 mod beacondb;
 mod config;
 mod db;

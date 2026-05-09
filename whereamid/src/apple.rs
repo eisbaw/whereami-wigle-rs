@@ -29,7 +29,6 @@ impl AppleClient {
     }
 
     /// Look up a single BSSID via Apple WPS. Returns None if not found.
-    #[allow(dead_code)]
     pub async fn lookup_bssid(&self, bssid: &str) -> Result<Option<ApInfo>> {
         let results = self.lookup_bssids(&[bssid.to_string()]).await?;
         Ok(results.into_iter().next())
