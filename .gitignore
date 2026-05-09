@@ -2,3 +2,6 @@
 wigle-wifi-wardriving/
 apple_bssid_locator/
 geowifi/
+whereamid/fuzz/target/
+whereamid/fuzz/corpus/
+whereamid/fuzz/artifacts/

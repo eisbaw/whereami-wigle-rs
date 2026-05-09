@@ -1,0 +1,38 @@
+[package]
+name = "whereamid-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.whereamid]
+path = ".."
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_iw_parser"
+path = "fuzz_targets/fuzz_iw_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_nmcli_parser"
+path = "fuzz_targets/fuzz_nmcli_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_apple_decode"
+path = "fuzz_targets/fuzz_apple_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_trilaterate"
+path = "fuzz_targets/fuzz_trilaterate.rs"
+doc = false

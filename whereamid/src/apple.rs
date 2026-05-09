@@ -15,11 +15,17 @@ pub struct AppleClient {
     client: Client,
 }
 
-impl AppleClient {
-    pub fn new() -> Self {
+impl Default for AppleClient {
+    fn default() -> Self {
         Self {
             client: Client::new(),
         }
+    }
+}
+
+impl AppleClient {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Look up a single BSSID via Apple WPS. Returns None if not found.
@@ -99,7 +105,7 @@ fn encode_request(bssids: &[String]) -> Vec<u8> {
 
 /// Decode the Apple WPS protobuf response.
 /// Returns ApInfo for each BSSID that has valid coordinates.
-fn decode_response(data: &[u8], _requested: &[String]) -> Result<Vec<ApInfo>> {
+pub fn decode_response(data: &[u8], _requested: &[String]) -> Result<Vec<ApInfo>> {
     let mut results = Vec::new();
     let mut pos = 0;
 
@@ -125,7 +131,7 @@ fn decode_response(data: &[u8], _requested: &[String]) -> Result<Vec<ApInfo>> {
 }
 
 /// Parse a single WifiDevice protobuf message.
-fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
+pub fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
     let mut bssid: Option<String> = None;
     let mut lat: Option<i64> = None;
     let mut lon: Option<i64> = None;
@@ -179,7 +185,7 @@ fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
 
 /// Parse a Location submessage — fields 1 (lat) and 2 (lon) are varint int64.
 /// Apple encodes these as plain signed varints (not zigzag), so we cast directly.
-fn parse_location(data: &[u8]) -> Result<(i64, i64)> {
+pub fn parse_location(data: &[u8]) -> Result<(i64, i64)> {
     let mut lat: i64 = 0;
     let mut lon: i64 = 0;
     let mut pos = 0;
@@ -266,10 +272,13 @@ fn decode_tag(data: &[u8], pos: usize) -> Result<(u32, u8, usize)> {
 fn decode_length_delimited(data: &[u8], pos: usize) -> Result<(&[u8], usize)> {
     let (len, new_pos) = decode_varint(data, pos)?;
     let len = len as usize;
-    if new_pos + len > data.len() {
-        bail!("protobuf length-delimited field extends past end of data");
-    }
-    Ok((&data[new_pos..new_pos + len], new_pos + len))
+    let end = new_pos
+        .checked_add(len)
+        .filter(|&e| e <= data.len())
+        .ok_or_else(|| {
+            anyhow::anyhow!("protobuf length-delimited field extends past end of data")
+        })?;
+    Ok((&data[new_pos..end], end))
 }
 
 fn skip_field(data: &[u8], pos: usize, wire_type: u8) -> Result<usize> {
