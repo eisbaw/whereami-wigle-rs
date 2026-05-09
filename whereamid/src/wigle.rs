@@ -139,7 +139,7 @@ impl WigleClient {
             frequency: r.frequency,
             city: r.city.clone(),
             country: r.country.clone(),
-            source: "wigle".to_string(),
+            source: crate::db::Source::Wigle.as_str().to_string(),
         })
     }
 }

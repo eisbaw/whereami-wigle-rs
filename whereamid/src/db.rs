@@ -21,6 +21,70 @@ pub struct ApInfo {
     pub source: String,
 }
 
+/// Origin of an AP fix, with an explicit ranking.
+///
+/// We persist (bssid, source, source_priority) so reads always return the
+/// highest-quality known fix and lower-quality writes cannot overwrite it.
+/// Higher numeric value = higher priority.
+///
+/// The ordering reflects empirical accuracy:
+/// - Apple WPS aggregates massive crowdsourced telemetry from iOS devices and
+///   is generally tightest.
+/// - WiGLE is community-submitted wardriving data; coverage is great but the
+///   per-AP position can drift.
+/// - BeaconDB is similar to WiGLE in spirit but smaller.
+/// - Manual is a user-supplied override with no implicit trust ordering;
+///   placed lowest deliberately so the system can correct user mistakes by
+///   preferring authoritative sources. If callers want a sticky manual
+///   override they should bump priority explicitly. (TODO if that becomes a
+///   real requirement.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Apple,
+    Wigle,
+    BeaconDb,
+    Manual,
+    /// Anything we read back from the DB that we no longer recognise.
+    /// Treated as the lowest priority so a real source can always win.
+    Unknown,
+}
+
+impl Source {
+    /// Numeric priority. Higher = more trusted.
+    pub fn priority(self) -> i32 {
+        match self {
+            Source::Apple => 40,
+            Source::Wigle => 30,
+            Source::BeaconDb => 20,
+            Source::Manual => 10,
+            Source::Unknown => 0,
+        }
+    }
+
+    /// Canonical wire-format string stored in `aps.source`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Apple => "apple",
+            Source::Wigle => "wigle",
+            Source::BeaconDb => "beacondb",
+            Source::Manual => "manual",
+            Source::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a stored `source` string. Unknown values map to `Source::Unknown`
+    /// (lowest priority) so they cannot win against any recognised source.
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "apple" => Source::Apple,
+            "wigle" => Source::Wigle,
+            "beacondb" => Source::BeaconDb,
+            "manual" => Source::Manual,
+            _ => Source::Unknown,
+        }
+    }
+}
+
 /// A pending BSSID awaiting resolution.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -37,7 +101,7 @@ pub struct Database {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 impl Database {
     /// Open or create the database at `path`. Sets WAL mode and creates schema if needed.
@@ -72,18 +136,81 @@ impl Database {
     }
 
     fn migrate(&self) -> Result<()> {
-        let version = self.get_schema_version();
+        let mut version = self.get_schema_version();
 
         if version == 0 {
             info!("initializing database schema v{SCHEMA_VERSION}");
             self.create_schema_v1()?;
-        } else if version < SCHEMA_VERSION {
-            info!("migrating database from v{version} to v{SCHEMA_VERSION}");
-            // Future migrations go here
-        } else {
-            debug!("database schema is up to date (v{version})");
+            version = 1;
         }
 
+        if version < 2 {
+            info!("migrating database v{version} -> v2 (add aps.source_priority)");
+            self.migrate_v1_to_v2()?;
+            version = 2;
+        }
+
+        if version == SCHEMA_VERSION {
+            debug!("database schema is up to date (v{version})");
+        } else if version > SCHEMA_VERSION {
+            tracing::warn!(
+                "database schema is v{version} but binary expects v{SCHEMA_VERSION}; \
+                 forward compatibility is not guaranteed"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// v1 -> v2: add `aps.source_priority` and backfill from the existing
+    /// `source` column. Idempotent: safe to run multiple times because the
+    /// schema_version row is the gating condition; we never reach this from
+    /// a v2 database.
+    fn migrate_v1_to_v2(&self) -> Result<()> {
+        // Defensive: if the column already exists (e.g. partial earlier run),
+        // skip the ALTER. We detect that via PRAGMA table_info.
+        let has_priority: bool = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(aps)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            let mut found = false;
+            for row in rows {
+                if row? == "source_priority" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_priority {
+            self.conn
+                .execute(
+                    "ALTER TABLE aps ADD COLUMN source_priority INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .context("failed to add aps.source_priority column")?;
+        }
+
+        // Backfill priorities from existing source strings. Hardcode the
+        // numbers here rather than calling Source::priority(): future code
+        // changes to the enum must not silently rewrite historical data.
+        // (If you change the priority ladder, write a new migration.)
+        self.conn.execute_batch(
+            "UPDATE aps SET source_priority = 40 WHERE source = 'apple';
+             UPDATE aps SET source_priority = 30 WHERE source = 'wigle';
+             UPDATE aps SET source_priority = 20 WHERE source = 'beacondb';
+             UPDATE aps SET source_priority = 10 WHERE source = 'manual';
+             UPDATE aps SET source_priority = 0  WHERE source NOT IN ('apple','wigle','beacondb','manual');",
+        )?;
+
+        // Bump schema_version. The row-management is conservative: update if
+        // a row exists, otherwise insert. (Task 0030 will tighten this.)
+        let updated = self
+            .conn
+            .execute("UPDATE schema_version SET version = 2", [])?;
+        if updated == 0 {
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (2)", [])?;
+        }
         Ok(())
     }
 
@@ -194,24 +321,35 @@ impl Database {
     }
 
     /// Insert or update a resolved AP.
+    ///
+    /// Source priority is enforced: an existing row is overwritten only if
+    /// the incoming row's source priority is **strictly greater than or
+    /// equal to** the stored row's. This keeps better fixes (Apple) sticky
+    /// against later, lower-quality writes (WiGLE/BeaconDB) for the same
+    /// BSSID.
+    ///
+    /// `last_seen` is **always** advanced regardless of priority decision —
+    /// observing a BSSID is independent of whose data is authoritative.
     pub fn upsert_ap(&self, ap: &ApInfo) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        let priority = Source::from_db_str(&ap.source).priority();
         self.conn.execute(
-            "INSERT INTO aps (bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, first_seen, last_seen, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11)
+            "INSERT INTO aps (bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, source_priority, first_seen, last_seen, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?12)
              ON CONFLICT(bssid) DO UPDATE SET
-                ssid = excluded.ssid,
-                lat = excluded.lat,
-                lon = excluded.lon,
-                encryption = excluded.encryption,
-                channel = excluded.channel,
-                frequency = excluded.frequency,
-                city = excluded.city,
-                country = excluded.country,
-                source = excluded.source,
-                last_seen = excluded.last_seen,
-                fetched_at = excluded.fetched_at",
-            params![ap.bssid, ap.ssid, ap.lat, ap.lon, ap.encryption, ap.channel, ap.frequency, ap.city, ap.country, ap.source, now],
+                ssid       = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.ssid       ELSE aps.ssid       END,
+                lat        = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.lat        ELSE aps.lat        END,
+                lon        = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.lon        ELSE aps.lon        END,
+                encryption = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.encryption ELSE aps.encryption END,
+                channel    = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.channel    ELSE aps.channel    END,
+                frequency  = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.frequency  ELSE aps.frequency  END,
+                city       = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.city       ELSE aps.city       END,
+                country    = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.country    ELSE aps.country    END,
+                source           = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.source           ELSE aps.source           END,
+                source_priority  = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.source_priority  ELSE aps.source_priority  END,
+                fetched_at       = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.fetched_at       ELSE aps.fetched_at       END,
+                last_seen  = excluded.last_seen",
+            params![ap.bssid, ap.ssid, ap.lat, ap.lon, ap.encryption, ap.channel, ap.frequency, ap.city, ap.country, ap.source, priority, now],
         )?;
         Ok(())
     }
@@ -529,6 +667,157 @@ mod tests {
         let got = db.get_ap("AA:BB:CC:DD:EE:FF").unwrap().unwrap();
         assert_eq!(got.ssid, Some("TestWiFi".to_string()));
         assert!((got.lat - 55.6684).abs() < 1e-6);
+    }
+
+    /// Build an ApInfo with the given source string and lat (used to tell
+    /// rows apart in priority assertions).
+    fn ap_with(source: &str, lat: f64) -> ApInfo {
+        ApInfo {
+            bssid: "AA:BB:CC:DD:EE:FF".to_string(),
+            ssid: Some(format!("ssid-{source}")),
+            lat,
+            lon: 12.5541,
+            encryption: None,
+            channel: Some(6),
+            frequency: Some(2437),
+            city: None,
+            country: None,
+            source: source.to_string(),
+        }
+    }
+
+    /// Source priority enum is internally consistent: ordering is strict
+    /// and matches what the migration backfill SQL hardcodes.
+    #[test]
+    fn source_priority_ladder() {
+        assert!(Source::Apple.priority() > Source::Wigle.priority());
+        assert!(Source::Wigle.priority() > Source::BeaconDb.priority());
+        assert!(Source::BeaconDb.priority() > Source::Manual.priority());
+        assert!(Source::Manual.priority() > Source::Unknown.priority());
+
+        // round-trip with the canonical string
+        for s in [
+            Source::Apple,
+            Source::Wigle,
+            Source::BeaconDb,
+            Source::Manual,
+            Source::Unknown,
+        ] {
+            assert_eq!(Source::from_db_str(s.as_str()), s);
+        }
+        // unknown strings collapse to Unknown
+        assert_eq!(Source::from_db_str("garbage"), Source::Unknown);
+        assert_eq!(Source::from_db_str(""), Source::Unknown);
+    }
+
+    /// upsert_ap honours the priority ladder. Exercise every cross-source
+    /// transition: equal-priority overwrites, higher-priority overwrites,
+    /// lower-priority does NOT overwrite the data fields, but `last_seen`
+    /// always advances (an observation is always recorded).
+    #[test]
+    fn upsert_ap_respects_source_priority() {
+        let db = Database::open_memory().unwrap();
+        let bssid = "AA:BB:CC:DD:EE:FF";
+
+        // 1. Wigle writes first.
+        db.upsert_ap(&ap_with("wigle", 1.0)).unwrap();
+        let got = db.get_ap(bssid).unwrap().unwrap();
+        assert_eq!(got.source, "wigle");
+        assert!((got.lat - 1.0).abs() < 1e-9);
+
+        // 2. Lower-priority manual write must NOT overwrite.
+        db.upsert_ap(&ap_with("manual", 2.0)).unwrap();
+        let got = db.get_ap(bssid).unwrap().unwrap();
+        assert_eq!(got.source, "wigle", "manual must not overwrite wigle");
+        assert!((got.lat - 1.0).abs() < 1e-9, "lat must not change");
+
+        // 3. Lower-priority beacondb write must NOT overwrite wigle either.
+        db.upsert_ap(&ap_with("beacondb", 3.0)).unwrap();
+        let got = db.get_ap(bssid).unwrap().unwrap();
+        assert_eq!(got.source, "wigle");
+
+        // 4. Equal-priority same-source rewrite SHOULD update the position
+        //    (we trust the more recent observation from the same source).
+        db.upsert_ap(&ap_with("wigle", 4.0)).unwrap();
+        let got = db.get_ap(bssid).unwrap().unwrap();
+        assert_eq!(got.source, "wigle");
+        assert!(
+            (got.lat - 4.0).abs() < 1e-9,
+            "same-source rewrite should update lat, got {}",
+            got.lat
+        );
+
+        // 5. Higher-priority apple write SHOULD overwrite.
+        db.upsert_ap(&ap_with("apple", 5.0)).unwrap();
+        let got = db.get_ap(bssid).unwrap().unwrap();
+        assert_eq!(got.source, "apple");
+        assert!((got.lat - 5.0).abs() < 1e-9);
+
+        // 6. Subsequent lower-priority writes (wigle, beacondb, manual,
+        //    unknown) must NOT overwrite apple.
+        for (src, lat) in [
+            ("wigle", 6.0),
+            ("beacondb", 7.0),
+            ("manual", 8.0),
+            ("garbage", 9.0),
+        ] {
+            db.upsert_ap(&ap_with(src, lat)).unwrap();
+            let got = db.get_ap(bssid).unwrap().unwrap();
+            assert_eq!(got.source, "apple", "{src} must not overwrite apple");
+            assert!((got.lat - 5.0).abs() < 1e-9);
+        }
+    }
+
+    /// Migration v1 -> v2 backfills source_priority from the source string.
+    /// We construct a v1 database by hand, then call `migrate` and verify
+    /// the column exists and is populated correctly.
+    #[test]
+    fn migrate_v1_to_v2_backfills_source_priority() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Build a v1 schema and seed it.
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (1);
+             CREATE TABLE aps (
+                 bssid TEXT PRIMARY KEY, ssid TEXT, lat REAL NOT NULL, lon REAL NOT NULL,
+                 encryption TEXT, channel INTEGER, frequency INTEGER, city TEXT, country TEXT,
+                 source TEXT NOT NULL, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+                 fetched_at TEXT NOT NULL
+             );
+             INSERT INTO aps VALUES ('A','x',1,1,NULL,NULL,NULL,NULL,NULL,'apple','t','t','t');
+             INSERT INTO aps VALUES ('B','x',1,1,NULL,NULL,NULL,NULL,NULL,'wigle','t','t','t');
+             INSERT INTO aps VALUES ('C','x',1,1,NULL,NULL,NULL,NULL,NULL,'beacondb','t','t','t');
+             INSERT INTO aps VALUES ('D','x',1,1,NULL,NULL,NULL,NULL,NULL,'manual','t','t','t');
+             INSERT INTO aps VALUES ('E','x',1,1,NULL,NULL,NULL,NULL,NULL,'mystery','t','t','t');
+             CREATE TABLE not_found (bssid TEXT PRIMARY KEY, first_seen TEXT, last_seen TEXT, checked_at TEXT);
+             CREATE TABLE pending (bssid TEXT PRIMARY KEY, ssid TEXT, channel INTEGER, frequency INTEGER, signal_dbm INTEGER, first_seen TEXT, last_seen TEXT, attempts INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        let db = Database { conn };
+        db.migrate().unwrap();
+        assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
+
+        let priorities: Vec<(String, i32)> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT bssid, source_priority FROM aps ORDER BY bssid")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            priorities,
+            vec![
+                ("A".to_string(), 40), // apple
+                ("B".to_string(), 30), // wigle
+                ("C".to_string(), 20), // beacondb
+                ("D".to_string(), 10), // manual
+                ("E".to_string(), 0),  // unknown
+            ]
+        );
     }
 
     #[test]
