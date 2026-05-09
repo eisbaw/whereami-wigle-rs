@@ -101,7 +101,7 @@ pub struct Database {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 impl Database {
     /// Open or create the database at `path`. Sets WAL mode and creates schema if needed.
@@ -148,6 +148,12 @@ impl Database {
             info!("migrating database v{version} -> v2 (add aps.source_priority)");
             self.migrate_v1_to_v2()?;
             version = 2;
+        }
+
+        if version < 3 {
+            info!("migrating database v{version} -> v3 (single-row schema_version)");
+            self.migrate_v2_to_v3()?;
+            version = 3;
         }
 
         if version == SCHEMA_VERSION {
@@ -214,6 +220,76 @@ impl Database {
         Ok(())
     }
 
+    /// v2 -> v3: rebuild `schema_version` so it can hold at most one row,
+    /// keyed by `id = 1`. SQLite cannot ALTER TABLE to add a CHECK
+    /// constraint, so we have to recreate the table.
+    ///
+    /// Behaviour for malformed v2 databases (multiple rows): coalesce to
+    /// MAX(version) — pick the highest version any row claims and discard
+    /// the others. This is the conservative choice; a smaller value could
+    /// trick `migrate()` into re-running an already-applied migration.
+    ///
+    /// Idempotent guard: detect if the new shape is already present
+    /// (someone might run migrate twice through different code paths) and
+    /// skip the rebuild in that case.
+    fn migrate_v2_to_v3(&self) -> Result<()> {
+        // Detect if the table is already single-row constrained. We look at
+        // the SQL stored in sqlite_master for the schema_version table.
+        let sql_present: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let already_constrained = sql_present
+            .as_deref()
+            .map(|s| s.contains("CHECK (id = 1)"))
+            .unwrap_or(false);
+        if already_constrained {
+            // Still bump version-row content to SCHEMA_VERSION below if needed.
+            let updated = self.conn.execute(
+                "UPDATE schema_version SET version = ?1 WHERE id = 1",
+                params![SCHEMA_VERSION],
+            )?;
+            if updated == 0 {
+                self.conn.execute(
+                    "INSERT INTO schema_version (id, version) VALUES (1, ?1)",
+                    params![SCHEMA_VERSION],
+                )?;
+            }
+            return Ok(());
+        }
+
+        // Rebuild atomically. If anything fails the original table survives.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to start transaction for schema_version rebuild")?;
+        tx.execute_batch(
+            "CREATE TABLE schema_version_new (
+                 id      INTEGER PRIMARY KEY CHECK (id = 1),
+                 version INTEGER NOT NULL
+             );
+             INSERT INTO schema_version_new (id, version)
+                 VALUES (1, COALESCE((SELECT MAX(version) FROM schema_version), 0));
+             DROP TABLE schema_version;
+             ALTER TABLE schema_version_new RENAME TO schema_version;",
+        )
+        .context("failed to rebuild schema_version with single-row constraint")?;
+
+        // Stamp the (now single) row to SCHEMA_VERSION. The version field
+        // could already be >= 3 if this migration was somehow applied out of
+        // order; in that case keep the higher value.
+        tx.execute(
+            "UPDATE schema_version SET version = ?1 WHERE id = 1 AND version < ?1",
+            params![SCHEMA_VERSION],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn get_schema_version(&self) -> i32 {
         // Table may not exist yet
         let result: Result<i32, _> =
@@ -277,15 +353,16 @@ impl Database {
             )
             .context("failed to create schema v1")?;
 
-        // Set version, but only if not already set
+        // Set version to 1 (this function only creates the v1 shape).
+        // Subsequent migrate_v1_to_v2 / migrate_v2_to_v3 will bump it.
+        // We previously inserted SCHEMA_VERSION here, which short-circuited
+        // newer migrations on a fresh database.
         let count: i32 = self
             .conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?;
         if count == 0 {
-            self.conn.execute(
-                "INSERT INTO schema_version (version) VALUES (?1)",
-                params![SCHEMA_VERSION],
-            )?;
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (1)", [])?;
         }
 
         Ok(())
@@ -646,6 +723,103 @@ mod tests {
     fn test_schema_creation() {
         let db = Database::open_memory().unwrap();
         assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
+    }
+
+    /// Helper: how many rows exist in schema_version, regardless of shape.
+    fn schema_version_row_count(db: &Database) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// migrate() must be idempotent: calling it twice on a fresh in-memory
+    /// DB must leave exactly one row in schema_version, with version =
+    /// SCHEMA_VERSION. This is the headline invariant from task 0030.
+    #[test]
+    fn migrate_is_idempotent_and_leaves_single_row() {
+        let db = Database::open_memory().unwrap();
+        // open_memory() already calls migrate() once. Call it again.
+        db.migrate().unwrap();
+
+        assert_eq!(
+            schema_version_row_count(&db),
+            1,
+            "schema_version must contain exactly one row"
+        );
+        assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
+
+        // And a third time, just to be paranoid.
+        db.migrate().unwrap();
+        assert_eq!(schema_version_row_count(&db), 1);
+        assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
+    }
+
+    /// The new schema_version table has a CHECK (id = 1) constraint.
+    /// Attempting to insert a second row must fail.
+    #[test]
+    fn schema_version_rejects_second_row() {
+        let db = Database::open_memory().unwrap();
+        let err = db
+            .conn
+            .execute(
+                "INSERT INTO schema_version (id, version) VALUES (2, 99)",
+                [],
+            )
+            .unwrap_err();
+        let msg = format!("{err}");
+        // Either CHECK constraint or PRIMARY KEY uniqueness on a duplicate
+        // value would qualify. id=2 should fail the CHECK.
+        assert!(
+            msg.contains("CHECK") || msg.contains("constraint") || msg.contains("UNIQUE"),
+            "expected constraint violation, got: {msg}"
+        );
+    }
+
+    /// A malformed v1/v2 database with multiple rows in schema_version must
+    /// be coalesced to a single row at MAX(version) by the v2->v3 migration.
+    #[test]
+    fn migrate_collapses_malformed_multirow_schema_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (1);
+             INSERT INTO schema_version VALUES (2);
+             INSERT INTO schema_version VALUES (1);
+             CREATE TABLE aps (
+                 bssid TEXT PRIMARY KEY, ssid TEXT, lat REAL NOT NULL, lon REAL NOT NULL,
+                 encryption TEXT, channel INTEGER, frequency INTEGER, city TEXT, country TEXT,
+                 source TEXT NOT NULL,
+                 source_priority INTEGER NOT NULL DEFAULT 0,
+                 first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, fetched_at TEXT NOT NULL
+             );
+             CREATE TABLE not_found (bssid TEXT PRIMARY KEY, first_seen TEXT, last_seen TEXT, checked_at TEXT);
+             CREATE TABLE pending (bssid TEXT PRIMARY KEY, ssid TEXT, channel INTEGER, frequency INTEGER, signal_dbm INTEGER, first_seen TEXT, last_seen TEXT, attempts INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        let db = Database { conn };
+        // Looks like v2 to get_schema_version() because LIMIT 1 returns one
+        // of the rows; we don't care which. The point is migrate() must
+        // collapse to a single row regardless.
+        db.migrate().unwrap();
+
+        assert_eq!(schema_version_row_count(&db), 1);
+        assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
+
+        // Constraint must now be active.
+        let err = db
+            .conn
+            .execute(
+                "INSERT INTO schema_version (id, version) VALUES (2, 99)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("CHECK")
+                || format!("{err}").contains("constraint")
+                || format!("{err}").contains("UNIQUE"),
+            "expected constraint violation, got: {err}"
+        );
     }
 
     #[test]
