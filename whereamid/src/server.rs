@@ -237,7 +237,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
             (b.clone(), signal)
         })
         .collect();
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
     candidates.truncate(state.args.top_n);
 
     // Cold-start fallback: if no stable APs have cached positions,
@@ -251,7 +251,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                     .iter()
                     .map(|(b, e)| (b.clone(), e.signal_dbm))
                     .collect();
-                v.sort_by(|a, b| b.1.cmp(&a.1));
+                v.sort_by_key(|c| std::cmp::Reverse(c.1));
                 v.truncate(state.args.top_n);
                 v
             })
@@ -463,7 +463,7 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
                     channel: entry.channel,
                 })
                 .collect();
-            nets.sort_by(|a, b| b.signal_dbm.cmp(&a.signal_dbm));
+            nets.sort_by_key(|n| std::cmp::Reverse(n.signal_dbm));
             nets
         }
         None => Vec::new(),
@@ -555,7 +555,7 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
             }
         })
         .collect();
-    bssids.sort_by(|a, b| b.signal_dbm.cmp(&a.signal_dbm));
+    bssids.sort_by_key(|n| std::cmp::Reverse(n.signal_dbm));
 
     drop(debouncer);
 

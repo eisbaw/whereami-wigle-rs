@@ -72,7 +72,7 @@ async fn wifi_scan_nmcli(interface: &str) -> Result<Vec<ScannedNetwork>> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut networks = parse_nmcli_output(&stdout);
-    networks.sort_by(|a, b| b.signal_dbm.cmp(&a.signal_dbm));
+    networks.sort_by_key(|n| std::cmp::Reverse(n.signal_dbm));
     Ok(networks)
 }
 
@@ -200,7 +200,7 @@ async fn wifi_scan_iw(interface: &str) -> Result<Vec<ScannedNetwork>> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut networks = parse_iw_output(&stdout);
-    networks.sort_by(|a, b| b.signal_dbm.cmp(&a.signal_dbm));
+    networks.sort_by_key(|n| std::cmp::Reverse(n.signal_dbm));
     Ok(networks)
 }
 
