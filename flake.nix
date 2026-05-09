@@ -56,7 +56,7 @@
       nixosModules.default = { pkgs, lib, ... }: {
         imports = [ ./nix/module.nix ];
         services.whereami.package = lib.mkDefault (pkgs.callPackage ./nix/package.nix {
-          craneLib = (crane.mkLib pkgs);
+          craneLib = crane.mkLib pkgs;
         });
       };
     };

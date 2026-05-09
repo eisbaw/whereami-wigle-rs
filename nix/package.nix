@@ -9,6 +9,13 @@
 }:
 
 let
+  # Get the source with git rev info preserved
+  gitSrc = builtins.fetchGit {
+    url = ./..;
+    allRefs = true;
+  };
+  gitRev = gitSrc.shortRev or "unknown";
+
   cargoToml = builtins.fromTOML (builtins.readFile ../whereamid/Cargo.toml);
   src = craneLib.cleanCargoSource ./..;
 
@@ -36,6 +43,11 @@ in
   # Phase 2: workspace code (reuses cached deps)
   craneLib.buildPackage (commonArgs // {
     inherit cargoArtifacts;
+
+    preBuild = ''
+      echo "${gitRev}" > whereamid/GIT_REV
+      echo "${gitRev}" > whereami-client/GIT_REV
+    '';
 
     postInstall = ''
       wrapProgram $out/bin/whereamid \
