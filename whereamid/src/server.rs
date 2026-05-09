@@ -40,6 +40,13 @@ pub struct DaemonState {
     pub apple: AppleClient,
     pub nominatim: NominatimClient,
     pub last_fix: tokio::sync::Mutex<Option<LastFix>>,
+    /// BSSIDs currently undergoing remote provider lookup. Used by
+    /// `resolver::resolve_chain` to coalesce concurrent requests for the
+    /// same BSSID (scan loop + locate cold-start + pending drain can all
+    /// fire at once otherwise). std::sync::Mutex is fine: we only ever hold
+    /// it for an insert or a remove, never across await points, and that
+    /// makes Drop-based cleanup viable for future RAII guards.
+    pub inflight: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// A cached last-known position with timestamp.

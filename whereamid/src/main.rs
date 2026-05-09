@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
         apple: apple::AppleClient::new(),
         nominatim: nominatim::NominatimClient::new(),
         last_fix: tokio::sync::Mutex::new(None),
+        inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
     });
 
     // Spawn background scan loop

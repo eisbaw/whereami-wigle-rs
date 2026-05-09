@@ -12,6 +12,47 @@ use crate::db::ApInfo;
 use crate::provider::{Provider, ProviderOutcome};
 use crate::server::DaemonState;
 
+/// RAII guard for an in-flight BSSID claim.
+/// Removes the BSSID from `state.inflight` on drop, including unwinding
+/// drops, so a panic mid-resolution cannot leak entries and permanently
+/// block future resolutions for that BSSID.
+struct InflightGuard<'a> {
+    state: &'a Arc<DaemonState>,
+    bssid: String,
+}
+
+impl<'a> InflightGuard<'a> {
+    /// Try to claim `bssid`. Returns `Some(guard)` if no other task holds it,
+    /// `None` if another task already claimed it.
+    fn try_claim(state: &'a Arc<DaemonState>, bssid: &str) -> Option<Self> {
+        let mut guard = state.inflight.lock().unwrap_or_else(|e| {
+            warn!("inflight mutex was poisoned — recovering");
+            e.into_inner()
+        });
+        if guard.insert(bssid.to_string()) {
+            Some(InflightGuard {
+                state,
+                bssid: bssid.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> Drop for InflightGuard<'a> {
+    fn drop(&mut self) {
+        let mut guard = match self.state.inflight.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("inflight mutex was poisoned on drop — recovering");
+                e.into_inner()
+            }
+        };
+        guard.remove(&self.bssid);
+    }
+}
+
 /// Result of a resolution operation.
 pub struct ResolveResult {
     pub positioned: Vec<ApInfo>,
@@ -110,6 +151,9 @@ pub async fn resolve_chain(
     let mut fetched_bssids: HashSet<String> = HashSet::new();
     let mut resolved: HashSet<String> = HashSet::new();
     let mut to_pend_at_end: Vec<String> = Vec::new();
+    // BSSIDs we deferred to a concurrent in-flight task; we must NOT mark
+    // them not_found at chain end (the other task owns that decision).
+    let mut deferred_to_other: HashSet<String> = HashSet::new();
 
     // Track providers that have hard-stopped this pass so we don't keep
     // calling them for subsequent BSSIDs.
@@ -154,6 +198,22 @@ pub async fn resolve_chain(
                 continue;
             }
         }
+
+        // In-flight dedup: claim this BSSID for the duration of provider work
+        // so that a concurrent resolve_chain call does not duplicate
+        // Apple/WiGLE traffic. The RAII guard releases on every exit path,
+        // including a panic-driven unwind.
+        // If another task already owns it, we defer entirely — that task
+        // will write to the cache / pending / not_found tables, and a later
+        // pass will see the result via the cache.
+        let _inflight_guard = match InflightGuard::try_claim(state, bssid) {
+            Some(g) => g,
+            None => {
+                debug!("{bssid} already in-flight, deferring to other task");
+                deferred_to_other.insert(bssid.clone());
+                continue;
+            }
+        };
 
         // Walk providers in order.
         let mut found = false;
@@ -239,6 +299,10 @@ pub async fn resolve_chain(
         if !found && queue_pending_for_this {
             to_pend_at_end.push(bssid.clone());
         }
+
+        // _inflight_guard drops here, releasing the claim. Pending/not_found
+        // inserts after the outer loop are pure DB writes and don't need
+        // the BSSID claimed.
     }
 
     // Apply deferred pending inserts.
@@ -267,6 +331,11 @@ pub async fn resolve_chain(
         let db = crate::server::lock_db(state);
         for bssid in bssids {
             if resolved.contains(bssid) {
+                continue;
+            }
+            if deferred_to_other.contains(bssid) {
+                // The concurrent in-flight task owns the not_found decision
+                // for this BSSID; we must not double-write or race it.
                 continue;
             }
             if pending_bssids.contains(bssid) {
