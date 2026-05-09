@@ -16,8 +16,9 @@ Two components:
   (CLI, curl,            |                    |
    Python, etc.)         |              cache miss?
                          |                    |
-                         +-----------> WiGLE API (remote)
-                                       BeaconDB  (remote, no auth)
+                         +-----------> Apple WPS  (remote, no auth, primary)
+                                       WiGLE API  (remote, secondary)
+                                       BeaconDB   (remote, no auth, currently unused)
 ```
 
 ### whereamid (daemon)
@@ -28,7 +29,7 @@ Responsibilities:
 - Accept queries over TCP
 - Manage the local SQLite cache (read/write)
 - Perform Wi-Fi scans (via `iw dev wlan0 scan` or nl80211)
-- Call remote APIs on cache miss (WiGLE, BeaconDB)
+- Call remote APIs on cache miss (Apple WPS first, then WiGLE)
 - Trilaterate position from known AP locations
 - Rate-limit outbound API calls to stay within WiGLE daily limits
 
@@ -48,7 +49,9 @@ All responses include a `"v": 1` field for protocol versioning.
 
 **`locate`** — "Where am I right now?"
 
-Takes the current stable APs (debounce filter), looks up any that aren't in the cache (hitting WiGLE immediately if needed), trilaterates, and responds. If no stable APs have known positions and WiGLE is unreachable, the request fails.
+Cache-only hot path: takes the current stable APs (debounce filter), trilaterates from whatever positions are already in the local `aps` cache, and responds immediately. Remote provider calls happen in background tasks (scan loop, pending drain, cold-start fallback) — `locate` itself never awaits an external API. If no stable APs have cached positions, the response is either an error or, if available, the previous known fix flagged with `stale: true` and `age_s`.
+
+If `--address-approx` is enabled, an approximate street address is attached when the rounded position is in the local address cache; on a miss the address resolves in the background and the next locate at the same rounded position will include it.
 
 ```json
 {"cmd": "locate"}
@@ -135,7 +138,7 @@ CREATE TABLE aps (
     frequency   INTEGER,           -- informational, MHz, from WiGLE
     city        TEXT,              -- informational, from WiGLE
     country     TEXT,              -- informational, from WiGLE
-    source      TEXT NOT NULL,     -- "wigle" | "beacondb" | "manual"
+    source      TEXT NOT NULL,     -- "apple" | "wigle" | "beacondb" | "manual"
     first_seen  TEXT NOT NULL,     -- UTC ISO 8601, when daemon first observed this AP
     last_seen   TEXT NOT NULL,     -- UTC ISO 8601, most recent scan that saw it
     fetched_at  TEXT NOT NULL      -- UTC ISO 8601, when position was resolved via API
@@ -252,30 +255,45 @@ A separate background task periodically attempts to resolve MACs in the `pending
 
 ## Remote API Backends
 
-### WiGLE (primary)
+### Apple WPS (primary)
+
+- Endpoint: Apple's location services protobuf endpoint (no public docs; reverse-engineered from iOS).
+- Auth: none.
+- Returns coordinates for the queried BSSID plus up to ~400 nearby BSSIDs in a single response, all stored in the local cache.
+- Quotas: no documented daily cap. The daemon does not rate-limit it; we treat it as best-effort.
+
+### WiGLE (secondary)
 
 - Endpoint: `GET https://api.wigle.net/api/v2/network/search?netid=<MAC>`
-- Auth: HTTP Basic (configured in daemon config)
-- Rate limit: respect daily quota. Track calls in SQLite metadata table.
+- Auth: HTTP Basic (configured in daemon config).
+- Rate limit: respect daily quota. The daemon reserves and refunds slots in the SQLite `metadata` table under a single transaction (read+increment in one atomic step).
 - Returns: `trilat`, `trilong`, `ssid`, `encryption`, `city`, `country`
 
-### BeaconDB (secondary, no auth)
+### BeaconDB (currently unused)
+
+A BeaconDB client exists in the codebase but is not wired into the active resolution chain. It was retained pending an exports feature; in the meantime the resolver never calls it. Treat the section as documentation of intent rather than runtime behaviour.
 
 - Endpoint: `POST https://beacondb.net/v1/geolocate`
 - Body: `{"wifiAccessPoints": [{"macAddress": "AA:BB:CC:DD:EE:FF"}]}`
 - No auth required
-- Returns position but no per-AP breakdown — useful as fallback for trilateration when WiGLE quota is exhausted
 - Limited database (~108M networks)
 
 ### Lookup strategy (on `locate` request)
 
-1. Take current stable MACs (top 10 by RSSI, passing debounce)
-2. Check local `aps` cache — any hits can trilaterate immediately
-3. For cache misses: query WiGLE immediately (one MAC per call)
-4. If WiGLE succeeds: add to `aps`, use for trilateration
-5. If WiGLE unreachable or 429: add to `pending` table, exclude from this trilateration
-6. If WiGLE quota exhausted: fall back to BeaconDB geolocate with remaining uncached MACs
-7. If zero MACs resolved (empty cache + no network): return error
+`locate` is cache-only on the hot path: it reads the `aps` table, trilaterates, and returns. It never blocks on a remote API. Concretely:
+
+1. Take current stable MACs (top-N by RSSI, passing debounce).
+2. Look them up in the local `aps` cache.
+3. If at least one hit, trilaterate and respond. If all missing AND we are using fallback candidates (cold-start with no stable APs yet), kick off a background resolution and return either a "no cached positions" error or, if available, the previous known fix flagged `stale: true`.
+
+Background resolution (`resolver::resolve_background`, run from the scan loop and from the cold-start branch above) walks the provider chain in this order:
+
+1. **Apple WPS** — free, batched, called first.
+2. **WiGLE** — for BSSIDs Apple did not return; respects daily quota.
+
+Successful lookups are written through to `aps` with a stored **source priority** (Apple > WiGLE > BeaconDB > Manual). Higher-priority writes overwrite lower-priority ones; a later WiGLE response cannot clobber an Apple fix for the same BSSID, but `last_seen` always advances. Concurrent lookups for the same BSSID are de-duplicated through an in-memory `inflight` set so the scan loop, pending drain, and locate cold-start cannot triple-fetch the same MAC.
+
+A separate background task drains the `pending` queue periodically; entries graduate to `aps` on success, to `not_found` on authoritative miss, and are dropped after `--pending-max-attempts` failures.
 
 ## Trilateration
 
@@ -339,16 +357,20 @@ whereami/
   whereamid/          (binary — the daemon)
     src/
       main.rs         (arg parsing, background tasks, TCP accept loop)
-      server.rs       (TCP connection handling, protocol dispatch)
+      server.rs       (TCP connection handling, protocol dispatch, address cache)
       scanner.rs      (Wi-Fi scan via iw, top-N RSSI filtering)
       debounce.rs     (sliding window, stable AP detection)
-      resolver.rs     (cache check -> API lookup -> pending queue)
+      resolver.rs     (provider chain orchestrator, in-flight dedup)
+      provider.rs     (Provider enum: Apple / WiGLE; outcome shape)
       pending.rs      (background pending queue drain task)
       trilaterate.rs  (weighted centroid)
-      db.rs           (SQLite: aps + pending tables)
+      db.rs           (SQLite: aps + pending + not_found + metadata tables)
       config.rs       (CLI args via clap + TOML secrets)
+      http.rs         (shared reqwest client builder with explicit timeouts)
+      apple.rs        (Apple WPS protobuf client)
       wigle.rs        (WiGLE API client)
-      beacondb.rs     (BeaconDB API client)
+      beacondb.rs     (BeaconDB API client; currently unused)
+      nominatim.rs    (OSM reverse geocoding, 1 req/s rate-limited)
   whereami-client/    (library crate)
     src/
       lib.rs          (connect, send command, parse response)
@@ -388,6 +410,26 @@ This generates:
 ### Package (`nix/package.nix`)
 
 Standard `rustPlatform.buildRustPackage` derivation. Wraps the binary with `makeWrapper` to ensure `iw` is on `PATH`.
+
+## Operational notes
+
+The implementation enforces a few invariants that are not obvious from the protocol surface:
+
+- **Explicit HTTP timeouts.** Every outbound HTTP client (Apple WPS, WiGLE, BeaconDB, Nominatim) is built through a single `client_with_timeout` helper that sets both a connect timeout and a total request timeout. `reqwest::Client::new()` with no timeout is forbidden because a hung remote would otherwise pin a tokio task indefinitely. Timeouts are currently compile-time constants (15 s for fast endpoints, 30 s for Nominatim); making them CLI-configurable is straightforward future work if needed.
+- **Source-priority enforcement on upserts.** `aps.source_priority` is stored alongside the `source` string. `upsert_ap` only overwrites the data fields when the incoming source's priority is greater than or equal to the stored row's. `last_seen` always advances. A later, lower-quality WiGLE write cannot clobber an Apple fix.
+- **In-flight de-duplication.** The scan loop, the pending drain, and a cold-start `locate` can all decide to resolve the same BSSID at the same time. `resolve_chain` claims each BSSID through an in-memory `inflight` set (RAII guard, panic-safe) so concurrent callers see a single remote round-trip; the losing caller defers to the cache once the winner finishes.
+- **Schema invariants.** `schema_version` is constrained to a single row (`CHECK (id = 1)`). Migrations are idempotent and run inside transactions.
+- **Decoupled reverse geocoding.** When `--address-approx` is set, `locate` uses an in-memory bounded cache keyed by rounded (lat, lon). Cache misses kick off a background Nominatim call so the response itself never blocks on the 1 req/s rate limiter.
+
+## Future work
+
+The following are explicitly **not yet built**:
+
+- **Location history (timeseries DB).** Tracked under `task-0031`. The intent is a long-running record of resolved positions for personal analytics; nothing in the current daemon writes to such a store.
+- **Continuous / streaming locate mode.** The TCP protocol is one-shot today; no subscriptions.
+- **CLI-tunable HTTP timeouts.** Currently constants; would be a small extension to `Args`.
+- **Bluetooth or cell-tower observations.** Wi-Fi only.
+- **Active BeaconDB integration.** The client exists but is unused in the resolver chain.
 
 ## Non-goals
 
