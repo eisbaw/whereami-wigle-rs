@@ -10,6 +10,15 @@ use crate::resolver::{
 };
 use crate::server::DaemonState;
 
+/// Maximum number of expired not_found entries to revive per drain pass.
+/// Bounded so a long-tail not_found revival cannot dominate the drain
+/// budget; subsequent passes pick up the remaining ones (task-0063).
+const NOT_FOUND_REVIVAL_BATCH: usize = 5;
+/// Maximum number of pending BSSIDs to attempt to resolve per drain pass.
+/// Bounded by --daily-limit and provider rate limits in practice; this
+/// is the structural upper bound on per-cycle API spend (task-0063).
+const PENDING_DRAIN_BATCH: usize = 10;
+
 /// Spawn the pending queue drain loop. Runs every `pending_interval` seconds.
 pub async fn run_pending_drain(state: Arc<DaemonState>) {
     let interval = Duration::from_secs(state.args.pending_interval);
@@ -35,33 +44,41 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
                 info!("deleted {deleted} pending entries exceeding {max_attempts} attempts");
             }
             Ok(_) => {}
-            Err(e) => warn!("failed to delete expired pending: {e}"),
+            Err(e) => {
+                warn!("failed to delete expired pending: {e}");
+                state.record_db_failure();
+            }
         }
     }
 
     // Re-check expired not_found entries (30 day TTL)
     {
         let db = crate::server::lock_db(state);
-        match db.get_expired_not_found(state.args.not_found_ttl_days, 5) {
+        match db.get_expired_not_found(state.args.not_found_ttl_days, NOT_FOUND_REVIVAL_BATCH) {
             Ok(expired) => {
                 for bssid in expired {
                     debug!("re-checking expired not_found entry: {bssid}");
                     if let Err(e) = db.delete_not_found(&bssid) {
                         warn!("failed to delete not_found {bssid}: {e}");
+                        state.record_db_failure();
                     }
                     if let Err(e) = db.insert_pending(&bssid, None, None, None, None) {
                         warn!("failed to insert pending {bssid}: {e}");
+                        state.record_db_failure();
                     }
                 }
             }
-            Err(e) => warn!("failed to get expired not_found: {e}"),
+            Err(e) => {
+                warn!("failed to get expired not_found: {e}");
+                state.record_db_failure();
+            }
         }
     }
 
-    // Pick up to 10 pending MACs
+    // Pick up to PENDING_DRAIN_BATCH pending MACs
     let pending = {
         let db = crate::server::lock_db(state);
-        match db.get_pending(10) {
+        match db.get_pending(PENDING_DRAIN_BATCH) {
             Ok(p) => p,
             Err(e) => {
                 warn!("failed to get pending entries: {e}");
@@ -125,6 +142,7 @@ mod tests {
             last_fix: tokio::sync::Mutex::new(None),
             inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
+            db_write_failures: std::sync::atomic::AtomicU64::new(0),
         })
     }
 

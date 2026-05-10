@@ -1,9 +1,10 @@
 ---
 id: TASK-0074
 title: Add inflight count to stats response
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-05-10 11:00'
+updated_date: '2026-05-10 14:10'
 labels:
   - observability
   - server
@@ -19,6 +20,18 @@ DaemonState.inflight HashSet has no operator visibility. If a provider hangs des
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 StatsResponse has inflight_count: usize
-- [ ] #2 whereami-client lib + CLI render the new field
+- [x] #1 StatsResponse has inflight_count: usize
+- [x] #2 whereami-client lib + CLI render the new field
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Added inflight: usize to StatsResponse on both server and client sides. server.rs::handle_stats reads state.inflight.lock().len() (or e.into_inner().len() on poison). CLI renders 'inflight: N' in stats output.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+stats endpoint now exposes the in-flight provider-lookup set size. Helps spot stuck Apple/WiGLE lookups despite HTTP timeouts.
+<!-- SECTION:FINAL_SUMMARY:END -->

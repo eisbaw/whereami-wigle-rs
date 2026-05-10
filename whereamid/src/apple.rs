@@ -70,15 +70,26 @@ impl AppleClient {
         }
 
         let data = resp.bytes().await?;
-        if data.len() < 10 {
+        if data.len() < APPLE_RESPONSE_HEADER_LEN {
             bail!("Apple WPS response too short ({} bytes)", data.len());
         }
 
-        // Skip 10-byte header, parse protobuf
-        let results = decode_response(&data[10..], bssids)?;
+        // Skip the fixed 10-byte ARPC response header, parse the
+        // protobuf payload that follows.
+        let results = decode_response(&data[APPLE_RESPONSE_HEADER_LEN..], bssids)?;
         Ok(results)
     }
 }
+
+/// Apple's ARPC response header is 10 fixed bytes before the protobuf
+/// payload. Naming this avoids a magic number in the slice index
+/// (task-0063).
+const APPLE_RESPONSE_HEADER_LEN: usize = 10;
+
+/// Apple WPS returns (-180, -180) for unknown BSSIDs after fixed-point
+/// scaling. We treat any reading below -179.0 as the sentinel so the
+/// 1e-8 conversion's last-bit shift can't escape detection. task-0063.
+const APPLE_NOT_FOUND_THRESHOLD: f64 = -179.0;
 
 /// Encode the Apple WPS protobuf request.
 /// Hand-encoded to avoid protobuf dependency.
@@ -205,8 +216,11 @@ pub fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
         (Some(b), Some(lt), Some(ln)) => {
             let lat_f = lt as f64 * 1e-8;
             let lon_f = ln as f64 * 1e-8;
-            // Apple returns (-180, -180) for not-found
-            if lat_f < -179.0 && lon_f < -179.0 {
+            // Apple returns (-180, -180) for not-found. Use a tolerant
+            // threshold (-179.0) rather than exact equality because the
+            // 1e-8 fixed-point conversion can shift the bottom bit
+            // (task-0063 named the threshold).
+            if lat_f < APPLE_NOT_FOUND_THRESHOLD && lon_f < APPLE_NOT_FOUND_THRESHOLD {
                 return Ok(None);
             }
             Ok(Some(ApInfo {

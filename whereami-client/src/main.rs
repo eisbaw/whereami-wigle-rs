@@ -76,11 +76,13 @@ fn main() {
             }
         }),
         "stats" | "st" => dispatch(client.stats(), json, |resp| {
-            println!("cached:    {}", resp.cached_aps);
-            println!("pending:   {}", resp.pending_aps);
-            println!("not_found: {}", resp.not_found_aps);
-            println!("db size:   {} KB", resp.db_size_bytes / 1024);
-            println!("API today: {}", resp.api_calls_today);
+            println!("cached:        {}", resp.cached_aps);
+            println!("pending:       {}", resp.pending_aps);
+            println!("not_found:     {}", resp.not_found_aps);
+            println!("inflight:      {}", resp.inflight);
+            println!("db size:       {} KB", resp.db_size_bytes / 1024);
+            println!("API today:     {}", resp.api_calls_today);
+            println!("db write fail: {}", resp.db_write_failures);
         }),
         "debug" | "d" => dispatch(client.debug(), json, |resp| {
             let cli_rev = env!("GIT_REV");

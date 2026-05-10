@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::db::ApInfo;
 use crate::provider::{Provider, ProviderOutcome};
@@ -254,7 +254,10 @@ pub async fn resolve_chain(
 
             match outcome {
                 ProviderOutcome::Found(ap) => {
-                    info!(
+                    // task-0073: per-BSSID resolution at debug! — Apple is
+                    // free + unbounded so info! per resolution fills the
+                    // journal during fast-scan in busy areas.
+                    debug!(
                         "{} resolved {} -> ({}, {})",
                         provider.name(),
                         ap.bssid,
@@ -265,10 +268,12 @@ pub async fn resolve_chain(
                         let db = crate::server::lock_db(state);
                         if let Err(e) = db.upsert_ap(&ap) {
                             warn!("failed to cache AP {}: {e}", ap.bssid);
+                            state.record_db_failure();
                         }
                         if policy.delete_pending_on_success {
                             if let Err(e) = db.delete_pending(&ap.bssid) {
                                 warn!("failed to delete pending {}: {e}", ap.bssid);
+                                state.record_db_failure();
                             }
                         }
                     }
@@ -284,6 +289,7 @@ pub async fn resolve_chain(
                         let db = crate::server::lock_db(state);
                         if let Err(e) = db.insert_not_found(bssid) {
                             warn!("failed to insert not_found {bssid}: {e}");
+                            state.record_db_failure();
                         }
                     }
                     // Try the next provider in the chain.
@@ -320,6 +326,7 @@ pub async fn resolve_chain(
                             let db = crate::server::lock_db(state);
                             if let Err(e2) = db.increment_pending_attempts(bssid) {
                                 warn!("failed to increment attempts for {bssid}: {e2}");
+                                state.record_db_failure();
                             }
                         }
                     }
@@ -342,6 +349,7 @@ pub async fn resolve_chain(
         for bssid in &to_pend_at_end {
             if let Err(e) = db.insert_pending(bssid, None, None, None, None) {
                 warn!("failed to insert pending {bssid}: {e}");
+                state.record_db_failure();
             }
         }
     }
@@ -382,6 +390,7 @@ pub async fn resolve_chain(
             }
             if let Err(e) = db.insert_not_found(bssid) {
                 warn!("failed to insert not_found {bssid}: {e}");
+                state.record_db_failure();
             }
             // task-0052: collapse drain_cleanup_after_chain — when the
             // chain marks not_found, also remove the pending row so the
@@ -390,6 +399,7 @@ pub async fn resolve_chain(
             if policy.delete_pending_on_not_found {
                 if let Err(e) = db.delete_pending(bssid) {
                     warn!("failed to delete pending {bssid} after not_found mark: {e}");
+                    state.record_db_failure();
                 }
             }
         }
@@ -466,6 +476,7 @@ mod tests {
             last_fix: tokio::sync::Mutex::new(None),
             inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
+            db_write_failures: std::sync::atomic::AtomicU64::new(0),
         })
     }
 

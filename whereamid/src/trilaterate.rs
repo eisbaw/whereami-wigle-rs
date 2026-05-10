@@ -219,19 +219,8 @@ fn estimate_accuracy(aps: &[PositionedAp], center_lat: f64, center_lon: f64) -> 
     avg_spread.clamp(10.0, 1000.0)
 }
 
-/// Haversine distance in meters between two lat/lon points.
-fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const R: f64 = 6_371_000.0; // Earth radius in meters
-
-    let d_lat = (lat2 - lat1).to_radians();
-    let d_lon = (lon2 - lon1).to_radians();
-
-    let a = (d_lat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos() * (d_lon / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().asin();
-
-    R * c
-}
+// task-0081: haversine_m moved to crate::geo. Use it via the path below.
+use crate::geo::haversine_m;
 
 #[cfg(test)]
 mod tests {

@@ -101,11 +101,6 @@ impl MockProvider {
         (self.respond)(bssid)
     }
 
-    #[allow(dead_code)] // exposed for future tests; no current caller
-    pub fn calls(&self) -> Vec<String> {
-        self.bssids_called.lock().expect("mock mutex").clone()
-    }
-
     pub fn call_count(&self) -> usize {
         self.bssids_called.lock().expect("mock mutex").len()
     }

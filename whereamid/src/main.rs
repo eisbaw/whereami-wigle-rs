@@ -7,6 +7,7 @@ mod apple;
 mod config;
 mod db;
 mod debounce;
+mod geo;
 mod history;
 mod http;
 mod nominatim;
@@ -113,6 +114,7 @@ async fn main() -> Result<()> {
         wigle: wigle_client,
         last_fix: tokio::sync::Mutex::new(initial_last_fix),
         inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        db_write_failures: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Spawn background scan loop

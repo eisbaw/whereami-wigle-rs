@@ -45,6 +45,15 @@ pub fn lock_db(state: &DaemonState) -> std::sync::MutexGuard<'_, crate::db::Data
 }
 
 impl DaemonState {
+    /// Bump the cumulative best-effort-DB-write-failure counter.
+    /// task-0076. Use at every warn-and-continue site that follows a
+    /// failed database operation so silent corruption is visible via
+    /// the stats endpoint.
+    pub fn record_db_failure(&self) {
+        self.db_write_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Run a closure against the locked Database. Centralises the
     /// poison-recovery + lock-scoping pattern so callers don't have to
     /// do `let db = lock_db(state); db.foo()` every time. For
@@ -85,6 +94,10 @@ pub struct DaemonState {
     /// next call at the same rounded position gets the address for free
     /// without blocking on Nominatim's 1 req/s rate limit.
     pub address_cache: std::sync::Mutex<AddressCache>,
+    /// Cumulative count of best-effort DB writes that failed (warn-only
+    /// sites). Surfaced via the stats endpoint (task-0076) so silent
+    /// corruption is visible without scraping the journal.
+    pub db_write_failures: std::sync::atomic::AtomicU64,
 }
 
 /// A cached last-known position with timestamp.
@@ -241,6 +254,13 @@ struct StatsResponse {
     not_found_aps: i64,
     db_size_bytes: i64,
     api_calls_today: u32,
+    /// Number of BSSIDs currently undergoing remote provider lookup
+    /// (size of state.inflight). task-0074.
+    inflight: usize,
+    /// Cumulative count of best-effort DB writes that failed and were
+    /// warned-only. Helps spot silent corruption (full disk, missing
+    /// write permissions, etc.). Reset on daemon restart. task-0076.
+    db_write_failures: u64,
 }
 
 fn error_json(msg: &str) -> String {
@@ -503,6 +523,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                                             warn!(
                                                 "failed to persist last_fix address backfill: {e}"
                                             );
+                                            bg_state.record_db_failure();
                                         }
                                     }
                                 }
@@ -548,6 +569,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                 let db = lock_db(state);
                 if let Err(e) = db.set_last_fix(&row) {
                     warn!("failed to persist last_fix: {e}");
+                    state.record_db_failure();
                 }
                 if let Err(e) = db.insert_fix(
                     &at.to_rfc3339(),
@@ -557,6 +579,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                     cached_count as i64,
                 ) {
                     warn!("failed to record fix in history: {e}");
+                    state.record_db_failure();
                 }
             }
 
@@ -896,9 +919,17 @@ async fn handle_history(
 }
 
 async fn handle_stats(state: &Arc<DaemonState>) -> String {
-    // task-0078: with_db scopes the lock automatically and centralises
-    // poison recovery. Each .unwrap_or(0) here logs nothing on failure;
-    // task-0076 may add a counter later.
+    let inflight = state
+        .inflight
+        .lock()
+        .map(|s| s.len())
+        .unwrap_or_else(|e| e.into_inner().len());
+    let db_write_failures = state
+        .db_write_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
+    // task-0078: with_db scopes the lock + poison recovery. Each
+    // .unwrap_or(0) here logs nothing on failure — see db_write_failures
+    // (task-0076) for cumulative visibility on silent write failures.
     let resp = state.with_db(|db| StatsResponse {
         ok: true,
         v: 1,
@@ -907,6 +938,8 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
         not_found_aps: db.not_found_ap_count().unwrap_or(0),
         db_size_bytes: db.db_size_bytes().unwrap_or(0),
         api_calls_today: db.api_calls_today().unwrap_or(0),
+        inflight,
+        db_write_failures,
     });
     ok_json(&resp)
 }

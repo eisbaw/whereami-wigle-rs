@@ -226,6 +226,14 @@ pub struct StatsResponse {
     pub db_size_bytes: i64,
     #[serde(default)]
     pub api_calls_today: u32,
+    /// In-flight provider lookups currently coalescing concurrent requests.
+    /// task-0074. Defaults to 0 for older daemons that don't emit it.
+    #[serde(default)]
+    pub inflight: usize,
+    /// Cumulative count of best-effort DB writes that failed since daemon
+    /// start. task-0076. Defaults to 0 for older daemons.
+    #[serde(default)]
+    pub db_write_failures: u64,
     #[serde(default)]
     pub error: Option<String>,
 }

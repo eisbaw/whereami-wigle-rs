@@ -1,9 +1,10 @@
 ---
 id: TASK-0073
 title: Demote per-resolution INFO logs to DEBUG
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-05-10 11:00'
+updated_date: '2026-05-10 14:10'
 labels:
   - observability
 dependencies: []
@@ -18,6 +19,18 @@ resolver.rs:238-244 logs every successful BSSID resolution at INFO including BSS
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Per-BSSID 'resolved' log line is debug! not info!
-- [ ] #2 Higher-level INFO logs preserved (scan summary, fast/slow phase transitions, drain summary)
+- [x] #1 Per-BSSID 'resolved' log line is debug! not info!
+- [x] #2 Higher-level INFO logs preserved (scan summary, fast/slow phase transitions, drain summary)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Demoted resolver.rs:258 'X resolved Y -> (lat, lon)' from info! to debug!. Removed unused 'info' import. Higher-level info logs (scan summary, fast/slow phase transitions, drain summary) preserved.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Per-BSSID resolution log demoted from info to debug. Default-level journal output is now bounded by scan-cycle frequency, not per-BSSID resolution count.
+<!-- SECTION:FINAL_SUMMARY:END -->
