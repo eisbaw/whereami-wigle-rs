@@ -96,10 +96,18 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for shutdown signal
+    // Wait for shutdown signal. Listen for both SIGINT (Ctrl-C) and SIGTERM
+    // (systemctl stop, docker stop, etc.). Without a SIGTERM handler systemd
+    // would SIGKILL the daemon after the stop timeout, potentially mid-write
+    // to SQLite or mid-API-call.
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
     tokio::select! {
         _ = signal::ctrl_c() => {
             info!("received SIGINT, shutting down");
+        }
+        _ = sigterm.recv() => {
+            info!("received SIGTERM, shutting down");
         }
         _ = server_handle => {
             error!("server task exited unexpectedly");
