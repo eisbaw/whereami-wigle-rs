@@ -107,7 +107,10 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
     // transient_error guard). When that happens, delete_pending_on_not_found
     // (task-0052) removes the pending row in the same critical section,
     // so this drain replaces the now-removed drain_cleanup_after_chain.
-    let bssids: Vec<String> = pending.iter().map(|p| p.bssid.clone()).collect();
+    let bssids: Vec<String> = pending
+        .iter()
+        .map(|(bssid, _attempts)| bssid.clone())
+        .collect();
     let policy = ChainPolicy {
         skip_cached: false,
         skip_not_found: false,

@@ -31,17 +31,13 @@ pub struct ApInfo {
 mod source;
 pub use source::Source;
 
-/// A pending BSSID awaiting resolution.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct PendingAp {
-    pub bssid: String,
-    pub ssid: Option<String>,
-    pub channel: Option<i32>,
-    pub frequency: Option<i32>,
-    pub signal_dbm: Option<i32>,
-    pub attempts: i32,
-}
+// task-0060: PendingAp struct removed. `get_pending` now returns the
+// minimal `(bssid, attempts)` tuple — the four metadata fields the
+// struct used to carry (ssid/channel/frequency/signal_dbm) had no
+// production consumer and only existed to suppress dead_code lints.
+// The SQL `pending` table still records them for debug queries; widen
+// the projection (and reintroduce a struct) the moment a real consumer
+// appears.
 
 pub struct Database {
     conn: Connection,
@@ -574,21 +570,21 @@ impl Database {
         Ok(())
     }
 
-    /// Get up to `limit` pending BSSIDs, ordered by fewest attempts first.
-    pub fn get_pending(&self, limit: usize) -> Result<Vec<PendingAp>> {
+    /// Get up to `limit` pending `(bssid, attempts)` rows, ordered by
+    /// fewest attempts first.
+    ///
+    /// task-0060: returns a tuple instead of the former `PendingAp`
+    /// struct. Production callers only need the BSSID; `attempts` is
+    /// retained for tests that assert the retry counter advances. Widen
+    /// the projection if a real consumer needs ssid/channel/frequency/
+    /// signal_dbm.
+    pub fn get_pending(&self, limit: usize) -> Result<Vec<(String, i32)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT bssid, ssid, channel, frequency, signal_dbm, attempts
+            "SELECT bssid, attempts
              FROM pending ORDER BY attempts ASC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok(PendingAp {
-                bssid: row.get(0)?,
-                ssid: row.get(1)?,
-                channel: row.get(2)?,
-                frequency: row.get(3)?,
-                signal_dbm: row.get(4)?,
-                attempts: row.get(5)?,
-            })
+            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
         })?;
         let mut result = Vec::new();
         for row in rows {
@@ -1205,12 +1201,12 @@ mod tests {
         .unwrap();
         let pending = db.get_pending(10).unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].bssid, "AA:BB:CC:DD:EE:FF");
-        assert_eq!(pending[0].attempts, 0);
+        assert_eq!(pending[0].0, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(pending[0].1, 0);
 
         db.increment_pending_attempts("AA:BB:CC:DD:EE:FF").unwrap();
         let pending = db.get_pending(10).unwrap();
-        assert_eq!(pending[0].attempts, 1);
+        assert_eq!(pending[0].1, 1);
 
         db.delete_pending("AA:BB:CC:DD:EE:FF").unwrap();
         let pending = db.get_pending(10).unwrap();
