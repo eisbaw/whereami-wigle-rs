@@ -70,6 +70,50 @@ pub struct Args {
     pub address_approx: bool,
 }
 
+impl Args {
+    /// Cross-field validation that clap cannot express in a single
+    /// `value_parser`. Call immediately after `parse()` so we fail fast
+    /// before any side effects (DB open, signals, threads, etc.).
+    ///
+    /// Single-field bounds (e.g. > 0) live on the field's `value_parser`
+    /// where clap can render the help text; this method is for invariants
+    /// across multiple fields.
+    pub fn validate(&self) -> Result<()> {
+        if self.debounce_window == 0 {
+            anyhow::bail!("--debounce-window must be > 0");
+        }
+        if self.debounce_threshold == 0 {
+            anyhow::bail!("--debounce-threshold must be > 0");
+        }
+        if self.debounce_threshold > self.debounce_window {
+            anyhow::bail!(
+                "--debounce-threshold ({}) must be <= --debounce-window ({})",
+                self.debounce_threshold,
+                self.debounce_window
+            );
+        }
+        if self.scan_interval_fast == 0 {
+            anyhow::bail!("--scan-interval-fast must be > 0");
+        }
+        if self.scan_interval_slow == 0 {
+            anyhow::bail!("--scan-interval-slow must be > 0");
+        }
+        if self.top_n == 0 {
+            anyhow::bail!("--top-n must be > 0");
+        }
+        if self.pending_interval == 0 {
+            anyhow::bail!("--pending-interval must be > 0");
+        }
+        if self.pending_max_attempts <= 0 {
+            anyhow::bail!("--pending-max-attempts must be > 0");
+        }
+        if self.not_found_ttl_days <= 0 {
+            anyhow::bail!("--not-found-ttl-days must be > 0");
+        }
+        Ok(())
+    }
+}
+
 /// TOML config file structure (secrets only).
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct ConfigFile {
@@ -128,4 +172,54 @@ pub fn load_config_file(path: &str) -> Result<ConfigFile> {
     let config: ConfigFile = toml::from_str(&contents)
         .with_context(|| format!("parsing config file {}", expanded.display()))?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(extra: &[&str]) -> Args {
+        let mut argv = vec!["whereamid"];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
+    }
+
+    #[test]
+    fn defaults_validate_clean() {
+        parse(&[]).validate().expect("default Args must validate");
+    }
+
+    #[test]
+    fn debounce_threshold_greater_than_window_rejected() {
+        let args = parse(&["--debounce-window", "3", "--debounce-threshold", "5"]);
+        let err = args.validate().expect_err("expected validation error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("debounce-threshold"),
+            "error message should name the offending flag, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn debounce_threshold_equal_to_window_accepted() {
+        parse(&["--debounce-window", "5", "--debounce-threshold", "5"])
+            .validate()
+            .expect("threshold == window must be allowed");
+    }
+
+    #[test]
+    fn zero_window_rejected() {
+        assert!(parse(&["--debounce-window", "0"]).validate().is_err());
+    }
+
+    #[test]
+    fn zero_top_n_rejected() {
+        assert!(parse(&["--top-n", "0"]).validate().is_err());
+    }
+
+    #[test]
+    fn zero_scan_interval_fast_rejected() {
+        assert!(parse(&["--scan-interval-fast", "0"]).validate().is_err());
+    }
 }

@@ -36,6 +36,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+    // Cross-field validation runs before any side effects (DB open,
+    // signals, threads). Bad combinations produce a clean error message
+    // and a non-zero exit, not a runtime assert deep inside Debouncer.
+    args.validate().context("invalid CLI arguments")?;
     info!("whereamid starting");
     info!("bind: {}", args.bind);
     info!("db: {}", args.db.display());
