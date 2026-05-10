@@ -112,9 +112,15 @@ fn main() {
                 println!();
                 for b in &resp.bssids {
                     let marker = if b.is_stable { "*" } else { " " };
+                    let signal = match b.signal_dbm {
+                        Some(s) => format!("{s:>4} dBm"),
+                        // task-0051: '----' marks stable BSSIDs absent
+                        // from the latest scan (no current signal).
+                        None => "  -- dBm".to_string(),
+                    };
                     println!(
-                        "{}{:17}  {:>4} dBm  {}/{}  {}",
-                        marker, b.bssid, b.signal_dbm, b.seen, b.needed, b.db_status,
+                        "{}{:17}  {}  {}/{}  {}",
+                        marker, b.bssid, signal, b.seen, b.needed, b.db_status,
                     );
                 }
                 println!();

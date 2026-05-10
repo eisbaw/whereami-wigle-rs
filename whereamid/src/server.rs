@@ -339,14 +339,15 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
     let stable = debouncer.stable_bssids();
     let visible = debouncer.latest_scan().map(|s| s.len()).unwrap_or(0);
 
-    // Build candidate list: stable APs with signal, sorted by RSSI, top-N
+    // Build candidate list: stable APs with a CURRENT signal, sorted by
+    // RSSI, top-N. Stable BSSIDs that fell out of the most recent scan
+    // (no current signal) are filtered out rather than fed a fake -90 dBm
+    // (task-0051) — fake readings poison trilateration weights, which is
+    // exactly the bug task-0043 fixed in the nmcli parser.
     let stable_count = stable.len();
     let mut candidates: Vec<(String, i32)> = stable
         .iter()
-        .map(|b| {
-            let signal = debouncer.latest_signal(b).unwrap_or(-90);
-            (b.clone(), signal)
-        })
+        .filter_map(|b| debouncer.latest_signal(b).map(|s| (b.clone(), s)))
         .collect();
     candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
     candidates.truncate(state.args.top_n);
@@ -703,7 +704,9 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
 #[derive(Serialize)]
 struct DebugBssid {
     bssid: String,
-    signal_dbm: i32,
+    /// None when the BSSID is debounce-stable but absent from the most
+    /// recent scan (was previously fabricated as -90 dBm; task-0051).
+    signal_dbm: Option<i32>,
     seen: usize,   // times seen in debounce window
     needed: usize, // threshold to be stable
     is_stable: bool,
@@ -729,16 +732,19 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
     let threshold = debouncer.threshold();
     let stable_set = debouncer.stable_bssids();
 
-    // Collect ALL BSSIDs ever seen in the ring buffer
-    let mut all_bssids: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    // Collect ALL BSSIDs ever seen in the ring buffer. Signals from the
+    // latest scan are Some(_); stable BSSIDs that fell out of the latest
+    // scan are None (task-0051).
+    let mut all_bssids: std::collections::HashMap<String, Option<i32>> =
+        std::collections::HashMap::new();
     if let Some(scan) = debouncer.latest_scan() {
         for (bssid, entry) in scan {
-            all_bssids.insert(bssid.clone(), entry.signal_dbm);
+            all_bssids.insert(bssid.clone(), Some(entry.signal_dbm));
         }
     }
-    // Also include stable ones not in latest scan
+    // Also include stable ones not in latest scan with signal=None.
     for b in &stable_set {
-        all_bssids.entry(b.clone()).or_insert(-90);
+        all_bssids.entry(b.clone()).or_insert(None);
     }
 
     let visible = debouncer.latest_scan().map(|s| s.len()).unwrap_or(0);
@@ -771,6 +777,8 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
             }
         })
         .collect();
+    // Sort: BSSIDs with a current signal first (strongest first); BSSIDs
+    // without a current signal last (None sorts after Some(_) under Reverse).
     bssids.sort_by_key(|n| std::cmp::Reverse(n.signal_dbm));
 
     drop(debouncer);

@@ -121,7 +121,10 @@ pub struct ScanResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DebugBssid {
     pub bssid: String,
-    pub signal_dbm: i32,
+    /// None when the BSSID is debounce-stable but missing from the most
+    /// recent scan. Daemon previously fabricated -90 dBm here (task-0051).
+    #[serde(default)]
+    pub signal_dbm: Option<i32>,
     pub seen: usize,
     pub needed: usize,
     pub is_stable: bool,
