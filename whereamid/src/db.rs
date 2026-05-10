@@ -101,7 +101,21 @@ pub struct Database {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
+
+/// A persisted last-known position. Stored as a single row in `last_fix`
+/// (CHECK id = 1) so the daemon can rehydrate after a restart.
+#[derive(Debug, Clone)]
+pub struct LastFixRow {
+    pub lat: f64,
+    pub lon: f64,
+    pub accuracy_m: f64,
+    pub address: Option<String>,
+    /// RFC3339 timestamp; the in-memory representation in server.rs uses
+    /// chrono::DateTime<Utc> for age computation across restarts.
+    pub at_rfc3339: String,
+    pub sources: i64,
+}
 
 impl Database {
     /// Open or create the database at `path`. Sets WAL mode and creates schema if needed.
@@ -154,6 +168,12 @@ impl Database {
             info!("migrating database v{version} -> v3 (single-row schema_version)");
             self.migrate_v2_to_v3()?;
             version = 3;
+        }
+
+        if version < 4 {
+            info!("migrating database v{version} -> v4 (last_fix table)");
+            self.migrate_v3_to_v4()?;
+            version = 4;
         }
 
         if version == SCHEMA_VERSION {
@@ -287,6 +307,30 @@ impl Database {
             params![SCHEMA_VERSION],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// v3 -> v4: add the `last_fix` table with a single-row CHECK so the
+    /// daemon can persist its last-known position across restarts. Idempotent
+    /// via `CREATE TABLE IF NOT EXISTS` and a fresh schema_version stamp.
+    fn migrate_v3_to_v4(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS last_fix (
+                     id          INTEGER PRIMARY KEY CHECK (id = 1),
+                     lat         REAL NOT NULL,
+                     lon         REAL NOT NULL,
+                     accuracy_m  REAL NOT NULL,
+                     address     TEXT,
+                     at_rfc3339  TEXT NOT NULL,
+                     sources     INTEGER NOT NULL
+                 );",
+            )
+            .context("failed to create last_fix table")?;
+        self.conn.execute(
+            "UPDATE schema_version SET version = ?1 WHERE id = 1",
+            params![SCHEMA_VERSION],
+        )?;
         Ok(())
     }
 
@@ -731,6 +775,56 @@ impl Database {
             .execute("DELETE FROM not_found WHERE bssid = ?1", params![bssid])?;
         Ok(())
     }
+
+    // --- last_fix table ---
+
+    /// Persist the last-known position. Single-row table; an existing row
+    /// is overwritten unconditionally.
+    pub fn set_last_fix(&self, fix: &LastFixRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO last_fix (id, lat, lon, accuracy_m, address, at_rfc3339, sources)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                lat        = excluded.lat,
+                lon        = excluded.lon,
+                accuracy_m = excluded.accuracy_m,
+                address    = excluded.address,
+                at_rfc3339 = excluded.at_rfc3339,
+                sources    = excluded.sources",
+            params![
+                fix.lat,
+                fix.lon,
+                fix.accuracy_m,
+                fix.address,
+                fix.at_rfc3339,
+                fix.sources
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read the persisted last-known position, if any.
+    pub fn get_last_fix(&self) -> Result<Option<LastFixRow>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT lat, lon, accuracy_m, address, at_rfc3339, sources
+                 FROM last_fix WHERE id = 1",
+                [],
+                |row| {
+                    Ok(LastFixRow {
+                        lat: row.get(0)?,
+                        lon: row.get(1)?,
+                        accuracy_m: row.get(2)?,
+                        address: row.get(3)?,
+                        at_rfc3339: row.get(4)?,
+                        sources: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
 }
 
 #[cfg(test)]
@@ -1137,5 +1231,122 @@ mod tests {
         let total = reserved.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(total, limit, "total reservations must equal daily_limit");
         assert_eq!(db.lock().unwrap().api_calls_today().unwrap(), limit);
+    }
+
+    #[test]
+    fn last_fix_round_trip() {
+        let db = Database::open_memory().unwrap();
+        // Empty initially.
+        assert!(db.get_last_fix().unwrap().is_none());
+
+        let row = LastFixRow {
+            lat: 55.6761,
+            lon: 12.5683,
+            accuracy_m: 42.0,
+            address: Some("Copenhagen".to_string()),
+            at_rfc3339: "2026-05-09T12:34:56+00:00".to_string(),
+            sources: 5,
+        };
+        db.set_last_fix(&row).unwrap();
+        let got = db.get_last_fix().unwrap().unwrap();
+        assert!((got.lat - row.lat).abs() < 1e-9);
+        assert!((got.lon - row.lon).abs() < 1e-9);
+        assert!((got.accuracy_m - row.accuracy_m).abs() < 1e-9);
+        assert_eq!(got.address, row.address);
+        assert_eq!(got.at_rfc3339, row.at_rfc3339);
+        assert_eq!(got.sources, row.sources);
+
+        // Overwrite must work and stay single-row.
+        let updated = LastFixRow {
+            lat: 48.8566,
+            lon: 2.3522,
+            accuracy_m: 99.0,
+            address: None,
+            at_rfc3339: "2026-05-10T00:00:00+00:00".to_string(),
+            sources: 7,
+        };
+        db.set_last_fix(&updated).unwrap();
+        let got = db.get_last_fix().unwrap().unwrap();
+        assert!((got.lat - 48.8566).abs() < 1e-9);
+        assert_eq!(got.address, None);
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM last_fix", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "last_fix must remain single-row after overwrite");
+    }
+
+    #[test]
+    fn last_fix_table_rejects_second_row() {
+        // The CHECK (id = 1) constraint must reject any insert with id != 1.
+        let db = Database::open_memory().unwrap();
+        let row = LastFixRow {
+            lat: 0.0,
+            lon: 0.0,
+            accuracy_m: 1.0,
+            address: None,
+            at_rfc3339: "2026-05-09T00:00:00+00:00".to_string(),
+            sources: 0,
+        };
+        db.set_last_fix(&row).unwrap();
+        let err = db.conn.execute(
+            "INSERT INTO last_fix (id, lat, lon, accuracy_m, address, at_rfc3339, sources)
+             VALUES (2, 0, 0, 0, NULL, '2026-05-09T00:00:00+00:00', 0)",
+            [],
+        );
+        assert!(
+            err.is_err(),
+            "INSERT with id=2 must violate CHECK constraint, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn last_fix_survives_db_reopen() {
+        // Round-trip through an on-disk DB so we exercise the file-backed path.
+        // Avoid adding a tempfile dep — manual cleanup is fine for one test.
+        let path = std::env::temp_dir().join(format!(
+            "whereamid_last_fix_test_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let row = LastFixRow {
+            lat: 51.5074,
+            lon: -0.1278,
+            accuracy_m: 25.0,
+            address: Some("London".to_string()),
+            at_rfc3339: "2026-05-09T08:00:00+00:00".to_string(),
+            sources: 3,
+        };
+        let result = (|| -> Result<()> {
+            {
+                let db = Database::open(&path)?;
+                db.set_last_fix(&row)?;
+            }
+            // Reopen: rehydration source-of-truth is on disk.
+            let db = Database::open(&path)?;
+            let got = db
+                .get_last_fix()?
+                .expect("rehydrated row must be present after reopen");
+            assert!((got.lat - row.lat).abs() < 1e-9);
+            assert!((got.lon - row.lon).abs() < 1e-9);
+            assert_eq!(got.address, row.address);
+            Ok(())
+        })();
+        // Cleanup the .db file plus WAL/SHM siblings even on failure.
+        for ext in ["", "-wal", "-shm"] {
+            let mut p = path.clone();
+            if !ext.is_empty() {
+                p.set_file_name(format!(
+                    "{}{}",
+                    p.file_name().unwrap().to_string_lossy(),
+                    ext
+                ));
+            }
+            let _ = std::fs::remove_file(&p);
+        }
+        result.unwrap();
     }
 }

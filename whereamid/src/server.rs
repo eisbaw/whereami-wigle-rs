@@ -108,12 +108,16 @@ pub struct DaemonState {
 }
 
 /// A cached last-known position with timestamp.
+///
+/// `at` is `chrono::DateTime<Utc>` rather than `std::time::Instant` so that
+/// the value can be persisted to SQLite (`last_fix` table) and rehydrated
+/// across daemon restarts. Wall-clock age is what users want anyway.
 pub struct LastFix {
     pub lat: f64,
     pub lon: f64,
     pub accuracy_m: f64,
     pub address: Option<String>,
-    pub at: std::time::Instant,
+    pub at: chrono::DateTime<chrono::Utc>,
     pub sources: usize,
 }
 
@@ -420,13 +424,34 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                                 // If a newer fix has overwritten it we
                                 // leave it alone (the newer one will
                                 // resolve its own address).
-                                let mut last = bg_state.last_fix.lock().await;
-                                if let Some(fix) = last.as_mut() {
-                                    if address_cache_key(fix.lat, fix.lon)
-                                        == address_cache_key(bg_lat, bg_lon)
-                                        && fix.address.is_none()
-                                    {
-                                        fix.address = Some(display);
+                                let persist = {
+                                    let mut last = bg_state.last_fix.lock().await;
+                                    if let Some(fix) = last.as_mut() {
+                                        if address_cache_key(fix.lat, fix.lon)
+                                            == address_cache_key(bg_lat, bg_lon)
+                                            && fix.address.is_none()
+                                        {
+                                            fix.address = Some(display.clone());
+                                            Some(crate::db::LastFixRow {
+                                                lat: fix.lat,
+                                                lon: fix.lon,
+                                                accuracy_m: fix.accuracy_m,
+                                                address: fix.address.clone(),
+                                                at_rfc3339: fix.at.to_rfc3339(),
+                                                sources: fix.sources as i64,
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                };
+                                // Persist updated address outside the lock.
+                                if let Some(row) = persist {
+                                    let db = lock_db(&bg_state);
+                                    if let Err(e) = db.set_last_fix(&row) {
+                                        warn!("failed to persist last_fix address backfill: {e}");
                                     }
                                 }
                             }
@@ -439,7 +464,9 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                 None
             };
 
-            // Save as last-known fix
+            // Save as last-known fix (in-memory and persisted to SQLite so
+            // that a restart can rehydrate the most recent position).
+            let at = chrono::Utc::now();
             {
                 let mut last = state.last_fix.lock().await;
                 *last = Some(LastFix {
@@ -447,9 +474,25 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                     lon: pos.lon,
                     accuracy_m: pos.accuracy_m,
                     address: address.clone(),
-                    at: std::time::Instant::now(),
+                    at,
                     sources: cached_count,
                 });
+            }
+            // Persist to DB. Failures are warned-only: a missed write here
+            // means we lose rehydration of THIS fix, but the in-memory copy
+            // is still authoritative until the daemon stops.
+            {
+                let db = lock_db(state);
+                if let Err(e) = db.set_last_fix(&crate::db::LastFixRow {
+                    lat: pos.lat,
+                    lon: pos.lon,
+                    accuracy_m: pos.accuracy_m,
+                    address: address.clone(),
+                    at_rfc3339: at.to_rfc3339(),
+                    sources: cached_count as i64,
+                }) {
+                    warn!("failed to persist last_fix: {e}");
+                }
             }
 
             let resp = LocateResponse {
@@ -491,7 +534,8 @@ async fn return_last_fix_or_error(
 ) -> String {
     let last = state.last_fix.lock().await;
     if let Some(fix) = last.as_ref() {
-        let age_s = fix.at.elapsed().as_secs();
+        // Wall-clock age. Negative ages (clock skew) clamp to zero.
+        let age_s = (chrono::Utc::now() - fix.at).num_seconds().max(0) as u64;
         let resp = LocateResponse {
             ok: true,
             v: 1,

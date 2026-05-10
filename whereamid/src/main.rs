@@ -53,6 +53,38 @@ async fn main() -> Result<()> {
     // Open database
     let db = Database::open(&args.db).context("opening database")?;
 
+    // Rehydrate last_fix from disk so the daemon can answer "where am I"
+    // immediately after a restart, before the first scan-and-resolve cycle
+    // completes. A malformed or out-of-range timestamp is treated as "no
+    // last fix" — better to skip than to crash on startup.
+    let initial_last_fix = match db.get_last_fix() {
+        Ok(Some(row)) => match chrono::DateTime::parse_from_rfc3339(&row.at_rfc3339) {
+            Ok(at) => Some(server::LastFix {
+                lat: row.lat,
+                lon: row.lon,
+                accuracy_m: row.accuracy_m,
+                address: row.address,
+                at: at.with_timezone(&chrono::Utc),
+                sources: row.sources.max(0) as usize,
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    "discarding persisted last_fix with unparseable timestamp '{}': {e}",
+                    row.at_rfc3339
+                );
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("failed to read persisted last_fix: {e}");
+            None
+        }
+    };
+    if initial_last_fix.is_some() {
+        info!("rehydrated last_fix from disk");
+    }
+
     // Initialize shared state
     let debouncer = Debouncer::new(args.debounce_window, args.debounce_threshold);
     let wigle_client =
@@ -71,7 +103,7 @@ async fn main() -> Result<()> {
         beacondb: beacondb_client,
         apple: apple::AppleClient::new(),
         nominatim: nominatim::NominatimClient::new(),
-        last_fix: tokio::sync::Mutex::new(None),
+        last_fix: tokio::sync::Mutex::new(initial_last_fix),
         inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         address_cache: std::sync::Mutex::new(server::AddressCache::new()),
     });
