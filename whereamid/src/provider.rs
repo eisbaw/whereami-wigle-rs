@@ -41,6 +41,11 @@ pub enum ProviderOutcome {
 pub enum Provider {
     Apple,
     Wigle,
+    /// Test-only mock that returns prebaked outcomes via a closure.
+    /// Allows unit tests of `resolve_chain` to exercise every branch
+    /// without making real network calls.
+    #[cfg(test)]
+    Mock(std::sync::Arc<MockProvider>),
 }
 
 impl Provider {
@@ -48,6 +53,8 @@ impl Provider {
         match self {
             Provider::Apple => "apple",
             Provider::Wigle => "wigle",
+            #[cfg(test)]
+            Provider::Mock(m) => m.name,
         }
     }
 
@@ -57,7 +64,50 @@ impl Provider {
         match self {
             Provider::Apple => apple_lookup(state, bssid).await,
             Provider::Wigle => wigle_lookup(state, bssid).await,
+            #[cfg(test)]
+            Provider::Mock(m) => m.lookup(bssid).await,
         }
+    }
+}
+
+/// Test-only mock provider. The closure is invoked per BSSID and decides
+/// the outcome; the mock also records every BSSID it was called with so
+/// tests can assert call patterns (e.g., to verify in-flight dedup).
+#[cfg(test)]
+pub struct MockProvider {
+    pub name: &'static str,
+    respond: Box<dyn Fn(&str) -> ProviderOutcome + Send + Sync>,
+    bssids_called: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl MockProvider {
+    pub fn new<F>(name: &'static str, respond: F) -> Self
+    where
+        F: Fn(&str) -> ProviderOutcome + Send + Sync + 'static,
+    {
+        Self {
+            name,
+            respond: Box::new(respond),
+            bssids_called: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub async fn lookup(&self, bssid: &str) -> ProviderOutcome {
+        self.bssids_called
+            .lock()
+            .expect("mock mutex")
+            .push(bssid.to_string());
+        (self.respond)(bssid)
+    }
+
+    #[allow(dead_code)] // exposed for future tests; no current caller
+    pub fn calls(&self) -> Vec<String> {
+        self.bssids_called.lock().expect("mock mutex").clone()
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.bssids_called.lock().expect("mock mutex").len()
     }
 }
 

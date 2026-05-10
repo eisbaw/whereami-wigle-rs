@@ -352,15 +352,14 @@ pub async fn resolve_chain(
                 // The miss may be temporary; fall through to whatever the
                 // pending/attempts-based policy decided. This is the
                 // "definitive not_found" guard required by task-0045.
+                //
+                // Note: this gate also covers the "we just queued it" case
+                // (via on_network_error::QueuePending or on_skipped::
+                // QueuePending), since both paths route through
+                // transient_error. There is intentionally no is_pending
+                // check here — drain_once feeds pending BSSIDs as input
+                // and a definitive miss must still mark them not_found.
                 continue;
-            }
-            match db.is_pending(bssid) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(e) => {
-                    warn!("is_pending probe failed for {bssid}: {e}; skipping not_found mark");
-                    continue;
-                }
             }
             if let Err(e) = db.insert_not_found(bssid) {
                 warn!("failed to insert not_found {bssid}: {e}");
@@ -412,4 +411,246 @@ pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
         on_hard_stop: HardStopAction::QueuePendingAndStop,
     };
     let _ = resolve_chain(bssids, state, &[Provider::Apple, Provider::Wigle], &policy).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Args;
+    use crate::db::{ApInfo, Database, Source};
+    use crate::provider::MockProvider;
+    use crate::server::{AddressCache, DaemonState};
+    use clap::Parser;
+
+    /// Build a minimal DaemonState backed by an in-memory DB.
+    /// The Apple/WiGLE/Nominatim clients are real but never called when the
+    /// test uses only Provider::Mock(...) as the chain providers.
+    fn test_state() -> Arc<DaemonState> {
+        let db = Database::open_memory().unwrap();
+        let args = Args::parse_from(["whereamid"]);
+        Arc::new(DaemonState {
+            db: std::sync::Mutex::new(db),
+            debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(10, 5)),
+            args,
+            wigle: crate::wigle::WigleClient::new("", ""),
+            apple: crate::apple::AppleClient::new(),
+            nominatim: crate::nominatim::NominatimClient::new(),
+            last_fix: tokio::sync::Mutex::new(None),
+            inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            address_cache: std::sync::Mutex::new(AddressCache::new()),
+        })
+    }
+
+    fn mk_ap(bssid: &str, lat: f64, lon: f64, source: Source) -> ApInfo {
+        ApInfo {
+            bssid: bssid.to_string(),
+            ssid: None,
+            lat,
+            lon,
+            encryption: None,
+            channel: None,
+            frequency: None,
+            city: None,
+            country: None,
+            source,
+        }
+    }
+
+    fn permissive_policy() -> ChainPolicy {
+        ChainPolicy {
+            skip_cached: true,
+            skip_not_found: true,
+            write_through: true,
+            delete_pending_on_success: false,
+            mark_not_found_per_provider: false,
+            mark_not_found_at_chain_end: true,
+            on_skipped: SkipAction::NextProvider,
+            on_network_error: NetErrorAction::Ignore,
+            on_hard_stop: HardStopAction::Stop,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_short_circuits_on_cache_hit() {
+        let state = test_state();
+        let cached = mk_ap("aa:bb:cc:dd:ee:01", 55.0, 12.0, Source::Apple);
+        crate::server::lock_db(&state).upsert_ap(&cached).unwrap();
+
+        let mock = std::sync::Arc::new(MockProvider::new("mock", |_| {
+            ProviderOutcome::Found(mk_ap("zz:zz:zz:zz:zz:zz", 0.0, 0.0, Source::Wigle))
+        }));
+        let providers = [Provider::Mock(std::sync::Arc::clone(&mock))];
+
+        let result = resolve_chain(
+            &["aa:bb:cc:dd:ee:01".to_string()],
+            &state,
+            &providers,
+            &permissive_policy(),
+        )
+        .await;
+
+        assert_eq!(result.positioned.len(), 1, "cache hit should be returned");
+        assert_eq!(
+            mock.call_count(),
+            0,
+            "provider must not be called on cache hit"
+        );
+        assert!((result.positioned[0].lat - 55.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_first_provider_found_stops_chain() {
+        let state = test_state();
+        let target = "aa:bb:cc:dd:ee:02".to_string();
+
+        let mock_a = std::sync::Arc::new(MockProvider::new("a", |bssid| {
+            ProviderOutcome::Found(mk_ap(bssid, 1.0, 2.0, Source::Apple))
+        }));
+        let mock_b = std::sync::Arc::new(MockProvider::new("b", |_| {
+            unreachable!("second provider must not be called when first found")
+        }));
+        let providers = [
+            Provider::Mock(std::sync::Arc::clone(&mock_a)),
+            Provider::Mock(std::sync::Arc::clone(&mock_b)),
+        ];
+
+        let result = resolve_chain(
+            std::slice::from_ref(&target),
+            &state,
+            &providers,
+            &permissive_policy(),
+        )
+        .await;
+        assert_eq!(result.positioned.len(), 1);
+        assert_eq!(mock_a.call_count(), 1);
+        assert_eq!(mock_b.call_count(), 0);
+        // Cache write happens because write_through=true.
+        let cached = crate::server::lock_db(&state).get_ap(&target).unwrap();
+        assert!(
+            cached.is_some(),
+            "successful resolution must write through to cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_both_not_found_writes_not_found_table() {
+        let state = test_state();
+        let target = "aa:bb:cc:dd:ee:03".to_string();
+
+        let mock_a = std::sync::Arc::new(MockProvider::new("a", |_| ProviderOutcome::NotFound));
+        let mock_b = std::sync::Arc::new(MockProvider::new("b", |_| ProviderOutcome::NotFound));
+        let providers = [
+            Provider::Mock(std::sync::Arc::clone(&mock_a)),
+            Provider::Mock(std::sync::Arc::clone(&mock_b)),
+        ];
+
+        let _ = resolve_chain(
+            std::slice::from_ref(&target),
+            &state,
+            &providers,
+            &permissive_policy(),
+        )
+        .await;
+
+        // Both providers consulted (the chain only stops on Found).
+        assert_eq!(mock_a.call_count(), 1);
+        assert_eq!(mock_b.call_count(), 1);
+        // Definitive miss: not_found is written.
+        let is_nf = crate::server::lock_db(&state)
+            .is_not_found(&target, state.args.not_found_ttl_days)
+            .unwrap();
+        assert!(
+            is_nf,
+            "definitive NotFound from all providers must mark not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_transient_error_suppresses_not_found_mark() {
+        // task-0045 invariant: when ANY provider returned a transient error
+        // (NetworkError / Skipped / HardStop), the chain must NOT mark
+        // not_found at chain end — the miss may be temporary.
+        let state = test_state();
+        let target = "aa:bb:cc:dd:ee:04".to_string();
+
+        let mock_a = std::sync::Arc::new(MockProvider::new("a", |_| ProviderOutcome::NotFound));
+        let mock_b = std::sync::Arc::new(MockProvider::new("b", |_| {
+            ProviderOutcome::NetworkError(anyhow::anyhow!("simulated"))
+        }));
+        let providers = [
+            Provider::Mock(std::sync::Arc::clone(&mock_a)),
+            Provider::Mock(std::sync::Arc::clone(&mock_b)),
+        ];
+
+        let _ = resolve_chain(
+            std::slice::from_ref(&target),
+            &state,
+            &providers,
+            &permissive_policy(),
+        )
+        .await;
+
+        let is_nf = crate::server::lock_db(&state)
+            .is_not_found(&target, state.args.not_found_ttl_days)
+            .unwrap();
+        assert!(
+            !is_nf,
+            "transient NetworkError must suppress not_found mark for {target}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_inflight_dedup_defers_concurrent_lookups() {
+        // Two concurrent resolve_chain calls for the same BSSID. The
+        // second must observe the BSSID in `state.inflight` and defer —
+        // its provider must not be called.
+        use tokio::sync::Notify;
+
+        let state = test_state();
+        let target = "aa:bb:cc:dd:ee:05".to_string();
+        let started = std::sync::Arc::new(Notify::new());
+        let release = std::sync::Arc::new(Notify::new());
+
+        // Manually pre-register the BSSID in inflight to simulate another
+        // task owning it. This is the simplest deterministic test of the
+        // dedup short-circuit (real concurrency is exercised elsewhere via
+        // the inflight lock contention paths, but those are racy to assert).
+        state.inflight.lock().unwrap().insert(target.clone());
+
+        let mock = std::sync::Arc::new(MockProvider::new("blocked", |_| {
+            unreachable!("provider must not be called when BSSID is already inflight")
+        }));
+        let providers = [Provider::Mock(std::sync::Arc::clone(&mock))];
+
+        let result = resolve_chain(
+            std::slice::from_ref(&target),
+            &state,
+            &providers,
+            &permissive_policy(),
+        )
+        .await;
+
+        assert_eq!(
+            mock.call_count(),
+            0,
+            "deduplicated call must not invoke provider"
+        );
+        assert!(result.positioned.is_empty());
+
+        // Cleanup the pre-registered inflight entry to keep the suppress
+        // check on not_found honest: we deferred to "another task" so the
+        // chain must NOT have written not_found for this BSSID.
+        state.inflight.lock().unwrap().remove(&target);
+        let is_nf = crate::server::lock_db(&state)
+            .is_not_found(&target, state.args.not_found_ttl_days)
+            .unwrap();
+        assert!(
+            !is_nf,
+            "deferred BSSID must not be marked not_found by this chain"
+        );
+
+        // Suppress unused warnings for the Notify imports while keeping
+        // the imports available for future lock-based concurrency tests.
+        let _ = (started, release);
+    }
 }

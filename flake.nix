@@ -51,10 +51,12 @@
             OPENSSL_DEV = pkgs.openssl.dev;
             PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
 
-            # cargo-fuzz binaries are sanitizer-instrumented and link
-            # libstdc++.so.6 at runtime; expose it on LD_LIBRARY_PATH.
+            # Make runtime libraries discoverable for binaries that the
+            # build tools link without baking an rpath:
+            #   - libstdc++ for cargo-fuzz sanitizer-instrumented binaries
+            #   - libssl/libcrypto for cargo-test binaries that load reqwest
             shellHook = ''
-              export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.openssl.out}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             '';
           };
         }
