@@ -154,6 +154,13 @@ pub async fn resolve_chain(
     // BSSIDs we deferred to a concurrent in-flight task; we must NOT mark
     // them not_found at chain end (the other task owns that decision).
     let mut deferred_to_other: HashSet<String> = HashSet::new();
+    // BSSIDs where at least one provider returned a transient error
+    // (network failure, rate limit, hard stop, or skipped). For these we
+    // never mark not_found at chain end: the miss may be temporary, so we
+    // fall back to the pending/attempts-based retry policy.
+    // Only when *every* provider returned a definitive NotFound do we have
+    // grounds to write to the not_found table.
+    let mut transient_error: HashSet<String> = HashSet::new();
 
     // Track providers that have hard-stopped this pass so we don't keep
     // calling them for subsequent BSSIDs.
@@ -262,15 +269,19 @@ pub async fn resolve_chain(
                     }
                     // Try the next provider in the chain.
                 }
-                ProviderOutcome::Skipped => match policy.on_skipped {
-                    SkipAction::NextProvider => {}
-                    SkipAction::QueuePending => {
-                        queue_pending_for_this = true;
+                ProviderOutcome::Skipped => {
+                    transient_error.insert(bssid.clone());
+                    match policy.on_skipped {
+                        SkipAction::NextProvider => {}
+                        SkipAction::QueuePending => {
+                            queue_pending_for_this = true;
+                        }
                     }
-                },
+                }
                 ProviderOutcome::HardStop => {
                     warn!("{} hard-stopped", provider.name());
                     stopped[idx] = true;
+                    transient_error.insert(bssid.clone());
                     match policy.on_hard_stop {
                         HardStopAction::Stop => {}
                         HardStopAction::QueuePendingAndStop => {
@@ -280,6 +291,7 @@ pub async fn resolve_chain(
                 }
                 ProviderOutcome::NetworkError(e) => {
                     warn!("{} network error for {bssid}: {e}", provider.name());
+                    transient_error.insert(bssid.clone());
                     match policy.on_network_error {
                         NetErrorAction::Ignore => {}
                         NetErrorAction::QueuePending => {
@@ -332,6 +344,14 @@ pub async fn resolve_chain(
             if deferred_to_other.contains(bssid) {
                 // The concurrent in-flight task owns the not_found decision
                 // for this BSSID; we must not double-write or race it.
+                continue;
+            }
+            if transient_error.contains(bssid) {
+                // At least one provider returned a transient error
+                // (network/rate-limit/skipped/hard-stop) for this BSSID.
+                // The miss may be temporary; fall through to whatever the
+                // pending/attempts-based policy decided. This is the
+                // "definitive not_found" guard required by task-0045.
                 continue;
             }
             match db.is_pending(bssid) {

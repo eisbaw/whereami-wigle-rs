@@ -76,9 +76,16 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
 
     // The pending list IS the input — they're already known to need
     // resolution, so don't pre-filter on cache or not_found. On WiGLE
-    // network errors, increment the existing pending row's attempts. Don't
-    // mark not_found here (drain runs periodically; let the chain
-    // succeed eventually or expire via max_attempts).
+    // network errors, increment the existing pending row's attempts.
+    //
+    // mark_not_found_at_chain_end is enabled but the chain itself only
+    // fires it when EVERY provider returned a definitive NotFound for the
+    // BSSID. Any transient error (network/rate-limit/skipped/hard-stop)
+    // suppresses the not_found mark, so a flaky network does not poison
+    // the not_found cache. When the mark fires, the chain also leaves the
+    // pending row in place; we explicitly remove it here so the BSSID
+    // does not retry every drain pass and burn API quota on something we
+    // already know nobody can resolve.
     let bssids: Vec<String> = pending.iter().map(|p| p.bssid.clone()).collect();
     let policy = ChainPolicy {
         skip_cached: false,
@@ -86,10 +93,37 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
         write_through: true,
         delete_pending_on_success: true,
         mark_not_found_per_provider: false,
-        mark_not_found_at_chain_end: false,
+        mark_not_found_at_chain_end: true,
         on_skipped: SkipAction::NextProvider,
         on_network_error: NetErrorAction::IncrementPending,
         on_hard_stop: HardStopAction::Stop,
     };
-    let _ = resolve_chain(&bssids, state, &[Provider::Apple, Provider::Wigle], &policy).await;
+    let result = resolve_chain(&bssids, state, &[Provider::Apple, Provider::Wigle], &policy).await;
+
+    // Whatever the chain just marked not_found is now redundantly pending
+    // and would retry on every drain. Remove those pending rows so the
+    // not_found TTL is the sole gate going forward (task-0045).
+    let db = crate::server::lock_db(state);
+    for bssid in &bssids {
+        // resolved == in result.fetched_bssids OR present in result.positioned;
+        // but pending-row deletion-on-success was already handled by the chain
+        // (delete_pending_on_success=true). We only need to clean up the
+        // newly-marked not_found ones here.
+        let was_resolved = result.fetched_bssids.contains(bssid)
+            || result.positioned.iter().any(|a| &a.bssid == bssid);
+        if was_resolved {
+            continue;
+        }
+        // is_not_found() returns true for entries within TTL. If the chain
+        // just marked it, this will be true.
+        match db.is_not_found(bssid, state.args.not_found_ttl_days) {
+            Ok(true) => {
+                if let Err(e) = db.delete_pending(bssid) {
+                    warn!("failed to delete pending {bssid} after not_found mark: {e}");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => warn!("is_not_found probe failed for {bssid}: {e}"),
+        }
+    }
 }
