@@ -5,3 +5,6 @@ geowifi/
 whereamid/fuzz/target/
 whereamid/fuzz/corpus/
 whereamid/fuzz/artifacts/
+
+# Backlog tooling artefact (per-user email preferences); never useful in repo.
+backlog/email-preferences.json
