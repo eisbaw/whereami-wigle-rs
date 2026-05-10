@@ -79,22 +79,42 @@ proptest! {
         }
     }
 
-    /// Trilateration accuracy is always positive.
+    /// Stronger-signal AP pulls the centroid toward itself.
+    ///
+    /// Generate one strong AP and one weak AP at distinct positions and assert
+    /// the centroid is closer to the strong one. This is the actual purpose
+    /// of the dBm-weighted formula. Replaces the previous tautological
+    /// `trilaterate_accuracy_positive` (clamped output is trivially > 0).
     #[test]
-    fn trilaterate_accuracy_positive(
-        coords in prop::collection::vec((50.0f64..56.0, 10.0f64..14.0), 1..8),
-        signals in prop::collection::vec(-90i32..-30, 1..8)
+    fn trilaterate_stronger_signal_pulls_centroid(
+        lat_a in 50.0f64..51.0,
+        lon_a in 10.0f64..11.0,
+        offset_lat in 0.005f64..0.05,
+        offset_lon in 0.005f64..0.05,
+        strong in -50i32..-30,
+        weak in -85i32..-70,
     ) {
-        let len = coords.len().min(signals.len());
-        let aps: Vec<PositionedAp> = coords[..len]
-            .iter()
-            .zip(signals[..len].iter())
-            .map(|(&(lat, lon), &sig)| PositionedAp { lat, lon, signal_dbm: Some(sig) })
-            .collect();
+        let strong_ap = PositionedAp {
+            lat: lat_a,
+            lon: lon_a,
+            signal_dbm: Some(strong),
+        };
+        let weak_ap = PositionedAp {
+            lat: lat_a + offset_lat,
+            lon: lon_a + offset_lon,
+            signal_dbm: Some(weak),
+        };
+        let aps = vec![strong_ap.clone(), weak_ap.clone()];
+        let result = trilaterate(&aps).unwrap();
 
-        if let Ok(result) = trilaterate(&aps) {
-            prop_assert!(result.accuracy_m > 0.0, "accuracy should be positive");
-        }
+        let d_strong = haversine_m_test(result.lat, result.lon, strong_ap.lat, strong_ap.lon);
+        let d_weak = haversine_m_test(result.lat, result.lon, weak_ap.lat, weak_ap.lon);
+        prop_assert!(
+            d_strong < d_weak,
+            "centroid should be closer to strong AP ({} dBm) than weak ({} dBm); \
+             d_strong={:.1}m, d_weak={:.1}m",
+            strong, weak, d_strong, d_weak
+        );
     }
 }
 
@@ -109,54 +129,122 @@ proptest! {
         prop_assert_eq!(&once, &twice);
     }
 
-    /// parse_iw_output never panics on arbitrary input.
+    /// parse_iw_output: panic-freedom plus a shape invariant. Every emitted
+    /// network must have a well-formed BSSID (six colon-separated hex bytes).
+    /// Without the shape check this would only validate that safe-Rust code
+    /// doesn't panic on parser input — almost no signal.
     #[test]
-    fn parse_iw_no_panic(input in ".*") {
-        let _ = parse_iw_output(&input);
+    fn parse_iw_output_emits_well_formed_bssids(input in ".*") {
+        let networks = parse_iw_output(&input);
+        for n in &networks {
+            let parts: Vec<&str> = n.bssid.split(':').collect();
+            prop_assert_eq!(
+                parts.len(), 6,
+                "iw parser emitted BSSID with {} colon-segments: {:?}",
+                parts.len(), n.bssid
+            );
+            for p in parts {
+                prop_assert!(
+                    p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()),
+                    "iw parser emitted non-hex BSSID octet {:?} in {}", p, n.bssid
+                );
+            }
+        }
     }
 
-    /// split_nmcli_fields never panics and round-trips unescaped fields.
+    /// split_nmcli_fields panic-freedom plus a shape invariant. The output
+    /// must never contain a literal "\:" escape sequence — those are the
+    /// inputs being escaped.
     #[test]
-    fn split_nmcli_no_panic(input in ".*") {
-        let _ = split_nmcli_fields(&input);
+    fn split_nmcli_no_unescaped_backslash_colon(input in ".*") {
+        let fields = split_nmcli_fields(&input);
+        for f in &fields {
+            prop_assert!(
+                !f.contains("\\:"),
+                "split_nmcli_fields left an unprocessed \\: escape in field {:?}", f
+            );
+        }
     }
 
-    /// split_nmcli_fields correctly splits on unescaped colons.
+    /// split_nmcli_fields correctly splits on unescaped colons even when
+    /// fields contain backslashes and escaped colons. The previous version
+    /// of this property tested only `[a-zA-Z0-9]{0,10}`, which never
+    /// exercised the escape logic — a vacuous regression.
     #[test]
-    fn split_nmcli_unescaped_colon_count(
-        fields in prop::collection::vec("[a-zA-Z0-9]{0,10}", 1..6)
+    fn split_nmcli_round_trips_with_escapes(
+        // Each "field" is built from raw chars that can include literal ':',
+        // which we'll then escape as '\:' to compose a wire-format line.
+        // We exclude '\\' itself so we don't have to model lookahead in
+        // round-trip; the escape semantics under '\\' are tested in the unit
+        // test for split_nmcli_fields directly.
+        fields in prop::collection::vec("[a-zA-Z0-9: ]{0,10}", 1..6)
     ) {
-        let joined = fields.join(":");
-        let split = split_nmcli_fields(&joined);
+        // Compose: every literal ':' in a field becomes '\:' on the wire.
+        let line = fields
+            .iter()
+            .map(|f| f.replace(':', "\\:"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let split = split_nmcli_fields(&line);
         prop_assert_eq!(split.len(), fields.len(),
-            "splitting {:?} on ':' should give {} fields, got {}", joined, fields.len(), split.len());
+            "expected {} fields, got {}; line was {:?}", fields.len(), split.len(), line);
+        for (orig, parsed) in fields.iter().zip(split.iter()) {
+            prop_assert_eq!(orig, parsed,
+                "round-trip mismatch: original {:?} != parsed {:?}", orig, parsed);
+        }
     }
 }
 
 // --- Debounce properties ---
 
 proptest! {
-    /// Stable BSSID count never exceeds the number of unique BSSIDs pushed.
+    /// Two non-trivial debounce invariants:
+    ///   1. After at least `threshold` scans containing every AP, every AP
+    ///      must be stable (the basic threshold contract).
+    ///   2. After fewer than `threshold` scans, NO AP can be stable.
+    /// The previous `debounce_stable_bounded` property (`stable.len() <=
+    /// num_aps`) was definitionally true for any HashMap-backed debouncer
+    /// and provided no real signal.
     #[test]
-    fn debounce_stable_bounded(
+    fn debounce_threshold_contract(
         window in 3usize..15,
-        threshold in 1usize..5,
-        num_scans in 1usize..20,
-        num_aps in 1usize..10,
+        threshold in 2usize..5,
+        num_aps in 1usize..6,
     ) {
         let threshold = threshold.min(window);
         let mut d = Debouncer::new(window, threshold);
 
-        for _ in 0..num_scans {
+        // Push exactly threshold-1 scans containing every AP — none stable.
+        for _ in 0..(threshold - 1) {
             let mut sample: ScanSample = std::collections::HashMap::new();
             for i in 0..num_aps {
                 sample.insert(format!("AP-{i}"), ScanEntry { signal_dbm: -60, ssid: None, channel: None });
             }
             d.push_scan(sample);
         }
+        prop_assert!(
+            d.stable_bssids().is_empty(),
+            "no AP should be stable after {} scans (threshold = {})",
+            threshold - 1, threshold
+        );
+
+        // One more scan crosses the threshold — every AP must be stable now.
+        let mut sample: ScanSample = std::collections::HashMap::new();
+        for i in 0..num_aps {
+            sample.insert(format!("AP-{i}"), ScanEntry { signal_dbm: -60, ssid: None, channel: None });
+        }
+        d.push_scan(sample);
 
         let stable = d.stable_bssids();
-        prop_assert!(stable.len() <= num_aps, "stable count {} > num_aps {}", stable.len(), num_aps);
+        prop_assert_eq!(
+            stable.len(), num_aps,
+            "after {} scans (threshold={}), every AP must be stable",
+            threshold, threshold
+        );
+        for i in 0..num_aps {
+            let key = format!("AP-{i}");
+            prop_assert!(stable.contains(&key), "AP-{} should be stable", i);
+        }
     }
 
     /// After window+1 empty scans, nothing is stable.
