@@ -101,12 +101,25 @@ pub fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
         } else {
             Some(ssid_raw)
         };
-        let signal_pct: i32 = fields[2].parse().unwrap_or(0);
+
+        // Skip rows where signal is missing or unparseable. The previous
+        // behaviour fell back to 0%, which the linear conversion below would
+        // then map to -90 dBm — indistinguishable from a real weak AP and
+        // thus poisons trilateration weights with fake data.
+        let signal_pct: i32 = match fields[2].trim().parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         let channel: Option<i32> = fields[3].parse().ok();
         let freq: Option<i32> = fields[4].parse().ok();
 
-        // Convert signal percentage (0-100) to approximate dBm
-        // nmcli reports 0-100 where 100 ~ -30 dBm, 0 ~ -90 dBm
+        // Convert signal percentage (0-100) to approximate dBm:
+        // 100 ≈ -30 dBm, 0 ≈ -90 dBm via the linear map below.
+        // NOTE: This is a coarse approximation. nmcli's percentage is itself
+        // derived from RSSI by a non-linear, driver-dependent formula in
+        // NetworkManager, so positions trilaterated purely from nmcli scans
+        // will have systematically biased weights. iw reports raw dBm and
+        // is the authoritative source when accuracy matters.
         let signal_dbm = -90 + ((signal_pct as f64 * 60.0 / 100.0) as i32);
 
         networks.push(ScannedNetwork {
@@ -372,6 +385,34 @@ BSS 11:22:33:44:55:66(on wlan0)
         assert_eq!(networks[0].signal_dbm, -51);
         assert_eq!(networks[1].bssid, "AA:BB:CC:DD:EE:02");
         assert_eq!(networks[1].ssid, Some("TestNet_5G".to_string()));
+    }
+
+    #[test]
+    fn test_parse_nmcli_skips_empty_signal() {
+        // First row has no signal field; second row has it. Only the second
+        // row should be emitted — empty signal must NOT be coerced to 0%/-90 dBm.
+        let output = concat!(
+            "AA\\:BB\\:CC\\:DD\\:EE\\:01:NoSig::6:2437\n",
+            "AA\\:BB\\:CC\\:DD\\:EE\\:02:HasSig:50:6:2437\n",
+        );
+        let networks = parse_nmcli_output(output);
+        assert_eq!(
+            networks.len(),
+            1,
+            "row with empty signal must be skipped, got {networks:?}"
+        );
+        assert_eq!(networks[0].bssid, "AA:BB:CC:DD:EE:02");
+    }
+
+    #[test]
+    fn test_parse_nmcli_skips_garbage_signal() {
+        // Non-numeric signal field also skipped, not coerced to 0.
+        let output = "AA\\:BB\\:CC\\:DD\\:EE\\:03:Bad:not_a_number:6:2437\n";
+        let networks = parse_nmcli_output(output);
+        assert!(
+            networks.is_empty(),
+            "row with garbage signal must be skipped, got {networks:?}"
+        );
     }
 
     #[test]
