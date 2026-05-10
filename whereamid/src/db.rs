@@ -218,56 +218,74 @@ impl Database {
         Ok(())
     }
 
+    /// Run a migration body inside an `unchecked_transaction`. The body MUST
+    /// also stamp schema_version (because the stamp shape differs across
+    /// versions: pre-v3 is a multi-row table, v3+ has CHECK(id=1)). On any
+    /// error the transaction is rolled back and the DB stays at the prior
+    /// version. Task-0047.
+    fn run_migration<F>(&self, body: F) -> Result<()>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to start migration transaction")?;
+        body(&tx)?;
+        tx.commit().context("failed to commit migration")?;
+        Ok(())
+    }
+
     /// v1 -> v2: add `aps.source_priority` and backfill from the existing
     /// `source` column. Idempotent: safe to run multiple times because the
     /// schema_version row is the gating condition; we never reach this from
-    /// a v2 database.
+    /// a v2 database. Wrapped in a transaction (task-0047) so a partial
+    /// migration cannot leave the DB with the column added but no version
+    /// bump (or vice versa).
     fn migrate_v1_to_v2(&self) -> Result<()> {
-        // Defensive: if the column already exists (e.g. partial earlier run),
-        // skip the ALTER. We detect that via PRAGMA table_info.
-        let has_priority: bool = {
-            let mut stmt = self.conn.prepare("PRAGMA table_info(aps)")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-            let mut found = false;
-            for row in rows {
-                if row? == "source_priority" {
-                    found = true;
-                    break;
+        self.run_migration(|tx| {
+            // Defensive: if the column already exists (e.g. partial earlier run),
+            // skip the ALTER. We detect that via PRAGMA table_info.
+            let has_priority: bool = {
+                let mut stmt = tx.prepare("PRAGMA table_info(aps)")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+                let mut found = false;
+                for row in rows {
+                    if row? == "source_priority" {
+                        found = true;
+                        break;
+                    }
                 }
-            }
-            found
-        };
-        if !has_priority {
-            self.conn
-                .execute(
+                found
+            };
+            if !has_priority {
+                tx.execute(
                     "ALTER TABLE aps ADD COLUMN source_priority INTEGER NOT NULL DEFAULT 0",
                     [],
                 )
                 .context("failed to add aps.source_priority column")?;
-        }
+            }
 
-        // Backfill priorities from existing source strings. Hardcode the
-        // numbers here rather than calling Source::priority(): future code
-        // changes to the enum must not silently rewrite historical data.
-        // (If you change the priority ladder, write a new migration.)
-        self.conn.execute_batch(
-            "UPDATE aps SET source_priority = 40 WHERE source = 'apple';
-             UPDATE aps SET source_priority = 30 WHERE source = 'wigle';
-             UPDATE aps SET source_priority = 20 WHERE source = 'beacondb';
-             UPDATE aps SET source_priority = 10 WHERE source = 'manual';
-             UPDATE aps SET source_priority = 0  WHERE source NOT IN ('apple','wigle','beacondb','manual');",
-        )?;
+            // Backfill priorities from existing source strings. Hardcode the
+            // numbers here rather than calling Source::priority(): future code
+            // changes to the enum must not silently rewrite historical data.
+            // (If you change the priority ladder, write a new migration.)
+            tx.execute_batch(
+                "UPDATE aps SET source_priority = 40 WHERE source = 'apple';
+                 UPDATE aps SET source_priority = 30 WHERE source = 'wigle';
+                 UPDATE aps SET source_priority = 20 WHERE source = 'beacondb';
+                 UPDATE aps SET source_priority = 10 WHERE source = 'manual';
+                 UPDATE aps SET source_priority = 0  WHERE source NOT IN ('apple','wigle','beacondb','manual');",
+            )?;
 
-        // Bump schema_version. The row-management is conservative: update if
-        // a row exists, otherwise insert. (Task 0030 will tighten this.)
-        let updated = self
-            .conn
-            .execute("UPDATE schema_version SET version = 2", [])?;
-        if updated == 0 {
-            self.conn
-                .execute("INSERT INTO schema_version (version) VALUES (2)", [])?;
-        }
-        Ok(())
+            // Bump schema_version. Multi-row shape (no id PK yet). Update if
+            // a row exists, otherwise insert.
+            let updated = tx.execute("UPDATE schema_version SET version = 2", [])?;
+            if updated == 0 {
+                tx.execute("INSERT INTO schema_version (version) VALUES (2)", [])?;
+            }
+            Ok(())
+        })
     }
 
     /// v2 -> v3: rebuild `schema_version` so it can hold at most one row,
@@ -343,9 +361,10 @@ impl Database {
     /// v3 -> v4: add the `last_fix` table with a single-row CHECK so the
     /// daemon can persist its last-known position across restarts. Idempotent
     /// via `CREATE TABLE IF NOT EXISTS` and a fresh schema_version stamp.
+    /// Wrapped in a transaction (task-0047).
     fn migrate_v3_to_v4(&self) -> Result<()> {
-        self.conn
-            .execute_batch(
+        self.run_migration(|tx| {
+            tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS last_fix (
                      id          INTEGER PRIMARY KEY CHECK (id = 1),
                      lat         REAL NOT NULL,
@@ -357,19 +376,21 @@ impl Database {
                  );",
             )
             .context("failed to create last_fix table")?;
-        self.conn.execute(
-            "UPDATE schema_version SET version = ?1 WHERE id = 1",
-            params![SCHEMA_VERSION],
-        )?;
-        Ok(())
+            tx.execute(
+                "UPDATE schema_version SET version = ?1 WHERE id = 1",
+                params![4],
+            )?;
+            Ok(())
+        })
     }
 
     /// v4 -> v5: add the `fixes` table (timeseries of successful locates)
     /// for the location-history feature (task-0031). Idempotent via
-    /// CREATE TABLE / INDEX IF NOT EXISTS.
+    /// CREATE TABLE / INDEX IF NOT EXISTS. Wrapped in a transaction
+    /// (task-0047).
     fn migrate_v4_to_v5(&self) -> Result<()> {
-        self.conn
-            .execute_batch(
+        self.run_migration(|tx| {
+            tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS fixes (
                      id          INTEGER PRIMARY KEY AUTOINCREMENT,
                      at_rfc3339  TEXT NOT NULL,
@@ -381,11 +402,12 @@ impl Database {
                  CREATE INDEX IF NOT EXISTS idx_fixes_at ON fixes(at_rfc3339);",
             )
             .context("failed to create fixes table")?;
-        self.conn.execute(
-            "UPDATE schema_version SET version = ?1 WHERE id = 1",
-            params![SCHEMA_VERSION],
-        )?;
-        Ok(())
+            tx.execute(
+                "UPDATE schema_version SET version = ?1 WHERE id = 1",
+                params![5],
+            )?;
+            Ok(())
+        })
     }
 
     fn get_schema_version(&self) -> i32 {
@@ -1418,6 +1440,49 @@ mod tests {
             err.is_err(),
             "INSERT with id=2 must violate CHECK constraint, got {err:?}"
         );
+    }
+
+    /// task-0047: a migration body that returns Err must roll back the
+    /// transaction, leaving the DB at the prior schema version with no
+    /// partial DDL applied.
+    #[test]
+    fn migration_rollback_on_error() {
+        let db = Database::open_memory().unwrap();
+        // Baseline: fully migrated DB at SCHEMA_VERSION.
+        assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
+
+        // Snapshot the table list pre-attempt.
+        let tables_before: Vec<String> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        // Run a migration body that creates a table then errors. The CREATE
+        // must NOT survive after the helper returns.
+        let result: Result<()> = db.run_migration(|tx| {
+            tx.execute_batch("CREATE TABLE rollback_target (id INTEGER PRIMARY KEY);")?;
+            anyhow::bail!("simulated mid-migration failure");
+        });
+        assert!(result.is_err(), "expected helper to surface body error");
+
+        let tables_after: Vec<String> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            tables_before, tables_after,
+            "rollback_target should not exist after failed migration"
+        );
+        // schema_version still at SCHEMA_VERSION (never bumped).
+        assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
     }
 
     #[test]
