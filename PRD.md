@@ -2,7 +2,7 @@
 
 ## Problem
 
-Browser-based geolocation (Google, Mozilla) requires sending your Wi-Fi environment to third-party servers on every query. Offline geolocation on Linux doesn't exist in usable form. GeoClue's Mozilla backend is dead, and BeaconDB doesn't yet offer data exports.
+Browser-based geolocation (Google, Mozilla) requires sending your Wi-Fi environment to third-party servers on every query. Offline geolocation on Linux doesn't exist in usable form. GeoClue's Mozilla backend is dead.
 
 We want: scan local Wi-Fi, resolve MAC addresses to coordinates, cache results locally, and answer "where am I?" without phoning home once the cache is warm.
 
@@ -37,10 +37,14 @@ Long-running process. Listens on a TCP socket (default `127.0.0.1:4747`). Newlin
 Responsibilities:
 - Accept queries over TCP
 - Manage the local SQLite cache (read/write)
-- Perform Wi-Fi scans (via `iw dev wlan0 scan` or nl80211)
-- Call remote APIs on cache miss (Apple WPS first, then WiGLE)
-- Trilaterate position from known AP locations
-- Rate-limit outbound API calls to stay within WiGLE daily limits
+- Perform Wi-Fi scans (via `nmcli` preferred, `iw dev wlan0 scan` fallback)
+- Call remote APIs on cache miss (Apple WPS first — free, no auth — then WiGLE)
+- Trilaterate position from known AP locations using a spherical-mean centroid
+- Atomically reserve outbound WiGLE API calls against a daily quota
+- Persist last-known fix and a fix timeseries (location-history feature)
+- Drain pending lookups in the background when connectivity returns
+- Drop `--address-approx` reverse-geocode calls onto a TTL'd cache so the
+  locate hot path never blocks on Nominatim's 1 req/s rate limit
 
 ### whereami-client (Rust library crate)
 
@@ -125,32 +129,34 @@ Response:
 
 ## Data Model (SQLite)
 
-Two tables in the same database file:
-
-All timestamps are **UTC**. SQLite in **WAL mode** (set on open via `PRAGMA journal_mode=WAL`).
+Schema version is **5**. All timestamps are **UTC ISO 8601 / RFC3339**.
+SQLite in **WAL mode** (set on open via `PRAGMA journal_mode=WAL`). Migrations
+run inside transactions and roll back atomically on failure.
 
 ```sql
--- Schema version tracking
+-- Schema version. Single-row CHECK guards against accidental multi-row state.
 CREATE TABLE schema_version (
-    version     INTEGER NOT NULL
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL
 );
-INSERT INTO schema_version (version) VALUES (1);
 
 -- Resolved APs with known positions
 CREATE TABLE aps (
-    bssid       TEXT PRIMARY KEY,  -- normalized uppercase, colon-separated
-    ssid        TEXT,
-    lat         REAL NOT NULL,
-    lon         REAL NOT NULL,
-    encryption  TEXT,              -- informational, from WiGLE (may differ from scan)
-    channel     INTEGER,           -- informational, from WiGLE
-    frequency   INTEGER,           -- informational, MHz, from WiGLE
-    city        TEXT,              -- informational, from WiGLE
-    country     TEXT,              -- informational, from WiGLE
-    source      TEXT NOT NULL,     -- "apple" | "wigle" | "beacondb" | "manual"
-    first_seen  TEXT NOT NULL,     -- UTC ISO 8601, when daemon first observed this AP
-    last_seen   TEXT NOT NULL,     -- UTC ISO 8601, most recent scan that saw it
-    fetched_at  TEXT NOT NULL      -- UTC ISO 8601, when position was resolved via API
+    bssid           TEXT PRIMARY KEY,  -- normalized uppercase, colon-separated
+    ssid            TEXT,
+    lat             REAL NOT NULL,
+    lon             REAL NOT NULL,
+    encryption      TEXT,              -- informational, from WiGLE
+    channel         INTEGER,
+    frequency       INTEGER,           -- MHz
+    city            TEXT,
+    country         TEXT,
+    source          TEXT NOT NULL,     -- "apple" | "wigle" | "beacondb" | "manual" | "unknown"
+    source_priority INTEGER NOT NULL DEFAULT 0,
+                                       -- 40 apple, 30 wigle, 20 beacondb (legacy), 10 manual, 0 unknown
+    first_seen      TEXT NOT NULL,
+    last_seen       TEXT NOT NULL,
+    fetched_at      TEXT NOT NULL
 );
 
 CREATE INDEX idx_aps_geo ON aps(lat, lon);
@@ -185,6 +191,30 @@ CREATE TABLE metadata (
 );
 -- Tracks: "api_calls_today" (integer), "api_calls_date" (UTC date YYYY-MM-DD)
 -- Reset logic: if api_calls_date != today (UTC), reset api_calls_today to 0.
+-- Read+increment runs in a single SQL transaction (try_reserve_api_call).
+
+-- Last-known fix, persisted across daemon restarts so `locate` can answer
+-- immediately at startup before the next scan-and-resolve cycle.
+CREATE TABLE last_fix (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    lat         REAL NOT NULL,
+    lon         REAL NOT NULL,
+    accuracy_m  REAL NOT NULL,
+    address     TEXT,
+    at_rfc3339  TEXT NOT NULL,
+    sources     INTEGER NOT NULL
+);
+
+-- Location-history timeseries: one row per successful locate response.
+CREATE TABLE fixes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    at_rfc3339  TEXT NOT NULL,
+    lat         REAL NOT NULL,
+    lon         REAL NOT NULL,
+    accuracy_m  REAL NOT NULL,
+    n_sources   INTEGER NOT NULL
+);
+CREATE INDEX idx_fixes_at ON fixes(at_rfc3339);
 ```
 
 The **pending table** acts as a work queue. The daemon drains it in the background whenever WiGLE becomes reachable:
@@ -197,16 +227,19 @@ No expiry on `aps` by default. APs don't move often. A future `purge` command co
 
 ## Wi-Fi Scanning
 
-Two approaches, in preference order:
+Two backends, in preference order:
 
-1. **nl80211 via netlink** — direct kernel interface, no subprocess. Crate: `neli` or `genetlink`. Requires `CAP_NET_ADMIN`.
-2. **Shell out to `iw dev <iface> scan`** — simpler, same capability requirement. Parse the text output.
+1. **`nmcli device wifi list --rescan auto`** (preferred) — runs without
+   `CAP_NET_ADMIN` if NetworkManager is the system Wi-Fi manager. Stable
+   field-separator-escaped output that parses cleanly. Documented choice in
+   ADR-010.
+2. **`iw dev <iface> scan trigger` + `iw dev <iface> scan dump`** —
+   fallback for systems without NetworkManager. Requires `CAP_NET_ADMIN`.
+   The trigger-then-dump split avoids "Device or resource busy" while the
+   interface is associated to an AP.
 
-Start with option 2. Move to option 1 if parsing `iw` output proves fragile.
-
-**Important**: `iw dev wlan0 scan` fails with "Device or resource busy" when the interface is associated to an AP (which it normally will be). Use the two-step approach: `iw dev wlan0 scan trigger` followed by `iw dev wlan0 scan dump`. The trigger initiates a background scan; the dump reads cached results. This works while connected.
-
-The daemon needs to run as root or with `CAP_NET_ADMIN` for scanning. Alternatively, accept scan results from clients (the `resolve` command) so the daemon itself doesn't need elevated privileges.
+The daemon picks `nmcli` when its output is parseable; otherwise it falls
+through to `iw`. Either path returns the same `ScannedNetwork` shape.
 
 ### Scan filtering and debounce interaction
 
@@ -278,14 +311,13 @@ A separate background task periodically attempts to resolve MACs in the `pending
 - Rate limit: respect daily quota. The daemon reserves and refunds slots in the SQLite `metadata` table under a single transaction (read+increment in one atomic step).
 - Returns: `trilat`, `trilong`, `ssid`, `encryption`, `city`, `country`
 
-### BeaconDB (currently unused)
+### BeaconDB (read-only legacy)
 
-A BeaconDB client exists in the codebase but is not wired into the active resolution chain. It was retained pending an exports feature; in the meantime the resolver never calls it. Treat the section as documentation of intent rather than runtime behaviour.
-
-- Endpoint: `POST https://beacondb.net/v1/geolocate`
-- Body: `{"wifiAccessPoints": [{"macAddress": "AA:BB:CC:DD:EE:FF"}]}`
-- No auth required
-- Limited database (~108M networks)
+`Source::BeaconDb` exists in the enum at priority 20 so historical DB rows
+from earlier prototypes still load at the correct priority. No production
+path writes new BeaconDB rows today; the BeaconDbClient module was deleted
+in task-0034. The API returns aggregate position (not per-AP), which makes
+it incompatible with the per-BSSID Provider chain.
 
 ### Lookup strategy (on `locate` request)
 
@@ -306,17 +338,23 @@ A separate background task drains the `pending` queue periodically; entries grad
 
 ## Trilateration
 
-Weighted centroid method:
+**Spherical-mean** weighted centroid:
 
 ```
-position = sum(weight_i * position_i) / sum(weight_i)
+v_i      = unit_vec(lat_i, lon_i)         # 3D unit vector on the sphere
+weight_i = 10 ^ (signal_dbm_i / 20)        # stronger signal = larger weight
+v        = normalize( sum(weight_i * v_i) )
+(lat, lon) = lat_lon_of(v)
 ```
 
-Where `weight_i` is derived from signal strength (if available):
-- `weight = 10 ^ (signal_dbm / -20)` — closer APs (stronger signal) get more weight
-- If no signal info (e.g. `resolve` command), equal weight
+The 3D-vector approach is necessary because lat/lon arithmetic mean is wrong
+on a sphere: two APs at lon=±179° would centroid to lon=0° (Africa) instead
+of the antimeridian. The current implementation handles antimeridian and
+near-polar inputs correctly. Antipodal inputs (vector sum near zero) fall
+back to the strongest-signal AP and inflate `accuracy_m`.
 
-This is simple and good enough for ~20-50m urban accuracy. Not worth implementing least-squares or Kalman filtering unless proven insufficient.
+Outlier rejection uses the same spherical-mean center plus median-distance
+filtering. Accurate to ~10–30m urban with 5+ resolved APs.
 
 ## Configuration
 
@@ -330,15 +368,23 @@ whereamid \
   --db /var/lib/whereami/aps.sqlite \
   --interface wlan0 \
   --config ~/.config/whereami/config.toml \
-  --scan-interval-fast 10 \       # seconds, during fast phase
-  --scan-fast-duration 60 \       # seconds, how long fast phase lasts
-  --scan-interval-slow 60 \       # seconds, steady state
-  --debounce-window 10 \          # number of samples in ring buffer
-  --debounce-threshold 5 \        # min appearances to be "stable"
-  --top-n 10 \                    # only consider N strongest APs per scan
-  --pending-interval 300 \        # seconds between pending queue drain runs
-  --pending-max-attempts 20 \    # drop from pending after this many failures
-  --daily-limit 100               # self-imposed WiGLE calls per day
+  --scan-interval-fast 10 \              # seconds, fast phase
+  --scan-fast-duration 60 \              # seconds, fast-phase length
+  --scan-interval-slow 60 \              # seconds, steady state
+  --debounce-window 10 \                 # ring buffer size
+  --debounce-threshold 5 \               # min appearances to be stable
+  --top-n 10 \                           # strongest APs for trilateration
+  --pending-interval 300 \               # pending drain interval (sec)
+  --pending-max-attempts 20 \            # drop pending after N failures
+  --daily-limit 100 \                    # WiGLE calls per day
+  --not-found-ttl-days 30 \              # re-check not_found after N days
+  --address-approx \                     # include street address (Nominatim)
+  --address-cache-ttl-days 7 \           # reverse-geocode cache TTL
+  --http-timeout-secs 15 \               # Apple/WiGLE total timeout
+  --nominatim-timeout-secs 30 \          # Nominatim total timeout
+  --history-retention-days 30 \          # prune fixes older than N days
+  --history-segment-distance-m 100 \     # stay-point clustering threshold
+  --history-segment-min-duration-secs 300  # min stay-point duration
 ```
 
 ### Config file (secrets only)
@@ -347,11 +393,8 @@ whereamid \
 
 ```toml
 [wigle]
-api_user = "AID..."
-api_key = "..."
-
-[beacondb]
-enabled = true
+api_user = "AID..."   # optional; daemon runs without WiGLE creds
+api_key  = "..."
 ```
 
 ## Crate Structure
@@ -376,13 +419,18 @@ whereami/
       db.rs           (SQLite: aps + pending + not_found + metadata tables)
       config.rs       (CLI args via clap + TOML secrets)
       http.rs         (shared reqwest client builder with explicit timeouts)
-      apple.rs        (Apple WPS protobuf client)
+      apple.rs        (Apple WPS protobuf client + encoder/decoder)
       wigle.rs        (WiGLE API client)
-      beacondb.rs     (BeaconDB API client; currently unused)
       nominatim.rs    (OSM reverse geocoding, 1 req/s rate-limited)
-  whereami-client/    (library crate)
+      history.rs      (segmentation + range parsing for location history)
+      geo.rs          (canonical haversine_m)
+      lib.rs          (re-exports for fuzzers and integration tests)
+      db/source.rs    (Source enum + priority ladder)
+      server/address_cache.rs (TTL'd reverse-geocode cache)
+  whereami-client/    (library + CLI)
     src/
-      lib.rs          (connect, send command, parse response)
+      lib.rs          (typed request/response, WhereAmIClient)
+      main.rs         (the `whereami` CLI binary)
 ```
 
 ## NixOS Deployment
@@ -424,7 +472,7 @@ Standard `rustPlatform.buildRustPackage` derivation. Wraps the binary with `make
 
 The implementation enforces a few invariants that are not obvious from the protocol surface:
 
-- **Explicit HTTP timeouts.** Every outbound HTTP client (Apple WPS, WiGLE, BeaconDB, Nominatim) is built through a single `client_with_timeout` helper that sets both a connect timeout and a total request timeout. `reqwest::Client::new()` with no timeout is forbidden because a hung remote would otherwise pin a tokio task indefinitely. Timeouts are currently compile-time constants (15 s for fast endpoints, 30 s for Nominatim); making them CLI-configurable is straightforward future work if needed.
+- **Explicit HTTP timeouts.** Every outbound HTTP client (Apple WPS, WiGLE, Nominatim) is built through a single `client_with_timeout` helper that sets both a connect timeout and a total request timeout. `reqwest::Client::new()` with no timeout is forbidden because a hung remote would otherwise pin a tokio task indefinitely. Total timeouts are CLI-configurable: `--http-timeout-secs` (Apple/WiGLE, default 15) and `--nominatim-timeout-secs` (default 30). Connect timeout is fixed at 5s.
 - **Source-priority enforcement on upserts.** `aps.source_priority` is stored alongside the `source` string. `upsert_ap` only overwrites the data fields when the incoming source's priority is greater than or equal to the stored row's. `last_seen` always advances. A later, lower-quality WiGLE write cannot clobber an Apple fix.
 - **In-flight de-duplication.** The scan loop, the pending drain, and a cold-start `locate` can all decide to resolve the same BSSID at the same time. `resolve_chain` claims each BSSID through an in-memory `inflight` set (RAII guard, panic-safe) so concurrent callers see a single remote round-trip; the losing caller defers to the cache once the winner finishes.
 - **Schema invariants.** `schema_version` is constrained to a single row (`CHECK (id = 1)`). Migrations are idempotent and run inside transactions.
@@ -434,18 +482,21 @@ The implementation enforces a few invariants that are not obvious from the proto
 
 The following are explicitly **not yet built**:
 
-- **Location history (timeseries DB).** Tracked under `task-0031`. The intent is a long-running record of resolved positions for personal analytics; nothing in the current daemon writes to such a store.
-- **Continuous / streaming locate mode.** The TCP protocol is one-shot today; no subscriptions.
-- **CLI-tunable HTTP timeouts.** Currently constants; would be a small extension to `Args`.
+- **Continuous / streaming locate mode.** The TCP protocol is one-shot today;
+  no subscriptions or long-poll.
 - **Bluetooth or cell-tower observations.** Wi-Fi only.
-- **Active BeaconDB integration.** The client exists but is unused in the resolver chain.
+- **Active BeaconDB integration.** The client was deleted in task-0034; the
+  Source enum still recognises historical rows. A renewed integration would
+  need the API to expose per-AP positions instead of aggregate fixes.
+- **Mozilla Location Services / Combain / Skyhook providers.** The Provider
+  trait makes adding a new backend a small change.
 
 ## Non-goals
 
 - No HTTP/REST — TCP + JSON lines is simpler and sufficient
 - No GUI — CLI and programmatic access only
 - No real-time tracking / continuous mode (yet)
-- No data upload/contribution to WiGLE or BeaconDB
+- No data upload/contribution to WiGLE or any other crowdsourced backend
 - No Bluetooth or cell tower support (Wi-Fi only for now)
 
 ## Open Questions
