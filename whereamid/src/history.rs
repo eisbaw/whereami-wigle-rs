@@ -123,7 +123,14 @@ pub fn parse_range(spec: &str) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     if spec.is_empty() {
         return Err(anyhow!("empty range spec"));
     }
-    let (num_str, unit) = spec.split_at(spec.len() - 1);
+    // Split off the LAST CHARACTER (not last byte) so non-ASCII unit chars
+    // don't panic on UTF-8 boundaries. task-0048.
+    let last_char = spec
+        .chars()
+        .next_back()
+        .ok_or_else(|| anyhow!("empty range spec"))?;
+    let unit_len = last_char.len_utf8();
+    let (num_str, unit) = spec.split_at(spec.len() - unit_len);
     let n: i64 = num_str
         .parse()
         .map_err(|_| anyhow!("invalid range '{spec}': expected '<number><unit>' (e.g. '7d')"))?;
@@ -248,5 +255,19 @@ mod tests {
         assert!(parse_range("7y").is_err()); // unknown unit
         assert!(parse_range("0d").is_err()); // must be > 0
         assert!(parse_range("-3d").is_err());
+    }
+
+    /// task-0048: parse_range used split_at(byte_len - 1) which panics on
+    /// non-char-boundary inputs. Now uses last char's len_utf8.
+    #[test]
+    fn parse_range_no_panic_on_non_ascii() {
+        // Multi-byte unit char: '日' is 3 bytes. Must NOT panic.
+        assert!(parse_range("7日").is_err());
+        // 4-byte char (emoji).
+        assert!(parse_range("7🚀").is_err());
+        // Pure non-ASCII string.
+        assert!(parse_range("日").is_err());
+        // Whitespace-only.
+        assert!(parse_range("   ").is_err());
     }
 }
