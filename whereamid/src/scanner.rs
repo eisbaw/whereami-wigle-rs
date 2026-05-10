@@ -282,6 +282,10 @@ pub fn normalize_bssid(bssid: &str) -> String {
 }
 
 /// Convert Wi-Fi frequency (MHz) to channel number.
+///
+/// Covers 2.4 GHz (channels 1-14), 5 GHz (channels ~36-177), and Wi-Fi 6E /
+/// 6 GHz (channels 1-233 starting at 5955 MHz). Per IEEE 802.11ax/be the 6 GHz
+/// channels use formula `(freq - 5950) / 5` over `5955..=7115` MHz.
 fn freq_to_channel(freq: i32) -> Option<i32> {
     match freq {
         2412 => Some(1),
@@ -298,7 +302,11 @@ fn freq_to_channel(freq: i32) -> Option<i32> {
         2467 => Some(12),
         2472 => Some(13),
         2484 => Some(14),
-        // 5 GHz: channel = (freq - 5000) / 5
+        // 6 GHz (Wi-Fi 6E / 7) — checked BEFORE the 5 GHz formula so that
+        // any future widening of the 5 GHz range cannot silently shadow it.
+        f if (5955..=7115).contains(&f) => Some((f - 5950) / 5),
+        // 5 GHz: channel = (freq - 5000) / 5. Range 5180-5885 covers UNII-1/2/3.
+        // The gap 5895-5945 (UNII-4 / DSRC) intentionally stays None.
         f if (5180..=5885).contains(&f) => Some((f - 5000) / 5),
         _ => None,
     }
@@ -383,7 +391,19 @@ BSS 11:22:33:44:55:66(on wlan0)
 
     #[test]
     fn test_freq_to_channel() {
+        // 2.4 GHz
         assert_eq!(freq_to_channel(2437), Some(6));
+        assert_eq!(freq_to_channel(2484), Some(14));
+        // 5 GHz
         assert_eq!(freq_to_channel(5180), Some(36));
+        assert_eq!(freq_to_channel(5825), Some(165));
+        // 6 GHz / Wi-Fi 6E
+        assert_eq!(freq_to_channel(5955), Some(1)); // first 6 GHz channel
+        assert_eq!(freq_to_channel(6105), Some(31)); // mid-range example
+        assert_eq!(freq_to_channel(7115), Some(233)); // last 6 GHz channel
+                                                      // Gaps that should remain None
+        assert_eq!(freq_to_channel(5905), None); // UNII-4 gap
+        assert_eq!(freq_to_channel(7120), None); // above 6 GHz
+        assert_eq!(freq_to_channel(2400), None); // below 2.4 GHz
     }
 }
