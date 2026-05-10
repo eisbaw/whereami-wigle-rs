@@ -98,6 +98,12 @@ pub struct DaemonState {
     /// sites). Surfaced via the stats endpoint (task-0076) so silent
     /// corruption is visible without scraping the journal.
     pub db_write_failures: std::sync::atomic::AtomicU64,
+    /// Cooperative shutdown signal. Background loops that sleep between
+    /// iterations should `tokio::select!` between their timer and
+    /// `state.shutdown.notified()`; on a SIGTERM/SIGINT main() calls
+    /// `notify_waiters()` so loops exit at the next iteration boundary
+    /// instead of being cut off mid-await. task-0075.
+    pub shutdown: tokio::sync::Notify,
 }
 
 /// A cached last-known position with timestamp.

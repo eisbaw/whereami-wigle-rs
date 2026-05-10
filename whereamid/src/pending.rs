@@ -30,7 +30,12 @@ pub async fn run_pending_drain(state: Arc<DaemonState>) {
     );
 
     loop {
-        sleep(interval).await;
+        // Cooperative shutdown (task-0075): break at the next iteration
+        // boundary when main() calls state.shutdown.notify_waiters().
+        tokio::select! {
+            _ = sleep(interval) => {},
+            _ = state.shutdown.notified() => break,
+        }
         drain_once(&state, max_attempts).await;
     }
 }
@@ -143,6 +148,7 @@ mod tests {
             inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
             db_write_failures: std::sync::atomic::AtomicU64::new(0),
+            shutdown: tokio::sync::Notify::new(),
         })
     }
 

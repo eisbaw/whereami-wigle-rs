@@ -115,28 +115,33 @@ async fn main() -> Result<()> {
         last_fix: tokio::sync::Mutex::new(initial_last_fix),
         inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         db_write_failures: std::sync::atomic::AtomicU64::new(0),
+        shutdown: tokio::sync::Notify::new(),
     });
 
-    // Spawn background scan loop
+    // Background tasks. Each respects state.shutdown via tokio::select!
+    // around its sleep, so they exit at the next iteration boundary rather
+    // than being cut off mid-await on SIGTERM (task-0075).
     let scan_state = Arc::clone(&state);
-    tokio::spawn(async move {
+    let scan_handle = tokio::spawn(async move {
         run_scan_loop(scan_state).await;
     });
 
-    // Spawn pending queue drain task
     let pending_state = Arc::clone(&state);
-    tokio::spawn(async move {
+    let pending_handle = tokio::spawn(async move {
         pending::run_pending_drain(pending_state).await;
     });
 
-    // Spawn history-prune task: drop fixes older than retention_days every
-    // 24h. The first sweep runs after one full interval so that the daemon's
-    // startup is not slowed down by a potentially large DELETE.
+    // History-prune task: drop fixes older than retention_days every 24h.
+    // The first sweep runs after one full interval so the daemon's startup
+    // is not slowed by a potentially large DELETE.
     let history_state = Arc::clone(&state);
-    tokio::spawn(async move {
+    let history_handle = tokio::spawn(async move {
         let interval = Duration::from_secs(24 * 60 * 60);
         loop {
-            sleep(interval).await;
+            tokio::select! {
+                _ = sleep(interval) => {},
+                _ = history_state.shutdown.notified() => break,
+            }
             let retention = history_state.args.history_retention_days;
             let pruned = {
                 let db = server::lock_db(&history_state);
@@ -145,14 +150,16 @@ async fn main() -> Result<()> {
             match pruned {
                 Ok(0) => {}
                 Ok(n) => info!("history prune: removed {n} fix rows older than {retention}d"),
-                Err(e) => tracing::warn!("history prune failed: {e}"),
+                Err(e) => {
+                    tracing::warn!("history prune failed: {e}");
+                    history_state.record_db_failure();
+                }
             }
         }
     });
 
-    // Spawn TCP server
     let server_state = Arc::clone(&state);
-    let server_handle = tokio::spawn(async move {
+    let mut server_handle = tokio::spawn(async move {
         if let Err(e) = server::run_server(server_state).await {
             error!("server error: {e}");
         }
@@ -171,9 +178,30 @@ async fn main() -> Result<()> {
         _ = sigterm.recv() => {
             info!("received SIGTERM, shutting down");
         }
-        _ = server_handle => {
+        _ = &mut server_handle => {
             error!("server task exited unexpectedly");
         }
+    }
+
+    // task-0075: cooperative drain. Notify all background loops to exit at
+    // their next iteration, then wait up to 5s for them to finish. Tasks
+    // that are between iterations (sleep) return promptly; tasks mid-DB-
+    // write return after the write completes. After the timeout we abort
+    // anything still running.
+    state.shutdown.notify_waiters();
+    server_handle.abort();
+    let drain_timeout = Duration::from_secs(5);
+    let drain = async {
+        let _ = scan_handle.await;
+        let _ = pending_handle.await;
+        let _ = history_handle.await;
+        let _ = server_handle.await;
+    };
+    if tokio::time::timeout(drain_timeout, drain).await.is_err() {
+        tracing::warn!(
+            "background tasks did not drain within {}s; aborting",
+            drain_timeout.as_secs()
+        );
     }
 
     info!("whereamid stopped");
@@ -229,6 +257,11 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
             }
         }
 
-        sleep(interval).await;
+        // Cooperative shutdown (task-0075): break out at the next iteration
+        // boundary when main() calls state.shutdown.notify_waiters().
+        tokio::select! {
+            _ = sleep(interval) => {},
+            _ = state.shutdown.notified() => break,
+        }
     }
 }
