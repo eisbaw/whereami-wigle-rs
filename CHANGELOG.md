@@ -134,8 +134,8 @@ is not supported (the binary will warn that the schema is too new).
 
 ### Tests
 
-Test count grew from 57 (at v0.3.0) to **146** (50 lib unit + 75 bin unit
-+ 9 proptest at v0.4.0 release-tip plus the new geo tests). Highlights:
+Test count grew from 57 (at v0.3.0) to **134** (50 lib unit + 75 bin unit
++ 9 proptest at v0.4.0 release-tip). Highlights:
 - Atomic rate-limit: 64-thread concurrency test asserting reservations ≤ limit.
 - Migration rollback: failing body leaves DB at prior version.
 - Antimeridian / polar / antipodal trilateration cases.
