@@ -224,13 +224,36 @@ struct ResolveResponse {
     results: Vec<ResolveResult>,
 }
 
+/// Provenance of a single `resolve` result (task-0062).
+///
+/// Distinct from the data-`Source` enum (apple/wigle/beacondb/manual/
+/// unknown) which records WHO supplied the position. Provenance records
+/// HOW the daemon obtained it for *this request*: from the on-disk cache,
+/// fetched live during the request, or absent. The wire field name is
+/// kept as `source` for backward compatibility with CLIs and curl scripts
+/// that already parse the prior stringly-typed protocol.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Provenance {
+    /// Fetched via a remote provider during this resolve call.
+    Api,
+    /// Served from the local SQLite cache.
+    Cache,
+    /// Definitively absent from cache and providers.
+    NotFound,
+}
+
 #[derive(Serialize)]
 struct ResolveResult {
     bssid: String,
     lat: Option<f64>,
     lon: Option<f64>,
     ssid: Option<String>,
-    source: String,
+    /// Wire field name stays `source` for backward compat. Internally
+    /// `provenance` to disambiguate from the data-source `Source` enum
+    /// (task-0062).
+    #[serde(rename = "source")]
+    provenance: Provenance,
 }
 
 #[derive(Serialize)]
@@ -681,10 +704,10 @@ async fn handle_resolve(bssids: &[String], state: &Arc<DaemonState>) -> String {
                     lat: Some(ap.lat),
                     lon: Some(ap.lon),
                     ssid: ap.ssid.clone(),
-                    source: if result.fetched_bssids.contains(bssid) {
-                        "api".to_string()
+                    provenance: if result.fetched_bssids.contains(bssid) {
+                        Provenance::Api
                     } else {
-                        "cache".to_string()
+                        Provenance::Cache
                     },
                 }
             } else {
@@ -693,7 +716,7 @@ async fn handle_resolve(bssids: &[String], state: &Arc<DaemonState>) -> String {
                     lat: None,
                     lon: None,
                     ssid: None,
-                    source: "not_found".to_string(),
+                    provenance: Provenance::NotFound,
                 }
             }
         })
@@ -738,6 +761,23 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
     ok_json(&resp)
 }
 
+/// DB classification of a BSSID seen by the debouncer (task-0062).
+/// Wire format is the lowercase string the previous stringly-typed
+/// implementation emitted; see `Provenance` for the rename rationale.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DbStatus {
+    /// BSSID is in the `aps` cache.
+    Cached,
+    /// BSSID is queued for resolution.
+    Pending,
+    /// BSSID is in the `not_found` table (definitively absent at every
+    /// provider, within the TTL window).
+    NotFound,
+    /// BSSID has not been observed by the daemon before this scan.
+    New,
+}
+
 #[derive(Serialize)]
 struct DebugBssid {
     bssid: String,
@@ -747,7 +787,7 @@ struct DebugBssid {
     seen: usize,   // times seen in debounce window
     needed: usize, // threshold to be stable
     is_stable: bool,
-    db_status: String, // "cached", "pending", "not_found", "new"
+    db_status: DbStatus,
 }
 
 #[derive(Serialize)]
@@ -793,16 +833,16 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
             let is_stable = stable_set.contains(bssid);
             let db = lock_db(state);
             let db_status = if db.get_ap(bssid).ok().flatten().is_some() {
-                "cached"
+                DbStatus::Cached
             } else if db
                 .is_not_found(bssid, state.args.not_found_ttl_days)
                 .unwrap_or(false)
             {
-                "not_found"
+                DbStatus::NotFound
             } else if db.is_pending(bssid).unwrap_or(false) {
-                "pending"
+                DbStatus::Pending
             } else {
-                "new"
+                DbStatus::New
             };
             DebugBssid {
                 bssid: bssid.clone(),
@@ -810,7 +850,7 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
                 seen,
                 needed: threshold,
                 is_stable,
-                db_status: db_status.to_string(),
+                db_status,
             }
         })
         .collect();
@@ -951,3 +991,95 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
 }
 
 // Address-cache tests moved to server/address_cache.rs alongside the impl.
+
+#[cfg(test)]
+mod wire_enum_tests {
+    //! task-0062: wire-format round-trip for the typed enums that
+    //! previously crossed the protocol as raw strings. These tests
+    //! pin the on-the-wire spelling so a future variant rename
+    //! (Rust-side) cannot silently break clients.
+    use super::*;
+
+    #[test]
+    fn db_status_serializes_to_documented_strings() {
+        assert_eq!(
+            serde_json::to_string(&DbStatus::Cached).unwrap(),
+            "\"cached\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DbStatus::Pending).unwrap(),
+            "\"pending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DbStatus::NotFound).unwrap(),
+            "\"not_found\""
+        );
+        assert_eq!(serde_json::to_string(&DbStatus::New).unwrap(), "\"new\"");
+    }
+
+    #[test]
+    fn db_status_round_trip() {
+        for v in [
+            DbStatus::Cached,
+            DbStatus::Pending,
+            DbStatus::NotFound,
+            DbStatus::New,
+        ] {
+            let s = serde_json::to_string(&v).unwrap();
+            let back: DbStatus = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, v);
+        }
+    }
+
+    #[test]
+    fn provenance_serializes_to_documented_strings() {
+        assert_eq!(serde_json::to_string(&Provenance::Api).unwrap(), "\"api\"");
+        assert_eq!(
+            serde_json::to_string(&Provenance::Cache).unwrap(),
+            "\"cache\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Provenance::NotFound).unwrap(),
+            "\"not_found\""
+        );
+    }
+
+    #[test]
+    fn provenance_round_trip() {
+        for v in [Provenance::Api, Provenance::Cache, Provenance::NotFound] {
+            let s = serde_json::to_string(&v).unwrap();
+            let back: Provenance = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, v);
+        }
+    }
+
+    #[test]
+    fn resolve_result_emits_source_field_name() {
+        // Provenance is internal; the JSON field MUST stay `source` for
+        // backward-compatible clients (curl scripts, older CLIs).
+        let r = ResolveResult {
+            bssid: "aa:bb:cc:dd:ee:ff".to_string(),
+            lat: Some(1.0),
+            lon: Some(2.0),
+            ssid: Some("x".to_string()),
+            provenance: Provenance::Cache,
+        };
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v.get("source").and_then(|x| x.as_str()), Some("cache"));
+        assert!(
+            v.get("provenance").is_none(),
+            "internal field name must not leak onto the wire"
+        );
+    }
+
+    #[test]
+    fn unknown_db_status_string_is_rejected() {
+        // We deliberately do NOT add #[serde(other)] — an unknown variant
+        // on the wire is a protocol mismatch and we want it loud, not
+        // silently mapped to a fallback. Newer daemons emitting a new
+        // variant will need a coordinated client bump (or a future
+        // task to add a tagged-other escape hatch).
+        let r: Result<DbStatus, _> = serde_json::from_str("\"unrecognised\"");
+        assert!(r.is_err(), "deserializing unknown db_status must fail");
+    }
+}

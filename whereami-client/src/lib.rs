@@ -77,14 +77,51 @@ pub struct LocateResponse {
     pub error: Option<String>,
 }
 
+/// Provenance of a `resolve` result (task-0062).
+///
+/// Disambiguated from the daemon's data-`Source` enum (apple/wigle/...)
+/// by the rename: the wire field is still `source` for backward compat
+/// but the typed Rust field on this struct is `provenance`. An unknown
+/// value from a future daemon maps to `Provenance::Unknown` so older
+/// clients keep parsing.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Provenance {
+    /// Fetched live during the request.
+    Api,
+    /// Served from the daemon's local cache.
+    Cache,
+    /// Definitively absent from cache and providers.
+    NotFound,
+    /// A value the daemon emitted that this client version does not
+    /// recognise. Forward-compat escape hatch (`#[serde(other)]`).
+    #[serde(other)]
+    Unknown,
+}
+
+impl std::fmt::Display for Provenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Provenance::Api => "api",
+            Provenance::Cache => "cache",
+            Provenance::NotFound => "not_found",
+            Provenance::Unknown => "unknown",
+        })
+    }
+}
+
 /// A single result from the `resolve` command.
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ResolveResultEntry {
     pub bssid: String,
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub ssid: Option<String>,
-    pub source: String,
+    /// Wire field name is `source` for backward compat. task-0062 renamed
+    /// the Rust field to `provenance` to disambiguate from the data-
+    /// source `Source` enum (apple/wigle/...).
+    #[serde(rename = "source")]
+    pub provenance: Provenance,
 }
 
 /// Response from the `resolve` command.
@@ -125,6 +162,40 @@ pub struct ScanResponse {
     pub error: Option<String>,
 }
 
+/// DB classification of a BSSID seen by the debouncer (task-0062).
+///
+/// Wire format mirrors the daemon's snake_case strings. An unknown
+/// value from a future daemon maps to `DbStatus::Unknown` so older
+/// clients keep parsing.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DbStatus {
+    /// In the daemon's `aps` cache.
+    Cached,
+    /// Queued for resolution.
+    Pending,
+    /// In the daemon's `not_found` table (definitively absent within TTL).
+    NotFound,
+    /// First-seen this scan.
+    New,
+    /// A value the daemon emitted that this client version does not
+    /// recognise. Forward-compat escape hatch (`#[serde(other)]`).
+    #[serde(other)]
+    Unknown,
+}
+
+impl std::fmt::Display for DbStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DbStatus::Cached => "cached",
+            DbStatus::Pending => "pending",
+            DbStatus::NotFound => "not_found",
+            DbStatus::New => "new",
+            DbStatus::Unknown => "unknown",
+        })
+    }
+}
+
 /// One BSSID's debug state, as the daemon returns it under `bssids`.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DebugBssid {
@@ -136,7 +207,7 @@ pub struct DebugBssid {
     pub seen: usize,
     pub needed: usize,
     pub is_stable: bool,
-    pub db_status: String,
+    pub db_status: DbStatus,
 }
 
 /// Response from the `debug` command.
@@ -380,3 +451,86 @@ impl_daemon_response!(StatsResponse);
 impl_daemon_response!(DebugResponse);
 impl_daemon_response!(VersionResponse);
 impl_daemon_response!(HistoryResponse);
+
+#[cfg(test)]
+mod wire_enum_tests {
+    //! task-0062: round-trip the typed wire enums against the strings the
+    //! daemon emits, including the Unknown forward-compat fallback.
+    use super::*;
+
+    #[test]
+    fn db_status_strings_match_daemon_vocabulary() {
+        for (variant, expected) in [
+            (DbStatus::Cached, "\"cached\""),
+            (DbStatus::Pending, "\"pending\""),
+            (DbStatus::NotFound, "\"not_found\""),
+            (DbStatus::New, "\"new\""),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), expected);
+            let back: DbStatus = serde_json::from_str(expected).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn db_status_unknown_string_maps_to_unknown_variant() {
+        // Forward-compat: a future daemon emitting a new variant must not
+        // break clients linked against this version.
+        let v: DbStatus = serde_json::from_str("\"future_variant\"").unwrap();
+        assert_eq!(v, DbStatus::Unknown);
+    }
+
+    #[test]
+    fn provenance_strings_match_daemon_vocabulary() {
+        for (variant, expected) in [
+            (Provenance::Api, "\"api\""),
+            (Provenance::Cache, "\"cache\""),
+            (Provenance::NotFound, "\"not_found\""),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), expected);
+            let back: Provenance = serde_json::from_str(expected).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn provenance_unknown_string_maps_to_unknown_variant() {
+        let v: Provenance = serde_json::from_str("\"future_variant\"").unwrap();
+        assert_eq!(v, Provenance::Unknown);
+    }
+
+    #[test]
+    fn resolve_result_entry_reads_legacy_source_field() {
+        // The wire still uses `source`; the typed Rust field is `provenance`.
+        // A client must parse responses produced by the current daemon.
+        let json =
+            r#"{"bssid":"aa:bb:cc:dd:ee:ff","lat":1.0,"lon":2.0,"ssid":"x","source":"cache"}"#;
+        let r: ResolveResultEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(r.provenance, Provenance::Cache);
+    }
+
+    #[test]
+    fn resolve_result_entry_emits_source_field_name() {
+        let r = ResolveResultEntry {
+            bssid: "aa:bb:cc:dd:ee:ff".to_string(),
+            lat: Some(1.0),
+            lon: Some(2.0),
+            ssid: None,
+            provenance: Provenance::Api,
+        };
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v.get("source").and_then(|x| x.as_str()), Some("api"));
+        assert!(v.get("provenance").is_none());
+    }
+
+    #[test]
+    fn debug_bssid_round_trip_with_typed_db_status() {
+        let json = r#"{"bssid":"aa:bb:cc:dd:ee:ff","signal_dbm":-50,"seen":3,"needed":3,"is_stable":true,"db_status":"cached"}"#;
+        let d: DebugBssid = serde_json::from_str(json).unwrap();
+        assert_eq!(d.db_status, DbStatus::Cached);
+        // Round-trip back to JSON and re-parse.
+        let s = serde_json::to_string(&d).unwrap();
+        let d2: DebugBssid = serde_json::from_str(&s).unwrap();
+        assert_eq!(d2.db_status, DbStatus::Cached);
+    }
+}
