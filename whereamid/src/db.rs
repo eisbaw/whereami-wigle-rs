@@ -18,7 +18,11 @@ pub struct ApInfo {
     pub frequency: Option<i32>,
     pub city: Option<String>,
     pub country: Option<String>,
-    pub source: String,
+    /// Provenance of the position. Internally a typed enum; the SQLite
+    /// boundary stringifies via `Source::as_str` and parses back via
+    /// `Source::from_db_str`. No string literals appear in production
+    /// callers.
+    pub source: Source,
 }
 
 /// Origin of an AP fix, with an explicit ranking.
@@ -423,6 +427,7 @@ impl Database {
                  FROM aps WHERE bssid = ?1",
                 params![bssid],
                 |row| {
+                    let source_str: String = row.get(9)?;
                     Ok(ApInfo {
                         bssid: row.get(0)?,
                         ssid: row.get(1)?,
@@ -433,7 +438,7 @@ impl Database {
                         frequency: row.get(6)?,
                         city: row.get(7)?,
                         country: row.get(8)?,
-                        source: row.get(9)?,
+                        source: Source::from_db_str(&source_str),
                     })
                 },
             )
@@ -453,7 +458,8 @@ impl Database {
     /// observing a BSSID is independent of whose data is authoritative.
     pub fn upsert_ap(&self, ap: &ApInfo) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        let priority = Source::from_db_str(&ap.source).priority();
+        let source_str = ap.source.as_str();
+        let priority = ap.source.priority();
         self.conn.execute(
             "INSERT INTO aps (bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, source_priority, first_seen, last_seen, fetched_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?12)
@@ -470,7 +476,7 @@ impl Database {
                 source_priority  = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.source_priority  ELSE aps.source_priority  END,
                 fetched_at       = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.fetched_at       ELSE aps.fetched_at       END,
                 last_seen  = excluded.last_seen",
-            params![ap.bssid, ap.ssid, ap.lat, ap.lon, ap.encryption, ap.channel, ap.frequency, ap.city, ap.country, ap.source, priority, now],
+            params![ap.bssid, ap.ssid, ap.lat, ap.lon, ap.encryption, ap.channel, ap.frequency, ap.city, ap.country, source_str, priority, now],
         )?;
         Ok(())
     }
@@ -947,20 +953,21 @@ mod tests {
             frequency: Some(2437),
             city: None,
             country: None,
-            source: "wigle".to_string(),
+            source: Source::Wigle,
         };
         db.upsert_ap(&ap).unwrap();
         let got = db.get_ap("AA:BB:CC:DD:EE:FF").unwrap().unwrap();
         assert_eq!(got.ssid, Some("TestWiFi".to_string()));
         assert!((got.lat - 55.6684).abs() < 1e-6);
+        assert_eq!(got.source, Source::Wigle);
     }
 
-    /// Build an ApInfo with the given source string and lat (used to tell
-    /// rows apart in priority assertions).
-    fn ap_with(source: &str, lat: f64) -> ApInfo {
+    /// Build an ApInfo with the given source and lat (used to tell rows
+    /// apart in priority assertions).
+    fn ap_with(source: Source, lat: f64) -> ApInfo {
         ApInfo {
             bssid: "AA:BB:CC:DD:EE:FF".to_string(),
-            ssid: Some(format!("ssid-{source}")),
+            ssid: Some(format!("ssid-{}", source.as_str())),
             lat,
             lon: 12.5541,
             encryption: None,
@@ -968,7 +975,7 @@ mod tests {
             frequency: Some(2437),
             city: None,
             country: None,
-            source: source.to_string(),
+            source,
         }
     }
 
@@ -1006,27 +1013,27 @@ mod tests {
         let bssid = "AA:BB:CC:DD:EE:FF";
 
         // 1. Wigle writes first.
-        db.upsert_ap(&ap_with("wigle", 1.0)).unwrap();
+        db.upsert_ap(&ap_with(Source::Wigle, 1.0)).unwrap();
         let got = db.get_ap(bssid).unwrap().unwrap();
-        assert_eq!(got.source, "wigle");
+        assert_eq!(got.source, Source::Wigle);
         assert!((got.lat - 1.0).abs() < 1e-9);
 
         // 2. Lower-priority manual write must NOT overwrite.
-        db.upsert_ap(&ap_with("manual", 2.0)).unwrap();
+        db.upsert_ap(&ap_with(Source::Manual, 2.0)).unwrap();
         let got = db.get_ap(bssid).unwrap().unwrap();
-        assert_eq!(got.source, "wigle", "manual must not overwrite wigle");
+        assert_eq!(got.source, Source::Wigle, "manual must not overwrite wigle");
         assert!((got.lat - 1.0).abs() < 1e-9, "lat must not change");
 
         // 3. Lower-priority beacondb write must NOT overwrite wigle either.
-        db.upsert_ap(&ap_with("beacondb", 3.0)).unwrap();
+        db.upsert_ap(&ap_with(Source::BeaconDb, 3.0)).unwrap();
         let got = db.get_ap(bssid).unwrap().unwrap();
-        assert_eq!(got.source, "wigle");
+        assert_eq!(got.source, Source::Wigle);
 
         // 4. Equal-priority same-source rewrite SHOULD update the position
         //    (we trust the more recent observation from the same source).
-        db.upsert_ap(&ap_with("wigle", 4.0)).unwrap();
+        db.upsert_ap(&ap_with(Source::Wigle, 4.0)).unwrap();
         let got = db.get_ap(bssid).unwrap().unwrap();
-        assert_eq!(got.source, "wigle");
+        assert_eq!(got.source, Source::Wigle);
         assert!(
             (got.lat - 4.0).abs() < 1e-9,
             "same-source rewrite should update lat, got {}",
@@ -1034,22 +1041,27 @@ mod tests {
         );
 
         // 5. Higher-priority apple write SHOULD overwrite.
-        db.upsert_ap(&ap_with("apple", 5.0)).unwrap();
+        db.upsert_ap(&ap_with(Source::Apple, 5.0)).unwrap();
         let got = db.get_ap(bssid).unwrap().unwrap();
-        assert_eq!(got.source, "apple");
+        assert_eq!(got.source, Source::Apple);
         assert!((got.lat - 5.0).abs() < 1e-9);
 
         // 6. Subsequent lower-priority writes (wigle, beacondb, manual,
         //    unknown) must NOT overwrite apple.
         for (src, lat) in [
-            ("wigle", 6.0),
-            ("beacondb", 7.0),
-            ("manual", 8.0),
-            ("garbage", 9.0),
+            (Source::Wigle, 6.0),
+            (Source::BeaconDb, 7.0),
+            (Source::Manual, 8.0),
+            (Source::Unknown, 9.0),
         ] {
             db.upsert_ap(&ap_with(src, lat)).unwrap();
             let got = db.get_ap(bssid).unwrap().unwrap();
-            assert_eq!(got.source, "apple", "{src} must not overwrite apple");
+            assert_eq!(
+                got.source,
+                Source::Apple,
+                "{:?} must not overwrite apple",
+                src
+            );
             assert!((got.lat - 5.0).abs() < 1e-9);
         }
     }
