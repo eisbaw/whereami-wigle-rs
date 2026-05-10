@@ -40,6 +40,7 @@
             buildInputs = [
               nightlyToolchain
               pkgs.cargo-fuzz
+              pkgs.just
               pkgs.pkg-config
               pkgs.openssl
               pkgs.sqlite
@@ -49,6 +50,12 @@
 
             OPENSSL_DEV = pkgs.openssl.dev;
             PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
+
+            # cargo-fuzz binaries are sanitizer-instrumented and link
+            # libstdc++.so.6 at runtime; expose it on LD_LIBRARY_PATH.
+            shellHook = ''
+              export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            '';
           };
         }
       );

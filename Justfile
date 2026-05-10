@@ -1,48 +1,73 @@
-# Justfile for whereami project
-# All recipes run inside nix-shell if shell.nix is present.
+# Justfile for whereami project.
+# Recipes assume you are inside the dev shell:  nix develop
+# (or run a single recipe with:  nix develop -c just <recipe>)
 
-nix_run := if path_exists("shell.nix") == "true" { "nix-shell --run" } else { "bash -c" }
-
+# Build the workspace
 build:
-    {{nix_run}} "cargo build"
+    cargo build
 
+# Run the unit + integration test suite
 test:
-    {{nix_run}} "cargo test"
+    cargo test
 
+# Run the daemon
 run *ARGS:
-    {{nix_run}} "cargo run --bin whereamid -- {{ARGS}}"
+    cargo run --bin whereamid -- {{ARGS}}
 
+# Strict clippy: any warning is a hard error
 lint:
-    {{nix_run}} "cargo clippy -- -D warnings"
+    cargo clippy --all-targets -- -D warnings
 
+# Verify formatting (CI-friendly; does not modify files)
 fmt:
-    {{nix_run}} "cargo fmt --check"
+    cargo fmt --check
 
+# Auto-format the workspace
+fmt-fix:
+    cargo fmt
+
+# Remove build artefacts
 clean:
-    {{nix_run}} "cargo clean"
+    cargo clean
 
+# Pre-commit gate: tests + strict clippy
 e2e:
-    {{nix_run}} "cargo test && cargo clippy -- -D warnings"
+    cargo test
+    cargo clippy --all-targets -- -D warnings
+
+# Full pre-commit gate including format check and short fuzz smoke
+qa: e2e fmt fuzz
 
 # --- Fuzz targets (nightly Rust via flake devShell) ---
-# Enter shell: nix develop
-# Then run: just fuzz-all
+# Each fuzz-<name> recipe runs indefinitely; Ctrl-C to stop.
+# `fuzz` is a short smoke (15s/target); `fuzz-all` is 60s/target.
 
+# Fuzz the iw scanner output parser
 fuzz-iw:
     cd whereamid && cargo fuzz run fuzz_iw_parser
 
+# Fuzz the nmcli scanner output parser
 fuzz-nmcli:
     cd whereamid && cargo fuzz run fuzz_nmcli_parser
 
+# Fuzz the Apple WPS protobuf decoder
 fuzz-apple:
     cd whereamid && cargo fuzz run fuzz_apple_decode
 
+# Fuzz the trilateration math
 fuzz-trilat:
     cd whereamid && cargo fuzz run fuzz_trilaterate
 
-# Run all fuzzers for 60s each
+# Quick smoke: 15s on every fuzz target (≈1 minute total)
+fuzz:
+    cd whereamid && cargo fuzz run fuzz_iw_parser     -- -max_total_time=15
+    cd whereamid && cargo fuzz run fuzz_nmcli_parser  -- -max_total_time=15
+    cd whereamid && cargo fuzz run fuzz_apple_decode  -- -max_total_time=15
+    cd whereamid && cargo fuzz run fuzz_trilaterate   -- -max_total_time=15
+
+# Long smoke: 60s on every fuzz target (≈4 minutes total)
 fuzz-all:
-    cd whereamid && cargo fuzz run fuzz_iw_parser -- -max_total_time=60
-    cd whereamid && cargo fuzz run fuzz_nmcli_parser -- -max_total_time=60
-    cd whereamid && cargo fuzz run fuzz_apple_decode -- -max_total_time=60
-    cd whereamid && cargo fuzz run fuzz_trilaterate -- -max_total_time=60
+    cd whereamid && cargo fuzz run fuzz_iw_parser     -- -max_total_time=60
+    cd whereamid && cargo fuzz run fuzz_nmcli_parser  -- -max_total_time=60
+    cd whereamid && cargo fuzz run fuzz_apple_decode  -- -max_total_time=60
+    cd whereamid && cargo fuzz run fuzz_trilaterate   -- -max_total_time=60
