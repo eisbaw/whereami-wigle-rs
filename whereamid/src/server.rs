@@ -466,34 +466,36 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                                 // If a newer fix has overwritten it we
                                 // leave it alone (the newer one will
                                 // resolve its own address).
-                                let persist = {
-                                    let mut last = bg_state.last_fix.lock().await;
-                                    if let Some(fix) = last.as_mut() {
-                                        if address_cache_key(fix.lat, fix.lon)
-                                            == address_cache_key(bg_lat, bg_lon)
-                                            && fix.address.is_none()
-                                        {
-                                            fix.address = Some(display.clone());
-                                            Some(crate::db::LastFixRow {
-                                                lat: fix.lat,
-                                                lon: fix.lon,
-                                                accuracy_m: fix.accuracy_m,
-                                                address: fix.address.clone(),
-                                                at_rfc3339: fix.at.to_rfc3339(),
-                                                sources: fix.sources as i64,
-                                            })
-                                        } else {
-                                            None
+                                //
+                                // The DB write happens *while we still hold*
+                                // the in-memory last_fix mutex (task-0046),
+                                // so a concurrent handle_locate cannot
+                                // replace the in-memory row, persist its own
+                                // newer row, and then have us overwrite that
+                                // newer row with stale lat/lon. Ordering is
+                                // last_fix (tokio) -> db (std), matching
+                                // handle_locate.
+                                let mut last = bg_state.last_fix.lock().await;
+                                if let Some(fix) = last.as_mut() {
+                                    if address_cache_key(fix.lat, fix.lon)
+                                        == address_cache_key(bg_lat, bg_lon)
+                                        && fix.address.is_none()
+                                    {
+                                        fix.address = Some(display.clone());
+                                        let row = crate::db::LastFixRow {
+                                            lat: fix.lat,
+                                            lon: fix.lon,
+                                            accuracy_m: fix.accuracy_m,
+                                            address: fix.address.clone(),
+                                            at_rfc3339: fix.at.to_rfc3339(),
+                                            sources: fix.sources as i64,
+                                        };
+                                        let db = lock_db(&bg_state);
+                                        if let Err(e) = db.set_last_fix(&row) {
+                                            warn!(
+                                                "failed to persist last_fix address backfill: {e}"
+                                            );
                                         }
-                                    } else {
-                                        None
-                                    }
-                                };
-                                // Persist updated address outside the lock.
-                                if let Some(row) = persist {
-                                    let db = lock_db(&bg_state);
-                                    if let Err(e) = db.set_last_fix(&row) {
-                                        warn!("failed to persist last_fix address backfill: {e}");
                                     }
                                 }
                             }
@@ -506,8 +508,22 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                 None
             };
 
-            // Save as last-known fix (in-memory and persisted to SQLite so
-            // that a restart can rehydrate the most recent position).
+            // Save as last-known fix: in-memory + SQLite, both under the
+            // last_fix mutex (task-0046).
+            //
+            // Holding the last_fix mutex across the DB write closes the race
+            // where two concurrent handle_locate calls could otherwise have
+            // their in-memory writes interleave with their DB writes:
+            //   T1 in-mem X, T1 drops, T2 in-mem Y, T2 drops + persists Y,
+            //   T1 persists X => disk diverges from in-memory.
+            //
+            // The DB writes are sync (no .await), so holding tokio::Mutex ->
+            // std::Mutex briefly is correct. Order matches the address-
+            // backfill task to avoid deadlock.
+            //
+            // History insert (task-0031) shares the same critical section
+            // because the cost of a second SQL statement is negligible vs
+            // the cost of duplicating the lock-scoping logic.
             let at = chrono::Utc::now();
             {
                 let mut last = state.last_fix.lock().await;
@@ -519,17 +535,6 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                     at,
                     sources: cached_count,
                 });
-            }
-            // Persist to DB. Failures are warned-only: a missed write here
-            // means we lose rehydration of THIS fix, but the in-memory copy
-            // is still authoritative until the daemon stops.
-            //
-            // Also record into the location-history timeseries (task-0031).
-            // Both writes are best-effort — a slow disk should not block the
-            // locate response. The whole block is sync inside the per-conn
-            // tokio task; we accept that the lock is held briefly across two
-            // SQL statements rather than spawning a separate task for it.
-            {
                 let db = lock_db(state);
                 if let Err(e) = db.set_last_fix(&crate::db::LastFixRow {
                     lat: pos.lat,
