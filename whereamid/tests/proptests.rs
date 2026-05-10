@@ -7,6 +7,19 @@ use whereamid::debounce::{Debouncer, ScanEntry, ScanSample};
 use whereamid::scanner::{normalize_bssid, parse_iw_output, split_nmcli_fields};
 use whereamid::trilaterate::{filter_outliers, trilaterate, PositionedAp};
 
+/// Local copy of haversine distance for proptest assertions; trilaterate.rs
+/// keeps its implementation private and we don't want to widen the API surface
+/// for tests.
+fn haversine_m_test(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const R: f64 = 6_371_000.0;
+    let d_lat = (lat2 - lat1).to_radians();
+    let d_lon = (lon2 - lon1).to_radians();
+    let a = (d_lat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (d_lon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+    R * c
+}
+
 // --- Trilateration properties ---
 
 proptest! {
@@ -23,9 +36,16 @@ proptest! {
         prop_assert!(!filtered.is_empty(), "filter_outliers returned empty for {} APs", aps.len());
     }
 
-    /// Trilateration result is within the bounding box of input APs (after outlier filtering).
+    /// Trilateration result lies within the spherical convex hull of input APs:
+    /// its haversine distance to every input AP is bounded by the diameter of
+    /// the input cluster.
+    ///
+    /// This is the spherically-correct version of "within the bounding box".
+    /// The lat/lon bounding-box property is wrong on a sphere — a great-circle
+    /// arc between two points can extend to higher latitudes than either
+    /// endpoint (think a flight London→Tokyo passing over Siberia).
     #[test]
-    fn trilaterate_within_bounds(
+    fn trilaterate_within_cluster_diameter(
         coords in prop::collection::vec((40.0f64..60.0, 5.0f64..20.0), 2..10)
     ) {
         let aps: Vec<PositionedAp> = coords
@@ -41,15 +61,22 @@ proptest! {
 
         let result = trilaterate(&filtered).unwrap();
 
-        let min_lat = filtered.iter().map(|a| a.lat).fold(f64::INFINITY, f64::min);
-        let max_lat = filtered.iter().map(|a| a.lat).fold(f64::NEG_INFINITY, f64::max);
-        let min_lon = filtered.iter().map(|a| a.lon).fold(f64::INFINITY, f64::min);
-        let max_lon = filtered.iter().map(|a| a.lon).fold(f64::NEG_INFINITY, f64::max);
+        // Compute the diameter of the input cluster (max pairwise haversine).
+        let mut diameter = 0.0_f64;
+        for i in 0..filtered.len() {
+            for j in (i + 1)..filtered.len() {
+                let d = haversine_m_test(filtered[i].lat, filtered[i].lon, filtered[j].lat, filtered[j].lon);
+                if d > diameter { diameter = d; }
+            }
+        }
 
-        prop_assert!(result.lat >= min_lat - 0.001 && result.lat <= max_lat + 0.001,
-            "lat {} outside bounds [{}, {}]", result.lat, min_lat, max_lat);
-        prop_assert!(result.lon >= min_lon - 0.001 && result.lon <= max_lon + 0.001,
-            "lon {} outside bounds [{}, {}]", result.lon, min_lon, max_lon);
+        // The centroid is no farther from any AP than the cluster diameter
+        // (with 1m slack for floating-point). This is a tight spherical-convex-hull bound.
+        for ap in &filtered {
+            let d = haversine_m_test(result.lat, result.lon, ap.lat, ap.lon);
+            prop_assert!(d <= diameter + 1.0,
+                "centroid->AP haversine {:.3}m exceeds cluster diameter {:.3}m", d, diameter);
+        }
     }
 
     /// Trilateration accuracy is always positive.
