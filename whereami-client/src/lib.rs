@@ -13,6 +13,14 @@ pub struct WhereAmIClient {
     addr: String,
 }
 
+/// Common shape of every daemon response (ok flag + optional error). Used
+/// by CLI dispatchers to handle the ok/error/json triage uniformly
+/// (task-0058).
+pub trait DaemonResponse {
+    fn is_ok(&self) -> bool;
+    fn error(&self) -> Option<&str>;
+}
+
 // --- Request types ---
 
 #[derive(Serialize)]
@@ -342,3 +350,25 @@ impl WhereAmIClient {
         self.request(&req)
     }
 }
+
+// task-0058: trait impls for every response so CLIs can dispatch
+// uniformly via `if !resp.is_ok() { fatal(resp.error()) }`.
+macro_rules! impl_daemon_response {
+    ($t:ty) => {
+        impl DaemonResponse for $t {
+            fn is_ok(&self) -> bool {
+                self.ok
+            }
+            fn error(&self) -> Option<&str> {
+                self.error.as_deref()
+            }
+        }
+    };
+}
+impl_daemon_response!(LocateResponse);
+impl_daemon_response!(ResolveResponse);
+impl_daemon_response!(ScanResponse);
+impl_daemon_response!(StatsResponse);
+impl_daemon_response!(DebugResponse);
+impl_daemon_response!(VersionResponse);
+impl_daemon_response!(HistoryResponse);

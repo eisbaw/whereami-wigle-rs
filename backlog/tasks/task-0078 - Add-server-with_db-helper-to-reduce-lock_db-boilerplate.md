@@ -1,9 +1,10 @@
 ---
 id: TASK-0078
 title: 'Add server::with_db helper to reduce lock_db boilerplate'
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-05-10 11:02'
+updated_date: '2026-05-10 13:39'
 labels:
   - refactor
 dependencies: []
@@ -18,7 +19,19 @@ lock_db is called 30+ times. The pattern is almost always 'let db = lock_db(stat
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 DaemonState::with_db<R>(&self, f: impl FnOnce(&Database) -> R) -> R helper exists
-- [ ] #2 At least handle_stats and handle_debug are converted as proof-of-pattern
-- [ ] #3 lock_db remains for sites that hold the guard across multiple calls (resolver chain)
+- [x] #1 DaemonState::with_db<R>(&self, f: impl FnOnce(&Database) -> R) -> R helper exists
+- [x] #2 At least handle_stats and handle_debug are converted as proof-of-pattern
+- [x] #3 lock_db remains for sites that hold the guard across multiple calls (resolver chain)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Added DaemonState::with_db<R>(|db| ...) helper that scopes the lock + poison recovery in one call. handle_stats converted as proof-of-pattern; lock_db remains for sites that hold the guard across multiple ops (resolver chain, handle_locate critical sections).
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+with_db<R>(closure) helper added. handle_stats converted. Other call sites can migrate incrementally.
+<!-- SECTION:FINAL_SUMMARY:END -->

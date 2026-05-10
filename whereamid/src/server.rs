@@ -46,9 +46,21 @@ pub const ADDRESS_CACHE_TTL_DAYS_DEFAULT: i64 = 7;
 
 /// Round (lat, lon) to a fixed-precision integer key. We use
 /// `(i32, i32)` rather than floats so equality is bit-exact and we
-/// don't have to worry about NaN comparisons. Negative coordinates
-/// round toward zero via `as i32`, which is what we want for keying.
+/// don't have to worry about NaN comparisons.
+///
+/// Trilateration only produces finite (lat, lon) and lat is bounded by
+/// [-90, 90], lon by [-180, 180]; with scale = 10^4 the absolute value
+/// is ≤ 1.8e6, well within i32 range. `f64 as i32` saturates on
+/// non-finite inputs (Rust 1.45+), so even a hypothetical NaN here would
+/// produce 0/0 — the cache would alias all NaNs to one cell, which is
+/// harmless because trilateration never produces NaN today and the cell
+/// would never be hit by a real query.
+/// task-0064: documented the saturation contract.
 fn address_cache_key(lat: f64, lon: f64) -> (i32, i32) {
+    debug_assert!(
+        lat.is_finite() && lon.is_finite(),
+        "address_cache_key called with non-finite ({lat}, {lon})"
+    );
     let scale = 10f64.powi(ADDRESS_CACHE_DECIMALS);
     ((lat * scale).round() as i32, (lon * scale).round() as i32)
 }
@@ -124,6 +136,24 @@ pub fn lock_db(state: &DaemonState) -> std::sync::MutexGuard<'_, crate::db::Data
     })
 }
 
+impl DaemonState {
+    /// Run a closure against the locked Database. Centralises the
+    /// poison-recovery + lock-scoping pattern so callers don't have to
+    /// do `let db = lock_db(state); db.foo()` every time. For
+    /// long-running access that spans multiple operations, use
+    /// `lock_db` directly to keep the guard alive across statements.
+    /// task-0078.
+    pub fn with_db<R>(&self, f: impl FnOnce(&crate::db::Database) -> R) -> R {
+        let db = self.db.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                "DB mutex was poisoned (a thread panicked while holding it) — recovering"
+            );
+            e.into_inner()
+        });
+        f(&db)
+    }
+}
+
 /// Shared daemon state, accessible from connection handlers.
 /// Database uses std::sync::Mutex because rusqlite::Connection is !Send.
 /// All DB ops are synchronous and fast, so we never hold the lock across await points.
@@ -163,23 +193,71 @@ pub struct LastFix {
     pub sources: usize,
 }
 
+// task-0059: bridge in-memory LastFix and on-disk LastFixRow. The
+// open-coded marshalling previously lived at three call sites in
+// handle_locate, the address-backfill task, and main.rs::main.
+impl From<&LastFix> for crate::db::LastFixRow {
+    fn from(fix: &LastFix) -> Self {
+        crate::db::LastFixRow {
+            lat: fix.lat,
+            lon: fix.lon,
+            accuracy_m: fix.accuracy_m,
+            address: fix.address.clone(),
+            at_rfc3339: fix.at.to_rfc3339(),
+            sources: fix.sources as i64,
+        }
+    }
+}
+
+impl TryFrom<crate::db::LastFixRow> for LastFix {
+    type Error = anyhow::Error;
+    fn try_from(row: crate::db::LastFixRow) -> Result<Self, Self::Error> {
+        let at = chrono::DateTime::parse_from_rfc3339(&row.at_rfc3339)
+            .map_err(|e| {
+                anyhow::anyhow!("unparseable last_fix timestamp {:?}: {e}", row.at_rfc3339)
+            })?
+            .with_timezone(&chrono::Utc);
+        Ok(LastFix {
+            lat: row.lat,
+            lon: row.lon,
+            accuracy_m: row.accuracy_m,
+            address: row.address,
+            at,
+            sources: row.sources.max(0) as usize,
+        })
+    }
+}
+
 // --- Protocol types ---
 
+/// Wire-protocol request, dispatched by the `cmd` field. task-0057
+/// replaced a flat struct with optional fields; the new shape makes
+/// illegal combinations (e.g. `cmd: locate` with `bssids` set) silently
+/// ignored by the command's variant rather than carried as ghost
+/// fields.
 #[derive(Deserialize, Debug)]
-struct Request {
-    cmd: String,
-    #[serde(default)]
-    bssids: Vec<String>,
-    /// Relative range for the `history` command (e.g. "7d", "24h").
-    /// Mutually exclusive with `from`/`to`.
-    #[serde(default)]
-    range: Option<String>,
-    /// Absolute start of the `history` range (RFC3339).
-    #[serde(default)]
-    from: Option<String>,
-    /// Absolute end of the `history` range (RFC3339).
-    #[serde(default)]
-    to: Option<String>,
+#[serde(tag = "cmd", rename_all = "lowercase")]
+enum Request {
+    Locate,
+    Resolve {
+        #[serde(default)]
+        bssids: Vec<String>,
+    },
+    Scan,
+    Stats,
+    Debug,
+    Version,
+    History {
+        /// Relative range (e.g. "7d", "24h"). Mutually exclusive with from/to.
+        #[serde(default)]
+        range: Option<String>,
+        /// Absolute start (RFC3339).
+        #[serde(default)]
+        from: Option<String>,
+        /// Absolute end (RFC3339).
+        #[serde(default)]
+        to: Option<String>,
+    },
 }
 
 #[derive(Serialize)]
@@ -266,6 +344,13 @@ fn error_json(msg: &str) -> String {
     .unwrap_or_else(|_| r#"{"ok":false,"v":1,"error":"serialization failed"}"#.to_string())
 }
 
+/// Serialize a response value or fall back to a generic error_json.
+/// Replaces the eight identical `serde_json::to_string(&resp).unwrap_or_else(...)`
+/// tails (task-0058).
+fn ok_json<T: Serialize>(t: &T) -> String {
+    serde_json::to_string(t).unwrap_or_else(|_| error_json("serialization failed"))
+}
+
 /// Start the TCP server. Runs until cancelled.
 pub async fn run_server(state: Arc<DaemonState>) -> Result<()> {
     let listener = TcpListener::bind(&state.args.bind).await?;
@@ -339,15 +424,16 @@ async fn handle_connection(stream: TcpStream, state: Arc<DaemonState>) -> Result
 }
 
 async fn dispatch_command(req: &Request, state: &Arc<DaemonState>) -> String {
-    match req.cmd.as_str() {
-        "locate" => handle_locate(state).await,
-        "resolve" => handle_resolve(&req.bssids, state).await,
-        "scan" => handle_scan(state).await,
-        "stats" => handle_stats(state).await,
-        "debug" => handle_debug(state).await,
-        "version" => handle_version(),
-        "history" => handle_history(req, state).await,
-        other => error_json(&format!("unknown command: {other}")),
+    match req {
+        Request::Locate => handle_locate(state).await,
+        Request::Resolve { bssids } => handle_resolve(bssids, state).await,
+        Request::Scan => handle_scan(state).await,
+        Request::Stats => handle_stats(state).await,
+        Request::Debug => handle_debug(state).await,
+        Request::Version => handle_version(),
+        Request::History { range, from, to } => {
+            handle_history(range.as_deref(), from.as_deref(), to.as_deref(), state).await
+        }
     }
 }
 
@@ -503,14 +589,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                                         && fix.address.is_none()
                                     {
                                         fix.address = Some(display.clone());
-                                        let row = crate::db::LastFixRow {
-                                            lat: fix.lat,
-                                            lon: fix.lon,
-                                            accuracy_m: fix.accuracy_m,
-                                            address: fix.address.clone(),
-                                            at_rfc3339: fix.at.to_rfc3339(),
-                                            sources: fix.sources as i64,
-                                        };
+                                        let row: crate::db::LastFixRow = (&*fix).into();
                                         let db = lock_db(&bg_state);
                                         if let Err(e) = db.set_last_fix(&row) {
                                             warn!(
@@ -548,23 +627,18 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
             let at = chrono::Utc::now();
             {
                 let mut last = state.last_fix.lock().await;
-                *last = Some(LastFix {
+                let new_fix = LastFix {
                     lat: pos.lat,
                     lon: pos.lon,
                     accuracy_m: pos.accuracy_m,
                     address: address.clone(),
                     at,
                     sources: cached_count,
-                });
+                };
+                let row: crate::db::LastFixRow = (&new_fix).into();
+                *last = Some(new_fix);
                 let db = lock_db(state);
-                if let Err(e) = db.set_last_fix(&crate::db::LastFixRow {
-                    lat: pos.lat,
-                    lon: pos.lon,
-                    accuracy_m: pos.accuracy_m,
-                    address: address.clone(),
-                    at_rfc3339: at.to_rfc3339(),
-                    sources: cached_count as i64,
-                }) {
+                if let Err(e) = db.set_last_fix(&row) {
                     warn!("failed to persist last_fix: {e}");
                 }
                 if let Err(e) = db.insert_fix(
@@ -594,7 +668,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                 stale: false,
                 age_s: None,
             };
-            serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+            ok_json(&resp)
         }
         Err(e) => {
             return_last_fix_or_error(
@@ -635,7 +709,7 @@ async fn return_last_fix_or_error(
             stale: true,
             age_s: Some(age_s),
         };
-        serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+        ok_json(&resp)
     } else {
         error_json(error_msg)
     }
@@ -693,7 +767,7 @@ async fn handle_resolve(bssids: &[String], state: &Arc<DaemonState>) -> String {
         v: 1,
         results,
     };
-    serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+    ok_json(&resp)
 }
 
 async fn handle_scan(state: &Arc<DaemonState>) -> String {
@@ -724,7 +798,7 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
         scan_age_ms,
         scanned_at,
     };
-    serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+    ok_json(&resp)
 }
 
 #[derive(Serialize)]
@@ -820,7 +894,7 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
         stable: stable_count,
         bssids,
     };
-    serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+    ok_json(&resp)
 }
 
 #[derive(Serialize)]
@@ -838,7 +912,7 @@ fn handle_version() -> String {
         version: env!("CARGO_PKG_VERSION"),
         git_rev: env!("GIT_REV"),
     };
-    serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+    ok_json(&resp)
 }
 
 #[derive(Serialize)]
@@ -853,10 +927,15 @@ struct HistoryResponse {
     segments: Vec<crate::history::Segment>,
 }
 
-async fn handle_history(req: &Request, state: &Arc<DaemonState>) -> String {
+async fn handle_history(
+    range: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    state: &Arc<DaemonState>,
+) -> String {
     // Resolve range: either `range="7d"` shorthand OR explicit from/to RFC3339.
     // Mutually exclusive. If neither is provided, default to the last 7 days.
-    let (from, to) = match (&req.range, &req.from, &req.to) {
+    let (from, to) = match (range, from, to) {
         (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
             return error_json("history: 'range' and 'from'/'to' are mutually exclusive");
         }
@@ -878,7 +957,9 @@ async fn handle_history(req: &Request, state: &Arc<DaemonState>) -> String {
             }
             (f, t)
         }
-        (None, None, None) => crate::history::parse_range("7d").unwrap(),
+        (None, None, None) => {
+            crate::history::parse_range("7d").expect("hardcoded default range '7d' must parse")
+        }
         _ => return error_json("history: provide either 'range' or both 'from' and 'to'"),
     };
 
@@ -903,27 +984,23 @@ async fn handle_history(req: &Request, state: &Arc<DaemonState>) -> String {
         to: to.to_rfc3339(),
         segments,
     };
-    serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+    ok_json(&resp)
 }
 
 async fn handle_stats(state: &Arc<DaemonState>) -> String {
-    let db = lock_db(state);
-    let cached = db.cached_ap_count().unwrap_or(0);
-    let pending = db.pending_ap_count().unwrap_or(0);
-    let not_found = db.not_found_ap_count().unwrap_or(0);
-    let db_size = db.db_size_bytes().unwrap_or(0);
-    let api_calls = db.api_calls_today().unwrap_or(0);
-
-    let resp = StatsResponse {
+    // task-0078: with_db scopes the lock automatically and centralises
+    // poison recovery. Each .unwrap_or(0) here logs nothing on failure;
+    // task-0076 may add a counter later.
+    let resp = state.with_db(|db| StatsResponse {
         ok: true,
         v: 1,
-        cached_aps: cached,
-        pending_aps: pending,
-        not_found_aps: not_found,
-        db_size_bytes: db_size,
-        api_calls_today: api_calls,
-    };
-    serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+        cached_aps: db.cached_ap_count().unwrap_or(0),
+        pending_aps: db.pending_ap_count().unwrap_or(0),
+        not_found_aps: db.not_found_ap_count().unwrap_or(0),
+        db_size_bytes: db.db_size_bytes().unwrap_or(0),
+        api_calls_today: db.api_calls_today().unwrap_or(0),
+    });
+    ok_json(&resp)
 }
 
 #[cfg(test)]

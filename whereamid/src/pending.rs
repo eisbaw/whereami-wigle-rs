@@ -5,7 +5,9 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
 
 use crate::provider::Provider;
-use crate::resolver::{resolve_chain, ChainPolicy, HardStopAction, NetErrorAction, SkipAction};
+use crate::resolver::{
+    resolve_chain, ChainPolicy, HardStopAction, NetErrorAction, NotFoundPolicy, SkipAction,
+};
 use crate::server::DaemonState;
 
 /// Spawn the pending queue drain loop. Runs every `pending_interval` seconds.
@@ -78,65 +80,24 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
     // resolution, so don't pre-filter on cache or not_found. On WiGLE
     // network errors, increment the existing pending row's attempts.
     //
-    // mark_not_found_at_chain_end is enabled but the chain itself only
-    // fires it when EVERY provider returned a definitive NotFound for the
-    // BSSID. Any transient error (network/rate-limit/skipped/hard-stop)
-    // suppresses the not_found mark, so a flaky network does not poison
-    // the not_found cache. When the mark fires, the chain also leaves the
-    // pending row in place; we explicitly remove it here so the BSSID
-    // does not retry every drain pass and burn API quota on something we
-    // already know nobody can resolve.
+    // The chain only fires the not_found mark when EVERY provider
+    // returned a definitive NotFound for the BSSID (task-0045's
+    // transient_error guard). When that happens, delete_pending_on_not_found
+    // (task-0052) removes the pending row in the same critical section,
+    // so this drain replaces the now-removed drain_cleanup_after_chain.
     let bssids: Vec<String> = pending.iter().map(|p| p.bssid.clone()).collect();
     let policy = ChainPolicy {
         skip_cached: false,
         skip_not_found: false,
         write_through: true,
         delete_pending_on_success: true,
-        mark_not_found_per_provider: false,
-        mark_not_found_at_chain_end: true,
+        delete_pending_on_not_found: true,
+        not_found: NotFoundPolicy::AtChainEnd,
         on_skipped: SkipAction::NextProvider,
         on_network_error: NetErrorAction::IncrementPending,
         on_hard_stop: HardStopAction::Stop,
     };
-    let result = resolve_chain(&bssids, state, &[Provider::Apple, Provider::Wigle], &policy).await;
-    drain_cleanup_after_chain(state, &bssids, &result).await;
-}
-
-/// Post-chain cleanup for the drain path: any BSSID the chain just marked
-/// not_found in this pass must be removed from pending so it doesn't retry
-/// on every drain. Extracted from drain_once so tests can drive the
-/// cleanup logic with a Provider::Mock.
-async fn drain_cleanup_after_chain(
-    state: &Arc<DaemonState>,
-    bssids: &[String],
-    result: &crate::resolver::ResolveResult,
-) {
-    // Whatever the chain just marked not_found is now redundantly pending
-    // and would retry on every drain. Remove those pending rows so the
-    // not_found TTL is the sole gate going forward (task-0045).
-    let db = crate::server::lock_db(state);
-    for bssid in bssids {
-        // resolved == in result.fetched_bssids OR present in result.positioned;
-        // but pending-row deletion-on-success was already handled by the chain
-        // (delete_pending_on_success=true). We only need to clean up the
-        // newly-marked not_found ones here.
-        let was_resolved = result.fetched_bssids.contains(bssid)
-            || result.positioned.iter().any(|a| &a.bssid == bssid);
-        if was_resolved {
-            continue;
-        }
-        // is_not_found() returns true for entries within TTL. If the chain
-        // just marked it, this will be true.
-        match db.is_not_found(bssid, state.args.not_found_ttl_days) {
-            Ok(true) => {
-                if let Err(e) = db.delete_pending(bssid) {
-                    warn!("failed to delete pending {bssid} after not_found mark: {e}");
-                }
-            }
-            Ok(false) => {}
-            Err(e) => warn!("is_not_found probe failed for {bssid}: {e}"),
-        }
-    }
+    let _ = resolve_chain(&bssids, state, &[Provider::Apple, Provider::Wigle], &policy).await;
 }
 
 #[cfg(test)]
@@ -145,7 +106,9 @@ mod tests {
     use crate::config::Args;
     use crate::db::Database;
     use crate::provider::{MockProvider, ProviderOutcome};
-    use crate::resolver::{resolve_chain, ChainPolicy, HardStopAction, NetErrorAction, SkipAction};
+    use crate::resolver::{
+        resolve_chain, ChainPolicy, HardStopAction, NetErrorAction, NotFoundPolicy, SkipAction,
+    };
     use crate::server::{AddressCache, DaemonState};
     use clap::Parser;
 
@@ -171,20 +134,22 @@ mod tests {
             skip_not_found: false,
             write_through: true,
             delete_pending_on_success: true,
-            mark_not_found_per_provider: false,
-            mark_not_found_at_chain_end: true,
+            delete_pending_on_not_found: true,
+            not_found: NotFoundPolicy::AtChainEnd,
             on_skipped: SkipAction::NextProvider,
             on_network_error: NetErrorAction::IncrementPending,
             on_hard_stop: HardStopAction::Stop,
         }
     }
 
-    /// task-0045 + drain_cleanup_after_chain end-to-end:
-    /// definitive NotFound from every provider results in (1) the BSSID
-    /// being marked not_found in the DB, AND (2) the BSSID being deleted
-    /// from pending so it won't retry on every drain.
+    /// task-0045 + task-0052 end-to-end: definitive NotFound from every
+    /// provider results in (1) the BSSID being marked not_found in the DB,
+    /// AND (2) the BSSID being deleted from pending so it won't retry on
+    /// every drain. Both happen inside resolve_chain via the
+    /// delete_pending_on_not_found policy bit (drain_cleanup_after_chain
+    /// was collapsed in task-0052).
     #[tokio::test]
-    async fn drain_cleanup_deletes_pending_after_definitive_not_found() {
+    async fn drain_chain_marks_not_found_and_deletes_pending_on_definitive_miss() {
         let state = test_state();
         let bssid = "aa:bb:cc:dd:ee:f1".to_string();
 
@@ -200,14 +165,13 @@ mod tests {
             crate::provider::Provider::Mock(std::sync::Arc::clone(&mock_a)),
             crate::provider::Provider::Mock(std::sync::Arc::clone(&mock_b)),
         ];
-        let result = resolve_chain(
+        let _ = resolve_chain(
             std::slice::from_ref(&bssid),
             &state,
             &providers,
             &drain_policy(),
         )
         .await;
-        drain_cleanup_after_chain(&state, std::slice::from_ref(&bssid), &result).await;
 
         let nf = crate::server::lock_db(&state)
             .is_not_found(&bssid, state.args.not_found_ttl_days)
@@ -216,14 +180,14 @@ mod tests {
         let pending = crate::server::lock_db(&state).is_pending(&bssid).unwrap();
         assert!(
             !pending,
-            "pending row must be deleted after definitive not_found"
+            "pending row must be deleted by the chain when not_found is marked"
         );
     }
 
     /// Counterexample: a transient NetworkError must NOT delete the pending
     /// row (the row is still pending, not_found wasn't marked).
     #[tokio::test]
-    async fn drain_cleanup_keeps_pending_when_transient_error() {
+    async fn drain_chain_keeps_pending_when_transient_error() {
         let state = test_state();
         let bssid = "aa:bb:cc:dd:ee:f2".to_string();
 
@@ -239,14 +203,13 @@ mod tests {
             crate::provider::Provider::Mock(std::sync::Arc::clone(&mock_a)),
             crate::provider::Provider::Mock(std::sync::Arc::clone(&mock_b)),
         ];
-        let result = resolve_chain(
+        let _ = resolve_chain(
             std::slice::from_ref(&bssid),
             &state,
             &providers,
             &drain_policy(),
         )
         .await;
-        drain_cleanup_after_chain(&state, std::slice::from_ref(&bssid), &result).await;
 
         let nf = crate::server::lock_db(&state)
             .is_not_found(&bssid, state.args.not_found_ttl_days)

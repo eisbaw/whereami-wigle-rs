@@ -92,6 +92,25 @@ pub enum HardStopAction {
     QueuePendingAndStop,
 }
 
+/// When the chain should record a not_found entry for a missed BSSID.
+/// Replaces the prior pair of booleans (mark_not_found_per_provider +
+/// mark_not_found_at_chain_end) which permitted two illegal combinations
+/// (both true / both false). task-0052.
+#[derive(Clone, Copy)]
+pub enum NotFoundPolicy {
+    /// Mark not_found as soon as any provider returns NotFound. Used by
+    /// resolve_readonly which has a single provider.
+    PerProvider,
+    /// Mark not_found only when every provider in the chain returned a
+    /// definitive NotFound. Used by resolve_background and pending drain
+    /// (transient errors suppress the mark via task-0045).
+    AtChainEnd,
+    /// Never mark not_found. No production path uses this today; kept
+    /// as a meaningful "off" rather than `Option<NotFoundPolicy>`.
+    #[allow(dead_code)]
+    Never,
+}
+
 /// Cross-cutting policy that distinguishes the three resolution flows.
 pub struct ChainPolicy {
     /// Skip BSSIDs already present in the `aps` cache before calling any provider.
@@ -102,12 +121,12 @@ pub struct ChainPolicy {
     pub write_through: bool,
     /// On a successful resolution, delete the BSSID from the pending queue.
     pub delete_pending_on_success: bool,
-    /// On a provider's authoritative NotFound, immediately mark not_found
-    /// (instead of waiting for the whole chain to miss).
-    pub mark_not_found_per_provider: bool,
-    /// At end of chain, mark not_found if no provider resolved it AND it
-    /// is not currently in the pending queue.
-    pub mark_not_found_at_chain_end: bool,
+    /// On a definitive end-of-chain not_found mark, also delete the
+    /// pending row for that BSSID (otherwise the drain loop would retry
+    /// every cycle and burn API quota on something every provider just
+    /// said doesn't exist). task-0052 collapses drain_cleanup_after_chain.
+    pub delete_pending_on_not_found: bool,
+    pub not_found: NotFoundPolicy,
     pub on_skipped: SkipAction,
     pub on_network_error: NetErrorAction,
     pub on_hard_stop: HardStopAction,
@@ -261,7 +280,7 @@ pub async fn resolve_chain(
                 }
                 ProviderOutcome::NotFound => {
                     debug!("{}: {bssid} not found", provider.name());
-                    if policy.mark_not_found_per_provider {
+                    if matches!(policy.not_found, NotFoundPolicy::PerProvider) {
                         let db = crate::server::lock_db(state);
                         if let Err(e) = db.insert_not_found(bssid) {
                             warn!("failed to insert not_found {bssid}: {e}");
@@ -335,7 +354,7 @@ pub async fn resolve_chain(
     // batch. That bounded the cost but silently misclassified pending
     // BSSIDs that fell outside the first 1000 rows. Use the indexed
     // is_pending probe instead — it is O(log n) per BSSID and never lies.
-    if policy.mark_not_found_at_chain_end {
+    if matches!(policy.not_found, NotFoundPolicy::AtChainEnd) {
         let db = crate::server::lock_db(state);
         for bssid in bssids {
             if resolved.contains(bssid) {
@@ -364,6 +383,15 @@ pub async fn resolve_chain(
             if let Err(e) = db.insert_not_found(bssid) {
                 warn!("failed to insert not_found {bssid}: {e}");
             }
+            // task-0052: collapse drain_cleanup_after_chain — when the
+            // chain marks not_found, also remove the pending row so the
+            // drain loop doesn't retry it every cycle. Only fires under
+            // delete_pending_on_not_found.
+            if policy.delete_pending_on_not_found {
+                if let Err(e) = db.delete_pending(bssid) {
+                    warn!("failed to delete pending {bssid} after not_found mark: {e}");
+                }
+            }
         }
     }
 
@@ -382,11 +410,11 @@ pub async fn resolve_readonly(bssids: &[String], state: &Arc<DaemonState>) -> Re
         skip_not_found: true,
         write_through: false,
         delete_pending_on_success: false,
+        delete_pending_on_not_found: false,
         // Mirror prior behavior: write not_found to avoid burning quota
-        // on repeat lookups. Per-provider is fine because the chain has a
+        // on repeat lookups. PerProvider is fine because the chain has a
         // single provider here.
-        mark_not_found_per_provider: true,
-        mark_not_found_at_chain_end: false,
+        not_found: NotFoundPolicy::PerProvider,
         on_skipped: SkipAction::NextProvider,
         on_network_error: NetErrorAction::Ignore,
         on_hard_stop: HardStopAction::Stop,
@@ -402,10 +430,10 @@ pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
         skip_not_found: true,
         write_through: true,
         delete_pending_on_success: false,
+        delete_pending_on_not_found: false,
         // Don't mark not_found per-provider: Apple may not know it but
         // WiGLE might (and vice versa). Decide at end of chain.
-        mark_not_found_per_provider: false,
-        mark_not_found_at_chain_end: true,
+        not_found: NotFoundPolicy::AtChainEnd,
         on_skipped: SkipAction::QueuePending,
         on_network_error: NetErrorAction::QueuePending,
         on_hard_stop: HardStopAction::QueuePendingAndStop,
@@ -462,8 +490,8 @@ mod tests {
             skip_not_found: true,
             write_through: true,
             delete_pending_on_success: false,
-            mark_not_found_per_provider: false,
-            mark_not_found_at_chain_end: true,
+            delete_pending_on_not_found: false,
+            not_found: NotFoundPolicy::AtChainEnd,
             on_skipped: SkipAction::NextProvider,
             on_network_error: NetErrorAction::Ignore,
             on_hard_stop: HardStopAction::Stop,

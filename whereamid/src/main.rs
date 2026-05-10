@@ -70,20 +70,10 @@ async fn main() -> Result<()> {
     // completes. A malformed or out-of-range timestamp is treated as "no
     // last fix" — better to skip than to crash on startup.
     let initial_last_fix = match db.get_last_fix() {
-        Ok(Some(row)) => match chrono::DateTime::parse_from_rfc3339(&row.at_rfc3339) {
-            Ok(at) => Some(server::LastFix {
-                lat: row.lat,
-                lon: row.lon,
-                accuracy_m: row.accuracy_m,
-                address: row.address,
-                at: at.with_timezone(&chrono::Utc),
-                sources: row.sources.max(0) as usize,
-            }),
+        Ok(Some(row)) => match server::LastFix::try_from(row) {
+            Ok(fix) => Some(fix),
             Err(e) => {
-                tracing::warn!(
-                    "discarding persisted last_fix with unparseable timestamp '{}': {e}",
-                    row.at_rfc3339
-                );
+                tracing::warn!("discarding persisted last_fix: {e}");
                 None
             }
         },
