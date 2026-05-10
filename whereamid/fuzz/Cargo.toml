@@ -33,6 +33,11 @@ path = "fuzz_targets/fuzz_apple_decode.rs"
 doc = false
 
 [[bin]]
+name = "fuzz_apple_encode"
+path = "fuzz_targets/fuzz_apple_encode.rs"
+doc = false
+
+[[bin]]
 name = "fuzz_trilaterate"
 path = "fuzz_targets/fuzz_trilaterate.rs"
 doc = false

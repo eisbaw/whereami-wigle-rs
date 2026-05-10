@@ -54,20 +54,26 @@ fuzz-nmcli:
 fuzz-apple:
     cd whereamid && cargo fuzz run fuzz_apple_decode
 
+# Fuzz the Apple WPS protobuf encoder (length-field invariant)
+fuzz-apple-encode:
+    cd whereamid && cargo fuzz run fuzz_apple_encode
+
 # Fuzz the trilateration math
 fuzz-trilat:
     cd whereamid && cargo fuzz run fuzz_trilaterate
 
-# Quick smoke: 15s on every fuzz target (≈1 minute total)
+# Quick smoke: 15s on every fuzz target (≈75s total)
 fuzz:
-    cd whereamid && cargo fuzz run fuzz_iw_parser     -- -max_total_time=15
-    cd whereamid && cargo fuzz run fuzz_nmcli_parser  -- -max_total_time=15
-    cd whereamid && cargo fuzz run fuzz_apple_decode  -- -max_total_time=15
-    cd whereamid && cargo fuzz run fuzz_trilaterate   -- -max_total_time=15
+    cd whereamid && cargo fuzz run fuzz_iw_parser      -- -max_total_time=15
+    cd whereamid && cargo fuzz run fuzz_nmcli_parser   -- -max_total_time=15
+    cd whereamid && cargo fuzz run fuzz_apple_decode   -- -max_total_time=15
+    cd whereamid && cargo fuzz run fuzz_apple_encode   -- -max_total_time=15
+    cd whereamid && cargo fuzz run fuzz_trilaterate    -- -max_total_time=15
 
-# Long smoke: 60s on every fuzz target (≈4 minutes total)
+# Long smoke: 60s on every fuzz target (≈5 minutes total)
 fuzz-all:
-    cd whereamid && cargo fuzz run fuzz_iw_parser     -- -max_total_time=60
-    cd whereamid && cargo fuzz run fuzz_nmcli_parser  -- -max_total_time=60
-    cd whereamid && cargo fuzz run fuzz_apple_decode  -- -max_total_time=60
-    cd whereamid && cargo fuzz run fuzz_trilaterate   -- -max_total_time=60
+    cd whereamid && cargo fuzz run fuzz_iw_parser      -- -max_total_time=60
+    cd whereamid && cargo fuzz run fuzz_nmcli_parser   -- -max_total_time=60
+    cd whereamid && cargo fuzz run fuzz_apple_decode   -- -max_total_time=60
+    cd whereamid && cargo fuzz run fuzz_apple_encode   -- -max_total_time=60
+    cd whereamid && cargo fuzz run fuzz_trilaterate    -- -max_total_time=60

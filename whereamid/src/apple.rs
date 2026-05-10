@@ -73,7 +73,7 @@ impl AppleClient {
 
 /// Encode the Apple WPS protobuf request.
 /// Hand-encoded to avoid protobuf dependency.
-pub(crate) fn encode_request(bssids: &[String]) -> Vec<u8> {
+pub fn encode_request(bssids: &[String]) -> Vec<u8> {
     // Build the inner protobuf (AppleWLoc message)
     let mut proto = Vec::new();
 
