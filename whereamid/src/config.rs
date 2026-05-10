@@ -68,6 +68,21 @@ pub struct Args {
     /// Include approximate street address in locate responses (via OSM Nominatim)
     #[arg(long)]
     pub address_approx: bool,
+
+    /// TTL for cached reverse-geocoded addresses (days). After this, an
+    /// entry is re-resolved on the next locate at that grid cell.
+    #[arg(long, default_value_t = 7)]
+    pub address_cache_ttl_days: i64,
+
+    /// Total HTTP request timeout for fast endpoints (Apple WPS, WiGLE) in seconds.
+    /// Connect timeout is fixed at 5s.
+    #[arg(long, default_value_t = 15)]
+    pub http_timeout_secs: u64,
+
+    /// Total HTTP request timeout for the OSM Nominatim endpoint in seconds.
+    /// Nominatim's public instance is frequently slow under load.
+    #[arg(long, default_value_t = 30)]
+    pub nominatim_timeout_secs: u64,
 }
 
 impl Args {
@@ -109,6 +124,15 @@ impl Args {
         }
         if self.not_found_ttl_days <= 0 {
             anyhow::bail!("--not-found-ttl-days must be > 0");
+        }
+        if self.address_cache_ttl_days < 0 {
+            anyhow::bail!("--address-cache-ttl-days must be >= 0 (0 disables the cache)");
+        }
+        if self.http_timeout_secs == 0 {
+            anyhow::bail!("--http-timeout-secs must be > 0");
+        }
+        if self.nominatim_timeout_secs == 0 {
+            anyhow::bail!("--nominatim-timeout-secs must be > 0");
         }
         Ok(())
     }

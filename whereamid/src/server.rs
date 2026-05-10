@@ -28,6 +28,10 @@ const ADDRESS_CACHE_DECIMALS: i32 = 4;
 /// insertion order) because the access pattern is "small set of locations
 /// you actually visit". A real LRU would be overkill for one user.
 const ADDRESS_CACHE_CAP: usize = 256;
+/// Default TTL for an address-cache entry. Address strings can drift
+/// (renamed streets, business closures, evolving Nominatim coverage), so
+/// we re-resolve after 7 days. CLI configurable via --address-cache-ttl-days.
+pub const ADDRESS_CACHE_TTL_DAYS_DEFAULT: i64 = 7;
 
 /// Round (lat, lon) to a fixed-precision integer key. We use
 /// `(i32, i32)` rather than floats so equality is bit-exact and we
@@ -38,29 +42,59 @@ fn address_cache_key(lat: f64, lon: f64) -> (i32, i32) {
     ((lat * scale).round() as i32, (lon * scale).round() as i32)
 }
 
+/// Cache entry: (address, inserted_at). The timestamp is used to expire
+/// stale entries after the configured TTL.
+struct AddressCacheEntry {
+    address: String,
+    inserted_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Tiny bounded cache mapping rounded (lat, lon) -> resolved address.
 /// `order` tracks insertion order so we can evict the oldest entry when
 /// capacity is exceeded. Not LRU; access doesn't promote.
+///
+/// Entries also expire after `ttl_days` to handle drift in Nominatim
+/// (renamed streets, closed businesses, expanded coverage). The TTL is
+/// checked on read so expired entries are reported as misses.
 pub struct AddressCache {
-    map: std::collections::HashMap<(i32, i32), String>,
+    map: std::collections::HashMap<(i32, i32), AddressCacheEntry>,
     order: std::collections::VecDeque<(i32, i32)>,
+    ttl_days: i64,
 }
 
 impl AddressCache {
+    /// Create an address cache with the default TTL. Production code uses
+    /// `with_ttl_days` to honour --address-cache-ttl-days; this exists for
+    /// tests and external consumers.
+    #[allow(dead_code)]
     pub fn new() -> Self {
+        Self::with_ttl_days(ADDRESS_CACHE_TTL_DAYS_DEFAULT)
+    }
+
+    pub fn with_ttl_days(ttl_days: i64) -> Self {
         Self {
             map: std::collections::HashMap::new(),
             order: std::collections::VecDeque::new(),
+            ttl_days,
         }
     }
 
     pub fn get(&self, lat: f64, lon: f64) -> Option<String> {
-        self.map.get(&address_cache_key(lat, lon)).cloned()
+        let entry = self.map.get(&address_cache_key(lat, lon))?;
+        let age_days = (chrono::Utc::now() - entry.inserted_at).num_days();
+        if age_days >= self.ttl_days {
+            return None;
+        }
+        Some(entry.address.clone())
     }
 
     pub fn insert(&mut self, lat: f64, lon: f64, addr: String) {
         let key = address_cache_key(lat, lon);
-        if self.map.insert(key, addr).is_none() {
+        let entry = AddressCacheEntry {
+            address: addr,
+            inserted_at: chrono::Utc::now(),
+        };
+        if self.map.insert(key, entry).is_none() {
             self.order.push_back(key);
             while self.order.len() > ADDRESS_CACHE_CAP {
                 if let Some(oldest) = self.order.pop_front() {
@@ -806,6 +840,37 @@ mod tests {
         assert!(
             cache.order.len() <= ADDRESS_CACHE_CAP,
             "order must respect capacity"
+        );
+    }
+
+    /// TTL: an entry whose inserted_at is older than ttl_days reads back
+    /// as None. We avoid waiting in real time by directly setting
+    /// `inserted_at` on the stored entry to a fabricated past timestamp.
+    #[test]
+    fn address_cache_expires_after_ttl() {
+        let mut cache = AddressCache::with_ttl_days(7);
+        cache.insert(55.6684, 12.5541, "Copenhagen".to_string());
+        assert_eq!(cache.get(55.6684, 12.5541).as_deref(), Some("Copenhagen"));
+
+        // Force the entry's inserted_at into the distant past (8 days ago).
+        let key = address_cache_key(55.6684, 12.5541);
+        cache.map.get_mut(&key).unwrap().inserted_at =
+            chrono::Utc::now() - chrono::TimeDelta::days(8);
+
+        assert!(
+            cache.get(55.6684, 12.5541).is_none(),
+            "entry older than TTL must read back as None"
+        );
+    }
+
+    /// TTL of 0 means every read is a miss (useful for disabling).
+    #[test]
+    fn address_cache_zero_ttl_always_misses() {
+        let mut cache = AddressCache::with_ttl_days(0);
+        cache.insert(0.0, 0.0, "anywhere".to_string());
+        assert!(
+            cache.get(0.0, 0.0).is_none(),
+            "ttl_days=0 must produce always-miss behaviour"
         );
     }
 }

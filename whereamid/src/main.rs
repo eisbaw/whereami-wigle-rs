@@ -90,8 +90,13 @@ async fn main() -> Result<()> {
 
     // Initialize shared state
     let debouncer = Debouncer::new(args.debounce_window, args.debounce_threshold);
-    let wigle_client =
-        wigle::WigleClient::new(&config_file.wigle.api_user, &config_file.wigle.api_key);
+    let http_timeout = Duration::from_secs(args.http_timeout_secs);
+    let nominatim_timeout = Duration::from_secs(args.nominatim_timeout_secs);
+    let wigle_client = wigle::WigleClient::with_timeout(
+        &config_file.wigle.api_user,
+        &config_file.wigle.api_key,
+        http_timeout,
+    );
 
     if !wigle_client.is_configured() {
         tracing::warn!("WiGLE credentials not configured - remote lookups disabled");
@@ -100,13 +105,15 @@ async fn main() -> Result<()> {
     let state = Arc::new(DaemonState {
         db: std::sync::Mutex::new(db),
         debouncer: tokio::sync::Mutex::new(debouncer),
+        apple: apple::AppleClient::with_timeout(http_timeout),
+        nominatim: nominatim::NominatimClient::with_timeout(nominatim_timeout),
+        address_cache: std::sync::Mutex::new(server::AddressCache::with_ttl_days(
+            args.address_cache_ttl_days,
+        )),
         args: args.clone(),
         wigle: wigle_client,
-        apple: apple::AppleClient::new(),
-        nominatim: nominatim::NominatimClient::new(),
         last_fix: tokio::sync::Mutex::new(initial_last_fix),
         inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
-        address_cache: std::sync::Mutex::new(server::AddressCache::new()),
     });
 
     // Spawn background scan loop

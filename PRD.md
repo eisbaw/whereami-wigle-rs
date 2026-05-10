@@ -25,6 +25,11 @@ earlier prototypes read back correctly at priority 20, but no BeaconDB
 client runs today (the API returns aggregate position, not per-AP, so
 it does not fit the per-BSSID Provider chain).
 
+HTTP timeouts are CLI-configurable via `--http-timeout-secs` (default 15s,
+applies to Apple WPS and WiGLE) and `--nominatim-timeout-secs` (default
+30s). The reverse-geocoded address cache TTL is configurable via
+`--address-cache-ttl-days` (default 7; 0 disables caching).
+
 ### whereamid (daemon)
 
 Long-running process. Listens on a TCP socket (default `127.0.0.1:4747`). Newline-delimited JSON protocol (one JSON object per line, one JSON response per line). No HTTP overhead — just raw TCP + JSON lines.

@@ -60,10 +60,18 @@ struct WigleResult {
 }
 
 impl WigleClient {
+    /// Default-timeout constructor. Production code uses `with_timeout` to
+    /// honour the CLI flag; this exists for tests and external consumers.
+    #[allow(dead_code)]
     pub fn new(api_user: &str, api_key: &str) -> Self {
-        let client = client_with_timeout(REQUEST_TIMEOUT_FAST);
+        Self::with_timeout(api_user, api_key, REQUEST_TIMEOUT_FAST)
+    }
+
+    /// Construct with an explicit HTTP request timeout. Used by main.rs to
+    /// honour --http-timeout-secs.
+    pub fn with_timeout(api_user: &str, api_key: &str, total: std::time::Duration) -> Self {
         Self {
-            client,
+            client: client_with_timeout(total),
             api_user: api_user.to_string(),
             api_key: api_key.to_string(),
         }

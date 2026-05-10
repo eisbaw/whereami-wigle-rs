@@ -18,15 +18,24 @@ pub struct AppleClient {
 
 impl Default for AppleClient {
     fn default() -> Self {
-        Self {
-            client: client_with_timeout(REQUEST_TIMEOUT_FAST),
-        }
+        Self::with_timeout(REQUEST_TIMEOUT_FAST)
     }
 }
 
 impl AppleClient {
+    /// Default-timeout constructor. Production code uses `with_timeout` to
+    /// honour the CLI flag; this exists for tests and external consumers.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct with an explicit HTTP request timeout. Used by main.rs to
+    /// honour --http-timeout-secs.
+    pub fn with_timeout(total: std::time::Duration) -> Self {
+        Self {
+            client: client_with_timeout(total),
+        }
     }
 
     /// Look up a single BSSID via Apple WPS. Returns None if not found.

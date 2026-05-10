@@ -43,9 +43,18 @@ pub struct NominatimClient {
 }
 
 impl NominatimClient {
+    /// Default-timeout constructor. Production code uses `with_timeout` to
+    /// honour the CLI flag; this exists for tests and external consumers.
+    #[allow(dead_code)]
     pub fn new() -> Self {
+        Self::with_timeout(REQUEST_TIMEOUT_NOMINATIM)
+    }
+
+    /// Construct with an explicit HTTP request timeout. Used by main.rs to
+    /// honour --nominatim-timeout-secs.
+    pub fn with_timeout(total: Duration) -> Self {
         Self {
-            client: client_with_timeout(REQUEST_TIMEOUT_NOMINATIM),
+            client: client_with_timeout(total),
             // Initialize to the past so first request goes through immediately
             last_request: Mutex::new(Instant::now() - Duration::from_secs(2)),
         }
