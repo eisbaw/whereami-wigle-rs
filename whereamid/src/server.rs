@@ -18,6 +18,13 @@ use crate::wigle::WigleClient;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BYTES: u64 = 64 * 1024; // 64 KiB max request size
 
+/// Maximum number of BSSIDs accepted in a single `resolve` request.
+/// MAX_REQUEST_BYTES bounds the wire size, but a 64 KiB JSON of 6-byte
+/// BSSIDs is ~7000 entries; resolve_chain takes the DB lock per BSSID,
+/// so an unbounded count would let one hostile request starve the rest
+/// of the daemon. task-0053.
+const MAX_RESOLVE_BSSIDS: usize = 256;
+
 /// Address-cache parameters.
 ///
 /// Key precision: 4 decimal degrees ~ 11 m at the equator. Locate fixes
@@ -626,6 +633,12 @@ async fn handle_resolve(bssids: &[String], state: &Arc<DaemonState>) -> String {
 
     if bssids.is_empty() {
         return error_json("resolve requires non-empty bssids array");
+    }
+    if bssids.len() > MAX_RESOLVE_BSSIDS {
+        return error_json(&format!(
+            "resolve accepts at most {MAX_RESOLVE_BSSIDS} BSSIDs per request (got {})",
+            bssids.len()
+        ));
     }
 
     let normalized: Vec<String> = bssids
