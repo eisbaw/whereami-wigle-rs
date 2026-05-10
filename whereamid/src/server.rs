@@ -9,7 +9,6 @@ use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::apple::AppleClient;
-use crate::beacondb::BeaconDbClient;
 use crate::config::Args;
 use crate::db::Database;
 use crate::debounce::Debouncer;
@@ -88,8 +87,6 @@ pub struct DaemonState {
     pub debouncer: tokio::sync::Mutex<Debouncer>,
     pub args: Args,
     pub wigle: WigleClient,
-    #[allow(dead_code)] // kept for future BeaconDB integration
-    pub beacondb: BeaconDbClient,
     pub apple: AppleClient,
     pub nominatim: NominatimClient,
     pub last_fix: tokio::sync::Mutex<Option<LastFix>>,

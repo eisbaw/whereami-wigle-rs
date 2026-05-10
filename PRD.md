@@ -18,8 +18,12 @@ Two components:
                          |                    |
                          +-----------> Apple WPS  (remote, no auth, primary)
                                        WiGLE API  (remote, secondary)
-                                       BeaconDB   (remote, no auth, currently unused)
 ```
+
+The Source enum still recognises `beacondb` so historical DB rows from
+earlier prototypes read back correctly at priority 20, but no BeaconDB
+client runs today (the API returns aggregate position, not per-AP, so
+it does not fit the per-BSSID Provider chain).
 
 ### whereamid (daemon)
 

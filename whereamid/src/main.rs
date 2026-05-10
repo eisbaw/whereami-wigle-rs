@@ -4,7 +4,6 @@
 //! and answers "where am I?" queries over TCP + JSON-lines.
 
 mod apple;
-mod beacondb;
 mod config;
 mod db;
 mod debounce;
@@ -93,7 +92,6 @@ async fn main() -> Result<()> {
     let debouncer = Debouncer::new(args.debounce_window, args.debounce_threshold);
     let wigle_client =
         wigle::WigleClient::new(&config_file.wigle.api_user, &config_file.wigle.api_key);
-    let beacondb_client = beacondb::BeaconDbClient::new(config_file.beacondb.enabled);
 
     if !wigle_client.is_configured() {
         tracing::warn!("WiGLE credentials not configured - remote lookups disabled");
@@ -104,7 +102,6 @@ async fn main() -> Result<()> {
         debouncer: tokio::sync::Mutex::new(debouncer),
         args: args.clone(),
         wigle: wigle_client,
-        beacondb: beacondb_client,
         apple: apple::AppleClient::new(),
         nominatim: nominatim::NominatimClient::new(),
         last_fix: tokio::sync::Mutex::new(initial_last_fix),

@@ -11,7 +11,7 @@ use reqwest::Client;
 /// Fail fast on TCP connect: 5s.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Default total request timeout for fast endpoints (Apple, WiGLE, BeaconDB).
+/// Default total request timeout for fast endpoints (Apple, WiGLE).
 /// 15s covers normal latency plus headroom; longer hangs almost certainly mean
 /// a stuck connection rather than slow processing.
 pub const REQUEST_TIMEOUT_FAST: Duration = Duration::from_secs(15);

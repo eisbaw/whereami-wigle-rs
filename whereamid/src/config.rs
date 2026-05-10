@@ -119,8 +119,6 @@ impl Args {
 pub struct ConfigFile {
     #[serde(default)]
     pub wigle: WigleConfig,
-    #[serde(default)]
-    pub beacondb: BeaconDbConfig,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -129,22 +127,6 @@ pub struct WigleConfig {
     pub api_user: String,
     #[serde(default)]
     pub api_key: String,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-pub struct BeaconDbConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for BeaconDbConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
 }
 
 /// Expand ~ to home directory.
