@@ -86,9 +86,17 @@ impl NominatimClient {
             .json()
             .await?;
 
+        // Reject empty / missing display_name (task-0050). Nominatim can
+        // return 200 OK with no result for unmapped locations; previously
+        // we cached "" as the address, which then leaked back to clients.
+        let display = resp
+            .display_name
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Nominatim returned empty display_name"))?;
+
         let addr = resp.address.as_ref();
         Ok(Address {
-            display: resp.display_name.unwrap_or_default(),
+            display,
             road: addr.and_then(|a| a.road.clone()),
             house_number: addr.and_then(|a| a.house_number.clone()),
             city: addr.and_then(|a| a.city.clone()),

@@ -33,7 +33,15 @@ use server::DaemonState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // Honor RUST_LOG (e.g. RUST_LOG=whereamid=debug) and default to "info"
+    // when unset. Requires the env-filter feature on tracing-subscriber
+    // (task-0054); without it the default fmt::init silently drops debug!.
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 
     let args = Args::parse();
     // Cross-field validation runs before any side effects (DB open,

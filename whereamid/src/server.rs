@@ -16,6 +16,10 @@ use crate::nominatim::NominatimClient;
 use crate::wigle::WigleClient;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total budget to write the response and close the socket. A slow client
+/// reading slowly should not pin a tokio task with the response buffered
+/// indefinitely. Symmetric to READ_TIMEOUT in magnitude (task-0080).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BYTES: u64 = 64 * 1024; // 64 KiB max request size
 
 /// Maximum number of BSSIDs accepted in a single `resolve` request.
@@ -318,9 +322,18 @@ async fn handle_connection(stream: TcpStream, state: Arc<DaemonState>) -> Result
         Err(e) => error_json(&format!("invalid request: {e}")),
     };
 
-    writer.write_all(response.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.shutdown().await?;
+    // Bound the write half of the connection. A slow-reading client
+    // could otherwise keep the response buffered and pin a tokio task
+    // forever (task-0080).
+    let write_response = async {
+        writer.write_all(response.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.shutdown().await
+    };
+    if timeout(WRITE_TIMEOUT, write_response).await.is_err() {
+        debug!("write timeout closing connection");
+        return Ok(());
+    }
 
     Ok(())
 }

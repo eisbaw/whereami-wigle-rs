@@ -107,6 +107,26 @@ pub struct Database {
 
 const SCHEMA_VERSION: i32 = 5;
 
+/// Parse the metadata.api_calls_today raw value. None / parse-failure both
+/// fall back to 0; a parse failure also warns so silent corruption is
+/// visible in logs (task-0077). Previously the silent unwrap_or(0) would
+/// reset the counter on garbage and re-charge the daily WiGLE quota.
+fn parse_api_calls_value(raw: Option<String>) -> u32 {
+    match raw.as_deref() {
+        None => 0,
+        Some(s) => match s.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(
+                    "metadata.api_calls_today is not a valid u32 ({:?}); treating as 0",
+                    s
+                );
+                0
+            }
+        },
+    }
+}
+
 /// A historical fix row from the `fixes` table (task-0031). Each row records
 /// one successful locate response so the daemon can answer "where was I N
 /// days ago" queries by grouping rows into stay-point segments.
@@ -717,14 +737,14 @@ impl Database {
             )
             .optional()?;
         let count: u32 = if stored_date.as_deref() == Some(&today) {
-            tx.query_row(
-                "SELECT value FROM metadata WHERE key = 'api_calls_today'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'api_calls_today'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            parse_api_calls_value(raw)
         } else {
             tx.execute(
                 "INSERT INTO metadata (key, value) VALUES ('api_calls_date', ?1)
@@ -773,15 +793,14 @@ impl Database {
             tx.commit()?;
             return Ok(());
         }
-        let count: u32 = tx
+        let raw: Option<String> = tx
             .query_row(
                 "SELECT value FROM metadata WHERE key = 'api_calls_today'",
                 [],
                 |row| row.get::<_, String>(0),
             )
-            .optional()?
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+            .optional()?;
+        let count: u32 = parse_api_calls_value(raw);
         let new_count = count.saturating_sub(1);
         tx.execute(
             "INSERT INTO metadata (key, value) VALUES ('api_calls_today', ?1)
@@ -794,10 +813,7 @@ impl Database {
 
     /// Get the number of API calls made today.
     pub fn api_calls_today(&self) -> Result<u32> {
-        match self.get_metadata("api_calls_today")? {
-            Some(v) => Ok(v.parse().unwrap_or(0)),
-            None => Ok(0),
-        }
+        Ok(parse_api_calls_value(self.get_metadata("api_calls_today")?))
     }
 
     // --- stats ---

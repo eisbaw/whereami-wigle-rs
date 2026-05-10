@@ -131,8 +131,15 @@ pub fn encode_request(bssids: &[String]) -> Vec<u8> {
 }
 
 /// Decode the Apple WPS protobuf response.
-/// Returns ApInfo for each BSSID that has valid coordinates.
-pub fn decode_response(data: &[u8], _requested: &[String]) -> Result<Vec<ApInfo>> {
+/// Returns ApInfo for each BSSID that has valid coordinates AND was in
+/// the original request set. Stray BSSIDs the server returns that we did
+/// not ask for are dropped (task-0049).
+pub fn decode_response(data: &[u8], requested: &[String]) -> Result<Vec<ApInfo>> {
+    let requested_set: std::collections::HashSet<String> = requested
+        .iter()
+        .map(|b| crate::scanner::normalize_bssid(b))
+        .collect();
+
     let mut results = Vec::new();
     let mut pos = 0;
 
@@ -146,7 +153,16 @@ pub fn decode_response(data: &[u8], _requested: &[String]) -> Result<Vec<ApInfo>
             pos = new_pos;
 
             if let Some(ap) = parse_wifi_device(msg_data)? {
-                results.push(ap);
+                // Only accept BSSIDs we actually asked for. parse_wifi_device
+                // already normalizes via scanner::normalize_bssid.
+                if requested_set.contains(&ap.bssid) {
+                    results.push(ap);
+                } else {
+                    debug!(
+                        "Apple returned unrequested BSSID {} -> ({}, {}); dropping",
+                        ap.bssid, ap.lat, ap.lon
+                    );
+                }
             }
         } else {
             // Skip unknown field
