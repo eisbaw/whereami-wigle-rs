@@ -122,6 +122,69 @@ fn main() {
             }
             Err(e) => fatal(&format!("error: {e}")),
         },
+        "history" | "h" => {
+            // First non-flag arg after "history" is the range (e.g. "7d");
+            // default to 7 days. --from / --to take RFC3339 timestamps.
+            let mut range: Option<String> = None;
+            let mut from: Option<String> = None;
+            let mut to: Option<String> = None;
+            let rest = &args[2..];
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--from" => {
+                        i += 1;
+                        if i >= rest.len() {
+                            fatal("--from requires an RFC3339 timestamp");
+                        }
+                        from = Some(rest[i].clone());
+                    }
+                    "--to" => {
+                        i += 1;
+                        if i >= rest.len() {
+                            fatal("--to requires an RFC3339 timestamp");
+                        }
+                        to = Some(rest[i].clone());
+                    }
+                    "--json" | "--scan-time=no" => {}
+                    other if !other.starts_with("--") && range.is_none() => {
+                        range = Some(other.to_string());
+                    }
+                    other => fatal(&format!("unknown history arg: {other}")),
+                }
+                i += 1;
+            }
+            // Default range = 7d if no explicit range/from-to.
+            if range.is_none() && from.is_none() && to.is_none() {
+                range = Some("7d".into());
+            }
+            match client.history(range, from, to) {
+                Ok(resp) if json => {
+                    println!("{}", serde_json::to_string(&resp).unwrap());
+                }
+                Ok(resp) if !resp.ok => {
+                    fatal(resp.error.as_deref().unwrap_or("unknown error"));
+                }
+                Ok(resp) => {
+                    println!("range: {} -> {}", resp.from, resp.to);
+                    println!("segments: {}", resp.segments.len());
+                    for seg in &resp.segments {
+                        let dur_min = seg.duration_secs / 60;
+                        println!(
+                            "  {} -> {}  {:.6},{:.6}  ±{:.0}m  {} fixes  ({}m)",
+                            seg.start_rfc3339,
+                            seg.end_rfc3339,
+                            seg.centroid_lat,
+                            seg.centroid_lon,
+                            seg.mean_accuracy_m,
+                            seg.n_fixes,
+                            dur_min
+                        );
+                    }
+                }
+                Err(e) => fatal(&format!("error: {e}")),
+            }
+        }
         "version" | "v" | "--version" | "-V" => {
             let cli_version = env!("CARGO_PKG_VERSION");
             let cli_rev = env!("GIT_REV");
@@ -160,10 +223,13 @@ fn main() {
             println!("  scan              Visible Wi-Fi networks");
             println!("  stats             Cache statistics");
             println!("  debug             Daemon debug state");
+            println!("  history [range]   Stay-point segments (default 7d; e.g. 24h, 7d, 1w)");
             println!("  version           Print CLI and daemon versions");
             println!();
             println!("Flags:");
             println!("  --json            Output raw JSON");
+            println!("  --from RFC3339    Absolute start (history)");
+            println!("  --to   RFC3339    Absolute end (history)");
         }
         other => {
             eprintln!("unknown command: {other}");

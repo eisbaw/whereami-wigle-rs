@@ -83,6 +83,22 @@ pub struct Args {
     /// Nominatim's public instance is frequently slow under load.
     #[arg(long, default_value_t = 30)]
     pub nominatim_timeout_secs: u64,
+
+    /// Days to retain rows in the location-history `fixes` table. Older rows
+    /// are pruned periodically. 0 disables history retention (fixes still
+    /// recorded but pruned on next sweep).
+    #[arg(long, default_value_t = 30)]
+    pub history_retention_days: i64,
+
+    /// Maximum distance (meters) between consecutive fixes for them to be
+    /// grouped into the same stay-point segment.
+    #[arg(long, default_value_t = 100)]
+    pub history_segment_distance_m: u64,
+
+    /// Minimum duration (seconds) for a segment to be reported. Shorter
+    /// runs (e.g. driving past a coffee shop) are dropped.
+    #[arg(long, default_value_t = 300)]
+    pub history_segment_min_duration_secs: u64,
 }
 
 impl Args {
@@ -133,6 +149,15 @@ impl Args {
         }
         if self.nominatim_timeout_secs == 0 {
             anyhow::bail!("--nominatim-timeout-secs must be > 0");
+        }
+        if self.history_retention_days < 0 {
+            anyhow::bail!("--history-retention-days must be >= 0 (0 disables retention)");
+        }
+        if self.history_segment_distance_m == 0 {
+            anyhow::bail!("--history-segment-distance-m must be > 0");
+        }
+        if self.history_segment_min_duration_secs == 0 {
+            anyhow::bail!("--history-segment-min-duration-secs must be > 0");
         }
         Ok(())
     }

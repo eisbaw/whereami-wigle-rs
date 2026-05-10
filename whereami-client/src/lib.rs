@@ -162,6 +162,44 @@ pub struct VersionResponse {
     pub error: Option<String>,
 }
 
+/// One stay-point segment in a `history` response.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct HistorySegment {
+    pub start_rfc3339: String,
+    pub end_rfc3339: String,
+    pub duration_secs: i64,
+    pub centroid_lat: f64,
+    pub centroid_lon: f64,
+    pub mean_accuracy_m: f64,
+    pub n_fixes: usize,
+}
+
+/// Response from the `history` command.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct HistoryResponse {
+    pub ok: bool,
+    pub v: u32,
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub to: String,
+    #[serde(default)]
+    pub segments: Vec<HistorySegment>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct HistoryRequest {
+    cmd: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    range: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to: Option<String>,
+}
+
 /// Response from the `stats` command.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct StatsResponse {
@@ -281,6 +319,23 @@ impl WhereAmIClient {
     /// Get the daemon's version string and git revision.
     pub fn version(&self) -> Result<VersionResponse> {
         let req = serde_json::to_string(&SimpleRequest { cmd: "version" })?;
+        self.request(&req)
+    }
+
+    /// Query location history. Pass either `range` ("7d", "24h") or both
+    /// `from` and `to` as RFC3339 timestamps; not both.
+    pub fn history(
+        &self,
+        range: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+    ) -> Result<HistoryResponse> {
+        let req = serde_json::to_string(&HistoryRequest {
+            cmd: "history",
+            range,
+            from,
+            to,
+        })?;
         self.request(&req)
     }
 }

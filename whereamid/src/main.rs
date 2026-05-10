@@ -7,6 +7,7 @@ mod apple;
 mod config;
 mod db;
 mod debounce;
+mod history;
 mod http;
 mod nominatim;
 mod pending;
@@ -126,6 +127,27 @@ async fn main() -> Result<()> {
     let pending_state = Arc::clone(&state);
     tokio::spawn(async move {
         pending::run_pending_drain(pending_state).await;
+    });
+
+    // Spawn history-prune task: drop fixes older than retention_days every
+    // 24h. The first sweep runs after one full interval so that the daemon's
+    // startup is not slowed down by a potentially large DELETE.
+    let history_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(24 * 60 * 60);
+        loop {
+            sleep(interval).await;
+            let retention = history_state.args.history_retention_days;
+            let pruned = {
+                let db = server::lock_db(&history_state);
+                db.prune_fixes(retention)
+            };
+            match pruned {
+                Ok(0) => {}
+                Ok(n) => info!("history prune: removed {n} fix rows older than {retention}d"),
+                Err(e) => tracing::warn!("history prune failed: {e}"),
+            }
+        }
     });
 
     // Spawn TCP server

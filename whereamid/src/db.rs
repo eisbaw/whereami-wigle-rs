@@ -105,7 +105,27 @@ pub struct Database {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
+
+/// A historical fix row from the `fixes` table (task-0031). Each row records
+/// one successful locate response so the daemon can answer "where was I N
+/// days ago" queries by grouping rows into stay-point segments.
+///
+/// `id` and `n_sources` are read from the DB but the segmentation logic
+/// (`history::segment_fixes`) only needs the position+timestamp+accuracy.
+/// They're carried for completeness so external consumers (e.g. analysis
+/// tools that consume the typed struct) get the full row.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct FixRow {
+    pub id: i64,
+    pub at_rfc3339: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub accuracy_m: f64,
+    /// Number of cached APs used to compute this fix.
+    pub n_sources: i64,
+}
 
 /// A persisted last-known position. Stored as a single row in `last_fix`
 /// (CHECK id = 1) so the daemon can rehydrate after a restart.
@@ -178,6 +198,12 @@ impl Database {
             info!("migrating database v{version} -> v4 (last_fix table)");
             self.migrate_v3_to_v4()?;
             version = 4;
+        }
+
+        if version < 5 {
+            info!("migrating database v{version} -> v5 (fixes timeseries table)");
+            self.migrate_v4_to_v5()?;
+            version = 5;
         }
 
         if version == SCHEMA_VERSION {
@@ -331,6 +357,30 @@ impl Database {
                  );",
             )
             .context("failed to create last_fix table")?;
+        self.conn.execute(
+            "UPDATE schema_version SET version = ?1 WHERE id = 1",
+            params![SCHEMA_VERSION],
+        )?;
+        Ok(())
+    }
+
+    /// v4 -> v5: add the `fixes` table (timeseries of successful locates)
+    /// for the location-history feature (task-0031). Idempotent via
+    /// CREATE TABLE / INDEX IF NOT EXISTS.
+    fn migrate_v4_to_v5(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS fixes (
+                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     at_rfc3339  TEXT NOT NULL,
+                     lat         REAL NOT NULL,
+                     lon         REAL NOT NULL,
+                     accuracy_m  REAL NOT NULL,
+                     n_sources   INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_fixes_at ON fixes(at_rfc3339);",
+            )
+            .context("failed to create fixes table")?;
         self.conn.execute(
             "UPDATE schema_version SET version = ?1 WHERE id = 1",
             params![SCHEMA_VERSION],
@@ -807,6 +857,64 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    // --- fixes table (timeseries; task-0031) ---
+
+    /// Append one fix row to the timeseries.
+    pub fn insert_fix(
+        &self,
+        at_rfc3339: &str,
+        lat: f64,
+        lon: f64,
+        accuracy_m: f64,
+        n_sources: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO fixes (at_rfc3339, lat, lon, accuracy_m, n_sources)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![at_rfc3339, lat, lon, accuracy_m, n_sources],
+        )?;
+        Ok(())
+    }
+
+    /// Read fix rows whose `at_rfc3339` falls within `[start_rfc3339, end_rfc3339]`,
+    /// in ascending time order.
+    pub fn get_fixes_in_range(
+        &self,
+        start_rfc3339: &str,
+        end_rfc3339: &str,
+    ) -> Result<Vec<FixRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, at_rfc3339, lat, lon, accuracy_m, n_sources
+             FROM fixes
+             WHERE at_rfc3339 >= ?1 AND at_rfc3339 <= ?2
+             ORDER BY at_rfc3339 ASC",
+        )?;
+        let rows = stmt.query_map(params![start_rfc3339, end_rfc3339], |r| {
+            Ok(FixRow {
+                id: r.get(0)?,
+                at_rfc3339: r.get(1)?,
+                lat: r.get(2)?,
+                lon: r.get(3)?,
+                accuracy_m: r.get(4)?,
+                n_sources: r.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Delete fixes older than `retention_days`. Returns count deleted.
+    pub fn prune_fixes(&self, retention_days: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::TimeDelta::days(retention_days)).to_rfc3339();
+        let n = self
+            .conn
+            .execute("DELETE FROM fixes WHERE at_rfc3339 < ?1", params![cutoff])?;
+        Ok(n)
     }
 
     /// Read the persisted last-known position, if any.
@@ -1310,6 +1418,52 @@ mod tests {
             err.is_err(),
             "INSERT with id=2 must violate CHECK constraint, got {err:?}"
         );
+    }
+
+    #[test]
+    fn fixes_round_trip_and_range_query() {
+        let db = Database::open_memory().unwrap();
+        // Three fixes spread across a day.
+        db.insert_fix("2026-05-09T08:00:00+00:00", 55.0, 12.0, 30.0, 5)
+            .unwrap();
+        db.insert_fix("2026-05-09T12:00:00+00:00", 55.001, 12.001, 25.0, 6)
+            .unwrap();
+        db.insert_fix("2026-05-09T16:00:00+00:00", 55.0, 12.0, 35.0, 4)
+            .unwrap();
+
+        // Query whole day: should return all 3 in ascending order.
+        let all = db
+            .get_fixes_in_range("2026-05-09T00:00:00+00:00", "2026-05-09T23:59:59+00:00")
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].at_rfc3339, "2026-05-09T08:00:00+00:00");
+        assert_eq!(all[2].at_rfc3339, "2026-05-09T16:00:00+00:00");
+
+        // Narrow query to the middle hour: only the 12:00 fix.
+        let mid = db
+            .get_fixes_in_range("2026-05-09T11:00:00+00:00", "2026-05-09T13:00:00+00:00")
+            .unwrap();
+        assert_eq!(mid.len(), 1);
+        assert!((mid[0].lat - 55.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fixes_prune_drops_old_rows() {
+        let db = Database::open_memory().unwrap();
+        // One row 100 days old, one row "now".
+        let old_ts = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
+        let new_ts = chrono::Utc::now().to_rfc3339();
+        db.insert_fix(&old_ts, 0.0, 0.0, 1.0, 1).unwrap();
+        db.insert_fix(&new_ts, 1.0, 1.0, 1.0, 1).unwrap();
+
+        let pruned = db.prune_fixes(30).unwrap();
+        assert_eq!(pruned, 1, "expected 1 row pruned");
+
+        let remaining = db
+            .get_fixes_in_range("2000-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00")
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!((remaining[0].lat - 1.0).abs() < 1e-9);
     }
 
     #[test]

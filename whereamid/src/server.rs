@@ -159,6 +159,16 @@ struct Request {
     cmd: String,
     #[serde(default)]
     bssids: Vec<String>,
+    /// Relative range for the `history` command (e.g. "7d", "24h").
+    /// Mutually exclusive with `from`/`to`.
+    #[serde(default)]
+    range: Option<String>,
+    /// Absolute start of the `history` range (RFC3339).
+    #[serde(default)]
+    from: Option<String>,
+    /// Absolute end of the `history` range (RFC3339).
+    #[serde(default)]
+    to: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -316,6 +326,7 @@ async fn dispatch_command(req: &Request, state: &Arc<DaemonState>) -> String {
         "stats" => handle_stats(state).await,
         "debug" => handle_debug(state).await,
         "version" => handle_version(),
+        "history" => handle_history(req, state).await,
         other => error_json(&format!("unknown command: {other}")),
     }
 }
@@ -512,6 +523,12 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
             // Persist to DB. Failures are warned-only: a missed write here
             // means we lose rehydration of THIS fix, but the in-memory copy
             // is still authoritative until the daemon stops.
+            //
+            // Also record into the location-history timeseries (task-0031).
+            // Both writes are best-effort — a slow disk should not block the
+            // locate response. The whole block is sync inside the per-conn
+            // tokio task; we accept that the lock is held briefly across two
+            // SQL statements rather than spawning a separate task for it.
             {
                 let db = lock_db(state);
                 if let Err(e) = db.set_last_fix(&crate::db::LastFixRow {
@@ -523,6 +540,15 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                     sources: cached_count as i64,
                 }) {
                     warn!("failed to persist last_fix: {e}");
+                }
+                if let Err(e) = db.insert_fix(
+                    &at.to_rfc3339(),
+                    pos.lat,
+                    pos.lon,
+                    pos.accuracy_m,
+                    cached_count as i64,
+                ) {
+                    warn!("failed to record fix in history: {e}");
                 }
             }
 
@@ -772,6 +798,71 @@ fn handle_version() -> String {
         v: 1,
         version: env!("CARGO_PKG_VERSION"),
         git_rev: env!("GIT_REV"),
+    };
+    serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
+}
+
+#[derive(Serialize)]
+struct HistoryResponse {
+    ok: bool,
+    v: u32,
+    /// RFC3339 inclusive start of the queried range.
+    from: String,
+    /// RFC3339 inclusive end of the queried range.
+    to: String,
+    /// Stay-point segments in ascending time order.
+    segments: Vec<crate::history::Segment>,
+}
+
+async fn handle_history(req: &Request, state: &Arc<DaemonState>) -> String {
+    // Resolve range: either `range="7d"` shorthand OR explicit from/to RFC3339.
+    // Mutually exclusive. If neither is provided, default to the last 7 days.
+    let (from, to) = match (&req.range, &req.from, &req.to) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return error_json("history: 'range' and 'from'/'to' are mutually exclusive");
+        }
+        (Some(spec), None, None) => match crate::history::parse_range(spec) {
+            Ok(r) => r,
+            Err(e) => return error_json(&format!("history: invalid range: {e}")),
+        },
+        (None, Some(f), Some(t)) => {
+            let f = match chrono::DateTime::parse_from_rfc3339(f) {
+                Ok(d) => d.with_timezone(&chrono::Utc),
+                Err(e) => return error_json(&format!("history: invalid 'from' timestamp: {e}")),
+            };
+            let t = match chrono::DateTime::parse_from_rfc3339(t) {
+                Ok(d) => d.with_timezone(&chrono::Utc),
+                Err(e) => return error_json(&format!("history: invalid 'to' timestamp: {e}")),
+            };
+            if f >= t {
+                return error_json("history: 'from' must be before 'to'");
+            }
+            (f, t)
+        }
+        (None, None, None) => crate::history::parse_range("7d").unwrap(),
+        _ => return error_json("history: provide either 'range' or both 'from' and 'to'"),
+    };
+
+    let fixes = {
+        let db = lock_db(state);
+        match db.get_fixes_in_range(&from.to_rfc3339(), &to.to_rfc3339()) {
+            Ok(v) => v,
+            Err(e) => return error_json(&format!("history: db error: {e}")),
+        }
+    };
+
+    let segments = crate::history::segment_fixes(
+        &fixes,
+        state.args.history_segment_distance_m as f64,
+        state.args.history_segment_min_duration_secs as i64,
+    );
+
+    let resp = HistoryResponse {
+        ok: true,
+        v: 1,
+        from: from.to_rfc3339(),
+        to: to.to_rfc3339(),
+        segments,
     };
     serde_json::to_string(&resp).unwrap_or_else(|_| error_json("serialization failed"))
 }
