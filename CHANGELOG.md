@@ -3,6 +3,46 @@
 All notable changes to whereami. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows semver.
 
+## [0.6.1] — 2026-05-13
+
+Robustness patch. One real-world incident (`whereami locate` returned a
+position ~900 m off in central Copenhagen because a single cached BSSID
+had a stale WiGLE position in Brazil) drove a rewrite of the outlier
+filter, with three follow-ups for reuse / observability / hygiene.
+
+### Fixed
+
+- **Catastrophic-outlier rejection in `filter_outliers`** (task-0083).
+  The prior single-stage filter used an unweighted spherical mean as the
+  cluster center, which has a 0% breakdown point: one ~10 000 km outlier
+  pulled the centroid ~1500 km away, inflating the median-distance
+  threshold so the very outlier that poisoned it could not be rejected.
+  Replaced with two stages:
+  1. `drop_isolated()`: drop any AP with no neighbor within 2 km.
+     Centroid-independent, so cannot be poisoned by far-away outliers.
+  2. `geometric_median()` via Weiszfeld iterations on the unit sphere
+     replaces the spherical mean for the threshold-reference centroid.
+     ~50% breakdown point.
+- **Regression test** `brazil_in_copenhagen_incident` pins the exact bug
+  with the original coordinates.
+
+### Added
+
+- **`GeoMedianResult` enum** + `tracing::{debug,warn}` events at five
+  previously-silent fallback paths in `filter_outliers` and
+  `geometric_median` (task-0085). Future Brazil-style incidents now
+  self-report under `RUST_LOG=whereamid::trilaterate=debug`.
+
+### Changed
+
+- **`history.rs::segment_fixes` uses `geometric_median`** for both its
+  running and stored stay-point centroids instead of an arithmetic
+  lat/lon mean (task-0084). Inherits the trilateration filter's
+  antimeridian / pole / outlier robustness for free.
+- **`PositionedAp` is now `Copy`** (task-0086), removing explicit
+  `.clone()` calls. Soft promise: future non-`Copy` fields would force a
+  revert.
+
 ## [0.6.0] — 2026-05-12
 
 Three deferred follow-ups from the v0.5.0 review, landed as a small
