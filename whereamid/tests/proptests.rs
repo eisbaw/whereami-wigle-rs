@@ -94,7 +94,7 @@ proptest! {
             lon: lon_a + offset_lon,
             signal_dbm: Some(weak),
         };
-        let aps = vec![strong_ap.clone(), weak_ap.clone()];
+        let aps = vec![strong_ap, weak_ap];
         let result = trilaterate(&aps).unwrap();
 
         let d_strong = haversine_m_test(result.lat, result.lon, strong_ap.lat, strong_ap.lon);

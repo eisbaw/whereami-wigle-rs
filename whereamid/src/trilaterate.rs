@@ -50,7 +50,14 @@ impl fmt::Display for GeoMedianResult {
 }
 
 /// Input for trilateration: a positioned AP with optional signal.
-#[derive(Debug, Clone)]
+///
+/// `Copy` (task-0086): every field is itself `Copy` (f64, f64, Option<i32>),
+/// so cloning is already a bitwise memcpy. Deriving `Copy` removes the
+/// ergonomic noise of explicit `.clone()` calls. Caveat: this is a soft
+/// promise to consumers — if a future field is non-Copy (e.g. an owning
+/// SSID `String` or a `Source` enum), reverting forces every by-value call
+/// site to clone or take a reference.
+#[derive(Debug, Clone, Copy)]
 pub struct PositionedAp {
     pub lat: f64,
     pub lon: f64,
@@ -157,7 +164,7 @@ pub fn filter_outliers(aps: &[PositionedAp]) -> Vec<PositionedAp> {
 
     // After stage 1, may have ≤2 APs left — bypass stage 2 in that case.
     if survivor_idx.len() <= 2 {
-        return survivor_idx.iter().map(|&i| aps[i].clone()).collect();
+        return survivor_idx.iter().map(|&i| aps[i]).collect();
     }
 
     let survivor_coords: Vec<(f64, f64)> = survivor_idx.iter().map(|&i| coords[i]).collect();
@@ -183,7 +190,7 @@ pub fn filter_outliers(aps: &[PositionedAp]) -> Vec<PositionedAp> {
                 n = survivor_coords.len(),
                 "filter_outliers: geometric_median produced {result} (mid-iteration cancellation); keeping stage-1 survivors as-is"
             );
-            return survivor_idx.iter().map(|&i| aps[i].clone()).collect();
+            return survivor_idx.iter().map(|&i| aps[i]).collect();
         }
         GeoMedianResult::Degenerate => {
             tracing::warn!(
@@ -191,7 +198,7 @@ pub fn filter_outliers(aps: &[PositionedAp]) -> Vec<PositionedAp> {
                 n = survivor_coords.len(),
                 "filter_outliers: geometric_median produced {result} (seed cancellation; antipodal input); keeping stage-1 survivors as-is"
             );
-            return survivor_idx.iter().map(|&i| aps[i].clone()).collect();
+            return survivor_idx.iter().map(|&i| aps[i]).collect();
         }
     };
 
@@ -207,7 +214,7 @@ pub fn filter_outliers(aps: &[PositionedAp]) -> Vec<PositionedAp> {
         .iter()
         .zip(distances.iter())
         .filter(|(_, d)| **d <= threshold)
-        .map(|(&i, _)| aps[i].clone())
+        .map(|(&i, _)| aps[i])
         .collect();
 
     if kept.is_empty() {
@@ -222,7 +229,7 @@ pub fn filter_outliers(aps: &[PositionedAp]) -> Vec<PositionedAp> {
             median_dist_m = median_dist,
             "filter_outliers stage-2 kept nothing; falling back to stage-1 survivors"
         );
-        survivor_idx.iter().map(|&i| aps[i].clone()).collect()
+        survivor_idx.iter().map(|&i| aps[i]).collect()
     } else {
         kept
     }
