@@ -25,9 +25,9 @@ pub struct Segment {
     pub end_rfc3339: String,
     /// Duration in seconds.
     pub duration_secs: i64,
-    /// Centroid latitude (mean of fix latitudes).
+    /// Centroid latitude (geometric median of fix latitudes — task-0084).
     pub centroid_lat: f64,
-    /// Centroid longitude (mean of fix longitudes).
+    /// Centroid longitude (geometric median of fix longitudes — task-0084).
     pub centroid_lon: f64,
     /// Mean accuracy_m of fixes in the segment.
     pub mean_accuracy_m: f64,
@@ -59,8 +59,6 @@ pub fn segment_fixes(
             return;
         }
         let n = cur.len();
-        let lat_sum: f64 = cur.iter().map(|f| f.lat).sum();
-        let lon_sum: f64 = cur.iter().map(|f| f.lon).sum();
         let acc_sum: f64 = cur.iter().map(|f| f.accuracy_m).sum();
         let start = cur.first().unwrap();
         let end = cur.last().unwrap();
@@ -76,22 +74,33 @@ pub fn segment_fixes(
             // Drop short segments — not a real stay-point.
             return;
         }
+        // task-0084: use the robust geometric median (Weiszfeld on unit
+        // sphere) instead of an arithmetic lat/lon mean. Inherits
+        // antimeridian/pole/outlier robustness from trilaterate. Falls back
+        // to the first fix when the cluster is degenerate (antipodal),
+        // which is fine for a stay-point of physically co-located fixes
+        // (where degeneracy effectively cannot occur in practice).
+        let coords: Vec<(f64, f64)> = cur.iter().map(|f| (f.lat, f.lon)).collect();
+        let (centroid_lat, centroid_lon) =
+            geometric_median(&coords).unwrap_or((cur[0].lat, cur[0].lon));
         segments.push(Segment {
             start_rfc3339: start.at_rfc3339.clone(),
             end_rfc3339: end.at_rfc3339.clone(),
             duration_secs,
-            centroid_lat: lat_sum / n as f64,
-            centroid_lon: lon_sum / n as f64,
+            centroid_lat,
+            centroid_lon,
             mean_accuracy_m: acc_sum / n as f64,
             n_fixes: n,
         });
     };
 
     for fix in fixes.iter().skip(1) {
-        // Distance from running centroid to this fix.
-        let n = cur.len() as f64;
-        let cx: f64 = cur.iter().map(|f| f.lat).sum::<f64>() / n;
-        let cy: f64 = cur.iter().map(|f| f.lon).sum::<f64>() / n;
+        // Distance from running centroid to this fix. task-0084: use the
+        // geometric median so segmentation membership is also outlier-robust
+        // and antimeridian/pole-correct. Same fallback to the first fix on
+        // degeneracy.
+        let coords: Vec<(f64, f64)> = cur.iter().map(|f| (f.lat, f.lon)).collect();
+        let (cx, cy) = geometric_median(&coords).unwrap_or((cur[0].lat, cur[0].lon));
         let d = haversine_m(cx, cy, fix.lat, fix.lon);
         if d <= dist_threshold_m {
             cur.push(fix);
@@ -107,6 +116,10 @@ pub fn segment_fixes(
 
 // task-0081: haversine_m moved to crate::geo. Use it via the path below.
 use crate::geo::haversine_m;
+// task-0084: reuse the robust spherical geometric median (Weiszfeld) for
+// stay-point centroids — replaces a naive arithmetic lat/lon mean that was
+// wrong near the antimeridian/poles and not outlier-robust.
+use crate::trilaterate::geometric_median;
 
 /// Parse a relative range string like "7d", "24h", "30m" into (start, end)
 /// where end is now and start is now-duration. Also accepts "1w".

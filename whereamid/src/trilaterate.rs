@@ -96,75 +96,92 @@ pub fn filter_outliers(aps: &[PositionedAp]) -> Vec<PositionedAp> {
         return aps.to_vec();
     }
 
-    // Stage 1: pairwise-neighbor pre-filter.
-    let survivors = drop_isolated(aps);
+    // Marshal to coordinate slice once; stages 1 and 2 only need lat/lon.
+    // The original PositionedAp slice is the source of truth for signal_dbm
+    // — we thread indices through both stages so signal info survives.
+    let coords: Vec<(f64, f64)> = aps.iter().map(|a| (a.lat, a.lon)).collect();
+
+    // Stage 1: pairwise-neighbor pre-filter. Returns indices into `coords`
+    // (and equivalently into `aps`).
+    let survivor_idx = drop_isolated(&coords);
 
     // After stage 1, may have ≤2 APs left — bypass stage 2 in that case.
-    if survivors.len() <= 2 {
-        return survivors;
+    if survivor_idx.len() <= 2 {
+        return survivor_idx.iter().map(|&i| aps[i].clone()).collect();
     }
 
+    let survivor_coords: Vec<(f64, f64)> = survivor_idx.iter().map(|&i| coords[i]).collect();
+
     // Stage 2: geometric-median centered threshold.
-    let (center_lat, center_lon) = match geometric_median(&survivors) {
+    let (center_lat, center_lon) = match geometric_median(&survivor_coords) {
         Some(c) => c,
         // Degenerate (e.g. antipodal survivors); keep what stage 1 left.
-        None => return survivors,
+        None => return survivor_idx.iter().map(|&i| aps[i].clone()).collect(),
     };
 
-    let distances: Vec<f64> = survivors
+    let distances: Vec<f64> = survivor_coords
         .iter()
-        .map(|ap| haversine_m(center_lat, center_lon, ap.lat, ap.lon))
+        .map(|&(lat, lon)| haversine_m(center_lat, center_lon, lat, lon))
         .collect();
 
     let median_dist = median(&distances);
     let threshold = f64::max(STAGE2_FLOOR_M, STAGE2_MEDIAN_MULTIPLIER * median_dist);
 
-    let kept: Vec<PositionedAp> = survivors
+    let kept: Vec<PositionedAp> = survivor_idx
         .iter()
         .zip(distances.iter())
         .filter(|(_, d)| **d <= threshold)
-        .map(|(ap, _)| ap.clone())
+        .map(|(&i, _)| aps[i].clone())
         .collect();
 
     if kept.is_empty() {
-        survivors
+        survivor_idx.iter().map(|&i| aps[i].clone()).collect()
     } else {
         kept
     }
 }
 
-/// Stage 1 of outlier filtering: drop APs that have no neighbor within
-/// `NEIGHBOR_RADIUS_M`. Independent of any centroid, so robust to even a
-/// majority of catastrophic outliers as long as a real cluster exists.
+/// Stage 1 of outlier filtering: return indices of points that have at least
+/// one neighbor within `NEIGHBOR_RADIUS_M`. Independent of any centroid, so
+/// robust to even a majority of catastrophic outliers as long as a real
+/// cluster exists.
 ///
-/// Fallback: if applying the filter would drop every AP (truly sparse
-/// rural cluster where each AP is >2 km from any other), the original
-/// slice is returned unchanged so stage 2 still has data.
-fn drop_isolated(aps: &[PositionedAp]) -> Vec<PositionedAp> {
-    if aps.len() <= 1 {
-        return aps.to_vec();
+/// Fallback: if applying the filter would drop every point (truly sparse
+/// rural cluster where each point is >2 km from any other), all indices are
+/// returned so the caller (stage 2) still has data.
+///
+/// Returning indices (rather than coordinates) lets callers preserve any
+/// per-point metadata attached to the original slice — e.g. signal_dbm in
+/// `filter_outliers` — without a separate join step.
+fn drop_isolated(coords: &[(f64, f64)]) -> Vec<usize> {
+    if coords.len() <= 1 {
+        return (0..coords.len()).collect();
     }
-    let kept: Vec<PositionedAp> = aps
+    let kept: Vec<usize> = coords
         .iter()
         .enumerate()
-        .filter(|(i, ap)| {
-            aps.iter().enumerate().any(|(j, other)| {
-                i != &j && haversine_m(ap.lat, ap.lon, other.lat, other.lon) <= NEIGHBOR_RADIUS_M
+        .filter(|(i, &(lat, lon))| {
+            coords.iter().enumerate().any(|(j, &(olat, olon))| {
+                i != &j && haversine_m(lat, lon, olat, olon) <= NEIGHBOR_RADIUS_M
             })
         })
-        .map(|(_, ap)| ap.clone())
+        .map(|(i, _)| i)
         .collect();
     if kept.is_empty() {
-        aps.to_vec()
+        (0..coords.len()).collect()
     } else {
         kept
     }
 }
 
-/// Geometric median of AP positions, computed in 3D unit-vector space via
-/// Weiszfeld's algorithm. Returns `(lat, lon)` in degrees, or `None` if
-/// the cluster is too degenerate to produce a meaningful center
+/// Geometric median of (lat, lon) coordinates, computed in 3D unit-vector
+/// space via Weiszfeld's algorithm. Returns `(lat, lon)` in degrees, or
+/// `None` if the cluster is too degenerate to produce a meaningful center
 /// (antipodal cancellation).
+///
+/// Operates on a plain `&[(f64, f64)]` (task-0084) so it can be reused
+/// outside the trilateration pipeline — e.g. history.rs stay-point
+/// centroids — without coupling to `PositionedAp`.
 ///
 /// The geometric median minimizes the sum of distances to all input
 /// points and has a ~50% breakdown point — half the inputs can be
@@ -176,14 +193,14 @@ fn drop_isolated(aps: &[PositionedAp]) -> Vec<PositionedAp> {
 /// `c' = sum(p_i / |p_i - c|) / sum(1 / |p_i - c|)` (renormalize to the
 /// unit sphere each step). Capped at 50 iterations or 1e-8 chord
 /// convergence, whichever comes first.
-fn geometric_median(aps: &[PositionedAp]) -> Option<(f64, f64)> {
-    if aps.is_empty() {
+pub(crate) fn geometric_median(coords: &[(f64, f64)]) -> Option<(f64, f64)> {
+    if coords.is_empty() {
         return None;
     }
     // Seed: spherical mean.
     let (mut sx, mut sy, mut sz) = (0.0, 0.0, 0.0);
-    for ap in aps {
-        let (x, y, z) = to_unit_vec(ap.lat, ap.lon);
+    for &(lat, lon) in coords {
+        let (x, y, z) = to_unit_vec(lat, lon);
         sx += x;
         sy += y;
         sz += z;
@@ -197,8 +214,8 @@ fn geometric_median(aps: &[PositionedAp]) -> Option<(f64, f64)> {
     // Weiszfeld iterations on the unit sphere (chord-distance weighting).
     for _ in 0..WEISZFELD_MAX_ITERS {
         let (mut nx, mut ny, mut nz, mut wsum) = (0.0, 0.0, 0.0, 0.0);
-        for ap in aps {
-            let (x, y, z) = to_unit_vec(ap.lat, ap.lon);
+        for &(lat, lon) in coords {
+            let (x, y, z) = to_unit_vec(lat, lon);
             let dx = x - cx;
             let dy = y - cy;
             let dz = z - cz;
@@ -613,7 +630,7 @@ mod tests {
     /// `filter_outliers` can't silently lose the Brazil-catcher property.
     #[test]
     fn drop_isolated_drops_lone_outlier() {
-        let aps = vec![
+        let aps = [
             PositionedAp {
                 lat: 55.707,
                 lon: 12.585,
@@ -636,10 +653,14 @@ mod tests {
                 signal_dbm: Some(-49),
             },
         ];
-        let kept = drop_isolated(&aps);
+        let coords: Vec<(f64, f64)> = aps.iter().map(|a| (a.lat, a.lon)).collect();
+        let kept = drop_isolated(&coords);
         assert_eq!(kept.len(), 3, "the isolated AP must be dropped");
-        for ap in &kept {
-            assert!(ap.lat > 0.0, "no Southern-hemisphere survivors expected");
+        for &i in &kept {
+            assert!(
+                aps[i].lat > 0.0,
+                "no Southern-hemisphere survivors expected"
+            );
         }
     }
 
@@ -648,7 +669,7 @@ mod tests {
     /// would otherwise be wiped, leaving stage 2 with nothing to chew on.
     #[test]
     fn drop_isolated_falls_back_when_all_isolated() {
-        let aps = vec![
+        let aps = [
             PositionedAp {
                 lat: 55.0,
                 lon: 12.0,
@@ -665,7 +686,8 @@ mod tests {
                 signal_dbm: None,
             },
         ];
-        let kept = drop_isolated(&aps);
+        let coords: Vec<(f64, f64)> = aps.iter().map(|a| (a.lat, a.lon)).collect();
+        let kept = drop_isolated(&coords);
         assert_eq!(
             kept.len(),
             3,
@@ -728,7 +750,8 @@ mod tests {
                 signal_dbm: None,
             }, // NYC
         ];
-        let (lat, lon) = geometric_median(&aps).expect("non-degenerate");
+        let coords: Vec<(f64, f64)> = aps.iter().map(|a| (a.lat, a.lon)).collect();
+        let (lat, lon) = geometric_median(&coords).expect("non-degenerate");
         // Cluster is at 55.7N, 12.58E. Geometric median should be within
         // ~1° (~110 km) — the spherical mean would land in the Atlantic.
         assert!(
