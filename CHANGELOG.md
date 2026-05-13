@@ -3,6 +3,29 @@
 All notable changes to whereami. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows semver.
 
+## [0.6.0] — 2026-05-12
+
+Three deferred follow-ups from the v0.5.0 review, landed as a small
+point release. No wire-format breaking changes.
+
+### Added
+
+- **`whereami` CLI uses clap derive** (task-0079). `--json` and
+  `--scan-time=no` are no longer hidden flags; `whereami help` honestly
+  lists every flag. Legacy invocations preserved byte-for-byte
+  (`whereami` → `locate`, single-letter aliases, `--scan-time=no`,
+  `--from`/`--to` for history). 10 new tests pin the surface.
+- **Typed `db_status` and `provenance` enums on the wire** (task-0062).
+  Same JSON spelling (`api`/`cache`/`not_found`, `fresh`/`stale`/
+  `not_found`/`unknown`); strict on the daemon, `#[serde(other)]` on
+  the client so older clients survive future daemon additions.
+
+### Changed
+
+- **`get_pending` returns `Vec<(String, i32)>`** instead of the unused
+  4-field `PendingAp` struct (task-0060). Pending SQL table unchanged;
+  re-add a struct when a real consumer appears.
+
 ## [0.5.0] — 2026-05-10
 
 Implementation sweep of backlog tasks 0046–0081 surfaced by the v0.4.0
