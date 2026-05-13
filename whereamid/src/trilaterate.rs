@@ -45,25 +45,142 @@ fn from_unit_vec(x: f64, y: f64, z: f64) -> (f64, f64) {
     (lat, lon)
 }
 
+/// Pairwise-neighbor radius for stage 1 of outlier filtering (task-0083).
+/// An AP must have at least one other AP within this distance to survive;
+/// catches catastrophic outliers (wrong continent, stale cache from a
+/// different city) regardless of how poisoned the centroid would be.
+const NEIGHBOR_RADIUS_M: f64 = 2_000.0;
+
+/// Stage-2 absolute floor on the distance threshold (meters). Even when
+/// the cluster is unrealistically tight, no AP within this radius of the
+/// geometric median is treated as an outlier. Reflects typical AP radio
+/// reach (~50–200m).
+const STAGE2_FLOOR_M: f64 = 200.0;
+
+/// Stage-2 multiplier on the median distance from the geometric median.
+/// 3× adapts the threshold to the actual cluster spread without being so
+/// permissive that single outliers stretch it past their own distance.
+const STAGE2_MEDIAN_MULTIPLIER: f64 = 3.0;
+
+/// Maximum Weiszfeld iterations for the geometric median. Linear
+/// convergence; clean inputs settle in <10. 50 is generous.
+const WEISZFELD_MAX_ITERS: usize = 50;
+
+/// Chord-distance convergence threshold on the unit sphere (~6 cm at
+/// Earth scale). Well below the STAGE2_FLOOR_M physical noise floor.
+const WEISZFELD_CONVERGENCE: f64 = 1e-8;
+
 /// Filter out outlier APs that are implausibly far from the cluster.
 ///
-/// Algorithm:
-/// 1. Compute the spherical mean (unweighted) of all APs as the cluster center
-/// 2. Compute each AP's haversine distance from that center
-/// 3. Compute the median of those distances (MAD-like measure of cluster spread)
-/// 4. Reject APs whose distance from center exceeds max(200m, 3 * median_distance)
+/// Two-stage robust filter (task-0083). The prior single-stage filter used
+/// an *unweighted spherical mean* as the cluster center, which has a 0%
+/// breakdown point: a single catastrophic outlier (e.g. WiGLE returning a
+/// Brazilian position for a Copenhagen-visible BSSID) pulls the center
+/// thousands of km away, inflating the median and the threshold so the
+/// poisoning outlier can never be rejected. Replaced with:
 ///
-/// The 200m floor reflects the physical assumption that APs in a neighborhood
-/// are within ~200m. The 3x median_distance handles cases where all APs are
-/// further apart (e.g. rural, or all have somewhat stale positions) — it adapts
-/// to the actual data spread rather than rejecting everything.
+/// 1. **Pairwise neighbor sanity** ("Brazil-catcher"): each AP must have
+///    at least one other AP within `NEIGHBOR_RADIUS_M`. This decision is
+///    independent of any centroid, so a single far-away outlier cannot
+///    defeat it. If applying this would drop *every* AP (rural cluster
+///    where all APs are >2 km from each other), the stage is bypassed.
+/// 2. **Geometric-median based threshold**: compute the geometric median
+///    of the survivors (Weiszfeld iterations on unit-vector representation;
+///    ~50% breakdown vs the spherical mean's 0%). Then reject survivors
+///    whose distance from the geometric median exceeds
+///    `max(200m, 3 * median_dist)`. The 200m floor reflects the physical
+///    assumption that APs in a neighborhood are within ~200m. The 3×
+///    multiplier adapts to actual cluster spread.
 pub fn filter_outliers(aps: &[PositionedAp]) -> Vec<PositionedAp> {
     if aps.len() <= 2 {
         return aps.to_vec();
     }
 
-    // Compute spherical-mean center (unweighted) — robust across the antimeridian
-    // and at the poles, where lat/lon medians give wrong answers.
+    // Stage 1: pairwise-neighbor pre-filter.
+    let survivors = drop_isolated(aps);
+
+    // After stage 1, may have ≤2 APs left — bypass stage 2 in that case.
+    if survivors.len() <= 2 {
+        return survivors;
+    }
+
+    // Stage 2: geometric-median centered threshold.
+    let (center_lat, center_lon) = match geometric_median(&survivors) {
+        Some(c) => c,
+        // Degenerate (e.g. antipodal survivors); keep what stage 1 left.
+        None => return survivors,
+    };
+
+    let distances: Vec<f64> = survivors
+        .iter()
+        .map(|ap| haversine_m(center_lat, center_lon, ap.lat, ap.lon))
+        .collect();
+
+    let median_dist = median(&distances);
+    let threshold = f64::max(STAGE2_FLOOR_M, STAGE2_MEDIAN_MULTIPLIER * median_dist);
+
+    let kept: Vec<PositionedAp> = survivors
+        .iter()
+        .zip(distances.iter())
+        .filter(|(_, d)| **d <= threshold)
+        .map(|(ap, _)| ap.clone())
+        .collect();
+
+    if kept.is_empty() {
+        survivors
+    } else {
+        kept
+    }
+}
+
+/// Stage 1 of outlier filtering: drop APs that have no neighbor within
+/// `NEIGHBOR_RADIUS_M`. Independent of any centroid, so robust to even a
+/// majority of catastrophic outliers as long as a real cluster exists.
+///
+/// Fallback: if applying the filter would drop every AP (truly sparse
+/// rural cluster where each AP is >2 km from any other), the original
+/// slice is returned unchanged so stage 2 still has data.
+fn drop_isolated(aps: &[PositionedAp]) -> Vec<PositionedAp> {
+    if aps.len() <= 1 {
+        return aps.to_vec();
+    }
+    let kept: Vec<PositionedAp> = aps
+        .iter()
+        .enumerate()
+        .filter(|(i, ap)| {
+            aps.iter().enumerate().any(|(j, other)| {
+                i != &j && haversine_m(ap.lat, ap.lon, other.lat, other.lon) <= NEIGHBOR_RADIUS_M
+            })
+        })
+        .map(|(_, ap)| ap.clone())
+        .collect();
+    if kept.is_empty() {
+        aps.to_vec()
+    } else {
+        kept
+    }
+}
+
+/// Geometric median of AP positions, computed in 3D unit-vector space via
+/// Weiszfeld's algorithm. Returns `(lat, lon)` in degrees, or `None` if
+/// the cluster is too degenerate to produce a meaningful center
+/// (antipodal cancellation).
+///
+/// The geometric median minimizes the sum of distances to all input
+/// points and has a ~50% breakdown point — half the inputs can be
+/// arbitrary outliers without dragging the result away from the
+/// remaining cluster. The arithmetic / spherical mean has 0% breakdown:
+/// a single outlier displaces it.
+///
+/// Implementation: start from the spherical mean, then iterate
+/// `c' = sum(p_i / |p_i - c|) / sum(1 / |p_i - c|)` (renormalize to the
+/// unit sphere each step). Capped at 50 iterations or 1e-8 chord
+/// convergence, whichever comes first.
+fn geometric_median(aps: &[PositionedAp]) -> Option<(f64, f64)> {
+    if aps.is_empty() {
+        return None;
+    }
+    // Seed: spherical mean.
     let (mut sx, mut sy, mut sz) = (0.0, 0.0, 0.0);
     for ap in aps {
         let (x, y, z) = to_unit_vec(ap.lat, ap.lon);
@@ -71,40 +188,49 @@ pub fn filter_outliers(aps: &[PositionedAp]) -> Vec<PositionedAp> {
         sy += y;
         sz += z;
     }
-    // If APs cancel (e.g. antipodal), the cluster has no meaningful center;
-    // fall back to keeping all APs and let trilaterate() handle the degeneracy.
-    let mag = (sx * sx + sy * sy + sz * sz).sqrt();
-    if mag < 1e-9 {
-        return aps.to_vec();
+    let m = (sx * sx + sy * sy + sz * sz).sqrt();
+    if m < 1e-9 {
+        return None;
     }
-    let (center_lat, center_lon) = from_unit_vec(sx, sy, sz);
+    let (mut cx, mut cy, mut cz) = (sx / m, sy / m, sz / m);
 
-    // Compute each AP's distance from the spherical-mean center
-    let distances: Vec<f64> = aps
-        .iter()
-        .map(|ap| haversine_m(center_lat, center_lon, ap.lat, ap.lon))
-        .collect();
-
-    // Compute median distance (the typical spread)
-    let median_dist = median(&distances);
-
-    // Threshold: max(200m physical floor, 3x the median spread)
-    let threshold = f64::max(200.0, 3.0 * median_dist);
-
-    // Keep APs within threshold of the median position
-    let kept: Vec<PositionedAp> = aps
-        .iter()
-        .zip(distances.iter())
-        .filter(|(_, d)| **d <= threshold)
-        .map(|(ap, _)| ap.clone())
-        .collect();
-
-    // If somehow nothing survived (shouldn't happen with 3x median), return all
-    if kept.is_empty() {
-        return aps.to_vec();
+    // Weiszfeld iterations on the unit sphere (chord-distance weighting).
+    for _ in 0..WEISZFELD_MAX_ITERS {
+        let (mut nx, mut ny, mut nz, mut wsum) = (0.0, 0.0, 0.0, 0.0);
+        for ap in aps {
+            let (x, y, z) = to_unit_vec(ap.lat, ap.lon);
+            let dx = x - cx;
+            let dy = y - cy;
+            let dz = z - cz;
+            let d = (dx * dx + dy * dy + dz * dz).sqrt();
+            // Cap weight to avoid singular spike when c coincides with a point.
+            let w = if d < 1e-9 { 1e9 } else { 1.0 / d };
+            nx += w * x;
+            ny += w * y;
+            nz += w * z;
+            wsum += w;
+        }
+        if wsum < 1e-15 {
+            break;
+        }
+        let nm = (nx * nx + ny * ny + nz * nz).sqrt();
+        if nm < 1e-9 {
+            // Antipodal-like cancellation under iteration; bail with prior c.
+            break;
+        }
+        let (ncx, ncy, ncz) = (nx / nm, ny / nm, nz / nm);
+        let dx = ncx - cx;
+        let dy = ncy - cy;
+        let dz = ncz - cz;
+        let delta = (dx * dx + dy * dy + dz * dz).sqrt();
+        cx = ncx;
+        cy = ncy;
+        cz = ncz;
+        if delta < WEISZFELD_CONVERGENCE {
+            break;
+        }
     }
-
-    kept
+    Some(from_unit_vec(cx, cy, cz))
 }
 
 #[allow(clippy::manual_is_multiple_of)]
@@ -479,6 +605,223 @@ mod tests {
         assert!(
             pos.accuracy_m >= 1000.0,
             "accuracy should be inflated for ambiguous centroid, got {}",
+            pos.accuracy_m
+        );
+    }
+
+    /// task-0083: pin stage-1 behavior directly so a refactor of
+    /// `filter_outliers` can't silently lose the Brazil-catcher property.
+    #[test]
+    fn drop_isolated_drops_lone_outlier() {
+        let aps = vec![
+            PositionedAp {
+                lat: 55.707,
+                lon: 12.585,
+                signal_dbm: Some(-70),
+            },
+            PositionedAp {
+                lat: 55.708,
+                lon: 12.585,
+                signal_dbm: Some(-72),
+            },
+            PositionedAp {
+                lat: 55.706,
+                lon: 12.586,
+                signal_dbm: Some(-74),
+            },
+            // Brazil — no neighbor within NEIGHBOR_RADIUS_M.
+            PositionedAp {
+                lat: -12.894,
+                lon: -38.292,
+                signal_dbm: Some(-49),
+            },
+        ];
+        let kept = drop_isolated(&aps);
+        assert_eq!(kept.len(), 3, "the isolated AP must be dropped");
+        for ap in &kept {
+            assert!(ap.lat > 0.0, "no Southern-hemisphere survivors expected");
+        }
+    }
+
+    /// task-0083: pin stage-1's "everyone is isolated -> bypass" fallback.
+    /// A 3-AP cluster with all pairwise distances > NEIGHBOR_RADIUS_M
+    /// would otherwise be wiped, leaving stage 2 with nothing to chew on.
+    #[test]
+    fn drop_isolated_falls_back_when_all_isolated() {
+        let aps = vec![
+            PositionedAp {
+                lat: 55.0,
+                lon: 12.0,
+                signal_dbm: None,
+            },
+            PositionedAp {
+                lat: 55.5,
+                lon: 12.5,
+                signal_dbm: None,
+            },
+            PositionedAp {
+                lat: 56.0,
+                lon: 13.0,
+                signal_dbm: None,
+            },
+        ];
+        let kept = drop_isolated(&aps);
+        assert_eq!(
+            kept.len(),
+            3,
+            "stage-1 must bypass (not erase) when every AP is isolated"
+        );
+    }
+
+    /// task-0083: direct test of the geometric median. With 5 clustered
+    /// points and 4 scattered outliers spread across the planet, the
+    /// geometric median's ~50% breakdown should still pin the result to
+    /// the cluster.
+    #[test]
+    fn geometric_median_resists_minority_outliers() {
+        let aps = vec![
+            // Cluster of 5 near (55.7, 12.58)
+            PositionedAp {
+                lat: 55.700,
+                lon: 12.580,
+                signal_dbm: None,
+            },
+            PositionedAp {
+                lat: 55.701,
+                lon: 12.581,
+                signal_dbm: None,
+            },
+            PositionedAp {
+                lat: 55.699,
+                lon: 12.579,
+                signal_dbm: None,
+            },
+            PositionedAp {
+                lat: 55.700,
+                lon: 12.582,
+                signal_dbm: None,
+            },
+            PositionedAp {
+                lat: 55.702,
+                lon: 12.580,
+                signal_dbm: None,
+            },
+            // 4 outliers on 4 different continents
+            PositionedAp {
+                lat: -33.87,
+                lon: 151.21,
+                signal_dbm: None,
+            }, // Sydney
+            PositionedAp {
+                lat: 35.68,
+                lon: 139.69,
+                signal_dbm: None,
+            }, // Tokyo
+            PositionedAp {
+                lat: -12.89,
+                lon: -38.29,
+                signal_dbm: None,
+            }, // Salvador
+            PositionedAp {
+                lat: 40.71,
+                lon: -74.00,
+                signal_dbm: None,
+            }, // NYC
+        ];
+        let (lat, lon) = geometric_median(&aps).expect("non-degenerate");
+        // Cluster is at 55.7N, 12.58E. Geometric median should be within
+        // ~1° (~110 km) — the spherical mean would land in the Atlantic.
+        assert!(
+            (lat - 55.7).abs() < 1.0,
+            "geometric median lat should be near cluster (55.7), got {lat}"
+        );
+        assert!(
+            (lon - 12.58).abs() < 1.0,
+            "geometric median lon should be near cluster (12.58), got {lon}"
+        );
+    }
+
+    /// task-0083: real-world incident. The user was at Strandboulevarden 95
+    /// in Copenhagen; `whereami locate` returned (55.71, 12.57) ±916m, ~900m
+    /// off, at Drejøgade. Cause: WiGLE had cached BSSID F6:B1:9C:0A:3A:60
+    /// (a randomized client MAC) at (-12.89, -38.29) — Salvador, Brazil.
+    /// The old single-stage filter (spherical-mean centroid + median
+    /// distance threshold) failed because the Brazilian outlier pulled
+    /// the centroid into northern France, inflating the median past the
+    /// threshold needed to reject the outlier itself. The new two-stage
+    /// filter must drop the Brazilian AP and land in the Copenhagen
+    /// cluster regardless.
+    #[test]
+    fn brazil_in_copenhagen_incident() {
+        let aps = vec![
+            // 6 Copenhagen APs around Strandboulevarden 95
+            PositionedAp {
+                lat: 55.70696,
+                lon: 12.58566,
+                signal_dbm: Some(-76),
+            },
+            PositionedAp {
+                lat: 55.70709,
+                lon: 12.58565,
+                signal_dbm: Some(-72),
+            },
+            PositionedAp {
+                lat: 55.70735,
+                lon: 12.58569,
+                signal_dbm: Some(-73),
+            },
+            PositionedAp {
+                lat: 55.70714,
+                lon: 12.58544,
+                signal_dbm: Some(-73),
+            },
+            PositionedAp {
+                lat: 55.70713,
+                lon: 12.58544,
+                signal_dbm: Some(-73),
+            },
+            PositionedAp {
+                lat: 55.70662,
+                lon: 12.58570,
+                signal_dbm: Some(-77),
+            },
+            // 1 Brazilian outlier — STRONGEST signal, so without filtering
+            // it would dominate the weighted centroid.
+            PositionedAp {
+                lat: -12.89422,
+                lon: -38.29226,
+                signal_dbm: Some(-49),
+            },
+        ];
+        let kept = filter_outliers(&aps);
+        assert_eq!(
+            kept.len(),
+            6,
+            "Brazilian outlier must be dropped; got {} survivors",
+            kept.len()
+        );
+        for ap in &kept {
+            assert!(
+                ap.lat > 55.0 && ap.lon > 12.0,
+                "all survivors must be in Copenhagen cluster, got ({}, {})",
+                ap.lat,
+                ap.lon
+            );
+        }
+        let pos = trilaterate(&aps).unwrap();
+        assert!(
+            (pos.lat - 55.707).abs() < 0.01,
+            "centroid lat should be near 55.707, got {}",
+            pos.lat
+        );
+        assert!(
+            (pos.lon - 12.585).abs() < 0.01,
+            "centroid lon should be near 12.585, got {}",
+            pos.lon
+        );
+        assert!(
+            pos.accuracy_m < 100.0,
+            "accuracy should be ~10s of meters, got {}",
             pos.accuracy_m
         );
     }
