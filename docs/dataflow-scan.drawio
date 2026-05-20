@@ -1,0 +1,124 @@
+<mxfile host="Electron" agent="whereami-dataflow-scan" version="29.0.3">
+  <diagram name="Scan &amp; Resolve" id="scan">
+    <mxGraphModel dx="0" dy="0" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1900" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="Scan &amp; Resolve — turning visible Wi-Fi into cached AP positions" style="text;html=1;align=center;verticalAlign=middle;fontSize=18;fontStyle=1;fillColor=none;strokeColor=none;" parent="1" vertex="1">
+          <mxGeometry x="400" y="30" width="1100" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="Steady-state ingestion. Two triggers (scan loop, pending drain loop) feed one resolver chain. Providers cascade Apple → WiGLE. Results land in three SQLite tables." style="text;html=1;align=center;verticalAlign=middle;fontSize=12;fontStyle=2;fontColor=#666666;fillColor=none;strokeColor=none;" parent="1" vertex="1">
+          <mxGeometry x="220" y="70" width="1460" height="24" as="geometry" />
+        </mxCell>
+
+        <!-- Top row: scan pipeline -->
+        <mxCell id="radio" value="Wi-Fi radio&#xa;(kernel)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=13;strokeWidth=2;" parent="1" vertex="1">
+          <mxGeometry x="60" y="180" width="180" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="scanloop" value="scan loop&#xa;fast 10s / slow 60s" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;dashed=1;strokeWidth=2;fontStyle=2;fontSize=13;" parent="1" vertex="1">
+          <mxGeometry x="600" y="105" width="220" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="scanner" value="scanner.rs&#xa;&#xa;nmcli (iw fallback)&#xa;parse → Vec&amp;lt;ScannedAp&amp;gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
+          <mxGeometry x="600" y="170" width="220" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="debouncer" value="Debouncer&#xa;&#xa;ring buffer per BSSID,&#xa;≥ M / N stable" style="whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
+          <mxGeometry x="900" y="170" width="220" height="110" as="geometry" />
+        </mxCell>
+
+        <!-- Middle row: resolver + providers -->
+        <mxCell id="drainloop" value="pending drain&#xa;every 300s" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;dashed=1;strokeWidth=2;fontStyle=2;fontSize=13;" parent="1" vertex="1">
+          <mxGeometry x="320" y="430" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="resolver" value="resolver.rs&#xa;&#xa;ChainPolicy:&#xa;resolve_readonly,&#xa;resolve_background,&#xa;drain_once" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
+          <mxGeometry x="600" y="410" width="220" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="inflight" value="Inflight&#xa;&#xa;BSSID dedup set,&#xa;RAII guard" style="whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
+          <mxGeometry x="900" y="420" width="220" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="apple_p" value="provider::apple&#xa;&#xa;protobuf encode/decode" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
+          <mxGeometry x="1200" y="420" width="220" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="apple" value="Apple WPS&#xa;no auth, primary" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;strokeWidth=2;fontSize=13;" parent="1" vertex="1">
+          <mxGeometry x="1500" y="420" width="180" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- Wigle row -->
+        <mxCell id="wigle_p" value="provider::wigle&#xa;&#xa;atomic quota reserve" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
+          <mxGeometry x="1200" y="600" width="220" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="wigle" value="WiGLE API&#xa;key, 100/day quota" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;strokeWidth=2;fontSize=13;" parent="1" vertex="1">
+          <mxGeometry x="1500" y="600" width="180" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- SQLite write targets -->
+        <mxCell id="aps" value="aps&#xa;bssid PK, lat, lon,&#xa;source_priority" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="430" y="820" width="200" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="notfound" value="not_found&#xa;TTL revival" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="680" y="820" width="200" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="pendingt" value="pending&#xa;attempts, backoff" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="930" y="820" width="200" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="meta" value="metadata&#xa;api_calls_today" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="1480" y="820" width="200" height="120" as="geometry" />
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e_radio_scan" style="endArrow=classic;html=1;strokeWidth=2;" parent="1" source="radio" target="scanner" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_radio_scan" value="scan" style="edgeLabel;html=1;fontSize=11;" parent="e_radio_scan" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_loop_scan" style="endArrow=classic;html=1;dashed=1;strokeColor=#9673a6;strokeWidth=2;" parent="1" source="scanloop" target="scanner" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_loop_scan" value="trigger" style="edgeLabel;html=1;fontSize=11;" parent="e_loop_scan" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_scan_deb" style="endArrow=classic;html=1;strokeWidth=2;" parent="1" source="scanner" target="debouncer" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_scan_deb" value="Vec&amp;lt;ScannedAp&amp;gt;" style="edgeLabel;html=1;fontSize=11;" parent="e_scan_deb" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_deb_res" style="endArrow=classic;html=1;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="debouncer" target="resolver" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_deb_res" value="stable BSSIDs" style="edgeLabel;html=1;fontSize=11;" parent="e_deb_res" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_drain_res" style="endArrow=classic;html=1;dashed=1;strokeColor=#9673a6;strokeWidth=2;" parent="1" source="drainloop" target="resolver" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_drain_res" value="trigger" style="edgeLabel;html=1;fontSize=11;" parent="e_drain_res" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_drain_pend" style="endArrow=classic;html=1;dashPattern=1 3;strokeWidth=2;exitX=0.5;exitY=1;entryX=0;entryY=0.5;" parent="1" source="drainloop" target="pendingt" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_drain_pend" value="select due" style="edgeLabel;html=1;fontSize=11;" parent="e_drain_pend" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_drain_nf" style="endArrow=classic;html=1;dashPattern=1 3;strokeWidth=2;exitX=0.5;exitY=1;entryX=0;entryY=0.5;" parent="1" source="drainloop" target="notfound" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_drain_nf" value="expired (TTL)" style="edgeLabel;html=1;fontSize=11;" parent="e_drain_nf" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_res_if" style="endArrow=classic;html=1;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="resolver" target="inflight" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_res_if" value="claim BSSID" style="edgeLabel;html=1;fontSize=11;" parent="e_res_if" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_if_apple" style="endArrow=classic;html=1;strokeWidth=2;" parent="1" source="inflight" target="apple_p" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_apple_ext" style="endArrow=classic;html=1;strokeWidth=2;" parent="1" source="apple_p" target="apple" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_apple_ext" value="POST" style="edgeLabel;html=1;fontSize=11;" parent="e_apple_ext" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_apple_wigle" style="endArrow=classic;html=1;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="apple_p" target="wigle_p" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_apple_wigle" value="NotFound ⇒ cascade" style="edgeLabel;html=1;fontSize=11;" parent="e_apple_wigle" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_wigle_ext" style="endArrow=classic;html=1;strokeWidth=2;" parent="1" source="wigle_p" target="wigle" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_wigle_ext" value="GET" style="edgeLabel;html=1;fontSize=11;" parent="e_wigle_ext" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_wigle_meta" style="endArrow=classic;html=1;dashPattern=1 3;strokeWidth=2;strokeColor=#82b366;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="wigle_p" target="meta" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_wigle_meta" value="atomic quota" style="edgeLabel;html=1;fontSize=11;" parent="e_wigle_meta" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <!-- Resolver writes (3 short downward arrows) -->
+        <mxCell id="e_res_aps" style="endArrow=classic;html=1;strokeWidth=2;exitX=0.2;exitY=1;entryX=0.5;entryY=0;" parent="1" source="resolver" target="aps" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_res_aps" value="upsert_ap" style="edgeLabel;html=1;fontSize=11;" parent="e_res_aps" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_res_nf" style="endArrow=classic;html=1;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="resolver" target="notfound" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_res_nf" value="mark not_found" style="edgeLabel;html=1;fontSize=11;" parent="e_res_nf" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_res_pend" style="endArrow=classic;html=1;strokeWidth=2;exitX=0.8;exitY=1;entryX=0.5;entryY=0;" parent="1" source="resolver" target="pendingt" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_res_pend" value="queue (transient)" style="edgeLabel;html=1;fontSize=11;" parent="e_res_pend" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+
+        <!-- Compact legend -->
+        <mxCell id="lg_bg" value="external = red border, loop = purple dashed, processing = blue, in-memory = yellow, SQLite = green cylinder. Edges: solid = data, dashed (purple) = trigger, dotted = read." style="text;html=1;align=left;verticalAlign=middle;fontSize=10;fillColor=#f5f5f5;strokeColor=#888888;dashed=1;fontColor=#444444;" parent="1" vertex="1">
+          <mxGeometry x="40" y="990" width="1700" height="40" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
