@@ -183,6 +183,27 @@ major design choices. Highlights:
 - Atomic daily-quota reservation (single SQL transaction).
 - CLI args for operations, TOML file for secrets only.
 
+### Dataflow diagrams
+
+Four focused diagrams (one per pipeline) — sources in `docs/*.drawio`,
+rendered to SVG. Click for full size.
+
+**Scan & Resolve** — Wi-Fi scan → debouncer → resolver chain → providers → SQLite writes:
+
+[![Scan & Resolve dataflow](docs/dataflow-scan.svg)](docs/dataflow-scan.svg)
+
+**Locate** — TCP request → cached AP lookup → outlier filter → trilateration → response:
+
+[![Locate dataflow](docs/dataflow-locate.svg)](docs/dataflow-locate.svg)
+
+**History** — stay-point segmentation over the fixes timeseries:
+
+[![History dataflow](docs/dataflow-history.svg)](docs/dataflow-history.svg)
+
+**Persist** — SQLite (WAL) topology, showing who writes and who reads each table:
+
+[![Persist topology](docs/dataflow-persist.svg)](docs/dataflow-persist.svg)
+
 See `CHANGELOG.md` for what changed since v0.3.0.
 
 ## License
