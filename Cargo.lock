@@ -1955,7 +1955,7 @@ dependencies = [
 
 [[package]]
 name = "whereami-client"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "whereamid"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "chrono",

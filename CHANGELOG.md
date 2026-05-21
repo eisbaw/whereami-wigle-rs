@@ -3,6 +3,40 @@
 All notable changes to whereami. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows semver.
 
+## [0.6.2] — 2026-05-21
+
+Documentation + planning release. No code changes.
+
+### Added
+
+- **Four focused dataflow diagrams** in `docs/` (replacing the prior single
+  monolithic figure that mixed five pipelines on one canvas):
+  - `dataflow-scan.drawio` — Wi-Fi scan + AP resolution chain
+  - `dataflow-locate.drawio` — on-demand locate flow
+  - `dataflow-history.drawio` — stay-point segmentation
+  - `dataflow-persist.drawio` — SQLite topology (who writes / who reads)
+- **86 spec-quality backlog tasks** (0097–0182) from a comprehensive
+  6-agent codebase review (mped-architect, keeper-maintainer, swe-gardener,
+  scout-testing-advocate, compass-domain-expert, forge-tooling-expert).
+  Each task has file:line references and detailed ACs ready for
+  implementation. Highlights:
+  - Correctness P0: Source::Manual priority, Apple `&&`→`||` not-found
+    gate, api_calls fail-closed on corruption, last_fix monotonicity,
+    `prune_fixes(0)` no-op (currently deletes all).
+  - Domain modeling: `Bssid([u8;6])` newtype with U/L-bit filter (the
+    principled subsume of task-0093 SSID denylist), band-aware `Channel`
+    enum, `Rssi` newtype tracking measurement source, position-provenance
+    separation, stay-point first-fix anchoring.
+  - Refactor structural: `whereami-protocol` crate to deduplicate wire
+    types, `ChainPolicy` → `ChainMode` enum, `DaemonState` split into
+    subsystem structs, library-vs-binary straddle resolution.
+  - Tests: real concurrent dedup test, schema migration v0/v3/v4 paths,
+    `decode_response` golden, daemon→client wire cross-tests,
+    Weiszfeld convergence proptest, expanded fuzz coverage.
+  - Tooling: GitHub Actions CI workflow, `rust-toolchain.toml`,
+    `cargo-audit`/`cargo-deny`, `cargo-release` wiring, workspace
+    shared deps, `.envrc`/direnv integration.
+
 ## [0.6.1] — 2026-05-13
 
 Robustness patch. One real-world incident (`whereami locate` returned a
