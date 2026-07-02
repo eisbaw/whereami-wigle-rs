@@ -99,6 +99,47 @@ proptest! {
         }
     }
 
+    /// task-0186 AC4: with a MIX of measured and signal-less APs, the centroid
+    /// must stay within the cluster diameter (a None AP must not run away with
+    /// it) and every output must be finite. This is the spherical-convex-hull
+    /// bound from `trilaterate_within_cluster_diameter` extended to the
+    /// previously-untested None path.
+    #[test]
+    fn trilaterate_mixed_signal_within_cluster_diameter(
+        coords in prop::collection::vec(
+            (40.0f64..60.0, 5.0f64..20.0, prop::option::of(-100i32..-30)),
+            2..10,
+        )
+    ) {
+        let aps: Vec<PositionedAp> = coords
+            .iter()
+            .map(|&(lat, lon, sig)| PositionedAp { lat, lon, signal_dbm: sig })
+            .collect();
+
+        let filtered = filter_outliers(&aps);
+        if filtered.len() < 2 {
+            return Ok(());
+        }
+        let result = trilaterate(&filtered).unwrap();
+        prop_assert!(
+            result.lat.is_finite() && result.lon.is_finite() && result.accuracy_m.is_finite(),
+            "non-finite result: ({}, {}, {})", result.lat, result.lon, result.accuracy_m
+        );
+
+        let mut diameter = 0.0_f64;
+        for i in 0..filtered.len() {
+            for j in (i + 1)..filtered.len() {
+                let d = haversine_m_test(filtered[i].lat, filtered[i].lon, filtered[j].lat, filtered[j].lon);
+                if d > diameter { diameter = d; }
+            }
+        }
+        for ap in &filtered {
+            let d = haversine_m_test(result.lat, result.lon, ap.lat, ap.lon);
+            prop_assert!(d <= diameter + 1.0,
+                "centroid->AP haversine {:.3}m exceeds cluster diameter {:.3}m", d, diameter);
+        }
+    }
+
     /// Stronger-signal AP pulls the centroid toward itself.
     ///
     /// Generate one strong AP and one weak AP at distinct positions and assert

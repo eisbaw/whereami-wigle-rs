@@ -389,12 +389,65 @@ fn median(values: &[f64]) -> f64 {
     }
 }
 
+/// Physical clamp window for Wi-Fi signal strength (dBm) before it enters the
+/// vote-weight exponent. Real RSSI sits in roughly [-100, -30] dBm; we widen
+/// to [-120, 0] to tolerate driver quirks while still bounding the exponent.
+/// Without this, a bogus value (the iw parser's saturating cast can emit up to
+/// i32::MAX) makes 10^(dbm/20) overflow to +inf, and the inf/inf normalization
+/// then yields NaN lat/lon returned as a "successful" Position. task-0186.
+const DBM_MIN: f64 = -120.0;
+const DBM_MAX: f64 = 0.0;
+
+/// dBm assigned to a signal-less AP only when NO AP in the set has a signal
+/// (so every AP is equal and the exact value is irrelevant). Mid-range Wi-Fi.
+/// When at least one AP has a signal, `missing_signal_dbm` uses the median of
+/// those instead. task-0186.
+const NOMINAL_MISSING_DBM: f64 = -75.0;
+
+/// Vote weight for one AP in the weighted centroid.
+///
+/// `10^(dbm/20)` is proportional to 1/distance under the free-space path-loss
+/// model, so a stronger (closer-to-0) signal pulls the centroid harder. `dbm`
+/// is clamped to `[DBM_MIN, DBM_MAX]` first, so any `i32` signal yields a
+/// finite weight in `[1e-6, 1]` and can never overflow the exponent to +inf.
+/// A missing signal uses `fallback_dbm` (see `missing_signal_dbm`) rather than
+/// a fixed constant, so a signal-less AP cannot dominate a set of weaker
+/// measured APs. task-0186.
+fn vote_weight(signal_dbm: Option<i32>, fallback_dbm: f64) -> f64 {
+    let dbm = signal_dbm.map(|d| d as f64).unwrap_or(fallback_dbm);
+    10f64.powf(dbm.clamp(DBM_MIN, DBM_MAX) / 20.0)
+}
+
+/// The dBm assigned to APs with no measured signal: the median of the measured
+/// dBm in the same set. Median (not mean/max) guarantees a signal-less AP
+/// never outweighs the strongest measured AP — its resolved dBm sits at the
+/// middle of the observed distribution, and `median <= max` is preserved by
+/// the monotonic clamp in `vote_weight`. A fixed nominal (e.g. -75 dBm) would
+/// NOT satisfy this: in a set of only weak APs (all < -75) it would outweigh
+/// every real one. When no AP has a signal, all are equal regardless, so we
+/// return `NOMINAL_MISSING_DBM`. task-0186.
+fn missing_signal_dbm(aps: &[PositionedAp]) -> f64 {
+    let present: Vec<f64> = aps
+        .iter()
+        .filter_map(|a| a.signal_dbm.map(|d| d as f64))
+        .collect();
+    if present.is_empty() {
+        NOMINAL_MISSING_DBM
+    } else {
+        median(&present)
+    }
+}
+
 /// Compute weighted centroid from positioned APs.
 ///
-/// Weight formula: 10^(signal_dbm / 20). Since signal_dbm is negative (e.g. -40),
-/// stronger signals (closer to 0) yield larger weights. E.g. -40 dBm -> weight 0.01,
-/// -80 dBm -> weight 0.0001, so the stronger AP gets 100x more influence.
-/// If no signal info, equal weight (1.0) for all APs.
+/// Weight formula: `10^(signal_dbm / 20)` via `vote_weight`. Since signal_dbm
+/// is negative (e.g. -40), stronger signals (closer to 0) yield larger weights.
+/// E.g. -40 dBm -> weight 0.01, -80 dBm -> weight 0.0001, so the stronger AP
+/// gets 100x more influence. dBm is clamped to [-120, 0] first, so an
+/// out-of-range value cannot overflow the weight to +inf (which would poison
+/// the normalized centroid to NaN). An AP with no signal is given the median
+/// of the measured dBm in the set (`missing_signal_dbm`) so it never dominates
+/// — the old `None => 1.0` equalled a 0 dBm signal, 100x-10000x a real AP.
 pub fn trilaterate(aps: &[PositionedAp]) -> Result<Position> {
     if aps.is_empty() {
         bail!("no positioned APs for trilateration");
@@ -418,11 +471,9 @@ pub fn trilaterate(aps: &[PositionedAp]) -> Result<Position> {
     let mut sz = 0.0;
     let mut sum_weight = 0.0;
 
+    let fallback_dbm = missing_signal_dbm(aps);
     for ap in aps {
-        let weight = match ap.signal_dbm {
-            Some(dbm) => f64::powf(10.0, dbm as f64 / 20.0),
-            None => 1.0,
-        };
+        let weight = vote_weight(ap.signal_dbm, fallback_dbm);
         let (x, y, z) = to_unit_vec(ap.lat, ap.lon);
         sx += weight * x;
         sy += weight * y;
@@ -472,11 +523,9 @@ fn estimate_accuracy(aps: &[PositionedAp], center_lat: f64, center_lon: f64) -> 
     let mut sum_dist = 0.0;
     let mut sum_weight = 0.0;
 
+    let fallback_dbm = missing_signal_dbm(aps);
     for ap in aps {
-        let weight = match ap.signal_dbm {
-            Some(dbm) => f64::powf(10.0, dbm as f64 / 20.0),
-            None => 1.0,
-        };
+        let weight = vote_weight(ap.signal_dbm, fallback_dbm);
         let dist = haversine_m(center_lat, center_lon, ap.lat, ap.lon);
         sum_dist += weight * dist;
         sum_weight += weight;
@@ -563,6 +612,79 @@ mod tests {
         let m = median(&[f64::NAN, 5.0, 1.0, 3.0]);
         // total_cmp order: [1.0, 3.0, 5.0, NaN]; even length → (3.0+5.0)/2.
         assert_eq!(m, 4.0, "median should be 4.0 despite the NaN, got {m}");
+    }
+
+    /// task-0186 AC1: a signal-less AP must never outweigh the strongest
+    /// measured AP — including a set where every measured AP is WEAKER than a
+    /// fixed nominal like -75 dBm (the case a constant fallback breaks). The
+    /// median-of-present fallback keeps the None weight <= the max weight.
+    #[test]
+    fn missing_signal_never_outweighs_strongest_measured() {
+        let aps = [
+            PositionedAp {
+                lat: 0.0,
+                lon: 0.0,
+                signal_dbm: Some(-80),
+            },
+            PositionedAp {
+                lat: 0.0,
+                lon: 0.0,
+                signal_dbm: Some(-90),
+            },
+            PositionedAp {
+                lat: 0.0,
+                lon: 0.0,
+                signal_dbm: None,
+            },
+        ];
+        let fb = missing_signal_dbm(&aps);
+        let none_w = vote_weight(None, fb);
+        let strongest_w = vote_weight(Some(-80), fb); // strongest measured
+        assert!(
+            none_w <= strongest_w,
+            "None weight {none_w} must be <= strongest measured weight {strongest_w}"
+        );
+        // median(-80, -90) = -85 < -80, so strictly less here.
+        assert!(none_w < strongest_w, "expected strictly less for this set");
+        // Sanity: a fixed -75 nominal WOULD have violated AC1 for this set.
+        let fixed_nominal_w = 10f64.powf(-75.0 / 20.0);
+        assert!(
+            fixed_nominal_w > strongest_w,
+            "a fixed -75 nominal would wrongly outweigh the -80 AP"
+        );
+    }
+
+    /// task-0186 AC2: any i32 signal_dbm must yield a finite lat/lon/accuracy.
+    /// Before the clamp, a huge dbm (the iw parser's saturating cast can emit
+    /// i32::MAX) overflowed 10^(dbm/20) to +inf and the normalization produced
+    /// NaN lat/lon returned as a "successful" Position.
+    #[test]
+    fn extreme_signal_dbm_yields_finite_position() {
+        let aps = vec![
+            PositionedAp {
+                lat: 55.700,
+                lon: 12.580,
+                signal_dbm: Some(i32::MAX),
+            },
+            PositionedAp {
+                lat: 55.701,
+                lon: 12.581,
+                signal_dbm: Some(i32::MIN),
+            },
+            PositionedAp {
+                lat: 55.700,
+                lon: 12.585,
+                signal_dbm: None,
+            },
+        ];
+        let pos = trilaterate(&aps).unwrap();
+        assert!(pos.lat.is_finite(), "lat must be finite, got {}", pos.lat);
+        assert!(pos.lon.is_finite(), "lon must be finite, got {}", pos.lon);
+        assert!(
+            pos.accuracy_m.is_finite(),
+            "accuracy must be finite, got {}",
+            pos.accuracy_m
+        );
     }
 
     #[test]
