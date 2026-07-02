@@ -356,6 +356,53 @@ mod tests {
         );
     }
 
+    /// Stopped-provider shadow (review follow-up to task-0189): once WiGLE
+    /// hard-stops (429) on one BSSID, later BSSIDs in the same batch see it
+    /// only as `stopped` — that absence is just as transient as the direct
+    /// HardStop, so an Apple-definitive NotFound alone must NOT mark them
+    /// not_found. Without the `stopped[idx]` -> hard_transient insert in
+    /// resolve_chain, B2 would be blacklisted for the full TTL off a
+    /// momentary rate-limit shadow.
+    #[tokio::test]
+    async fn drain_chain_hard_stop_shadow_does_not_mark_later_bssids() {
+        let state = test_state();
+        let b1 = "aa:bb:cc:dd:ee:a7".to_string();
+        let b2 = "aa:bb:cc:dd:ee:a8".to_string();
+        for b in [&b1, &b2] {
+            crate::server::lock_db(&state)
+                .insert_pending(b, None, None, None, None)
+                .unwrap();
+        }
+
+        let wigle = std::sync::Arc::new(MockProvider::new("wigle-429", |_| {
+            ProviderOutcome::HardStop
+        }));
+        let providers = [
+            mock("apple", |_| ProviderOutcome::NotFound),
+            Provider::Mock(std::sync::Arc::clone(&wigle)),
+        ];
+        let bssids = [b1.clone(), b2.clone()];
+        let _ = resolve_chain(&bssids, &state, &providers, &drain_policy()).await;
+
+        assert_eq!(
+            wigle.call_count(),
+            1,
+            "wigle must not be consulted again after hard-stopping"
+        );
+        for b in [&b1, &b2] {
+            assert!(
+                !crate::server::lock_db(&state)
+                    .is_not_found(b, state.args.not_found_ttl_days)
+                    .unwrap(),
+                "{b}: transient hard-stop (direct or shadowed) must not mark not_found"
+            );
+            assert!(
+                crate::server::lock_db(&state).is_pending(b).unwrap(),
+                "{b}: pending row must survive the transient outage"
+            );
+        }
+    }
+
     /// task-0189 AC#4: a quota-exhausted WiGLE returns Skipped exactly like an
     /// unconfigured one (provider.rs `wigle_lookup`: both `!is_configured` and
     /// `!reserved` yield `Skipped`), so from the chain's viewpoint this is

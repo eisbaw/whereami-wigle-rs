@@ -291,6 +291,13 @@ pub async fn resolve_chain(
 
         for (idx, provider) in providers.iter().enumerate() {
             if stopped[idx] {
+                // A stopped provider is stopped for a transient reason
+                // (HardStop is the sole setter of `stopped`), so its
+                // absence for THIS bssid is transient too. Without this,
+                // an Apple-NotFound after WiGLE hard-stopped earlier in
+                // the batch would mark not_found on Apple's word alone —
+                // a 30-day blacklist off a momentary 429 shadow.
+                hard_transient.insert(bssid.clone());
                 continue;
             }
 
