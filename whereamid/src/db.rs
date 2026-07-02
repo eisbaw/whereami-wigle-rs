@@ -45,23 +45,27 @@ pub struct Database {
 
 const SCHEMA_VERSION: i32 = 5;
 
-/// Parse the metadata.api_calls_today raw value. None / parse-failure both
-/// fall back to 0; a parse failure also warns so silent corruption is
-/// visible in logs (task-0077). Previously the silent unwrap_or(0) would
-/// reset the counter on garbage and re-charge the daily WiGLE quota.
-fn parse_api_calls_value(raw: Option<String>) -> u32 {
+/// Parse the `metadata.api_calls_today` raw value.
+///
+/// `None` (key absent) is a legitimate "no calls recorded yet today" and
+/// maps to `Ok(0)`. A present-but-non-numeric value is corruption (disk
+/// gremlins, partial write) and returns `Err` so callers fail **closed**
+/// (task-0097): `try_reserve_api_call` denies the slot rather than silently
+/// resetting the counter to 0 and re-charging the full daily WiGLE quota on
+/// top of whatever was already spent — the WiGLE budget is irreversible.
+/// The `warn` (task-0077) keeps the corruption visible in logs; it now
+/// describes the deny action instead of the old "treating as 0" heal.
+fn parse_api_calls_value(raw: Option<String>) -> Result<u32> {
     match raw.as_deref() {
-        None => 0,
-        Some(s) => match s.parse() {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::warn!(
-                    "metadata.api_calls_today is not a valid u32 ({:?}); treating as 0",
-                    s
-                );
-                0
-            }
-        },
+        None => Ok(0),
+        Some(s) => s.parse::<u32>().map_err(|_| {
+            tracing::warn!(
+                "metadata.api_calls_today is not a valid u32 ({:?}); \
+                 denying API reservation to avoid double-spending the daily quota",
+                s
+            );
+            anyhow::anyhow!("corrupt metadata.api_calls_today value: {s:?}")
+        }),
     }
 }
 
@@ -682,7 +686,16 @@ impl Database {
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
-            parse_api_calls_value(raw)
+            match parse_api_calls_value(raw) {
+                Ok(v) => v,
+                // task-0097: corrupt counter -> fail closed. Deny the slot and
+                // return WITHOUT writing. Healing the garbage here would reset
+                // the counter and re-charge up to `daily_limit` fresh WiGLE
+                // calls on top of whatever was already spent. Dropping `tx`
+                // uncommitted rolls back cleanly (no write has happened on this
+                // branch). The warn already fired inside parse_api_calls_value.
+                Err(_) => return Ok(false),
+            }
         } else {
             tx.execute(
                 "INSERT INTO metadata (key, value) VALUES ('api_calls_date', ?1)
@@ -738,7 +751,10 @@ impl Database {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        let count: u32 = parse_api_calls_value(raw);
+        // task-0097: a corrupt counter propagates as Err (tx rolls back, no
+        // write). Refunding by healing the garbage to "0" would re-introduce
+        // the double-spend heal this task closes, so fail closed here too.
+        let count: u32 = parse_api_calls_value(raw)?;
         let new_count = count.saturating_sub(1);
         tx.execute(
             "INSERT INTO metadata (key, value) VALUES ('api_calls_today', ?1)
@@ -751,7 +767,10 @@ impl Database {
 
     /// Get the number of API calls made today.
     pub fn api_calls_today(&self) -> Result<u32> {
-        Ok(parse_api_calls_value(self.get_metadata("api_calls_today")?))
+        // task-0097: corrupt counter -> Err. The only caller (status display)
+        // uses `.unwrap_or(0)`, so a garbage row renders as 0 in stats without
+        // affecting the enforcement path in try_reserve_api_call.
+        parse_api_calls_value(self.get_metadata("api_calls_today")?)
     }
 
     // --- stats ---
@@ -1264,6 +1283,45 @@ mod tests {
         db.refund_api_call().unwrap();
         db.refund_api_call().unwrap();
         assert_eq!(db.api_calls_today().unwrap(), 0);
+    }
+
+    /// task-0097: a corrupt `api_calls_today` value must fail **closed** —
+    /// `try_reserve_api_call` denies the slot and leaves the garbage row
+    /// untouched, rather than healing it to 0 and re-charging the full daily
+    /// WiGLE quota on top of whatever was already spent.
+    #[test]
+    fn try_reserve_fails_closed_on_corrupt_counter() {
+        let mut db = Database::open_memory().unwrap();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        // Seed a corrupt counter for *today* so try_reserve reads it instead
+        // of resetting on a date rollover.
+        db.conn
+            .execute(
+                "INSERT INTO metadata (key, value) VALUES ('api_calls_date', ?1)",
+                rusqlite::params![today],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO metadata (key, value) VALUES ('api_calls_today', 'garbage')",
+                [],
+            )
+            .unwrap();
+
+        // Fail closed: deny the reservation despite a generous limit.
+        let reserved = db.try_reserve_api_call(100).unwrap();
+        assert!(!reserved, "corrupt counter must deny the reservation");
+
+        // The corrupt row must NOT be healed/overwritten by the denied call.
+        let raw: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'api_calls_today'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, "garbage", "corrupt counter row must be left untouched");
     }
 
     /// Concurrent reservations must not exceed the daily limit even when
