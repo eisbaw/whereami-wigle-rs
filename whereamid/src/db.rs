@@ -829,8 +829,23 @@ impl Database {
 
     // --- last_fix table ---
 
-    /// Persist the last-known position. Single-row table; an existing row
-    /// is overwritten unconditionally.
+    /// Persist the last-known position into the single-row `last_fix` table.
+    ///
+    /// **Invariant: monotonic by `at_rfc3339` — older writes are silently
+    /// dropped.** The UPSERT overwrites the existing row only when the
+    /// incoming `at_rfc3339` is `>=` the stored one (see the trailing
+    /// `WHERE`). Concurrent locates are already serialized by the daemon's DB
+    /// mutex (task-0046); this guard instead defends against the wall clock
+    /// moving backwards (NTP step, container time fix on restart) letting a
+    /// stale fix clobber a newer one (task-0100).
+    ///
+    /// The string `>=` is a valid chronological test only because every
+    /// writer produces `DateTime::<Utc>::to_rfc3339()`: a fixed-width
+    /// `YYYY-MM-DDTHH:MM:SS` prefix and a constant `+00:00` offset, so
+    /// lexicographic order matches time order. (AutoSi variable-width
+    /// fractional seconds still sort correctly because the `.` that starts a
+    /// fraction sorts after the `+` of the offset.) A non-UTC offset, or a
+    /// writer switching timestamp formats, would break this.
     pub fn set_last_fix(&self, fix: &LastFixRow) -> Result<()> {
         self.conn.execute(
             "INSERT INTO last_fix (id, lat, lon, accuracy_m, address, at_rfc3339, sources)
@@ -841,7 +856,8 @@ impl Database {
                 accuracy_m = excluded.accuracy_m,
                 address    = excluded.address,
                 at_rfc3339 = excluded.at_rfc3339,
-                sources    = excluded.sources",
+                sources    = excluded.sources
+             WHERE excluded.at_rfc3339 >= last_fix.at_rfc3339",
             params![
                 fix.lat,
                 fix.lon,
@@ -857,6 +873,16 @@ impl Database {
     // --- fixes table (timeseries; task-0031) ---
 
     /// Append one fix row to the timeseries.
+    ///
+    /// task-0100: unlike [`Database::set_last_fix`], the `fixes` timeseries
+    /// has **no monotonicity guard**. Rows are ordered by the auto-increment
+    /// `id` (insertion order), not by `at_rfc3339`, so a wall-clock skew can
+    /// append a row whose timestamp predates its neighbour. That is
+    /// intentional: a timeseries records observations in the order they
+    /// happened. `get_fixes_in_range` still filters and sorts by `at_rfc3339`,
+    /// so an out-of-order row lands in its correct time bucket. No DB-side
+    /// `CHECK` is added — it would require a schema migration and would reject
+    /// legitimate skew-affected observations.
     pub fn insert_fix(
         &self,
         at_rfc3339: &str,
@@ -1430,6 +1456,61 @@ mod tests {
             err.is_err(),
             "INSERT with id=2 must violate CHECK constraint, got {err:?}"
         );
+    }
+
+    /// task-0100: set_last_fix is monotonic by at_rfc3339. A write carrying an
+    /// OLDER timestamp than the stored row (e.g. after the clock steps
+    /// backwards) must be silently dropped, leaving the newer fix intact. A
+    /// subsequent newer write must still apply (the guard is `>=`, not `==`).
+    #[test]
+    fn set_last_fix_drops_older_timestamp() {
+        let db = Database::open_memory().unwrap();
+        let t2 = LastFixRow {
+            lat: 55.0,
+            lon: 12.0,
+            accuracy_m: 10.0,
+            address: Some("newer".to_string()),
+            at_rfc3339: "2026-05-10T00:00:00+00:00".to_string(),
+            sources: 5,
+        };
+        db.set_last_fix(&t2).unwrap();
+
+        // Older write (T1 < T2) must NOT overwrite the newer stored fix.
+        let t1 = LastFixRow {
+            lat: 48.0,
+            lon: 2.0,
+            accuracy_m: 99.0,
+            address: Some("older".to_string()),
+            at_rfc3339: "2026-05-09T00:00:00+00:00".to_string(),
+            sources: 1,
+        };
+        db.set_last_fix(&t1).unwrap();
+
+        let got = db.get_last_fix().unwrap().unwrap();
+        assert_eq!(
+            got.at_rfc3339, "2026-05-10T00:00:00+00:00",
+            "older write must be dropped"
+        );
+        assert!(
+            (got.lat - 55.0).abs() < 1e-9,
+            "position must remain the newer fix, got lat {}",
+            got.lat
+        );
+        assert_eq!(got.address, Some("newer".to_string()));
+
+        // Sanity: an equal-or-newer write still applies.
+        let t3 = LastFixRow {
+            lat: 10.0,
+            lon: 20.0,
+            accuracy_m: 5.0,
+            address: Some("newest".to_string()),
+            at_rfc3339: "2026-05-11T00:00:00+00:00".to_string(),
+            sources: 9,
+        };
+        db.set_last_fix(&t3).unwrap();
+        let got = db.get_last_fix().unwrap().unwrap();
+        assert_eq!(got.at_rfc3339, "2026-05-11T00:00:00+00:00");
+        assert!((got.lat - 10.0).abs() < 1e-9);
     }
 
     /// task-0047: a migration body that returns Err must roll back the
