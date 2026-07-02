@@ -73,12 +73,13 @@ pub enum SkipAction {
 /// What the orchestrator should do on a transient network error.
 #[derive(Clone, Copy)]
 pub enum NetErrorAction {
-    /// Log and continue.
+    /// Log and continue. task-0189 removed the former `IncrementPending`
+    /// variant: the pending drain now bumps attempts once per pass in
+    /// `drain_once` (post-resolve), so per-error increments here would
+    /// double-count.
     Ignore,
     /// Insert into the pending queue.
     QueuePending,
-    /// Increment the existing pending row's attempts counter.
-    IncrementPending,
 }
 
 /// What the orchestrator should do when a provider signals `HardStop`
@@ -173,13 +174,31 @@ pub async fn resolve_chain(
     // BSSIDs we deferred to a concurrent in-flight task; we must NOT mark
     // them not_found at chain end (the other task owns that decision).
     let mut deferred_to_other: HashSet<String> = HashSet::new();
-    // BSSIDs where at least one provider returned a transient error
-    // (network failure, rate limit, hard stop, or skipped). For these we
-    // never mark not_found at chain end: the miss may be temporary, so we
-    // fall back to the pending/attempts-based retry policy.
-    // Only when *every* provider returned a definitive NotFound do we have
-    // grounds to write to the not_found table.
-    let mut transient_error: HashSet<String> = HashSet::new();
+    // task-0189: the old single `transient_error` set conflated two very
+    // different situations. Split into:
+    //
+    //   hard_transient   — a provider hit a NetworkError or HardStop for this
+    //                      BSSID. The miss may be temporary, so we must NOT
+    //                      conclude absence; fall back to the pending/attempts
+    //                      retry policy (the task-0045 invariant).
+    //   authoritative_nf — at least one provider *authoritatively* returned
+    //                      NotFound for this BSSID. This is the load-bearing
+    //                      positive evidence that grants an end-of-chain mark.
+    //
+    // A `Skipped` provider (creds unconfigured / daily quota exhausted) is a
+    // deterministic *abstention*: it is neither transient evidence that blocks
+    // a mark nor authoritative evidence that grants one, so it feeds neither
+    // set. An all-Skipped BSSID therefore has an empty authoritative_nf and is
+    // left pending — never marked. That is what stops credential-free mode
+    // from livelocking: before this, Skipped fed transient_error and
+    // permanently suppressed every mark, so an Apple-definitive NotFound with
+    // WiGLE unconfigured was re-queried on every scan forever.
+    //
+    // authoritative_nf is also the seed of per-provider not_found granularity
+    // (task-0128), which would let us remember "Apple says no" without
+    // suppressing a later WiGLE retry.
+    let mut hard_transient: HashSet<String> = HashSet::new();
+    let mut authoritative_nf: HashSet<String> = HashSet::new();
 
     // Track providers that have hard-stopped this pass so we don't keep
     // calling them for subsequent BSSIDs.
@@ -285,6 +304,9 @@ pub async fn resolve_chain(
                 }
                 ProviderOutcome::NotFound => {
                     debug!("{}: {bssid} not found", provider.name());
+                    // task-0189: authoritative evidence of absence. Load-bearing
+                    // for the end-of-chain mark below.
+                    authoritative_nf.insert(bssid.clone());
                     if matches!(policy.not_found, NotFoundPolicy::PerProvider) {
                         let db = crate::server::lock_db(state);
                         if let Err(e) = db.insert_not_found(bssid) {
@@ -295,7 +317,10 @@ pub async fn resolve_chain(
                     // Try the next provider in the chain.
                 }
                 ProviderOutcome::Skipped => {
-                    transient_error.insert(bssid.clone());
+                    // task-0189: a Skipped provider is a deterministic
+                    // abstention (unconfigured creds / exhausted quota), not
+                    // transient evidence and not authoritative evidence. It
+                    // feeds neither set; it only drives the per-policy action.
                     match policy.on_skipped {
                         SkipAction::NextProvider => {}
                         SkipAction::QueuePending => {
@@ -306,7 +331,7 @@ pub async fn resolve_chain(
                 ProviderOutcome::HardStop => {
                     warn!("{} hard-stopped", provider.name());
                     stopped[idx] = true;
-                    transient_error.insert(bssid.clone());
+                    hard_transient.insert(bssid.clone());
                     match policy.on_hard_stop {
                         HardStopAction::Stop => {}
                         HardStopAction::QueuePendingAndStop => {
@@ -316,18 +341,11 @@ pub async fn resolve_chain(
                 }
                 ProviderOutcome::NetworkError(e) => {
                     warn!("{} network error for {bssid}: {e}", provider.name());
-                    transient_error.insert(bssid.clone());
+                    hard_transient.insert(bssid.clone());
                     match policy.on_network_error {
                         NetErrorAction::Ignore => {}
                         NetErrorAction::QueuePending => {
                             queue_pending_for_this = true;
-                        }
-                        NetErrorAction::IncrementPending => {
-                            let db = crate::server::lock_db(state);
-                            if let Err(e2) = db.increment_pending_attempts(bssid) {
-                                warn!("failed to increment attempts for {bssid}: {e2}");
-                                state.record_db_failure();
-                            }
                         }
                     }
                 }
@@ -354,14 +372,19 @@ pub async fn resolve_chain(
         }
     }
 
-    // End-of-chain not_found marking: only mark if no provider found it
-    // AND it isn't already pending (queued from a network/skipped case).
+    // End-of-chain not_found marking (task-0189 rule). Mark a BSSID absent
+    // iff ALL of:
+    //   - it was not resolved this pass,
+    //   - it was not deferred to a concurrent in-flight task,
+    //   - no provider hit a genuinely-transient failure (NetworkError /
+    //     HardStop) for it, and
+    //   - at least one provider *authoritatively* returned NotFound for it.
     //
-    // Previously we slurped up to 1000 pending rows into a HashSet to
-    // answer membership questions for the (typically few) BSSIDs in this
-    // batch. That bounded the cost but silently misclassified pending
-    // BSSIDs that fell outside the first 1000 rows. Use the indexed
-    // is_pending probe instead — it is O(log n) per BSSID and never lies.
+    // The last conjunct is load-bearing: a BSSID whose providers all merely
+    // Skipped had NO provider consulted, so we have no grounds to assert
+    // absence — leave it pending rather than invent a not_found. This is what
+    // lets credential-free mode (WiGLE unconfigured) record Apple-definitive
+    // misses (task-0189 AC#1/AC#4) without livelocking on all-Skipped rows.
     if matches!(policy.not_found, NotFoundPolicy::AtChainEnd) {
         let db = crate::server::lock_db(state);
         for bssid in bssids {
@@ -373,19 +396,14 @@ pub async fn resolve_chain(
                 // for this BSSID; we must not double-write or race it.
                 continue;
             }
-            if transient_error.contains(bssid) {
-                // At least one provider returned a transient error
-                // (network/rate-limit/skipped/hard-stop) for this BSSID.
-                // The miss may be temporary; fall through to whatever the
-                // pending/attempts-based policy decided. This is the
-                // "definitive not_found" guard required by task-0045.
-                //
-                // Note: this gate also covers the "we just queued it" case
-                // (via on_network_error::QueuePending or on_skipped::
-                // QueuePending), since both paths route through
-                // transient_error. There is intentionally no is_pending
-                // check here — drain_once feeds pending BSSIDs as input
-                // and a definitive miss must still mark them not_found.
+            if hard_transient.contains(bssid) {
+                // NetworkError / HardStop: the miss may be temporary. Fall
+                // through to the pending/attempts retry policy (task-0045).
+                continue;
+            }
+            if !authoritative_nf.contains(bssid) {
+                // No provider said NotFound (e.g. every provider Skipped).
+                // We cannot assert absence; leave it pending for a later pass.
                 continue;
             }
             if let Err(e) = db.insert_not_found(bssid) {

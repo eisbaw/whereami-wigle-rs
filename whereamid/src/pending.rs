@@ -36,11 +36,17 @@ pub async fn run_pending_drain(state: Arc<DaemonState>) {
             _ = sleep(interval) => {},
             _ = state.shutdown.notified() => break,
         }
-        drain_once(&state, max_attempts).await;
+        drain_once(&state, max_attempts, &[Provider::Apple, Provider::Wigle]).await;
     }
 }
 
-async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
+/// Run one drain pass over the pending queue using `providers` as the chain.
+///
+/// `providers` is injected (rather than hard-coded) so tests can drive the
+/// pass with `Provider::Mock`s; production passes `[Apple, Wigle]`. The real
+/// Apple provider makes network calls and never returns `Skipped`, so the
+/// all-Skipped fairness/age-out cases below are reachable only under mocks.
+async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32, providers: &[Provider]) {
     // Clean up entries that exceeded max attempts
     {
         let db = crate::server::lock_db(state);
@@ -99,14 +105,13 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
     debug!("draining {} pending entries", pending.len());
 
     // The pending list IS the input — they're already known to need
-    // resolution, so don't pre-filter on cache or not_found. On WiGLE
-    // network errors, increment the existing pending row's attempts.
+    // resolution, so don't pre-filter on cache or not_found.
     //
-    // The chain only fires the not_found mark when EVERY provider
-    // returned a definitive NotFound for the BSSID (task-0045's
-    // transient_error guard). When that happens, delete_pending_on_not_found
-    // (task-0052) removes the pending row in the same critical section,
-    // so this drain replaces the now-removed drain_cleanup_after_chain.
+    // The chain marks not_found only when a provider authoritatively returned
+    // NotFound and nothing was genuinely transient (task-0189). When it marks,
+    // delete_pending_on_not_found (task-0052) removes the pending row in the
+    // same critical section, so this drain replaces the removed
+    // drain_cleanup_after_chain.
     let bssids: Vec<String> = pending
         .iter()
         .map(|(bssid, _attempts)| bssid.clone())
@@ -119,10 +124,36 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32) {
         delete_pending_on_not_found: true,
         not_found: NotFoundPolicy::AtChainEnd,
         on_skipped: SkipAction::NextProvider,
-        on_network_error: NetErrorAction::IncrementPending,
+        // task-0189: retry accounting is done once per pass below, so a
+        // per-error increment here would double-count. Ignore.
+        on_network_error: NetErrorAction::Ignore,
         on_hard_stop: HardStopAction::Stop,
     };
-    let _ = resolve_chain(&bssids, state, &[Provider::Apple, Provider::Wigle], &policy).await;
+    let _ = resolve_chain(&bssids, state, providers, &policy).await;
+
+    // task-0189: advance the attempts counter once per drain pass for every
+    // BSSID we just tried. resolve_chain deletes rows it resolved or
+    // definitively marked not_found, so those UPDATEs affect 0 rows (no-op).
+    // Rows that survived this pass — a genuinely-transient failure, or (only
+    // reachable under mocks, since the real Apple provider never Skips) an
+    // all-providers-skipped BSSID — advance one step. This both (a) ages
+    // hopeless rows out via delete_expired_pending(pending_max_attempts) and
+    // (b) makes get_pending's `ORDER BY attempts ASC` rotate, so a batch of
+    // stuck rows cannot monopolise every drain and starve newer entries
+    // (task-0189 AC#2/AC#3).
+    //
+    // Caveat: a BSSID deferred to a concurrent in-flight task is still pending
+    // here and is bumped too. Harmless — that task's success/not_found deletes
+    // the row well before attempts reaches the cap.
+    {
+        let db = crate::server::lock_db(state);
+        for bssid in &bssids {
+            if let Err(e) = db.increment_pending_attempts(bssid) {
+                warn!("failed to increment attempts for {bssid}: {e}");
+                state.record_db_failure();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -164,7 +195,7 @@ mod tests {
             delete_pending_on_not_found: true,
             not_found: NotFoundPolicy::AtChainEnd,
             on_skipped: SkipAction::NextProvider,
-            on_network_error: NetErrorAction::IncrementPending,
+            on_network_error: NetErrorAction::Ignore,
             on_hard_stop: HardStopAction::Stop,
         }
     }
@@ -244,5 +275,179 @@ mod tests {
         assert!(!nf, "transient error must not mark not_found");
         let pending = crate::server::lock_db(&state).is_pending(&bssid).unwrap();
         assert!(pending, "pending row must survive a transient error");
+    }
+
+    fn mock(name: &'static str, outcome: fn(&str) -> ProviderOutcome) -> Provider {
+        Provider::Mock(std::sync::Arc::new(MockProvider::new(name, outcome)))
+    }
+
+    /// task-0189 AC#1: with WiGLE unconfigured (Skipped) and Apple
+    /// authoritatively NotFound, the BSSID is marked not_found and, under the
+    /// drain policy, its pending row deleted. Before task-0189, Skipped fed the
+    /// transient guard and suppressed the mark forever, so every scan
+    /// re-queried an Apple WPS call for the same unknown AP.
+    #[tokio::test]
+    async fn drain_chain_marks_not_found_when_apple_nf_and_wigle_skipped() {
+        let state = test_state();
+        let bssid = "aa:bb:cc:dd:ee:a1".to_string();
+        crate::server::lock_db(&state)
+            .insert_pending(&bssid, None, None, None, None)
+            .unwrap();
+
+        let apple = std::sync::Arc::new(MockProvider::new("apple", |_| ProviderOutcome::NotFound));
+        let providers = [
+            crate::provider::Provider::Mock(std::sync::Arc::clone(&apple)),
+            mock("wigle", |_| ProviderOutcome::Skipped),
+        ];
+        let _ = resolve_chain(
+            std::slice::from_ref(&bssid),
+            &state,
+            &providers,
+            &drain_policy(),
+        )
+        .await;
+
+        assert_eq!(apple.call_count(), 1, "apple must be consulted");
+        let nf = crate::server::lock_db(&state)
+            .is_not_found(&bssid, state.args.not_found_ttl_days)
+            .unwrap();
+        assert!(
+            nf,
+            "Apple-definitive NotFound with WiGLE Skipped must mark not_found"
+        );
+        assert!(
+            !crate::server::lock_db(&state).is_pending(&bssid).unwrap(),
+            "marking not_found must delete the pending row under the drain policy"
+        );
+    }
+
+    /// task-0189 AC#1 negative twin: when EVERY provider merely Skipped, no
+    /// provider was actually consulted, so there is no authoritative absence —
+    /// the BSSID stays pending and is NOT marked not_found.
+    #[tokio::test]
+    async fn drain_chain_all_skipped_leaves_pending_unmarked() {
+        let state = test_state();
+        let bssid = "aa:bb:cc:dd:ee:a2".to_string();
+        crate::server::lock_db(&state)
+            .insert_pending(&bssid, None, None, None, None)
+            .unwrap();
+
+        let providers = [
+            mock("p1", |_| ProviderOutcome::Skipped),
+            mock("p2", |_| ProviderOutcome::Skipped),
+        ];
+        let _ = resolve_chain(
+            std::slice::from_ref(&bssid),
+            &state,
+            &providers,
+            &drain_policy(),
+        )
+        .await;
+
+        assert!(
+            !crate::server::lock_db(&state)
+                .is_not_found(&bssid, state.args.not_found_ttl_days)
+                .unwrap(),
+            "all-Skipped BSSID must NOT be marked not_found"
+        );
+        assert!(
+            crate::server::lock_db(&state).is_pending(&bssid).unwrap(),
+            "all-Skipped BSSID must remain pending"
+        );
+    }
+
+    /// task-0189 AC#4: a quota-exhausted WiGLE returns Skipped exactly like an
+    /// unconfigured one (provider.rs `wigle_lookup`: both `!is_configured` and
+    /// `!reserved` yield `Skipped`), so from the chain's viewpoint this is
+    /// identical to AC#1. A quota-exhausted day must not disable not_found
+    /// marking for an Apple-definitive miss.
+    #[tokio::test]
+    async fn drain_chain_marks_not_found_when_apple_nf_and_wigle_quota_exhausted() {
+        let state = test_state();
+        let bssid = "aa:bb:cc:dd:ee:a4".to_string();
+        crate::server::lock_db(&state)
+            .insert_pending(&bssid, None, None, None, None)
+            .unwrap();
+
+        let providers = [
+            mock("apple", |_| ProviderOutcome::NotFound),
+            // Stands in for wigle_lookup's quota-exhausted (`!reserved`) branch.
+            mock("wigle-quota-exhausted", |_| ProviderOutcome::Skipped),
+        ];
+        let _ = resolve_chain(
+            std::slice::from_ref(&bssid),
+            &state,
+            &providers,
+            &drain_policy(),
+        )
+        .await;
+
+        assert!(
+            crate::server::lock_db(&state)
+                .is_not_found(&bssid, state.args.not_found_ttl_days)
+                .unwrap(),
+            "quota-exhausted WiGLE must not suppress an Apple-definitive not_found mark"
+        );
+    }
+
+    /// task-0189 AC#2: a pending row whose every drain pass ends without
+    /// success must eventually age out via `pending_max_attempts`. The
+    /// post-pass attempts bump feeds `delete_expired_pending`. (All-Skipped is
+    /// a mock-only shape — the real Apple never Skips; the production
+    /// equivalent is a persistently NetworkError-ing Apple.)
+    #[tokio::test]
+    async fn drain_once_ages_out_perpetually_unresolved_row() {
+        let state = test_state();
+        let max_attempts = 2;
+        let bssid = "aa:bb:cc:dd:ee:a3".to_string();
+        crate::server::lock_db(&state)
+            .insert_pending(&bssid, None, None, None, None)
+            .unwrap();
+
+        let providers = [mock("skip", |_| ProviderOutcome::Skipped)];
+        // attempts: 0 -> 1 -> 2, then delete_expired removes it at attempts>=2.
+        for _ in 0..(max_attempts + 1) {
+            drain_once(&state, max_attempts, &providers).await;
+        }
+
+        assert!(
+            !crate::server::lock_db(&state).is_pending(&bssid).unwrap(),
+            "a perpetually-unresolved pending row must age out via max_attempts"
+        );
+    }
+
+    /// task-0189 AC#3: with more stuck (all-Skipped) rows than one drain batch,
+    /// no row is starved. The attempts bump rotates get_pending's
+    /// `ORDER BY attempts ASC`, so a second pass drains the rows the first pass
+    /// could not reach. Assert every row advanced (none stuck at 0), which is
+    /// impossible under the old head-of-line monopoly.
+    #[tokio::test]
+    async fn drain_once_rotates_across_batches_no_head_of_line_monopoly() {
+        let state = test_state();
+        let total = PENDING_DRAIN_BATCH + 5; // 15 rows > batch of 10
+        let bssids: Vec<String> = (0..total)
+            .map(|i| format!("aa:bb:cc:dd:ee:{i:02x}"))
+            .collect();
+        {
+            let db = crate::server::lock_db(&state);
+            for b in &bssids {
+                db.insert_pending(b, None, None, None, None).unwrap();
+            }
+        }
+
+        let providers = [mock("skip", |_| ProviderOutcome::Skipped)];
+        // High cap so nothing expires; we are testing rotation, not age-out.
+        let max_attempts = 1000;
+        drain_once(&state, max_attempts, &providers).await;
+        drain_once(&state, max_attempts, &providers).await;
+
+        let all = crate::server::lock_db(&state)
+            .get_pending(total * 2)
+            .unwrap();
+        assert_eq!(all.len(), total, "no rows resolved/removed (all Skipped)");
+        assert!(
+            all.iter().all(|(_, attempts)| *attempts >= 1),
+            "every pending row must advance across two passes (no starvation): {all:?}"
+        );
     }
 }
