@@ -228,20 +228,23 @@ pub fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
         (Some(b), Some(lt), Some(ln)) => {
             let lat_f = lt as f64 * 1e-8;
             let lon_f = ln as f64 * 1e-8;
-            // Apple returns (-180, -180) for not-found. Reject when EITHER
-            // coordinate falls below the threshold (OR, not AND): a
-            // truncated/misparsed response that yields one sentinel-ish and
-            // one plausible coordinate (e.g. (-179.99, 12.34)) must still be
-            // treated as "no position" rather than persisted under the
-            // top-priority Source::Apple (task-0098). The tolerant -179.0
-            // threshold (not exact -180) absorbs the 1e-8 fixed-point
-            // conversion's bottom-bit shift (task-0063).
-            if lat_f < APPLE_NOT_FOUND_THRESHOLD || lon_f < APPLE_NOT_FOUND_THRESHOLD {
+            // Apple returns (-180, -180) for not-found, always paired.
+            // Latitude is the sentinel discriminator: real latitude is within
+            // +/-90, so lat < -179 can only be the sentinel or garbage — never
+            // a real fix. Using latitude alone (not lon) avoids a
+            // false-negative on real South-Pacific antimeridian APs whose
+            // longitude legitimately falls in [-180, -179) (task-0225). The
+            // tolerant -179.0 threshold (not exact -180) absorbs the 1e-8
+            // fixed-point conversion's bottom-bit shift (task-0063).
+            if lat_f < APPLE_NOT_FOUND_THRESHOLD {
                 return Ok(None);
             }
             // Range sanity: valid latitude is within +/-90, longitude within
             // +/-180. Anything beyond is malformed protobuf; drop it rather
-            // than cache a bogus fix (task-0098).
+            // than cache a bogus fix. This backstops the sentinel check — a
+            // partial-sentinel response like (-179.99, 12.34) is rejected here
+            // because |lat| > 90, so it is never persisted under the
+            // top-priority Source::Apple (task-0098).
             if lat_f.abs() > MAX_ABS_LATITUDE || lon_f.abs() > MAX_ABS_LONGITUDE {
                 return Ok(None);
             }
@@ -603,6 +606,21 @@ mod tests {
         assert!((ap.lat - 55.68).abs() < 1e-6, "lat={}", ap.lat);
         assert!((ap.lon - 12.57).abs() < 1e-6, "lon={}", ap.lon);
         assert!(matches!(ap.source, crate::db::Source::Apple));
+    }
+
+    /// A real South-Pacific antimeridian AP (Fiji/Taveuni: valid latitude,
+    /// longitude in [-180, -179)) MUST resolve. This is the regression guard
+    /// for task-0225: a latitude-only sentinel gate keeps it, whereas an
+    /// OR-on-longitude gate would wrongly swallow it as not-found.
+    #[test]
+    fn antimeridian_ap_resolves() {
+        let loc = encode_location_msg(Some(scaled(-16.8)), Some(scaled(-179.9)));
+        let wd = encode_wifi_device_msg("aa:bb:cc:dd:ee:ff", Some(&loc));
+        let ap = parse_wifi_device(&wd)
+            .unwrap()
+            .expect("antimeridian AP must resolve, not be swallowed by the not-found gate");
+        assert!((ap.lat - (-16.8)).abs() < 1e-6, "lat={}", ap.lat);
+        assert!((ap.lon - (-179.9)).abs() < 1e-6, "lon={}", ap.lon);
     }
 
     /// The (-180, -180) sentinel remains not-found: regression guard that
