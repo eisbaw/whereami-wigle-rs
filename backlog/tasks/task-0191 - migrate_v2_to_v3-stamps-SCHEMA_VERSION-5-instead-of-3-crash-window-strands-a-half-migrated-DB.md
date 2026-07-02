@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-07-02 04:50'
-updated_date: '2026-07-02 23:05'
+updated_date: '2026-07-02 23:20'
 labels:
   - correctness
 dependencies: []
@@ -50,6 +50,8 @@ Implemented in commit 1078900 (fix(db): stamp v2->v3 migration at literal 3).
 - Shape-repair added at top of migrate() with table_exists() + highest_satisfied_shape_version() helpers; only fires when version<=SCHEMA_VERSION and shape missing (v>=4 needs last_fix, v>=5 needs fixes). version>SCHEMA_VERSION left untouched (forward-compat).
 - Gotcha for future work: repair writes via UPDATE ... WHERE id=1; safe because repair only triggers at version>=4 which implies the v3 single-row shape. A schema_version table manually corrupted to a non-id shape while stamped >=4 is out of contract and fails loudly (not silently). Documented in-code.
 - Gate green: 272 tests (7+22+1+82+147+11+2), clippy clean, fmt clean.
+
+Review gate (orchestrator, 2026-07-03): qa-test-runner GO (279 tests green at 3d6dbd6, clippy re-verified on a FRESH target — 0 warnings, fmt clean, migration+perm tests 2x + 5x stress with zero flakes, no temp-dir leaks). mped-architect GO on all 3 ACs; explicitly endorsed the INSERT OR IGNORE deviation as a genuine improvement (the steered updated==0/INSERT structure PK-violates on an out-of-order (1,>=3) row); walked all crash windows of the shape-repair — crash-safe, re-entrant, cannot downgrade healthy or future DBs. In-thread hardening 53aba50: softened the shape-repair comment (re-keyed row makes the repair UPDATE a zero-row no-op retried next open, not a loud failure).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-07-02 04:52'
-updated_date: '2026-07-02 23:06'
+updated_date: '2026-07-02 23:20'
 labels:
   - security
   - privacy
@@ -60,6 +60,8 @@ AC#2 nuance: hm-module has no StateDirectory, so StateDirectoryMode is N/A there
 Nix validation run: nix-instantiate --parse on both module files (PARSE_OK), nix develop -c true (OK), nix flake show (evaluates; nixosModules.default + homeManagerModules present). StateDirectoryMode/UMask are standard systemd serviceConfig freeform string options.
 
 Gate green: 279 tests (7+22+1+85+151+11+2), clippy clean, fmt clean.
+
+Review gate (orchestrator, 2026-07-03): qa-test-runner GO + mped-architect GO. Architect judged the AC#1 disclosed-gap handling honest and sufficient (NOT AC-gaming): manual path mode-bit-verified, system/hm covered by the same tested daemon backstop, nix layer deferred to 0209. In-thread hardening 53aba50 addressed the two review minors: (1) tighten_file_to_0600 now re-stats after successful chmod and warns if the file is still loose (FUSE/network FS can ignore chmod) — fail-closed for a privacy feature; (2) new test real_wal_sidecar_is_born_owner_only pins the SQLite sidecar mode-inheritance claim against a REAL SQLite-created -wal (was previously verified only by reasoning). Post-fix gate: 281 tests green, clippy+fmt clean. Known accepted nits: fresh-creation mode asserts are umask-vacuous under 0077 (the loose-preexisting tests are the real guards); create-then-chmod microsecond window on manual runs under loose umask (rusqlite has no create-mode hook; nix paths have UMask=0077).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
