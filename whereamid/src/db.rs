@@ -103,11 +103,60 @@ pub struct LastFixRow {
     pub sources: i64,
 }
 
+/// task-0197: tighten the SQLite database file (and any pre-existing -wal/-shm
+/// sidecars) to mode 0600. Best-effort: a chmod failure is warned, never
+/// fatal, so the daemon can still serve reads on a read-only filesystem.
+/// Called on every open BEFORE WAL is enabled, so sidecars SQLite creates
+/// afterward inherit the tightened mode (SQLite copies the DB file's perms).
+/// Unix-only by construction — whereamid is Linux-only (tokio unix signals,
+/// nmcli/iw).
+fn tighten_db_file_permissions(path: &Path) {
+    tighten_file_to_0600(path);
+    // Sidecars from a prior run may still be group/other-readable; tighten
+    // them if present (SQLite names them "<db>-wal" / "<db>-shm").
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        tighten_file_to_0600(Path::new(&sidecar));
+    }
+}
+
+/// chmod a single file to 0600. A missing file is a silent no-op (an absent
+/// sidecar is normal); any other error warns and is swallowed.
+fn tighten_file_to_0600(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(
+                "could not tighten permissions on {} to 0600 ({e}); \
+                 it may be readable by other local users",
+                path.display()
+            );
+        }
+    }
+}
+
 impl Database {
     /// Open or create the database at `path`. Sets WAL mode and creates schema if needed.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open database at {}", path.display()))?;
+
+        // task-0197: tighten the DB file to owner-only (0600) on EVERY open,
+        // BEFORE the journal_mode pragma below activates WAL. SQLite copies the
+        // main database file's permission bits onto the -wal/-shm sidecars it
+        // creates, so tightening first means those sidecars are born 0600 too.
+        // On an existing DB left loose by an older daemon this is also the
+        // AC#3 "existing databases are tightened on startup" path. Best-effort:
+        // a chmod failure warns and continues so a read-only filesystem can
+        // still serve read queries.
+        //
+        // NOTE (task-0192): this chmod MUST stay before the journal_mode
+        // pragma — reordering it after WAL activation would let the sidecars be
+        // created group/other-readable before we tighten the main file.
+        tighten_db_file_permissions(path);
 
         let wal_mode: String = conn
             .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
@@ -1947,5 +1996,112 @@ mod tests {
             let _ = std::fs::remove_file(&p);
         }
         result.unwrap();
+    }
+
+    // --- task-0197: DB file permission hardening -------------------------
+
+    /// Unique throwaway directory for one file-backed test (no `tempfile`
+    /// dependency — matches tests/shutdown.rs's convention).
+    fn unique_tempdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "whereamid-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// "<path>-wal" / "<path>-shm" as a sibling PathBuf (append, do NOT replace
+    /// the .sqlite extension).
+    fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+        let mut s = path.as_os_str().to_owned();
+        s.push(suffix);
+        s.into()
+    }
+
+    fn mode_bits(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// task-0197 AC#2: a freshly created DB file is owner-only (0600). (The
+    /// 0700 state-directory half lives in main.rs's ensure_private_dir test —
+    /// Database::open does not create the parent directory.)
+    #[test]
+    fn open_creates_db_file_0600() {
+        let dir = unique_tempdir("perms-fresh");
+        let path = dir.join("aps.sqlite");
+        {
+            let _db = Database::open(&path).unwrap();
+        }
+        assert_eq!(
+            mode_bits(&path),
+            0o600,
+            "a freshly created DB file must be 0600, not group/other readable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// task-0197 AC#3: an existing DB left group/other-readable by an older
+    /// daemon is tightened back to 0600 on the next open.
+    #[test]
+    fn open_tightens_preexisting_loose_db() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_tempdir("perms-existing");
+        let path = dir.join("aps.sqlite");
+        // First open creates a valid, migrated DB (already 0600).
+        {
+            let _db = Database::open(&path).unwrap();
+        }
+        // Simulate an older daemon: loosen the file to world-readable 0644.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_bits(&path), 0o644, "precondition: DB is loose");
+        // Reopen: startup must tighten it back.
+        {
+            let _db = Database::open(&path).unwrap();
+        }
+        assert_eq!(
+            mode_bits(&path),
+            0o600,
+            "an existing loose DB must be tightened to 0600 on open"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// task-0197: the tighten helper covers the main file AND pre-existing
+    /// -wal/-shm sidecars, and silently ignores a missing sidecar (NotFound).
+    /// Exercised directly (deterministically) because a clean connection close
+    /// checkpoints and removes the sidecars, making them awkward to observe
+    /// via the integration path.
+    #[test]
+    fn tighten_db_file_permissions_covers_main_and_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_tempdir("perms-tighten");
+        let path = dir.join("aps.sqlite");
+        let wal = sidecar(&path, "-wal");
+        let shm = sidecar(&path, "-shm");
+        // Create main + both sidecars, all group/world readable.
+        for p in [&path, &wal, &shm] {
+            std::fs::write(p, b"x").unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        tighten_db_file_permissions(&path);
+        for p in [&path, &wal, &shm] {
+            assert_eq!(
+                mode_bits(p),
+                0o600,
+                "{} must be tightened to 0600",
+                p.display()
+            );
+        }
+        // A missing sidecar must be a silent no-op (no panic).
+        std::fs::remove_file(&wal).unwrap();
+        tighten_db_file_permissions(&path);
+        assert_eq!(mode_bits(&path), 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

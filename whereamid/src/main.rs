@@ -54,10 +54,19 @@ async fn main() -> Result<()> {
     info!("db: {}", args.db.display());
     info!("interface: {}", args.interface);
 
-    // Ensure DB directory exists
+    // Ensure the DB's parent directory exists and is owner-only (0700). We
+    // create it at a tight mode ourselves rather than relying solely on the
+    // systemd unit's StateDirectoryMode/UMask, so manual and --db-relocated
+    // runs are protected too (task-0197). A pre-existing directory the daemon
+    // did NOT create is left untouched (never chmod a possibly-shared parent
+    // like /tmp) but warned about when it is group/other-accessible.
     if let Some(parent) = args.db.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating db directory {}", parent.display()))?;
+        // parent() is "" for a bare filename; that means CWD, which already
+        // exists and is not ours to re-permission.
+        if !parent.as_os_str().is_empty() {
+            ensure_private_dir(parent)?;
+            warn_if_dir_accessible(parent);
+        }
     }
 
     // Load secrets from config file
@@ -251,6 +260,50 @@ async fn main() -> Result<()> {
 
     info!("whereamid stopped");
     Ok(())
+}
+
+/// Create every missing component of `dir` with mode 0700 (owner-only).
+///
+/// Uses `DirBuilder::mode` so the restrictive permission is applied at
+/// creation time — there is no window where the directory briefly exists 0755
+/// before a follow-up chmod. `mode()` applies ONLY to components this call
+/// creates; pre-existing ancestors (e.g. `/var/lib`, `/home/<user>`, `/tmp`)
+/// are left untouched, which is correct — the daemon must never re-permission
+/// a shared parent it did not create. Unix-only by construction: whereamid is
+/// Linux-only (tokio unix signals, nmcli/iw). task-0197.
+fn ensure_private_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating state directory {}", dir.display()))
+}
+
+/// Warn (do NOT chmod) if `dir` is readable or traversable by group or other.
+/// The daemon only tightens directories it created itself
+/// ([`ensure_private_dir`]); a pre-existing state directory may be shared, so
+/// we surface the exposure for the operator to fix rather than silently
+/// changing a directory we do not own. task-0197.
+fn warn_if_dir_accessible(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(dir) {
+        Ok(md) => {
+            let mode = md.permissions().mode();
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    "state directory {} is group/other-accessible (mode {:o}); the \
+                     location history in the database may be exposed to other local \
+                     users — consider chmod 700",
+                    dir.display(),
+                    mode & 0o7777
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!("could not stat state directory {} ({e})", dir.display());
+        }
+    }
 }
 
 /// Metadata key holding the number of tasks force-aborted at the end of the
@@ -536,5 +589,71 @@ mod orphan_count_tests {
         db.set_metadata(ORPHANS_ABORTED_KEY, "not-a-number")
             .unwrap();
         assert_eq!(load_orphan_count(&db), 0);
+    }
+}
+
+#[cfg(test)]
+mod state_dir_tests {
+    //! task-0197: the daemon must create its state directory owner-only
+    //! (0700), including every nested component it makes, so the location
+    //! history it stores is not exposed to other local users on manual /
+    //! --db-relocated runs.
+    use super::ensure_private_dir;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn unique_tempdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "whereamid-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mode_bits(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// AC#2 (dir half): ensure_private_dir creates ALL missing nested
+    /// components at 0700, not just the leaf. The pre-existing base tempdir
+    /// (0755, the analog of /var/lib) is left untouched — only the components
+    /// we create get the tight mode.
+    #[test]
+    fn ensure_private_dir_creates_nested_components_0700() {
+        let base = unique_tempdir("statedir");
+        // Capture the pre-existing base mode; it must be unchanged afterward
+        // (robust to whatever umask create_dir_all ran under).
+        let base_mode_before = mode_bits(&base);
+        let nested = base.join("a").join("b").join("whereami");
+        ensure_private_dir(&nested).unwrap();
+
+        assert_eq!(
+            mode_bits(&base.join("a")),
+            0o700,
+            "created 'a' must be 0700"
+        );
+        assert_eq!(
+            mode_bits(&base.join("a").join("b")),
+            0o700,
+            "created 'b' must be 0700"
+        );
+        assert_eq!(mode_bits(&nested), 0o700, "leaf must be 0700");
+        // We must not have re-permissioned the pre-existing base directory.
+        assert_eq!(
+            mode_bits(&base),
+            base_mode_before,
+            "pre-existing base dir must be left untouched"
+        );
+
+        // Idempotent: a second call on the now-existing path is a no-op that
+        // neither errors nor loosens the mode.
+        ensure_private_dir(&nested).unwrap();
+        assert_eq!(mode_bits(&nested), 0o700);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
