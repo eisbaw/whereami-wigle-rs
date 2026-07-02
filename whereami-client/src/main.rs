@@ -18,7 +18,6 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Serialize;
 use std::process;
 use whereami_client::{DaemonResponse, WhereAmIClient};
 
@@ -118,19 +117,63 @@ fn fatal(msg: &str) -> ! {
     process::exit(1);
 }
 
-/// Common dispatch ladder: --json prints raw, ok=false fatals with the
-/// daemon's error, ok=true delegates to render. Replaces six near-
-/// identical match blocks in the CLI (task-0058).
-fn dispatch<T: Serialize + DaemonResponse>(result: Result<T>, json: bool, render: impl FnOnce(&T)) {
+/// Human-mode dispatch ladder: ok=false fatals with the daemon's error,
+/// ok=true delegates to render, transport error fatals. The `--json` path
+/// is now handled separately by `emit_json` (task-0183), so this no longer
+/// branches on json and never re-serializes the parsed struct.
+fn dispatch<T: DaemonResponse>(result: Result<T>, render: impl FnOnce(&T)) {
     match result {
-        Ok(resp) if json => println!(
-            "{}",
-            serde_json::to_string(&resp).expect("response struct must serialize")
-        ),
         Ok(resp) if !resp.is_ok() => fatal(resp.error().unwrap_or("unknown error")),
         Ok(resp) => render(&resp),
         Err(e) => fatal(&format!("error: {e}")),
     }
+}
+
+/// Build a CLI-synthesized `--json` error line. Used ONLY when there is
+/// no daemon line to pass through (daemon unreachable, or it returned an
+/// unusable/non-JSON payload). Serialized via serde_json so the message is
+/// always correctly escaped and stdout stays valid JSON (task-0183 AC #3).
+///
+/// NOTE: this object is fabricated by the CLI, not received from the
+/// daemon — it is the one case where `--json` output is not a verbatim
+/// daemon line. protocol.md documents this transport-error shape (see
+/// TASK-0213).
+fn synth_error(msg: &str) -> String {
+    serde_json::json!({ "ok": false, "error": msg }).to_string()
+}
+
+/// Pure core of the `--json` path (task-0183): map the raw-line result to
+/// the exact stdout line and process exit code. No I/O, so it is directly
+/// unit-testable.
+///
+/// - Valid JSON line: passed through BYTE-IDENTICALLY. Exit 0 iff its `ok`
+///   field is boolean true, else exit 1. We parse ONLY `ok` and never
+///   re-serialize, so no field absent on the wire is invented and no
+///   present/unknown field is dropped.
+/// - Non-JSON line (broken daemon): treated as a transport failure — a
+///   synthesized error embedding the offending payload, exit 1.
+/// - Transport error (daemon down): synthesized error, exit 1.
+fn json_output(raw: Result<String>) -> (String, i32) {
+    match raw {
+        Ok(line) => match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(value) => {
+                let ok = value.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
+                (line, i32::from(!ok))
+            }
+            Err(_) => (
+                synth_error(&format!("daemon returned a non-JSON response: {line}")),
+                1,
+            ),
+        },
+        Err(e) => (synth_error(&format!("{e:#}")), 1),
+    }
+}
+
+/// Emit the `--json` result and exit. Never returns.
+fn emit_json(raw: Result<String>) -> ! {
+    let (line, code) = json_output(raw);
+    println!("{line}");
+    process::exit(code);
 }
 
 fn main() {
@@ -179,7 +222,10 @@ fn main() {
 }
 
 fn run_locate(client: &WhereAmIClient, json: bool) {
-    dispatch(client.locate(), json, |resp| {
+    if json {
+        emit_json(client.locate_raw());
+    }
+    dispatch(client.locate(), |resp| {
         if resp.stale {
             let age_s = resp.age_s.unwrap_or(0);
             let age_str = if age_s < 60 {
@@ -204,7 +250,10 @@ fn run_locate(client: &WhereAmIClient, json: bool) {
 }
 
 fn run_scan(client: &WhereAmIClient, json: bool, no_scan_time: bool) {
-    dispatch(client.scan(), json, |resp| {
+    if json {
+        emit_json(client.scan_raw());
+    }
+    dispatch(client.scan(), |resp| {
         if !no_scan_time {
             let age_ms = resp.scan_age_ms.unwrap_or(0);
             let age_s = age_ms / 1000;
@@ -227,7 +276,10 @@ fn run_scan(client: &WhereAmIClient, json: bool, no_scan_time: bool) {
 }
 
 fn run_stats(client: &WhereAmIClient, json: bool) {
-    dispatch(client.stats(), json, |resp| {
+    if json {
+        emit_json(client.stats_raw());
+    }
+    dispatch(client.stats(), |resp| {
         println!("cached:        {}", resp.cached_aps);
         println!("pending:       {}", resp.pending_aps);
         println!("not_found:     {}", resp.not_found_aps);
@@ -239,7 +291,10 @@ fn run_stats(client: &WhereAmIClient, json: bool) {
 }
 
 fn run_debug(client: &WhereAmIClient, json: bool) {
-    dispatch(client.debug(), json, |resp| {
+    if json {
+        emit_json(client.debug_raw());
+    }
+    dispatch(client.debug(), |resp| {
         let cli_rev = env!("GIT_REV");
         let daemon_rev = resp.daemon_rev.as_deref().unwrap_or("?");
         println!("cli: {cli_rev}  daemon: {daemon_rev}");
@@ -290,7 +345,13 @@ fn run_history(
     } else {
         range
     };
-    dispatch(client.history(range, from, to), json, |resp| {
+    // Argument validation above (usage errors) is reported on stderr in
+    // both modes, matching clap; from here on the daemon response — or a
+    // synthesized transport error — is what reaches stdout under --json.
+    if json {
+        emit_json(client.history_raw(range, from, to));
+    }
+    dispatch(client.history(range, from, to), |resp| {
         println!("range: {} -> {}", resp.from, resp.to);
         println!("segments: {}", resp.segments.len());
         for seg in &resp.segments {
@@ -310,12 +371,16 @@ fn run_history(
 }
 
 fn run_version(client: &WhereAmIClient, json: bool) {
+    // --json version must never print the human `cli: ...` banner to
+    // stdout; it goes through the same raw passthrough as every other
+    // command, so stdout stays valid JSON even with the daemon down
+    // (task-0183 AC #3).
+    if json {
+        emit_json(client.version_raw());
+    }
     let cli_version = env!("CARGO_PKG_VERSION");
     let cli_rev = env!("GIT_REV");
     match client.version() {
-        Ok(resp) if json => {
-            println!("{}", serde_json::to_string(&resp).unwrap());
-        }
         Ok(resp) if !resp.ok => {
             println!("cli:    {cli_version} ({cli_rev})");
             eprintln!(
@@ -468,5 +533,93 @@ mod tests {
         // non-zero on parse failure.
         let res = Cli::try_parse_from(["whereami", "wibble"]);
         assert!(res.is_err());
+    }
+
+    // --- task-0183: --json raw passthrough ---
+
+    #[test]
+    fn json_output_passes_ok_response_through_byte_identically() {
+        // An ok:true line must be emitted verbatim: no field absent on the
+        // wire (error/address/stale/cached/...) may be invented, and exit
+        // code is 0. This is the regression the old re-serialize path had.
+        let line = r#"{"ok":true,"v":1,"lat":1.5,"lon":2.5,"accuracy_m":30.0,"sources":3}"#;
+        let (out, code) = json_output(Ok(line.to_string()));
+        assert_eq!(
+            out, line,
+            "output must be byte-identical to the daemon line"
+        );
+        assert_eq!(code, 0);
+        for absent in ["error", "address", "stale", "cached", "fetched", "pending"] {
+            assert!(
+                !out.contains(absent),
+                "field {absent:?} was absent on the wire but appeared in --json output"
+            );
+        }
+    }
+
+    #[test]
+    fn json_output_error_response_is_verbatim_and_exits_nonzero() {
+        // ok:false must pass through unchanged AND exit nonzero. Previously
+        // this printed fabricated lat/lon 0.0 (Null Island) and exited 0.
+        let line = r#"{"ok":false,"v":1,"error":"scan buffer empty"}"#;
+        let (out, code) = json_output(Ok(line.to_string()));
+        assert_eq!(out, line);
+        assert_ne!(code, 0, "ok:false must exit nonzero");
+        assert!(!out.contains("lat"), "must not fabricate a lat field");
+        assert!(!out.contains("lon"), "must not fabricate a lon field");
+    }
+
+    #[test]
+    fn json_output_preserves_unknown_forward_compat_fields() {
+        // A field this client version does not know about must survive the
+        // passthrough (the old typed re-serialize dropped unknown fields).
+        let line = r#"{"ok":true,"v":2,"lat":1.0,"lon":2.0,"future_field":"keepme"}"#;
+        let (out, code) = json_output(Ok(line.to_string()));
+        assert_eq!(out, line);
+        assert_eq!(code, 0);
+        assert!(out.contains("future_field"));
+    }
+
+    #[test]
+    fn json_output_transport_error_is_synthesized_valid_json() {
+        // AC #3: daemon unreachable must still yield exactly one valid JSON
+        // line on stdout and a nonzero exit.
+        let (out, code) = json_output(Err(anyhow::anyhow!("connection refused")));
+        assert_ne!(code, 0);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("stdout must be valid JSON");
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["error"], serde_json::json!("connection refused"));
+    }
+
+    #[test]
+    fn json_output_non_json_line_is_synthesized_valid_json() {
+        // A broken daemon emitting a non-JSON line must not corrupt stdout;
+        // we synthesize an error embedding the (escaped) payload.
+        let (out, code) = json_output(Ok("this is not json".to_string()));
+        assert_ne!(code, 0);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("stdout must be valid JSON");
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert!(v["error"].as_str().unwrap().contains("this is not json"));
+    }
+
+    #[test]
+    fn json_output_missing_ok_field_still_valid_json_and_nonzero() {
+        // Valid JSON but no boolean `ok`: pass through byte-identically
+        // (stdout stays valid JSON) but treat as failure since ok!=true.
+        let line = r#"{"v":1,"note":"weird"}"#;
+        let (out, code) = json_output(Ok(line.to_string()));
+        assert_eq!(out, line);
+        assert_ne!(code, 0);
+    }
+
+    #[test]
+    fn json_output_control_bytes_never_reach_stdout_raw() {
+        // Defense-in-depth: a non-JSON payload carrying terminal escapes
+        // must be serde-escaped inside the synthesized error, so stdout is
+        // valid JSON and carries no raw ESC (ties task-0183 to task-0198).
+        let (out, _code) = json_output(Ok("\u{1b}[2J\u{07}".to_string()));
+        assert!(!out.contains('\u{1b}'), "raw ESC must not reach stdout");
+        assert!(!out.contains('\u{07}'), "raw BEL must not reach stdout");
+        let _v: serde_json::Value = serde_json::from_str(&out).expect("still valid JSON");
     }
 }

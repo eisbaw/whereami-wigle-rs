@@ -342,74 +342,83 @@ impl WhereAmIClient {
         Ok(response_line.trim().to_string())
     }
 
-    /// Send a request and read the response. One-shot TCP connection.
-    fn request<T: for<'de> Deserialize<'de>>(&self, json: &str) -> Result<T> {
-        let mut stream = TcpStream::connect(&self.addr)
-            .with_context(|| format!("connecting to whereamid at {}", self.addr))?;
-
-        stream
-            .write_all(json.as_bytes())
-            .context("sending request")?;
-        stream.write_all(b"\n").context("sending newline")?;
-        stream.flush().context("flushing")?;
-
-        // Signal we're done writing
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .context("shutdown write")?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .context("reading response")?;
-
-        if response_line.is_empty() {
+    /// Parse a daemon response line into the typed response `T`.
+    ///
+    /// Every typed accessor fetches its raw line via the matching
+    /// `*_raw()` method (which builds the request struct and calls
+    /// `raw_command`) and parses it here. That keeps the typed path and
+    /// the `--json` passthrough on a single source of truth for both the
+    /// request bytes and the transport (task-0183): they can no longer
+    /// drift because there is exactly one place each request is built.
+    fn parse_response_line<T: for<'de> Deserialize<'de>>(line: &str) -> Result<T> {
+        if line.is_empty() {
             bail!("empty response from daemon");
         }
-
-        let resp: T = serde_json::from_str(&response_line).context("parsing response JSON")?;
-        Ok(resp)
+        serde_json::from_str(line).context("parsing response JSON")
     }
 
     /// Ask "where am I?" based on current stable APs.
     pub fn locate(&self) -> Result<LocateResponse> {
-        let req = serde_json::to_string(&LocateRequest { cmd: "locate" })?;
-        self.request(&req)
+        Self::parse_response_line(&self.locate_raw()?)
+    }
+
+    /// Raw `locate`: the daemon's response line verbatim (feeds `--json`).
+    pub fn locate_raw(&self) -> Result<String> {
+        self.raw_command(&serde_json::to_string(&LocateRequest { cmd: "locate" })?)
     }
 
     /// Look up specific BSSIDs (ephemeral, does not write to cache).
     pub fn resolve(&self, bssids: Vec<String>) -> Result<ResolveResponse> {
-        let req = serde_json::to_string(&ResolveRequest {
+        Self::parse_response_line(&self.resolve_raw(bssids)?)
+    }
+
+    /// Raw `resolve`: the daemon's response line verbatim (feeds `--json`).
+    pub fn resolve_raw(&self, bssids: Vec<String>) -> Result<String> {
+        self.raw_command(&serde_json::to_string(&ResolveRequest {
             cmd: "resolve",
             bssids,
-        })?;
-        self.request(&req)
+        })?)
     }
 
     /// Get current visible Wi-Fi networks.
     pub fn scan(&self) -> Result<ScanResponse> {
-        let req = serde_json::to_string(&SimpleRequest { cmd: "scan" })?;
-        self.request(&req)
+        Self::parse_response_line(&self.scan_raw()?)
+    }
+
+    /// Raw `scan`: the daemon's response line verbatim (feeds `--json`).
+    pub fn scan_raw(&self) -> Result<String> {
+        self.raw_command(&serde_json::to_string(&SimpleRequest { cmd: "scan" })?)
     }
 
     /// Get cache and API statistics.
     pub fn stats(&self) -> Result<StatsResponse> {
-        let req = serde_json::to_string(&SimpleRequest { cmd: "stats" })?;
-        self.request(&req)
+        Self::parse_response_line(&self.stats_raw()?)
+    }
+
+    /// Raw `stats`: the daemon's response line verbatim (feeds `--json`).
+    pub fn stats_raw(&self) -> Result<String> {
+        self.raw_command(&serde_json::to_string(&SimpleRequest { cmd: "stats" })?)
     }
 
     /// Get the daemon's debug snapshot: scan buffer state, per-BSSID
     /// debounce counters, DB classification.
     pub fn debug(&self) -> Result<DebugResponse> {
-        let req = serde_json::to_string(&SimpleRequest { cmd: "debug" })?;
-        self.request(&req)
+        Self::parse_response_line(&self.debug_raw()?)
+    }
+
+    /// Raw `debug`: the daemon's response line verbatim (feeds `--json`).
+    pub fn debug_raw(&self) -> Result<String> {
+        self.raw_command(&serde_json::to_string(&SimpleRequest { cmd: "debug" })?)
     }
 
     /// Get the daemon's version string and git revision.
     pub fn version(&self) -> Result<VersionResponse> {
-        let req = serde_json::to_string(&SimpleRequest { cmd: "version" })?;
-        self.request(&req)
+        Self::parse_response_line(&self.version_raw()?)
+    }
+
+    /// Raw `version`: the daemon's response line verbatim (feeds `--json`).
+    pub fn version_raw(&self) -> Result<String> {
+        self.raw_command(&serde_json::to_string(&SimpleRequest { cmd: "version" })?)
     }
 
     /// Query location history. Pass either `range` ("7d", "24h") or both
@@ -420,13 +429,22 @@ impl WhereAmIClient {
         from: Option<String>,
         to: Option<String>,
     ) -> Result<HistoryResponse> {
-        let req = serde_json::to_string(&HistoryRequest {
+        Self::parse_response_line(&self.history_raw(range, from, to)?)
+    }
+
+    /// Raw `history`: the daemon's response line verbatim (feeds `--json`).
+    pub fn history_raw(
+        &self,
+        range: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+    ) -> Result<String> {
+        self.raw_command(&serde_json::to_string(&HistoryRequest {
             cmd: "history",
             range,
             from,
             to,
-        })?;
-        self.request(&req)
+        })?)
     }
 }
 
