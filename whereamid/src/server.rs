@@ -239,8 +239,17 @@ enum Provenance {
     Api,
     /// Served from the local SQLite cache.
     Cache,
-    /// Definitively absent from cache and providers.
+    /// Authoritative absence: a provider returned NotFound for this BSSID on
+    /// this call, or the not_found table recorded absence within its TTL.
+    /// Safe for a client to cache as "not locatable".
     NotFound,
+    /// task-0194: the daemon could not consult a provider for this BSSID this
+    /// call, so absence is NOT established — the lookup was deferred to an
+    /// in-flight resolution, the only provider was skipped (missing creds /
+    /// exhausted quota), or a transient failure occurred. Distinct from
+    /// NotFound so clients that cache not_found don't blacklist a BSSID that
+    /// is still resolvable; the client should retry later.
+    Unresolved,
 }
 
 #[derive(Serialize)]
@@ -711,12 +720,24 @@ async fn handle_resolve(bssids: &[String], state: &Arc<DaemonState>) -> String {
                     },
                 }
             } else {
+                // task-0194: only report not_found when the resolver
+                // established *authoritative* absence for this call (a provider
+                // said NotFound, or the not_found table did within TTL).
+                // Everything else — deferred to an in-flight resolution, a
+                // provider skipped for missing creds / exhausted quota, or a
+                // transient failure — is `unresolved`: absence is NOT
+                // established, so a client must retry rather than blacklist it.
+                let provenance = if result.not_found.contains(bssid) {
+                    Provenance::NotFound
+                } else {
+                    Provenance::Unresolved
+                };
                 ResolveResult {
                     bssid: bssid.clone(),
                     lat: None,
                     lon: None,
                     ssid: None,
-                    provenance: Provenance::NotFound,
+                    provenance,
                 }
             }
         })
@@ -1042,11 +1063,21 @@ mod wire_enum_tests {
             serde_json::to_string(&Provenance::NotFound).unwrap(),
             "\"not_found\""
         );
+        // task-0194: new wire value.
+        assert_eq!(
+            serde_json::to_string(&Provenance::Unresolved).unwrap(),
+            "\"unresolved\""
+        );
     }
 
     #[test]
     fn provenance_round_trip() {
-        for v in [Provenance::Api, Provenance::Cache, Provenance::NotFound] {
+        for v in [
+            Provenance::Api,
+            Provenance::Cache,
+            Provenance::NotFound,
+            Provenance::Unresolved,
+        ] {
             let s = serde_json::to_string(&v).unwrap();
             let back: Provenance = serde_json::from_str(&s).unwrap();
             assert_eq!(back, v);
@@ -1085,13 +1116,10 @@ mod wire_enum_tests {
 }
 
 #[cfg(test)]
-mod history_dispatch_tests {
-    //! task-0184: a history request whose range overflows chrono must return
-    //! the protocol-mandated `ok:false` error envelope rather than panic the
-    //! connection task (a panic would hand the client a dropped socket, not
-    //! the documented error JSON). Exercises the full dispatch path
-    //! (Request -> handle_history -> parse_range -> error_json) against a
-    //! real in-memory DaemonState.
+mod dispatch_tests {
+    //! Full-dispatch integration tests (Request -> dispatch_command -> handler
+    //! -> JSON) against a real in-memory DaemonState. Covers history overflow
+    //! (task-0184) and resolve provenance mapping (task-0194).
     use super::*;
     use clap::Parser;
 
@@ -1118,6 +1146,25 @@ mod history_dispatch_tests {
         })
     }
 
+    /// Extract `results[0].source` from a resolve dispatch response.
+    fn resolve_source(resp: &str) -> String {
+        let v: serde_json::Value =
+            serde_json::from_str(resp).expect("dispatch must return valid JSON");
+        assert_eq!(
+            v.get("ok").and_then(|b| b.as_bool()),
+            Some(true),
+            "resolve must succeed, got {resp}"
+        );
+        v["results"][0]["source"]
+            .as_str()
+            .unwrap_or_else(|| panic!("results[0].source missing in {resp}"))
+            .to_string()
+    }
+
+    /// task-0184: a history request whose range overflows chrono must return
+    /// the protocol-mandated `ok:false` error envelope rather than panic the
+    /// connection task (a panic would hand the client a dropped socket, not
+    /// the documented error JSON).
     #[tokio::test]
     async fn history_huge_range_yields_ok_false_not_panic() {
         let state = test_state();
@@ -1141,6 +1188,67 @@ mod history_dispatch_tests {
                 .and_then(|e| e.as_str())
                 .is_some_and(|s| s.contains("invalid range")),
             "error should explain the invalid range, got {resp}"
+        );
+    }
+
+    /// task-0194 AC#1: an uncached BSSID resolved while WiGLE is unconfigured
+    /// (test_state uses empty creds -> wigle_lookup returns Skipped) must be
+    /// reported as `unresolved`, NOT `not_found` — the daemon consulted no
+    /// provider, so absence is not established. Same shape as quota-exhausted.
+    #[tokio::test]
+    async fn resolve_uncached_wigle_unconfigured_is_unresolved() {
+        let state = test_state();
+        let req = Request::Resolve {
+            bssids: vec!["AA:BB:CC:DD:EE:01".to_string()],
+        };
+        let resp = dispatch_command(&req, &state).await;
+        assert_eq!(
+            resolve_source(&resp),
+            "unresolved",
+            "unconfigured WiGLE must yield unresolved, got {resp}"
+        );
+    }
+
+    /// task-0194 AC#2: a resolve racing a background resolution of the same
+    /// BSSID (another task holds the in-flight claim) must be reported as
+    /// `unresolved`, NOT `not_found` — the owning task owns the verdict.
+    #[tokio::test]
+    async fn resolve_racing_inflight_claim_is_unresolved() {
+        let state = test_state();
+        let bssid = "AA:BB:CC:DD:EE:02".to_string();
+        // Simulate a concurrent task already resolving this BSSID.
+        state.inflight.lock().unwrap().insert(bssid.clone());
+
+        let req = Request::Resolve {
+            bssids: vec![bssid],
+        };
+        let resp = dispatch_command(&req, &state).await;
+        assert_eq!(
+            resolve_source(&resp),
+            "unresolved",
+            "in-flight race must yield unresolved, got {resp}"
+        );
+    }
+
+    /// task-0194 AC#3 (positive): `not_found` is still emitted when absence is
+    /// authoritative — here the not_found table holds the BSSID within TTL, so
+    /// the read-only resolve short-circuits and reports `not_found`.
+    #[tokio::test]
+    async fn resolve_table_not_found_is_reported_as_not_found() {
+        let state = test_state();
+        let bssid = "AA:BB:CC:DD:EE:03".to_string();
+        crate::server::lock_db(&state)
+            .insert_not_found(&bssid)
+            .unwrap();
+
+        let req = Request::Resolve {
+            bssids: vec![bssid],
+        };
+        let resp = dispatch_command(&req, &state).await;
+        assert_eq!(
+            resolve_source(&resp),
+            "not_found",
+            "table-authoritative absence must be reported as not_found, got {resp}"
         );
     }
 }

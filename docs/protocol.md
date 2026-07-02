@@ -83,8 +83,16 @@ Every response includes:
 
 `source` in this response is the **provenance** for the result:
 - `"cache"` — answered from the local `aps` table.
-- `"api"` — fetched from WiGLE on this call.
-- `"not_found"` — no provider had a position for this BSSID.
+- `"api"` — fetched from a provider on this call.
+- `"not_found"` — **authoritative absence**: a provider returned NotFound for
+  this BSSID on this call, or the daemon's not_found table recorded absence
+  within its TTL. Safe to cache as "not locatable".
+- `"unresolved"` — the daemon could **not** consult a provider for this BSSID
+  this call, so absence is **not** established. Causes: the lookup was deferred
+  to an in-flight background resolution of the same BSSID; the only provider
+  was skipped because WiGLE credentials are unconfigured or the daily quota is
+  exhausted; or a transient network / rate-limit failure. Retry later — do
+  **not** cache this as absent.
 
 (This is distinct from the `aps.source` column in the SQLite cache, which
 records *which provider* originally supplied the position: `apple`, `wigle`,
@@ -234,4 +242,8 @@ println!("{:.6}, {:.6}  ±{}m", resp.lat, resp.lon, resp.accuracy_m as i64);
 ## Versioning
 
 The protocol version field (`v`) is integer-bumped on incompatible changes.
-Backward-compatible additions (new fields, new commands) keep `v=1`.
+Backward-compatible additions (new fields, new commands, and new enum values
+in existing string fields such as `source`) keep `v=1`. Clients should treat
+an unrecognised `source` value like `unresolved` (absence not established, so
+retry) rather than erroring. The `source: "unresolved"` value was added this
+way (task-0194).

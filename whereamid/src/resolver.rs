@@ -58,6 +58,18 @@ pub struct ResolveResult {
     pub positioned: Vec<ApInfo>,
     /// BSSIDs that came from a remote provider (not the local cache).
     pub fetched_bssids: HashSet<String>,
+    /// task-0194: BSSIDs this call established as *authoritatively absent* —
+    /// either the not_found table said so within TTL, or the provider chain
+    /// reached a definitive absence for it (the task-0189 rule: some provider
+    /// authoritatively returned NotFound and nothing was genuinely transient).
+    ///
+    /// This is the honest, per-call not_found signal `handle_resolve` reports
+    /// on the wire. It is deliberately INDEPENDENT of whether the not_found
+    /// *table* was written: task-0092 made resolve_readonly classify absence
+    /// without persisting it. A BSSID that was merely skipped (missing creds /
+    /// exhausted quota), deferred to an in-flight task, or hit a transient
+    /// failure is NOT in this set — those are "unresolved", not "not_found".
+    pub not_found: HashSet<String>,
 }
 
 /// What the orchestrator should do when a provider is `Skipped`
@@ -204,6 +216,11 @@ pub async fn resolve_chain(
     // suppressing a later WiGLE retry.
     let mut hard_transient: HashSet<String> = HashSet::new();
     let mut authoritative_nf: HashSet<String> = HashSet::new();
+    // task-0194: BSSIDs authoritatively absent for THIS call — fed by the
+    // not_found-table short-circuit below and by the end-of-chain definitive
+    // verdict. Returned so handle_resolve can report an honest wire not_found
+    // (vs. "unresolved" for skipped/deferred/transient).
+    let mut result_not_found: HashSet<String> = HashSet::new();
 
     // Track providers that have hard-stopped this pass so we don't keep
     // calling them for subsequent BSSIDs.
@@ -245,6 +262,9 @@ pub async fn resolve_chain(
             };
             if is_nf {
                 debug!("{bssid} in not_found cache, skipping");
+                // task-0194: the not_found table is authoritative within TTL,
+                // so this BSSID IS definitively absent for this call.
+                result_not_found.insert(bssid.clone());
                 continue;
             }
         }
@@ -373,8 +393,8 @@ pub async fn resolve_chain(
         }
     }
 
-    // End-of-chain not_found marking (task-0189 rule). Mark a BSSID absent
-    // iff ALL of:
+    // End-of-chain classification (task-0189 rule, generalised by task-0194).
+    // A BSSID is *authoritatively absent for this call* iff ALL of:
     //   - it was not resolved this pass,
     //   - it was not deferred to a concurrent in-flight task,
     //   - no provider hit a genuinely-transient failure (NetworkError /
@@ -386,35 +406,45 @@ pub async fn resolve_chain(
     // absence — leave it pending rather than invent a not_found. This is what
     // lets credential-free mode (WiGLE unconfigured) record Apple-definitive
     // misses (task-0189 AC#1/AC#4) without livelocking on all-Skipped rows.
-    if matches!(policy.not_found, NotFoundPolicy::AtChainEnd) {
-        let db = crate::server::lock_db(state);
-        for bssid in bssids {
-            if resolved.contains(bssid) {
-                continue;
-            }
-            if deferred_to_other.contains(bssid) {
-                // The concurrent in-flight task owns the not_found decision
-                // for this BSSID; we must not double-write or race it.
-                continue;
-            }
-            if hard_transient.contains(bssid) {
-                // NetworkError / HardStop: the miss may be temporary. Fall
-                // through to the pending/attempts retry policy (task-0045).
-                continue;
-            }
-            if !authoritative_nf.contains(bssid) {
-                // No provider said NotFound (e.g. every provider Skipped).
-                // We cannot assert absence; leave it pending for a later pass.
-                continue;
-            }
+    //
+    // task-0194: this classification runs for EVERY policy so the returned
+    // `not_found` set is honest even for resolve_readonly (Never), which
+    // classifies without persisting (task-0092 made table-write and wire-report
+    // independent). Only AtChainEnd additionally writes the not_found table and
+    // (under delete_pending_on_not_found) drops the pending row. Everything
+    // that falls through the `continue`s above is left out of result_not_found
+    // and therefore reported as "unresolved" on the wire, not not_found.
+    let persist = matches!(policy.not_found, NotFoundPolicy::AtChainEnd);
+    let db = persist.then(|| crate::server::lock_db(state));
+    for bssid in bssids {
+        if resolved.contains(bssid) {
+            continue;
+        }
+        if deferred_to_other.contains(bssid) {
+            // The concurrent in-flight task owns the decision (task-0194 AC#2):
+            // "unresolved" on the wire, never not_found.
+            continue;
+        }
+        if hard_transient.contains(bssid) {
+            // NetworkError / HardStop: the miss may be temporary (task-0045).
+            // Fall through to the pending/attempts retry policy: "unresolved".
+            continue;
+        }
+        if !authoritative_nf.contains(bssid) {
+            // No provider said NotFound — e.g. every provider Skipped
+            // (task-0194 AC#1). Cannot assert absence: "unresolved".
+            continue;
+        }
+        // Definitive absence for this call.
+        result_not_found.insert(bssid.clone());
+        if let Some(db) = &db {
             if let Err(e) = db.insert_not_found(bssid) {
                 warn!("failed to insert not_found {bssid}: {e}");
                 state.record_db_failure();
             }
-            // task-0052: collapse drain_cleanup_after_chain — when the
-            // chain marks not_found, also remove the pending row so the
-            // drain loop doesn't retry it every cycle. Only fires under
-            // delete_pending_on_not_found.
+            // task-0052: collapse drain_cleanup_after_chain — when the chain
+            // marks not_found, also remove the pending row so the drain loop
+            // doesn't retry it every cycle. Only under delete_pending_on_not_found.
             if policy.delete_pending_on_not_found {
                 if let Err(e) = db.delete_pending(bssid) {
                     warn!("failed to delete pending {bssid} after not_found mark: {e}");
@@ -427,6 +457,7 @@ pub async fn resolve_chain(
     ResolveResult {
         positioned,
         fetched_bssids,
+        not_found: result_not_found,
     }
 }
 
@@ -713,6 +744,13 @@ mod tests {
             "deduplicated call must not invoke provider"
         );
         assert!(result.positioned.is_empty());
+        // task-0194: a deferred BSSID is NOT authoritative absence — it must
+        // not appear in the not_found set (handle_resolve reports it as
+        // "unresolved", never "not_found").
+        assert!(
+            !result.not_found.contains(&target),
+            "deferred BSSID must not be classified not_found"
+        );
 
         // Cleanup the pre-registered inflight entry to keep the suppress
         // check on not_found honest: we deferred to "another task" so the
@@ -729,6 +767,42 @@ mod tests {
         // Suppress unused warnings for the Notify imports while keeping
         // the imports available for future lock-based concurrency tests.
         let _ = (started, release);
+    }
+
+    /// task-0194: ResolveResult.not_found holds ONLY authoritative absences.
+    /// A definitive miss (provider NotFound, nothing transient) is included; a
+    /// merely-Skipped BSSID (no provider consulted) is not.
+    #[tokio::test]
+    async fn resolve_chain_not_found_set_is_authoritative_only() {
+        let state = test_state();
+        let definitive = "aa:bb:cc:dd:ee:d1".to_string();
+        let skipped = "aa:bb:cc:dd:ee:d2".to_string();
+
+        let mock = std::sync::Arc::new(MockProvider::new("p", |b| {
+            if b.ends_with("d2") {
+                ProviderOutcome::Skipped
+            } else {
+                ProviderOutcome::NotFound
+            }
+        }));
+        let providers = [Provider::Mock(std::sync::Arc::clone(&mock))];
+
+        let result = resolve_chain(
+            &[definitive.clone(), skipped.clone()],
+            &state,
+            &providers,
+            &permissive_policy(),
+        )
+        .await;
+
+        assert!(
+            result.not_found.contains(&definitive),
+            "authoritative NotFound must be in the not_found set"
+        );
+        assert!(
+            !result.not_found.contains(&skipped),
+            "a merely-Skipped BSSID must NOT be in the not_found set"
+        );
     }
 
     /// task-0092 AC#1: the read-only resolve policy must never write not_found.

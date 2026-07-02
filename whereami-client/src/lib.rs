@@ -91,8 +91,14 @@ pub enum Provenance {
     Api,
     /// Served from the daemon's local cache.
     Cache,
-    /// Definitively absent from cache and providers.
+    /// Authoritatively absent: a provider returned NotFound this call, or the
+    /// daemon's not_found table recorded absence within its TTL.
     NotFound,
+    /// task-0194: the daemon could not consult a provider for this BSSID this
+    /// call (deferred to an in-flight resolution, provider skipped for missing
+    /// creds / exhausted quota, or a transient failure), so absence is NOT
+    /// established. Retry later rather than caching it as absent.
+    Unresolved,
     /// A value the daemon emitted that this client version does not
     /// recognise. Forward-compat escape hatch (`#[serde(other)]`).
     #[serde(other)]
@@ -105,6 +111,7 @@ impl std::fmt::Display for Provenance {
             Provenance::Api => "api",
             Provenance::Cache => "cache",
             Provenance::NotFound => "not_found",
+            Provenance::Unresolved => "unresolved",
             Provenance::Unknown => "unknown",
         })
     }
@@ -504,6 +511,9 @@ mod wire_enum_tests {
             (Provenance::Api, "\"api\""),
             (Provenance::Cache, "\"cache\""),
             (Provenance::NotFound, "\"not_found\""),
+            // task-0194: daemon emits `unresolved` for deferred/skipped/
+            // transient BSSIDs (absence not established).
+            (Provenance::Unresolved, "\"unresolved\""),
         ] {
             assert_eq!(serde_json::to_string(&variant).unwrap(), expected);
             let back: Provenance = serde_json::from_str(expected).unwrap();
