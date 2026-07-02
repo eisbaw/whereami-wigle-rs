@@ -121,10 +121,12 @@ Maximum **256 BSSIDs** per `resolve` request.
 - `db_write_failures` — cumulative best-effort DB write failures since
   daemon start. Non-zero values indicate silent corruption is being logged
   but not fatal.
-- `orphan_tasks_aborted` — cumulative count of tracked background tasks
-  (proactive resolve / address backfill) force-aborted at shutdown because
-  they did not finish within the drain budget. Non-zero means the last
-  shutdown killed in-flight work. Reset on daemon restart.
+- `orphan_tasks_aborted` — number of background tasks (proactive resolve /
+  address backfill spawns and the daemon's scan/drain/prune/server loops)
+  force-aborted at the end of the **last clean shutdown** because they did
+  not finish within the drain budget. Non-zero means that shutdown killed
+  in-flight work. The value is persisted at shutdown and reloaded at
+  startup; a crash/SIGKILL does not update it.
 
 ### `debug` — daemon debug snapshot
 

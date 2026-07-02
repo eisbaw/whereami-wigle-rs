@@ -655,6 +655,16 @@ impl Database {
         Ok(result)
     }
 
+    /// Set (insert or overwrite) a metadata value by key.
+    pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     /// Atomically reserve an API call slot for today.
     ///
     /// Performs daily-counter reset, current-count read, and increment in a

@@ -341,10 +341,13 @@ struct StatsResponse {
     /// warned-only. Helps spot silent corruption (full disk, missing
     /// write permissions, etc.). Reset on daemon restart. task-0076.
     db_write_failures: u64,
-    /// Cumulative count of tracked background tasks force-aborted at shutdown
-    /// because they did not finish within the drain budget. Non-zero means the
-    /// daemon killed in-flight resolve/backfill work on the last shutdown.
-    /// Reset on daemon restart. task-0102.
+    /// Number of background tasks (tracked resolve/backfill spawns and the
+    /// named scan/drain/prune/server loops) force-aborted at the end of the
+    /// LAST clean shutdown because they did not finish within the drain
+    /// budget. Persisted at shutdown and reloaded at startup — the count is
+    /// produced after the server socket closes, so the previous run's value
+    /// is the only observable one. A crash/SIGKILL does not update it.
+    /// task-0102.
     orphan_tasks_aborted: u64,
 }
 

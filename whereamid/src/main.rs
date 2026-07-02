@@ -88,6 +88,15 @@ async fn main() -> Result<()> {
         info!("rehydrated last_fix from disk");
     }
 
+    // Rehydrate the last clean shutdown's forced-abort count so the stats
+    // endpoint can actually report it (task-0102 review): the in-memory bump
+    // happens only after the server socket has closed, so without this
+    // persist/reload cycle no client could ever observe a non-zero value.
+    let orphans_last_shutdown = load_orphan_count(&db);
+    if orphans_last_shutdown > 0 {
+        info!("last shutdown force-aborted {orphans_last_shutdown} tasks (see stats)");
+    }
+
     // Initialize shared state
     let debouncer = Debouncer::new(args.debounce_window, args.debounce_threshold);
     let http_timeout = Duration::from_secs(args.http_timeout_secs);
@@ -117,7 +126,7 @@ async fn main() -> Result<()> {
         db_write_failures: std::sync::atomic::AtomicU64::new(0),
         shutdown: tokio_util::sync::CancellationToken::new(),
         tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
-        orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
+        orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(orphans_last_shutdown),
     });
 
     // Background tasks. Each selects its work/sleep against
@@ -217,17 +226,55 @@ async fn main() -> Result<()> {
     // completion here (a std::sync::Mutex guard cannot be held across await).
     let tracked = std::mem::take(&mut *state.tasks.lock().unwrap_or_else(|e| e.into_inner()));
 
-    // task-0190/0102: wait up to the budget, then force-abort survivors and
-    // count them so the leak is observable via stats.
+    // task-0190/0102: wait up to the budget, then force-abort survivors.
     let aborted = run_shutdown_drain(Duration::from_secs(5), named, tracked).await;
     if aborted > 0 {
+        // Journal observability, independent of the stats persist below.
+        info!("shutdown drain force-aborted {aborted} orphaned tasks");
         state
             .orphan_tasks_aborted
             .fetch_add(aborted, std::sync::atomic::Ordering::Relaxed);
     }
+    // Persist THIS shutdown's count — 0 included, so a stale non-zero from an
+    // older shutdown cannot masquerade as current. The next run loads it at
+    // startup and serves it via stats; the in-memory bump above happens after
+    // the server socket has closed and is observable by nobody (task-0102
+    // review). A crash/SIGKILL skips this write, so the persisted value
+    // always describes the last CLEAN shutdown.
+    {
+        let db = server::lock_db(&state);
+        if let Err(e) = db.set_metadata(ORPHANS_ABORTED_KEY, &aborted.to_string()) {
+            tracing::warn!("failed to persist {ORPHANS_ABORTED_KEY}: {e}");
+            state.record_db_failure();
+        }
+    }
 
     info!("whereamid stopped");
     Ok(())
+}
+
+/// Metadata key holding the number of tasks force-aborted at the end of the
+/// last clean shutdown's drain. Persisted at shutdown and reloaded at startup
+/// so `stats.orphan_tasks_aborted` reports the previous run's aborts — the
+/// count is produced only after the server socket has closed, so within a
+/// single run it is observable by nobody (task-0102 review).
+const ORPHANS_ABORTED_KEY: &str = "orphans_aborted_last_shutdown";
+
+/// Load the persisted forced-abort count from the last clean shutdown.
+/// Missing or malformed values count as 0 — better to under-report a
+/// diagnostic than to refuse to start.
+fn load_orphan_count(db: &Database) -> u64 {
+    match db.get_metadata(ORPHANS_ABORTED_KEY) {
+        Ok(Some(v)) => v.parse().unwrap_or_else(|_| {
+            tracing::warn!("corrupt {ORPHANS_ABORTED_KEY} metadata value {v:?}; treating as 0");
+            0
+        }),
+        Ok(None) => 0,
+        Err(e) => {
+            tracing::warn!("failed to read {ORPHANS_ABORTED_KEY}: {e}");
+            0
+        }
+    }
 }
 
 /// Drive the cooperative shutdown drain (task-0190/0102/0195).
@@ -276,8 +323,11 @@ async fn run_shutdown_drain(
             aborted += 1;
         }
     }
-    // JoinSet::len() is the number of not-yet-joined tasks; on timeout these
-    // are the survivors. Abort them and reap so the aborts are observed.
+    // Reap tracked tasks that completed on their own but were never joined —
+    // the graceful phase drains `named` first, so a wedged named handle
+    // starves the tracked reap and JoinSet::len() would overcount finished
+    // tasks as aborted. After the reap, len() is genuinely-running survivors.
+    while tracked.try_join_next().is_some() {}
     aborted += tracked.len() as u64;
     tracked.abort_all();
     while tracked.join_next().await.is_some() {}
@@ -428,5 +478,63 @@ mod shutdown_drain_tests {
             aborted, 1,
             "only the still-running task counts; the finished one was reaped"
         );
+    }
+
+    /// Review C1 regression: a wedged NAMED handle starves the graceful
+    /// phase's tracked reap (`named` drains first), so tracked tasks that
+    /// completed on their own would be miscounted as aborted without the
+    /// timeout-path `try_join_next` reap. Expected: wedged named (1) + stuck
+    /// tracked (1) = 2, not 4.
+    #[tokio::test(start_paused = true)]
+    async fn drain_does_not_count_finished_tracked_when_named_wedges() {
+        let named = vec![tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        })];
+        let mut tracked = JoinSet::new();
+        tracked.spawn(async {}); // completes on its own, never joined gracefully
+        tracked.spawn(async {}); // completes on its own, never joined gracefully
+        tracked.spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }); // genuine survivor
+        let aborted = run_shutdown_drain(Duration::from_secs(1), named, tracked).await;
+        assert_eq!(
+            aborted, 2,
+            "finished-but-unjoined tracked tasks must be reaped before counting"
+        );
+    }
+}
+
+#[cfg(test)]
+mod orphan_count_tests {
+    //! Persist/reload cycle for `orphan_tasks_aborted` (task-0102 review):
+    //! the count is written to DB metadata at clean shutdown and rehydrated
+    //! at startup, because it is produced only after the server socket has
+    //! closed — the previous run's value is the only observable one.
+    use super::{load_orphan_count, ORPHANS_ABORTED_KEY};
+    use crate::db::Database;
+
+    #[test]
+    fn missing_key_loads_zero() {
+        let db = Database::open_memory().unwrap();
+        assert_eq!(load_orphan_count(&db), 0);
+    }
+
+    #[test]
+    fn persisted_count_round_trips() {
+        let db = Database::open_memory().unwrap();
+        db.set_metadata(ORPHANS_ABORTED_KEY, "7").unwrap();
+        assert_eq!(load_orphan_count(&db), 7);
+        // A later clean shutdown overwrites — including with 0, so a stale
+        // non-zero cannot masquerade as the most recent shutdown's result.
+        db.set_metadata(ORPHANS_ABORTED_KEY, "0").unwrap();
+        assert_eq!(load_orphan_count(&db), 0);
+    }
+
+    #[test]
+    fn malformed_value_loads_zero() {
+        let db = Database::open_memory().unwrap();
+        db.set_metadata(ORPHANS_ABORTED_KEY, "not-a-number")
+            .unwrap();
+        assert_eq!(load_orphan_count(&db), 0);
     }
 }
