@@ -432,6 +432,8 @@ fn run_history(
     // Argument validation above (usage errors) is reported on stderr in
     // both modes, matching clap; from here on the daemon response — or a
     // synthesized transport error — is what reaches stdout under --json.
+    // Whether these CLI-side usage errors should instead emit synthesized
+    // JSON under --json is tracked in TASK-0228 (deliberate for now).
     if json {
         emit_json(client.history_raw(range, from, to));
     }
