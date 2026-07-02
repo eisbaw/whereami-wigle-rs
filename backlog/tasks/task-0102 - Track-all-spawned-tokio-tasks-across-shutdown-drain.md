@@ -1,9 +1,11 @@
 ---
 id: TASK-0102
 title: Track all spawned tokio tasks across shutdown drain
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@claude'
 created_date: '2026-05-20 21:11'
+updated_date: '2026-07-02 22:22'
 labels:
   - robustness
   - shutdown
@@ -18,8 +20,44 @@ src/main.rs:236-240 + src/server.rs:494-499 + src/server.rs:511-561. Cooperative
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Detached spawns moved behind a tokio::task::JoinSet (or similar handle-tracking structure) owned by DaemonState
-- [ ] #2 Shutdown drain waits up to 5s for the JoinSet to drain before forced-exit (matches the existing budget from task-0075)
-- [ ] #3 Stats counter orphan_tasks_aborted increments on each forced-cancellation at shutdown
-- [ ] #4 Test: spawn 5 fake resolve_background tasks that sleep 10s, trigger shutdown after 1s, assert orphan_tasks_aborted == 5 OR the drain waited (whichever the implementation chose)
+- [x] #1 Detached spawns moved behind a tokio::task::JoinSet (or similar handle-tracking structure) owned by DaemonState
+- [x] #2 Shutdown drain waits up to 5s for the JoinSet to drain before forced-exit (matches the existing budget from task-0075)
+- [x] #3 Stats counter orphan_tasks_aborted increments on each forced-cancellation at shutdown
+- [x] #4 Test: spawn 5 fake resolve_background tasks that sleep 10s, trigger shutdown after 1s, assert orphan_tasks_aborted == 5 OR the drain waited (whichever the implementation chose)
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+DaemonState gains tasks: Mutex<JoinSet<()>> + orphan_tasks_aborted: AtomicU64 and a spawn_tracked(&self, fut) helper (refuses after cancel; reaps completed slots via try_join_next). Convert the 3 detached spawns (scan-loop resolve, handle_locate fallback resolve, nominatim backfill) to spawn_tracked; per-connection spawn stays detached (task-0201). main mem::takes the JoinSet and drains it in run_shutdown_drain within the 5s budget; survivors force-aborted and counted into orphan_tasks_aborted, surfaced in StatsResponse + protocol.md. Paused-time test: 5x10s tracked tasks, cancel after 1s -> orphan==5.
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented in commit 414a048 (spawn_tracked + stat) on top of the drain from 62d7957.
+
+- DaemonState gained `tasks: std::sync::Mutex<tokio::task::JoinSet<()>>` and `orphan_tasks_aborted: AtomicU64`.
+- spawn_tracked(&self, fut): reaps completed slots via `while set.try_join_next().is_some() {}` on every call (a JoinSet only frees a completed slot when joined, else it grows unbounded), and REFUSES to spawn once is_cancelled() (structural "no new work after shutdown", shared with task-0190 AC#2).
+- Converted the 3 detached spawns: scan-loop proactive resolve (main.rs), handle_locate fallback resolve, and the Nominatim address backfill (server.rs). The per-connection accept spawn stays detached ON PURPOSE (bounded by READ/WRITE timeouts) with a comment pointing at task-0201.
+- main mem::takes the JoinSet out of the std::sync::Mutex (cannot hold that guard across await) and drains it in run_shutdown_drain within the 5s budget; survivors are abort_all()d and counted.
+
+Gotcha: JoinSet<()> tasks capture Arc<DaemonState>; the JoinHandle in the set does not, and the task future (with its Arc) is dropped by the runtime on completion, so no DaemonState reference cycle leaks — only a tiny () slot lingers until the next spawn_tracked reaps it.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Track the three detached background spawns in a DaemonState-owned JoinSet so shutdown drains them under one budget instead of killing them mid-API-call.
+
+What changed:
+- Added DaemonState.tasks (Mutex<JoinSet<()>>) + spawn_tracked(&self, fut), which reaps finished slots each call and refuses after cancel.
+- Routed scan-loop resolve, locate fallback resolve, and Nominatim backfill through spawn_tracked. Per-connection handlers stay detached (task-0201).
+- run_shutdown_drain waits up to 5s for the JoinSet (+ named loops), then force-aborts survivors and increments orphan_tasks_aborted, surfaced in StatsResponse + handle_stats and documented in docs/protocol.md.
+
+Why: orphaned resolve/backfill tasks killed at process exit left partial writes (e.g. a reserved WiGLE slot with no aps row).
+
+Tests: drain_aborts_five_stuck_tracked_tasks (AC#4 shape: 5 tasks sleep 10s, 1s budget, assert orphan==5); drain_counts_only_survivors; spawn_tracked_runs_the_future / spawn_tracked_refuses_after_cancel.
+
+Risks/follow-ups: bounded mpsc backpressure for resolve_background is still task-0121; consolidating the now-5 duplicated test DaemonState literals is filed as task-0230.
+<!-- SECTION:FINAL_SUMMARY:END -->

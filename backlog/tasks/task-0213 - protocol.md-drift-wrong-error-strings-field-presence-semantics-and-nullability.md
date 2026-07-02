@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:54'
-updated_date: '2026-07-02 18:19'
+updated_date: '2026-07-02 22:23'
 labels:
   - docs
   - protocol
@@ -39,4 +39,6 @@ forward-carried from task-0183/0198/0199 (all Done):
 forward-carried from 0183 review: also document the passthrough asymmetry - under --json the client validates nothing but the ok field, so a malformed-but-ok:true daemon line passes through with exit 0 (dumb relay by design), while human mode fails its typed parse with exit 1. Belongs next to the synthesized transport-error object documentation.
 
 Forward-carried from task-0194: docs/protocol.md resolve `source` vocabulary was extended to api|cache|not_found|unresolved. New value 'unresolved' = the daemon could not consult a provider this call (deferred to in-flight resolution / provider skipped for creds/quota / transient failure); not_found is now explicitly documented as AUTHORITATIVE absence. Added a versioning note that new enum values in existing string fields are additive (v stays 1). If task-0213 reconciles protocol.md vs code: the daemon Provenance enum (whereamid/src/server.rs ~L237) and client Provenance enum (whereami-client/src/lib.rs ~L89) both now carry Unresolved and serialize to 'unresolved'; the wire_enum_tests in both crates pin this spelling.
+
+Forward-carried from task-0102: docs/protocol.md stats section gained an `orphan_tasks_aborted` field (u64), added exactly in sync with the StatsResponse struct + handle_stats. Keep it in the drift reconciliation. Stats response now has: cached_aps, pending_aps, not_found_aps, db_size_bytes, api_calls_today, inflight, db_write_failures, orphan_tasks_aborted.
 <!-- SECTION:NOTES:END -->

@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:53'
+updated_date: '2026-07-02 22:23'
 labels:
   - nix
 dependencies: []
@@ -24,3 +25,9 @@ nix/module.nix serviceConfig omits Restart, so systemd default Restart=no applie
 - [ ] #2 a non-zero exit puts the unit through auto-restart, not terminal failed
 - [ ] #3 restart backoff is bounded (StartLimitIntervalSec/Burst) so a hard-failing binary does not hot-loop
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Forward-carried from task-0195: DECISION POINT for systemd Restart=. The daemon now exits 0 (clean Ok(())) on a bind failure — the server task logs the error and main runs the normal shutdown drain. With Restart=on-failure that clean exit-0 would NOT trigger a restart, so a transient port conflict leaves the daemon permanently dead. Either use Restart=always, OR change main to propagate a non-zero exit when the server task ends on its own (bind failure) rather than via a shutdown signal. The `server_exited` flag in main.rs already distinguishes that case cleanly.
+<!-- SECTION:NOTES:END -->
