@@ -99,16 +99,21 @@ pub enum HardStopAction {
 /// (both true / both false). task-0052.
 #[derive(Clone, Copy)]
 pub enum NotFoundPolicy {
-    /// Mark not_found as soon as any provider returns NotFound. Used by
-    /// resolve_readonly which has a single provider.
-    PerProvider,
-    /// Mark not_found only when every provider in the chain returned a
-    /// definitive NotFound. Used by resolve_background and pending drain
-    /// (transient errors suppress the mark via task-0045).
+    /// Mark not_found only when the chain reaches a definitive absence:
+    /// not resolved, not deferred, no genuinely-transient outcome, and at
+    /// least one provider authoritatively returned NotFound (task-0189).
+    /// Used by resolve_background and the pending drain.
     AtChainEnd,
-    /// Never mark not_found. No production path uses this today; kept
-    /// as a meaningful "off" rather than `Option<NotFoundPolicy>`.
-    #[allow(dead_code)]
+    /// Never write to the not_found table. Used by resolve_readonly
+    /// (task-0092): the read-only `resolve` surface must not mutate daemon
+    /// state, so a probe that misses does not block the daemon from
+    /// re-checking that BSSID for the not_found TTL.
+    ///
+    /// task-0092 also removed the former `PerProvider` variant (mark on the
+    /// first provider NotFound): after resolve_readonly moved to `Never`, no
+    /// policy constructed it. Its role — a single-provider chain that marks
+    /// immediately — is equivalent to `AtChainEnd` on a one-provider chain,
+    /// so nothing was lost.
     Never,
 }
 
@@ -305,15 +310,11 @@ pub async fn resolve_chain(
                 ProviderOutcome::NotFound => {
                     debug!("{}: {bssid} not found", provider.name());
                     // task-0189: authoritative evidence of absence. Load-bearing
-                    // for the end-of-chain mark below.
+                    // for the end-of-chain mark below. task-0092 removed the
+                    // former PerProvider immediate-write branch here (no policy
+                    // constructs PerProvider now); the not_found table is
+                    // written only at chain end, under AtChainEnd.
                     authoritative_nf.insert(bssid.clone());
-                    if matches!(policy.not_found, NotFoundPolicy::PerProvider) {
-                        let db = crate::server::lock_db(state);
-                        if let Err(e) = db.insert_not_found(bssid) {
-                            warn!("failed to insert not_found {bssid}: {e}");
-                            state.record_db_failure();
-                        }
-                    }
                     // Try the next provider in the chain.
                 }
                 ProviderOutcome::Skipped => {
@@ -429,25 +430,43 @@ pub async fn resolve_chain(
     }
 }
 
-/// Resolve BSSIDs for the `resolve` command (ephemeral -- does NOT write to aps cache).
-/// Cascade is WiGLE-only: callers expect on-demand resolution against WiGLE,
-/// matching prior behavior.
-pub async fn resolve_readonly(bssids: &[String], state: &Arc<DaemonState>) -> ResolveResult {
-    let policy = ChainPolicy {
+/// Policy for the read-only `resolve` surface. Extracted (task-0092) so the
+/// exact policy resolve_readonly uses is a single source of truth that tests
+/// can assert on directly rather than reconstructing.
+fn readonly_policy() -> ChainPolicy {
+    ChainPolicy {
         skip_cached: true,
         skip_not_found: true,
         write_through: false,
         delete_pending_on_success: false,
         delete_pending_on_not_found: false,
-        // Mirror prior behavior: write not_found to avoid burning quota
-        // on repeat lookups. PerProvider is fine because the chain has a
-        // single provider here.
-        not_found: NotFoundPolicy::PerProvider,
+        // task-0092: never write not_found from the read-only surface.
+        not_found: NotFoundPolicy::Never,
         on_skipped: SkipAction::NextProvider,
         on_network_error: NetErrorAction::Ignore,
         on_hard_stop: HardStopAction::Stop,
-    };
-    resolve_chain(bssids, state, &[Provider::Wigle], &policy).await
+    }
+}
+
+/// Resolve BSSIDs for the `resolve` command. Read-only with respect to
+/// discovered state (task-0092): it does NOT persist positions to the `aps`
+/// cache, does NOT enqueue pending work, and — the task-0092 fix — does NOT
+/// write the not_found table.
+///
+/// The read-only `resolve` surface means "look this up for me, do not change
+/// what the daemon believes". The prior policy wrote a WiGLE miss to the
+/// not_found table for `not_found_ttl_days` (default 30d), so a user probing a
+/// BSSID WiGLE happened not to have would silently block the daemon from
+/// re-checking it for a month — a surprise they never asked for. Proactive
+/// not_found population is the scan/drain path's job (resolve_background / the
+/// pending drain), not this one.
+///
+/// One benign write remains: a cache HIT bumps that row's `last_seen` via
+/// `touch_ap` (shared cache-lookup bookkeeping; the stored position, pending
+/// queue, and not_found table are all untouched). Cascade is WiGLE-only,
+/// matching prior behaviour.
+pub async fn resolve_readonly(bssids: &[String], state: &Arc<DaemonState>) -> ResolveResult {
+    resolve_chain(bssids, state, &[Provider::Wigle], &readonly_policy()).await
 }
 
 /// Background resolution: resolve uncached stable BSSIDs proactively.
@@ -710,5 +729,83 @@ mod tests {
         // Suppress unused warnings for the Notify imports while keeping
         // the imports available for future lock-based concurrency tests.
         let _ = (started, release);
+    }
+
+    /// task-0092 AC#1: the read-only resolve policy must never write not_found.
+    #[test]
+    fn resolve_readonly_policy_is_never() {
+        assert!(
+            matches!(readonly_policy().not_found, NotFoundPolicy::Never),
+            "resolve_readonly must use NotFoundPolicy::Never (task-0092)"
+        );
+    }
+
+    /// task-0092 AC#3: an unknown BSSID probed through the read-only policy —
+    /// even when the provider authoritatively returns NotFound — must leave the
+    /// not_found table unchanged. Before task-0092 the PerProvider policy wrote
+    /// it, blocking re-probes for the 30-day TTL.
+    #[tokio::test]
+    async fn resolve_readonly_unknown_bssid_does_not_write_not_found() {
+        let state = test_state();
+        let target = "aa:bb:cc:dd:ee:c1".to_string();
+
+        // A provider that definitively says NotFound — the case the old
+        // PerProvider policy would have persisted.
+        let mock = std::sync::Arc::new(MockProvider::new("wigle", |_| ProviderOutcome::NotFound));
+        let providers = [Provider::Mock(std::sync::Arc::clone(&mock))];
+
+        let result = resolve_chain(
+            std::slice::from_ref(&target),
+            &state,
+            &providers,
+            &readonly_policy(),
+        )
+        .await;
+
+        assert_eq!(mock.call_count(), 1, "provider must be consulted");
+        assert!(
+            result.positioned.is_empty(),
+            "unknown BSSID has no position"
+        );
+        assert!(
+            !crate::server::lock_db(&state)
+                .is_not_found(&target, state.args.not_found_ttl_days)
+                .unwrap(),
+            "read-only resolve must NOT write the not_found table (task-0092)"
+        );
+    }
+
+    /// task-0092 AC#4: a cached BSSID is returned from the read-only surface
+    /// without inserting/removing an aps row, without touching the pending
+    /// queue, and without writing not_found. (The cache-hit path bumps
+    /// `last_seen` via touch_ap — benign bookkeeping; the stored position is
+    /// unchanged, which is what we assert.) The real WiGLE is never consulted
+    /// on a cache hit, so this exercises the actual resolve_readonly function.
+    #[tokio::test]
+    async fn resolve_readonly_cached_bssid_returns_without_state_writes() {
+        let state = test_state();
+        let target = "aa:bb:cc:dd:ee:c2".to_string();
+        let cached = mk_ap(&target, 55.5, 12.5, Source::Apple);
+        crate::server::lock_db(&state).upsert_ap(&cached).unwrap();
+
+        let result = resolve_readonly(std::slice::from_ref(&target), &state).await;
+
+        assert_eq!(result.positioned.len(), 1, "cached BSSID must be returned");
+        assert!((result.positioned[0].lat - 55.5).abs() < 1e-9);
+        assert!((result.positioned[0].lon - 12.5).abs() < 1e-9);
+        assert!(
+            result.fetched_bssids.is_empty(),
+            "a cache hit is not a fetch"
+        );
+
+        let db = crate::server::lock_db(&state);
+        // Position row still present and unchanged.
+        let ap = db.get_ap(&target).unwrap().expect("aps row must survive");
+        assert!((ap.lat - 55.5).abs() < 1e-9 && (ap.lon - 12.5).abs() < 1e-9);
+        // No not_found write, no pending enqueue.
+        assert!(!db
+            .is_not_found(&target, state.args.not_found_ttl_days)
+            .unwrap());
+        assert!(!db.is_pending(&target).unwrap());
     }
 }
