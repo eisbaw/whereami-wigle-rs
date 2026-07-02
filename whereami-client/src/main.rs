@@ -19,7 +19,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::process;
-use whereami_client::{DaemonResponse, WhereAmIClient};
+use whereami_client::{DaemonResponse, LocateResponse, ScanResponse, WhereAmIClient};
 
 /// `whereami` — Wi-Fi geolocation CLI.
 ///
@@ -123,7 +123,9 @@ fn fatal(msg: &str) -> ! {
 /// branches on json and never re-serializes the parsed struct.
 fn dispatch<T: DaemonResponse>(result: Result<T>, render: impl FnOnce(&T)) {
     match result {
-        Ok(resp) if !resp.is_ok() => fatal(resp.error().unwrap_or("unknown error")),
+        // Sanitize the daemon-sourced error too: it can echo attacker
+        // input and is printed straight to the terminal (task-0198).
+        Ok(resp) if !resp.is_ok() => fatal(&sanitize(resp.error().unwrap_or("unknown error"))),
         Ok(resp) => render(&resp),
         Err(e) => fatal(&format!("error: {e}")),
     }
@@ -174,6 +176,87 @@ fn emit_json(raw: Result<String>) -> ! {
     let (line, code) = json_output(raw);
     println!("{line}");
     process::exit(code);
+}
+
+/// Escape control characters in daemon-sourced strings before printing
+/// them to a terminal, so an attacker-controlled SSID or address cannot
+/// smuggle ANSI/OSC escape sequences into the operator's terminal
+/// (task-0198). `char::is_control()` covers C0 (U+0000..=U+001F), DEL
+/// (U+007F) and C1 (U+0080..=U+009F) — including ESC 0x1B, CR 0x0D,
+/// BEL 0x07 and CSI 0x9B — which become visible `\u{..}`/`\r`-style
+/// escapes via `char::escape_default`. Every other char (printable ASCII,
+/// emoji, non-Latin scripts) passes through unchanged so legitimate SSIDs
+/// still render readably (AC #3).
+///
+/// Applied ONLY in the human renderer. The `--json` path is a byte-
+/// identical daemon passthrough (task-0183) and must stay untouched —
+/// that IS task-0198 AC #2.
+fn sanitize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Render a `scan` response to the human-readable multi-line string
+/// (trailing newline per line). Daemon-sourced strings — SSID, BSSID and
+/// the scan timestamp — are sanitized against terminal-escape injection
+/// (task-0198). Pure, so it is directly unit-testable (AC #4).
+fn render_scan(resp: &ScanResponse, no_scan_time: bool) -> String {
+    let mut out = String::new();
+    if !no_scan_time {
+        let age_ms = resp.scan_age_ms.unwrap_or(0);
+        let age_s = age_ms / 1000;
+        let scanned_at = resp.scanned_at.as_deref().unwrap_or("?");
+        out.push_str(&format!(
+            "scanned: {}  ({age_s}s ago)\n",
+            sanitize(scanned_at)
+        ));
+        out.push('\n');
+    }
+    for net in &resp.networks {
+        let channel = net
+            .channel
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".into());
+        let ssid = net
+            .ssid
+            .as_deref()
+            .map(sanitize)
+            .unwrap_or_else(|| "<hidden>".into());
+        out.push_str(&format!(
+            "{:17}  {:>4} dBm  ch{:<3}  {}\n",
+            sanitize(&net.bssid),
+            net.signal_dbm,
+            channel,
+            ssid
+        ));
+    }
+    out
+}
+
+/// Render a `locate` response's stdout body (optional address line plus
+/// the coordinate line). The daemon-sourced address is sanitized against
+/// terminal-escape injection (task-0198); the stale banner is written to
+/// stderr by the caller. Pure, so it is directly unit-testable.
+fn render_locate(resp: &LocateResponse) -> String {
+    let mut out = String::new();
+    if let Some(addr) = resp.address.as_deref() {
+        if !addr.is_empty() {
+            out.push_str(&sanitize(addr));
+            out.push('\n');
+        }
+    }
+    out.push_str(&format!(
+        "{:.6}, {:.6}  ±{}m  ({} sources)\n",
+        resp.lat, resp.lon, resp.accuracy_m as i64, resp.sources
+    ));
+    out
 }
 
 fn main() {
@@ -237,15 +320,7 @@ fn run_locate(client: &WhereAmIClient, json: bool) {
             };
             eprint!("[last known, {age_str} ago] ");
         }
-        if let Some(addr) = resp.address.as_deref() {
-            if !addr.is_empty() {
-                println!("{addr}");
-            }
-        }
-        println!(
-            "{:.6}, {:.6}  ±{}m  ({} sources)",
-            resp.lat, resp.lon, resp.accuracy_m as i64, resp.sources,
-        );
+        print!("{}", render_locate(resp));
     });
 }
 
@@ -254,24 +329,7 @@ fn run_scan(client: &WhereAmIClient, json: bool, no_scan_time: bool) {
         emit_json(client.scan_raw());
     }
     dispatch(client.scan(), |resp| {
-        if !no_scan_time {
-            let age_ms = resp.scan_age_ms.unwrap_or(0);
-            let age_s = age_ms / 1000;
-            let scanned_at = resp.scanned_at.as_deref().unwrap_or("?");
-            println!("scanned: {scanned_at}  ({age_s}s ago)");
-            println!();
-        }
-        for net in &resp.networks {
-            println!(
-                "{:17}  {:>4} dBm  ch{:<3}  {}",
-                net.bssid,
-                net.signal_dbm,
-                net.channel
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "-".into()),
-                net.ssid.as_deref().unwrap_or("<hidden>")
-            );
-        }
+        print!("{}", render_scan(resp, no_scan_time));
     });
 }
 
@@ -297,7 +355,8 @@ fn run_debug(client: &WhereAmIClient, json: bool) {
     dispatch(client.debug(), |resp| {
         let cli_rev = env!("GIT_REV");
         let daemon_rev = resp.daemon_rev.as_deref().unwrap_or("?");
-        println!("cli: {cli_rev}  daemon: {daemon_rev}");
+        // daemon_rev is daemon-sourced; sanitize before printing (task-0198).
+        println!("cli: {cli_rev}  daemon: {}", sanitize(daemon_rev));
         println!();
         let age = resp.scan_age_ms.unwrap_or(0);
         println!(
@@ -315,7 +374,12 @@ fn run_debug(client: &WhereAmIClient, json: bool) {
             };
             println!(
                 "{}{:17}  {}  {}/{}  {}",
-                marker, b.bssid, signal, b.seen, b.needed, b.db_status,
+                marker,
+                sanitize(&b.bssid),
+                signal,
+                b.seen,
+                b.needed,
+                b.db_status,
             );
         }
         println!();
@@ -352,14 +416,16 @@ fn run_history(
         emit_json(client.history_raw(range, from, to));
     }
     dispatch(client.history(range, from, to), |resp| {
-        println!("range: {} -> {}", resp.from, resp.to);
+        // from/to and the per-segment timestamps are daemon-sourced;
+        // sanitize before printing (task-0198).
+        println!("range: {} -> {}", sanitize(&resp.from), sanitize(&resp.to));
         println!("segments: {}", resp.segments.len());
         for seg in &resp.segments {
             let dur_min = seg.duration_secs / 60;
             println!(
                 "  {} -> {}  {:.6},{:.6}  ±{:.0}m  {} fixes  ({}m)",
-                seg.start_rfc3339,
-                seg.end_rfc3339,
+                sanitize(&seg.start_rfc3339),
+                sanitize(&seg.end_rfc3339),
                 seg.centroid_lat,
                 seg.centroid_lon,
                 seg.mean_accuracy_m,
@@ -383,9 +449,10 @@ fn run_version(client: &WhereAmIClient, json: bool) {
     match client.version() {
         Ok(resp) if !resp.ok => {
             println!("cli:    {cli_version} ({cli_rev})");
+            // Daemon-sourced error string; sanitize before printing (task-0198).
             eprintln!(
                 "daemon: {}",
-                resp.error.as_deref().unwrap_or("unknown error")
+                sanitize(resp.error.as_deref().unwrap_or("unknown error"))
             );
             process::exit(1);
         }
@@ -393,7 +460,12 @@ fn run_version(client: &WhereAmIClient, json: bool) {
             let daemon_version = resp.version.as_deref().unwrap_or("?");
             let daemon_rev = resp.git_rev.as_deref().unwrap_or("?");
             println!("cli:    {cli_version} ({cli_rev})");
-            println!("daemon: {daemon_version} ({daemon_rev})");
+            // Daemon-sourced strings; sanitize before printing (task-0198).
+            println!(
+                "daemon: {} ({})",
+                sanitize(daemon_version),
+                sanitize(daemon_rev)
+            );
         }
         Err(e) => {
             println!("cli:    {cli_version} ({cli_rev})");
@@ -621,5 +693,124 @@ mod tests {
         assert!(!out.contains('\u{1b}'), "raw ESC must not reach stdout");
         assert!(!out.contains('\u{07}'), "raw BEL must not reach stdout");
         let _v: serde_json::Value = serde_json::from_str(&out).expect("still valid JSON");
+    }
+
+    // --- task-0198: control-byte sanitization in the human renderer ---
+
+    /// Assert that a rendered string carries no raw C0 control byte (other
+    /// than the renderer's own '\n'), no DEL, and no raw C1 sequence — the
+    /// security property of task-0198, checked at the byte level so it
+    /// genuinely bites (UTF-8-aware: multibyte chars are not flagged).
+    fn assert_no_raw_control_bytes(out: &str) {
+        for (i, &b) in out.as_bytes().iter().enumerate() {
+            assert!(
+                !(b <= 0x1f && b != b'\n'),
+                "raw C0 byte {b:#04x} at offset {i} leaked to stdout: {out:?}"
+            );
+            assert_ne!(b, 0x7f, "raw DEL byte at offset {i} leaked to stdout");
+        }
+        // C1 controls U+0080..=U+009F encode as UTF-8 0xC2 followed by
+        // 0x80..=0x9F. A legitimate char like © (0xC2 0xA9) or an emoji
+        // (0xF0-lead) is not matched, so this only catches real C1.
+        for w in out.as_bytes().windows(2) {
+            assert!(
+                !(w[0] == 0xc2 && (0x80..=0x9f).contains(&w[1])),
+                "raw C1 sequence {:#04x} {:#04x} leaked to stdout",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn render_scan_escapes_control_bytes_but_keeps_emoji() {
+        // SSID mixes the four escapes named by the task (ESC/CR/CSI/BEL)
+        // with an emoji, proving escapes are neutralized AND legitimate
+        // UTF-8 survives — in a single render pass.
+        let resp = whereami_client::ScanResponse {
+            ok: true,
+            v: 1,
+            networks: vec![whereami_client::NetworkEntry {
+                bssid: "aa:bb:cc:dd:ee:ff".to_string(),
+                ssid: Some("Free\u{1b}[2KWiFi\u{0d}\u{9b}31m\u{07}😀".to_string()),
+                signal_dbm: -42,
+                channel: Some(6),
+            }],
+            scan_age_ms: Some(1000),
+            scanned_at: Some("2026-07-02T00:00:00Z".to_string()),
+            error: None,
+        };
+        let out = render_scan(&resp, false);
+        assert_no_raw_control_bytes(&out);
+        // Escapes rendered visibly (not dropped): ESC and CR are the
+        // stable, high-confidence forms.
+        assert!(
+            out.contains("\\u{1b}"),
+            "ESC should be escaped, got: {out:?}"
+        );
+        assert!(out.contains("\\r"), "CR should be escaped");
+        // AC #3: legitimate UTF-8 (emoji) survives, and readable SSID text
+        // is preserved.
+        assert!(out.contains('😀'), "emoji must render unchanged");
+        assert!(out.contains("Free") && out.contains("WiFi"));
+    }
+
+    #[test]
+    fn render_scan_clean_line_is_byte_stable() {
+        // sanitize is a no-op on control-free data, so ordinary output is
+        // byte-for-byte the fixed layout (guards the println!->String
+        // refactor against accidental spacing drift).
+        let resp = whereami_client::ScanResponse {
+            ok: true,
+            v: 1,
+            networks: vec![whereami_client::NetworkEntry {
+                bssid: "aa:bb:cc:dd:ee:ff".to_string(),
+                ssid: Some("HomeNet".to_string()),
+                signal_dbm: -55,
+                channel: Some(11),
+            }],
+            scan_age_ms: None,
+            scanned_at: None,
+            error: None,
+        };
+        assert_eq!(
+            render_scan(&resp, true),
+            "aa:bb:cc:dd:ee:ff   -55 dBm  ch11   HomeNet\n"
+        );
+    }
+
+    #[test]
+    fn render_locate_escapes_control_bytes_in_address() {
+        let resp = whereami_client::LocateResponse {
+            ok: true,
+            v: 1,
+            lat: 1.5,
+            lon: 2.5,
+            accuracy_m: 10.0,
+            sources: 3,
+            cached: 0,
+            fetched: 0,
+            pending: 0,
+            visible: 0,
+            stable: 0,
+            // OSC 0 title-set + BEL: the classic terminal-title injection.
+            address: Some("Evil St \u{1b}]0;pwned\u{07}".to_string()),
+            stale: false,
+            age_s: None,
+            error: None,
+        };
+        let out = render_locate(&resp);
+        assert_no_raw_control_bytes(&out);
+        assert!(
+            out.contains("\\u{1b}"),
+            "ESC should be escaped, got: {out:?}"
+        );
+        assert!(out.contains("Evil St"));
+    }
+
+    #[test]
+    fn sanitize_is_identity_on_printable_and_multibyte() {
+        assert_eq!(sanitize("plain ascii 123"), "plain ascii 123");
+        assert_eq!(sanitize("café 北京 😀"), "café 北京 😀");
     }
 }
