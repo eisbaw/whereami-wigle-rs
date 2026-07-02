@@ -85,8 +85,8 @@ pub struct Args {
     pub nominatim_timeout_secs: u64,
 
     /// Days to retain rows in the location-history `fixes` table. Older rows
-    /// are pruned periodically. 0 disables history retention (fixes still
-    /// recorded but pruned on next sweep).
+    /// are pruned periodically. 0 disables retention (no pruning); fixes are
+    /// kept indefinitely.
     #[arg(long, default_value_t = 30)]
     pub history_retention_days: i64,
 

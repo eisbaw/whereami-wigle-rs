@@ -929,8 +929,18 @@ impl Database {
         Ok(out)
     }
 
-    /// Delete fixes older than `retention_days`. Returns count deleted.
+    /// Delete fixes older than `retention_days`. Returns the number deleted.
+    ///
+    /// task-0101: `retention_days == 0` means "retention disabled — keep
+    /// forever" (matching the `--history-retention-days` help text), so it
+    /// early-returns `Ok(0)` and deletes nothing. Without this guard the
+    /// cutoff would equal `now` and every sweep would wipe the entire
+    /// history. Negative values are rejected at startup by `Args::validate`
+    /// (fail-fast in config.rs), so `> 0` is the only case reaching DELETE.
     pub fn prune_fixes(&self, retention_days: i64) -> Result<usize> {
+        if retention_days == 0 {
+            return Ok(0);
+        }
         let cutoff = (Utc::now() - chrono::TimeDelta::days(retention_days)).to_rfc3339();
         let n = self
             .conn
@@ -1600,6 +1610,30 @@ mod tests {
             .unwrap();
         assert_eq!(remaining.len(), 1);
         assert!((remaining[0].lat - 1.0).abs() < 1e-9);
+    }
+
+    /// task-0101: retention_days == 0 disables pruning (keep forever). It must
+    /// be a no-op even when every row is far older than "now" — the previous
+    /// behaviour computed cutoff == now and deleted them all on every sweep.
+    #[test]
+    fn prune_fixes_zero_retention_is_noop() {
+        let db = Database::open_memory().unwrap();
+        let old_ts = (chrono::Utc::now() - chrono::TimeDelta::days(365)).to_rfc3339();
+        for _ in 0..10 {
+            db.insert_fix(&old_ts, 1.0, 2.0, 3.0, 1).unwrap();
+        }
+
+        let pruned = db.prune_fixes(0).unwrap();
+        assert_eq!(pruned, 0, "retention 0 must delete nothing");
+
+        let remaining = db
+            .get_fixes_in_range("2000-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00")
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            10,
+            "no fixes should be deleted with retention 0"
+        );
     }
 
     #[test]
