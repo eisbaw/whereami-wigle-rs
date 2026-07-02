@@ -10,7 +10,7 @@
 //! detour past a coffee shop is not a "place".
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
 
 use crate::db::FixRow;
@@ -142,20 +142,34 @@ pub fn parse_range(spec: &str) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     if n <= 0 {
         return Err(anyhow!("range '{spec}' must be > 0"));
     }
+    // Use the fallible `try_*` constructors: `TimeDelta::days(n)` and friends
+    // PANIC when the requested magnitude exceeds `TimeDelta`'s bounds (e.g.
+    // ~10^17 seconds). `try_*` returns None instead so we can surface the
+    // protocol-mandated error JSON rather than aborting the connection task.
+    // task-0184.
     let dur = match unit {
-        "s" => Duration::seconds(n),
-        "m" => Duration::minutes(n),
-        "h" => Duration::hours(n),
-        "d" => Duration::days(n),
-        "w" => Duration::weeks(n),
+        "s" => TimeDelta::try_seconds(n),
+        "m" => TimeDelta::try_minutes(n),
+        "h" => TimeDelta::try_hours(n),
+        "d" => TimeDelta::try_days(n),
+        "w" => TimeDelta::try_weeks(n),
         other => {
             return Err(anyhow!(
                 "unknown range unit '{other}' in '{spec}': use s/m/h/d/w"
             ))
         }
-    };
+    }
+    .ok_or_else(|| anyhow!("range '{spec}' is too large to represent"))?;
+    // Even when `dur` is a valid TimeDelta, `now - dur` PANICS when the
+    // resulting year underflows `DateTime`'s representable range (~year
+    // -262144). e.g. "100000000d" (~274k years) constructs a valid TimeDelta
+    // but overflows the subtraction. `checked_sub_signed` returns None there.
+    // task-0184.
     let now = Utc::now();
-    Ok((now - dur, now))
+    let start = now
+        .checked_sub_signed(dur)
+        .ok_or_else(|| anyhow!("range '{spec}' extends before the earliest representable date"))?;
+    Ok((start, now))
 }
 
 #[cfg(test)]
@@ -274,6 +288,50 @@ mod tests {
         assert!(parse_range("日").is_err());
         // Whitespace-only.
         assert!(parse_range("   ").is_err());
+    }
+
+    /// task-0184: parse_range fed the count into panicking chrono APIs.
+    /// Two distinct overflow sites must both degrade to Err (never panic):
+    ///
+    ///  1. TimeDelta construction: a magnitude beyond TimeDelta's bounds
+    ///     (~10^17 s) made `Duration::seconds` panic.
+    ///  2. DateTime subtraction: a magnitude that builds a valid TimeDelta
+    ///     but drives the year below ~-262144 made `now - dur` panic.
+    ///
+    /// `100000000d` (~274k years, 10 bytes — well inside the 64 KiB request
+    /// cap) is the reported reachable-from-TCP panic.
+    #[test]
+    fn parse_range_returns_err_on_overflow_never_panics() {
+        // Site 2 (DateTime subtraction): valid TimeDelta, year underflow.
+        assert!(
+            parse_range("100000000d").is_err(),
+            "100000000d must be a clean Err, not a panic"
+        );
+        // Site 1 (TimeDelta construction): magnitude beyond TimeDelta bounds.
+        assert!(
+            parse_range("99999999999999999s").is_err(),
+            "99999999999999999s must be a clean Err, not a panic"
+        );
+
+        // i64::MAX against every unit — the largest magnitude the parser can
+        // accept. Whichever site each unit trips, the result must be Err.
+        let max = i64::MAX; // 9223372036854775807
+        for unit in ["s", "m", "h", "d", "w"] {
+            let spec = format!("{max}{unit}");
+            assert!(
+                parse_range(&spec).is_err(),
+                "parse_range({spec:?}) must be Err (overflow), not a panic"
+            );
+        }
+
+        // A weeks value that constructs a valid TimeDelta yet overflows the
+        // subtraction: 10^8 weeks ≈ 1.9M years into the past (well beyond
+        // DateTime's ~-262144 floor). 10^7 weeks (~191k years) would still be
+        // representable, so it must be large enough to actually cross it.
+        assert!(
+            parse_range("100000000w").is_err(),
+            "100000000w must overflow the date subtraction to Err"
+        );
     }
 }
 

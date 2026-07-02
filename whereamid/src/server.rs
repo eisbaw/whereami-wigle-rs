@@ -1083,3 +1083,64 @@ mod wire_enum_tests {
         assert!(r.is_err(), "deserializing unknown db_status must fail");
     }
 }
+
+#[cfg(test)]
+mod history_dispatch_tests {
+    //! task-0184: a history request whose range overflows chrono must return
+    //! the protocol-mandated `ok:false` error envelope rather than panic the
+    //! connection task (a panic would hand the client a dropped socket, not
+    //! the documented error JSON). Exercises the full dispatch path
+    //! (Request -> handle_history -> parse_range -> error_json) against a
+    //! real in-memory DaemonState.
+    use super::*;
+    use clap::Parser;
+
+    /// Build a minimal, side-effect-free DaemonState backed by an in-memory
+    /// SQLite DB. The network clients construct HTTP clients only (no I/O at
+    /// construction), so this is cheap and hermetic.
+    fn test_state() -> std::sync::Arc<DaemonState> {
+        let args = crate::config::Args::parse_from(["whereamid"]);
+        std::sync::Arc::new(DaemonState {
+            db: std::sync::Mutex::new(crate::db::Database::open_memory().unwrap()),
+            debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(
+                args.debounce_window,
+                args.debounce_threshold,
+            )),
+            wigle: crate::wigle::WigleClient::new("", ""),
+            apple: crate::apple::AppleClient::new(),
+            nominatim: crate::nominatim::NominatimClient::new(),
+            last_fix: tokio::sync::Mutex::new(None),
+            inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            address_cache: std::sync::Mutex::new(AddressCache::new()),
+            db_write_failures: std::sync::atomic::AtomicU64::new(0),
+            shutdown: tokio::sync::Notify::new(),
+            args,
+        })
+    }
+
+    #[tokio::test]
+    async fn history_huge_range_yields_ok_false_not_panic() {
+        let state = test_state();
+        let req = Request::History {
+            range: Some("100000000d".to_string()),
+            from: None,
+            to: None,
+        };
+        // Returning normally at all is the "connection survives" property:
+        // before task-0184 this call panicked inside parse_range.
+        let resp = dispatch_command(&req, &state).await;
+        let v: serde_json::Value =
+            serde_json::from_str(&resp).expect("dispatch must return valid JSON");
+        assert_eq!(
+            v.get("ok").and_then(|b| b.as_bool()),
+            Some(false),
+            "huge range must yield ok:false, got {resp}"
+        );
+        assert!(
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|s| s.contains("invalid range")),
+            "error should explain the invalid range, got {resp}"
+        );
+    }
+}
