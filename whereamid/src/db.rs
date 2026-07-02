@@ -936,9 +936,12 @@ impl Database {
     /// early-returns `Ok(0)` and deletes nothing. Without this guard the
     /// cutoff would equal `now` and every sweep would wipe the entire
     /// history. Negative values are rejected at startup by `Args::validate`
-    /// (fail-fast in config.rs), so `> 0` is the only case reaching DELETE.
+    /// (fail-fast in config.rs); the guard is `<= 0` rather than `== 0` so
+    /// that this `pub` DELETE fails *safe* (no-op) rather than *catastrophic*
+    /// (a negative would make the cutoff a future time and wipe everything)
+    /// even if some future caller bypasses `validate`.
     pub fn prune_fixes(&self, retention_days: i64) -> Result<usize> {
-        if retention_days == 0 {
+        if retention_days <= 0 {
             return Ok(0);
         }
         let cutoff = (Utc::now() - chrono::TimeDelta::days(retention_days)).to_rfc3339();
@@ -1521,6 +1524,22 @@ mod tests {
         let got = db.get_last_fix().unwrap().unwrap();
         assert_eq!(got.at_rfc3339, "2026-05-11T00:00:00+00:00");
         assert!((got.lat - 10.0).abs() < 1e-9);
+
+        // Equal-timestamp write MUST apply: the address-backfill path
+        // (server.rs) re-persists the same fix with only `address` changed
+        // and an unchanged `at_rfc3339`. This pins the `>=` (not `>`) guard —
+        // a regression to `>` would silently stop address backfill.
+        let t3_backfill = LastFixRow {
+            address: Some("backfilled".to_string()),
+            ..t3.clone()
+        };
+        db.set_last_fix(&t3_backfill).unwrap();
+        let got = db.get_last_fix().unwrap().unwrap();
+        assert_eq!(
+            got.address,
+            Some("backfilled".to_string()),
+            "equal-timestamp write must apply (address backfill depends on >=)"
+        );
     }
 
     /// task-0047: a migration body that returns Err must roll back the
@@ -1633,6 +1652,20 @@ mod tests {
             remaining.len(),
             10,
             "no fixes should be deleted with retention 0"
+        );
+
+        // Defense-in-depth: a negative retention must also be a no-op, not a
+        // full wipe (cutoff would otherwise be in the future). validate()
+        // rejects negatives upstream, but this pub DELETE must fail safe.
+        let pruned_neg = db.prune_fixes(-5).unwrap();
+        assert_eq!(pruned_neg, 0, "negative retention must delete nothing");
+        let remaining = db
+            .get_fixes_in_range("2000-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00")
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            10,
+            "negative retention must not wipe history"
         );
     }
 
