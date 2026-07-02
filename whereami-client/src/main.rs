@@ -131,7 +131,9 @@ fn dispatch<T: DaemonResponse>(result: Result<T>, render: impl FnOnce(&T)) {
         // input and is printed straight to the terminal (task-0198).
         Ok(resp) if !resp.is_ok() => fatal(&sanitize(resp.error().unwrap_or("unknown error"))),
         Ok(resp) => render(&resp),
-        Err(e) => fatal(&format!("error: {e}")),
+        // Transport errors are CLI/OS-origin today, but sanitize anyway in
+        // case a future error variant embeds daemon-controlled bytes.
+        Err(e) => fatal(&sanitize(&format!("error: {e}"))),
     }
 }
 
@@ -176,6 +178,13 @@ fn json_output(raw: Result<String>) -> (String, i32) {
 }
 
 /// Emit the `--json` result and exit. Never returns.
+///
+/// Callers must pair this with the human path in an
+/// `if json { emit_json(..) } else { dispatch(..) }` so the two modes are
+/// mutually exclusive by control flow, not merely by this `-> !`
+/// signature — otherwise a future non-diverging refactor would silently
+/// fall through into a second daemon call and human output after the JSON
+/// line was already printed.
 fn emit_json(raw: Result<String>) -> ! {
     let (line, code) = json_output(raw);
     println!("{line}");
@@ -272,6 +281,12 @@ fn main() {
     // quietly from SIGPIPE (exit status 141), matching cat/grep and every
     // other well-behaved Unix filter.
     //
+    // The disposition is process-wide, so it also covers writes to the
+    // daemon TCP socket (lib.rs raw_command): a daemon that accepts the
+    // connection and then closes mid-write kills the process with 141
+    // instead of the clean synthesized-JSON transport error. Still a
+    // loud, nonzero failure — an accepted trade-off for pipe correctness.
+    //
     // Safety: signal() is async-signal-safe; we call it exactly once, before
     // spawning threads or doing any I/O, with a constant handler — nothing
     // can race with it.
@@ -327,84 +342,88 @@ fn main() {
 fn run_locate(client: &WhereAmIClient, json: bool) {
     if json {
         emit_json(client.locate_raw());
+    } else {
+        dispatch(client.locate(), |resp| {
+            if resp.stale {
+                let age_s = resp.age_s.unwrap_or(0);
+                let age_str = if age_s < 60 {
+                    format!("{age_s}s")
+                } else if age_s < 3600 {
+                    format!("{}m", age_s / 60)
+                } else {
+                    format!("{}h", age_s / 3600)
+                };
+                eprint!("[last known, {age_str} ago] ");
+            }
+            print!("{}", render_locate(resp));
+        });
     }
-    dispatch(client.locate(), |resp| {
-        if resp.stale {
-            let age_s = resp.age_s.unwrap_or(0);
-            let age_str = if age_s < 60 {
-                format!("{age_s}s")
-            } else if age_s < 3600 {
-                format!("{}m", age_s / 60)
-            } else {
-                format!("{}h", age_s / 3600)
-            };
-            eprint!("[last known, {age_str} ago] ");
-        }
-        print!("{}", render_locate(resp));
-    });
 }
 
 fn run_scan(client: &WhereAmIClient, json: bool, no_scan_time: bool) {
     if json {
         emit_json(client.scan_raw());
+    } else {
+        dispatch(client.scan(), |resp| {
+            print!("{}", render_scan(resp, no_scan_time));
+        });
     }
-    dispatch(client.scan(), |resp| {
-        print!("{}", render_scan(resp, no_scan_time));
-    });
 }
 
 fn run_stats(client: &WhereAmIClient, json: bool) {
     if json {
         emit_json(client.stats_raw());
+    } else {
+        dispatch(client.stats(), |resp| {
+            println!("cached:        {}", resp.cached_aps);
+            println!("pending:       {}", resp.pending_aps);
+            println!("not_found:     {}", resp.not_found_aps);
+            println!("inflight:      {}", resp.inflight);
+            println!("db size:       {} KB", resp.db_size_bytes / 1024);
+            println!("API today:     {}", resp.api_calls_today);
+            println!("db write fail: {}", resp.db_write_failures);
+        });
     }
-    dispatch(client.stats(), |resp| {
-        println!("cached:        {}", resp.cached_aps);
-        println!("pending:       {}", resp.pending_aps);
-        println!("not_found:     {}", resp.not_found_aps);
-        println!("inflight:      {}", resp.inflight);
-        println!("db size:       {} KB", resp.db_size_bytes / 1024);
-        println!("API today:     {}", resp.api_calls_today);
-        println!("db write fail: {}", resp.db_write_failures);
-    });
 }
 
 fn run_debug(client: &WhereAmIClient, json: bool) {
     if json {
         emit_json(client.debug_raw());
-    }
-    dispatch(client.debug(), |resp| {
-        let cli_rev = env!("GIT_REV");
-        let daemon_rev = resp.daemon_rev.as_deref().unwrap_or("?");
-        // daemon_rev is daemon-sourced; sanitize before printing (task-0198).
-        println!("cli: {cli_rev}  daemon: {}", sanitize(daemon_rev));
-        println!();
-        let age = resp.scan_age_ms.unwrap_or(0);
-        println!(
-            "scan age: {}ms  samples: {}  visible: {}  stable: {}",
-            age, resp.samples_in_buffer, resp.visible, resp.stable
-        );
-        println!();
-        for b in &resp.bssids {
-            let marker = if b.is_stable { "*" } else { " " };
-            let signal = match b.signal_dbm {
-                Some(s) => format!("{s:>4} dBm"),
-                // task-0051: '-- dBm' marks stable BSSIDs absent
-                // from the latest scan (no current signal).
-                None => "  -- dBm".to_string(),
-            };
+    } else {
+        dispatch(client.debug(), |resp| {
+            let cli_rev = env!("GIT_REV");
+            let daemon_rev = resp.daemon_rev.as_deref().unwrap_or("?");
+            // daemon_rev is daemon-sourced; sanitize before printing (task-0198).
+            println!("cli: {cli_rev}  daemon: {}", sanitize(daemon_rev));
+            println!();
+            let age = resp.scan_age_ms.unwrap_or(0);
             println!(
-                "{}{:17}  {}  {}/{}  {}",
-                marker,
-                sanitize(&b.bssid),
-                signal,
-                b.seen,
-                b.needed,
-                b.db_status,
+                "scan age: {}ms  samples: {}  visible: {}  stable: {}",
+                age, resp.samples_in_buffer, resp.visible, resp.stable
             );
-        }
-        println!();
-        println!("* = stable  seen/needed = debounce count/threshold");
-    });
+            println!();
+            for b in &resp.bssids {
+                let marker = if b.is_stable { "*" } else { " " };
+                let signal = match b.signal_dbm {
+                    Some(s) => format!("{s:>4} dBm"),
+                    // task-0051: '-- dBm' marks stable BSSIDs absent
+                    // from the latest scan (no current signal).
+                    None => "  -- dBm".to_string(),
+                };
+                println!(
+                    "{}{:17}  {}  {}/{}  {}",
+                    marker,
+                    sanitize(&b.bssid),
+                    signal,
+                    b.seen,
+                    b.needed,
+                    b.db_status,
+                );
+            }
+            println!();
+            println!("* = stable  seen/needed = debounce count/threshold");
+        });
+    }
 }
 
 fn run_history(
@@ -436,26 +455,27 @@ fn run_history(
     // JSON under --json is tracked in TASK-0228 (deliberate for now).
     if json {
         emit_json(client.history_raw(range, from, to));
+    } else {
+        dispatch(client.history(range, from, to), |resp| {
+            // from/to and the per-segment timestamps are daemon-sourced;
+            // sanitize before printing (task-0198).
+            println!("range: {} -> {}", sanitize(&resp.from), sanitize(&resp.to));
+            println!("segments: {}", resp.segments.len());
+            for seg in &resp.segments {
+                let dur_min = seg.duration_secs / 60;
+                println!(
+                    "  {} -> {}  {:.6},{:.6}  ±{:.0}m  {} fixes  ({}m)",
+                    sanitize(&seg.start_rfc3339),
+                    sanitize(&seg.end_rfc3339),
+                    seg.centroid_lat,
+                    seg.centroid_lon,
+                    seg.mean_accuracy_m,
+                    seg.n_fixes,
+                    dur_min
+                );
+            }
+        });
     }
-    dispatch(client.history(range, from, to), |resp| {
-        // from/to and the per-segment timestamps are daemon-sourced;
-        // sanitize before printing (task-0198).
-        println!("range: {} -> {}", sanitize(&resp.from), sanitize(&resp.to));
-        println!("segments: {}", resp.segments.len());
-        for seg in &resp.segments {
-            let dur_min = seg.duration_secs / 60;
-            println!(
-                "  {} -> {}  {:.6},{:.6}  ±{:.0}m  {} fixes  ({}m)",
-                sanitize(&seg.start_rfc3339),
-                sanitize(&seg.end_rfc3339),
-                seg.centroid_lat,
-                seg.centroid_lon,
-                seg.mean_accuracy_m,
-                seg.n_fixes,
-                dur_min
-            );
-        }
-    });
 }
 
 fn run_version(client: &WhereAmIClient, json: bool) {
@@ -465,34 +485,37 @@ fn run_version(client: &WhereAmIClient, json: bool) {
     // (task-0183 AC #3).
     if json {
         emit_json(client.version_raw());
-    }
-    let cli_version = env!("CARGO_PKG_VERSION");
-    let cli_rev = env!("GIT_REV");
-    match client.version() {
-        Ok(resp) if !resp.ok => {
-            println!("cli:    {cli_version} ({cli_rev})");
-            // Daemon-sourced error string; sanitize before printing (task-0198).
-            eprintln!(
-                "daemon: {}",
-                sanitize(resp.error.as_deref().unwrap_or("unknown error"))
-            );
-            process::exit(1);
-        }
-        Ok(resp) => {
-            let daemon_version = resp.version.as_deref().unwrap_or("?");
-            let daemon_rev = resp.git_rev.as_deref().unwrap_or("?");
-            println!("cli:    {cli_version} ({cli_rev})");
-            // Daemon-sourced strings; sanitize before printing (task-0198).
-            println!(
-                "daemon: {} ({})",
-                sanitize(daemon_version),
-                sanitize(daemon_rev)
-            );
-        }
-        Err(e) => {
-            println!("cli:    {cli_version} ({cli_rev})");
-            eprintln!("daemon: error: {e}");
-            process::exit(1);
+    } else {
+        let cli_version = env!("CARGO_PKG_VERSION");
+        let cli_rev = env!("GIT_REV");
+        match client.version() {
+            Ok(resp) if !resp.ok => {
+                println!("cli:    {cli_version} ({cli_rev})");
+                // Daemon-sourced error string; sanitize before printing (task-0198).
+                eprintln!(
+                    "daemon: {}",
+                    sanitize(resp.error.as_deref().unwrap_or("unknown error"))
+                );
+                process::exit(1);
+            }
+            Ok(resp) => {
+                let daemon_version = resp.version.as_deref().unwrap_or("?");
+                let daemon_rev = resp.git_rev.as_deref().unwrap_or("?");
+                println!("cli:    {cli_version} ({cli_rev})");
+                // Daemon-sourced strings; sanitize before printing (task-0198).
+                println!(
+                    "daemon: {} ({})",
+                    sanitize(daemon_version),
+                    sanitize(daemon_rev)
+                );
+            }
+            Err(e) => {
+                println!("cli:    {cli_version} ({cli_rev})");
+                // CLI/OS-origin today; sanitized for the same reason as
+                // dispatch's transport-error arm.
+                eprintln!("daemon: error: {}", sanitize(&e.to_string()));
+                process::exit(1);
+            }
         }
     }
 }
@@ -798,6 +821,34 @@ mod tests {
         assert_eq!(
             render_scan(&resp, true),
             "aa:bb:cc:dd:ee:ff   -55 dBm  ch11   HomeNet\n"
+        );
+    }
+
+    #[test]
+    fn render_locate_clean_output_is_byte_stable() {
+        // Same guard as the scan variant: sanitize is a no-op on clean
+        // data, so the exact address/coordinate layout is pinned against
+        // accidental format drift.
+        let resp = whereami_client::LocateResponse {
+            ok: true,
+            v: 1,
+            lat: 55.676098,
+            lon: 12.568337,
+            accuracy_m: 42.7,
+            sources: 4,
+            cached: 0,
+            fetched: 0,
+            pending: 0,
+            visible: 0,
+            stable: 0,
+            address: Some("Rådhuspladsen 1, København".to_string()),
+            stale: false,
+            age_s: None,
+            error: None,
+        };
+        assert_eq!(
+            render_locate(&resp),
+            "Rådhuspladsen 1, København\n55.676098, 12.568337  ±42m  (4 sources)\n"
         );
     }
 
