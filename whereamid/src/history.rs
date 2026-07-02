@@ -276,3 +276,23 @@ mod tests {
         assert!(parse_range("   ").is_err());
     }
 }
+
+// task-0082: Kani harnesses. See apple.rs for setup notes.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// `parse_range` had a real panic bug (task-0048: byte-indexed split_at
+    /// on a non-char-boundary). Kani proves panic-freedom over every
+    /// bounded UTF-8 input — including the multi-byte char cases the
+    /// existing unit tests can only sample.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn parse_range_no_panic() {
+        const N: usize = 32;
+        let bytes: [u8; N] = kani::any();
+        if let Ok(s) = std::str::from_utf8(&bytes) {
+            let _ = parse_range(s);
+        }
+    }
+}

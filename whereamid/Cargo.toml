@@ -26,3 +26,10 @@ anyhow = "1"
 
 [dev-dependencies]
 proptest = "1.11.0"
+
+# The Kani proof harnesses (src/*.rs `#[cfg(kani)]` modules) are gated on the
+# `kani` cfg, which Kani injects at proof time but which is unknown to a normal
+# rustc. Declare it so `cargo clippy -- -D warnings` does not reject it via the
+# unexpected_cfgs lint. See task-0082 and the `kani` Justfile recipe.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

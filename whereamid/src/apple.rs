@@ -507,3 +507,93 @@ mod tests {
         assert_eq!(declared, envelope.len() - PAYLOAD_OFFSET);
     }
 }
+
+// task-0082: Kani bounded-model-checker harnesses. Setup is out-of-band
+// (not in the nix devshell): `cargo install --locked kani-verifier &&
+// cargo kani setup`. Then `just kani` runs them.
+//
+// Harnesses verify panic-freedom: every Result-returning decoder must
+// produce either Ok or a bail!()-shaped Err for any byte sequence Kani
+// chooses, never an index-out-of-bounds, integer overflow, or arithmetic
+// panic. The fuzz targets cover the same surface stochastically; Kani
+// proves it exhaustively over the bounded input domain.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// `decode_varint` reads up to 10 continuation bytes (each contributes
+    /// 7 bits of a u64). Bound the loop at 11 so Kani can prove
+    /// termination, and bound the input slice large enough that any
+    /// valid varint AND any pos within range are covered.
+    #[kani::proof]
+    #[kani::unwind(11)]
+    fn decode_varint_no_panic() {
+        const N: usize = 16;
+        let data: [u8; N] = kani::any();
+        let pos: usize = kani::any();
+        kani::assume(pos <= N);
+        let _ = decode_varint(&data, pos);
+    }
+
+    /// `decode_tag` is a thin wrapper around decode_varint plus integer
+    /// shifts. Same bounds.
+    #[kani::proof]
+    #[kani::unwind(11)]
+    fn decode_tag_no_panic() {
+        const N: usize = 16;
+        let data: [u8; N] = kani::any();
+        let pos: usize = kani::any();
+        kani::assume(pos <= N);
+        let _ = decode_tag(&data, pos);
+    }
+
+    /// `decode_length_delimited` reads a varint then slices `data[pos..pos+len]`.
+    /// The checked_add + filter guards against overflow and out-of-bounds;
+    /// Kani must prove those guards never fail under any input.
+    #[kani::proof]
+    #[kani::unwind(11)]
+    fn decode_length_delimited_no_panic() {
+        const N: usize = 16;
+        let data: [u8; N] = kani::any();
+        let pos: usize = kani::any();
+        kani::assume(pos <= N);
+        let _ = decode_length_delimited(&data, pos);
+    }
+
+    /// `skip_field` switches on wire_type and advances pos by 4/8 bytes
+    /// or via a nested decoder. Bound the input enough to cover all
+    /// arithmetic in the 4/8-byte arms.
+    #[kani::proof]
+    #[kani::unwind(11)]
+    fn skip_field_no_panic() {
+        const N: usize = 16;
+        let data: [u8; N] = kani::any();
+        let pos: usize = kani::any();
+        let wire_type: u8 = kani::any();
+        kani::assume(pos <= N);
+        let _ = skip_field(&data, pos, wire_type);
+    }
+
+    /// `parse_wifi_device` walks the inner protobuf message, whose call
+    /// graph reaches `decode_varint`'s continuation-byte loop. The unwind
+    /// bound is therefore governed by that inner loop (10 iterations + 1),
+    /// not the outer field loop — the same 11 the low-level decoders use.
+    #[kani::proof]
+    #[kani::unwind(11)]
+    fn parse_wifi_device_no_panic() {
+        const N: usize = 16;
+        let data: [u8; N] = kani::any();
+        let _ = parse_wifi_device(&data);
+    }
+
+    /// `decode_response` is the top-level entry point. Pass an empty
+    /// requested-slice so we don't need to symbolically model strings.
+    /// Unwind bound governed by the nested `decode_varint` loop (see above).
+    #[kani::proof]
+    #[kani::unwind(11)]
+    fn decode_response_no_panic_empty_requested() {
+        const N: usize = 16;
+        let data: [u8; N] = kani::any();
+        let _ = decode_response(&data, &[]);
+    }
+}

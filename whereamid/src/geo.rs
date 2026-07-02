@@ -39,3 +39,28 @@ mod tests {
         assert!(haversine_m(55.0, 12.0, 55.0, 12.0) < 1e-6);
     }
 }
+
+// task-0082: Kani harness for haversine_m.
+//
+// Honest caveat: Kani's f64 reasoning is limited. sin/cos/asin/sqrt are
+// modelled approximately and exhaustive search across 4×64 bits of
+// floating-point input does not terminate in practical time. This
+// harness is written so the panic-freedom property is *expressible*; if
+// it is too slow to prove in CI, comment it out — the proptest in
+// `proptests.rs::trilaterate_within_cluster_diameter` exercises the
+// same surface stochastically.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn haversine_m_no_panic_on_finite_input() {
+        let lat1: f64 = kani::any();
+        let lon1: f64 = kani::any();
+        let lat2: f64 = kani::any();
+        let lon2: f64 = kani::any();
+        kani::assume(lat1.is_finite() && lon1.is_finite());
+        kani::assume(lat2.is_finite() && lon2.is_finite());
+        let _ = haversine_m(lat1, lon1, lat2, lon2);
+    }
+}

@@ -448,3 +448,44 @@ BSS 11:22:33:44:55:66(on wlan0)
         assert_eq!(freq_to_channel(2400), None); // below 2.4 GHz
     }
 }
+
+// task-0082: Kani harnesses. See apple.rs for setup notes.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// `freq_to_channel` is a total function — every i32 must produce
+    /// either Some or None, never panic. Kani exhaustively explores the
+    /// branch / range guards (no loops, no unwind needed).
+    #[kani::proof]
+    fn freq_to_channel_total() {
+        let freq: i32 = kani::any();
+        let _ = freq_to_channel(freq);
+    }
+
+    /// `split_nmcli_fields` walks bytes once, handling backslash escapes.
+    /// Bounded UTF-8 input; Kani proves panic-freedom (no out-of-bounds
+    /// peeks, no integer panics) over every valid 32-byte UTF-8 string.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn split_nmcli_fields_no_panic() {
+        const N: usize = 32;
+        let bytes: [u8; N] = kani::any();
+        if let Ok(s) = std::str::from_utf8(&bytes) {
+            let _ = split_nmcli_fields(s);
+        }
+    }
+
+    /// `normalize_bssid` is .trim().to_uppercase() — a thin wrapper
+    /// around stdlib but still worth proving panic-free under symbolic
+    /// UTF-8 input.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn normalize_bssid_no_panic() {
+        const N: usize = 32;
+        let bytes: [u8; N] = kani::any();
+        if let Ok(s) = std::str::from_utf8(&bytes) {
+            let _ = normalize_bssid(s);
+        }
+    }
+}

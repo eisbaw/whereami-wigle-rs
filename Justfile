@@ -77,3 +77,14 @@ fuzz-all:
     cd whereamid && cargo fuzz run fuzz_apple_decode   -- -max_total_time=60
     cd whereamid && cargo fuzz run fuzz_apple_encode   -- -max_total_time=60
     cd whereamid && cargo fuzz run fuzz_trilaterate    -- -max_total_time=60
+
+# --- Kani bounded-model-checker (task-0082) ---
+# Setup is OUT OF BAND because Kani brings its own forked Rust toolchain;
+# don't try to run this inside `nix develop`. One-time:
+#     cargo install --locked kani-verifier
+#     cargo kani setup
+# Then `just kani` runs all #[kani::proof] harnesses in whereamid (the only
+# crate with proofs; whereami-client has none).
+# Individual proofs can be selected with: cd whereamid && cargo kani --harness <name>
+kani:
+    cd whereamid && cargo kani -p whereamid

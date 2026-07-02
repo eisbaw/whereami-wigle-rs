@@ -142,6 +142,39 @@ just fuzz-apple-encode   # focused: Apple WPS encoder fuzz
 The dev shell exposes `just`, the nightly Rust toolchain, `cargo-fuzz`, and
 all native deps. `RUST_LOG=whereamid=debug` enables verbose logging.
 
+### Formal verification (Kani)
+
+The parser-heavy code paths (Apple WPS protobuf decoder, scanner string
+parsers, history range parser) carry `#[cfg(kani)]`-gated proof harnesses
+that assert panic-freedom over a bounded input domain, intended to be
+discharged by the [Kani](https://github.com/model-checking/kani) bounded
+model checker. Where they prove, they cover the whole bounded domain
+exhaustively rather than sampling it like fuzzing does. Running them
+requires the out-of-band setup below; they are not part of `just e2e` or
+CI yet, so treat a harness as "written, not yet proven" until you have
+run `just kani` locally.
+
+Kani brings its own forked Rust toolchain, so it lives **outside** the
+Nix dev shell. One-time setup:
+
+```bash
+cargo install --locked kani-verifier
+cargo kani setup
+```
+
+Then:
+
+```bash
+just kani                                       # run all proofs
+cd whereamid && cargo kani --harness <name>     # single proof
+```
+
+The harnesses are gated on `cfg(kani)` so normal `cargo build`,
+`cargo test`, and `cargo clippy` are unaffected. The `geo::haversine_m`
+harness reasons over `f64`; if it doesn't terminate in reasonable time
+on your hardware, comment it out — the same surface is exercised
+stochastically by the proptest suite.
+
 ## NixOS module
 
 ```nix
