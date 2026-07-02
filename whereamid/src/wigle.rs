@@ -35,9 +35,13 @@ pub struct WigleClient {
 }
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
 struct WigleSearchResponse {
     success: bool,
+    /// Present on error responses; WiGLE reports quota exhaustion as
+    /// `{"success":false,"message":"too many queries today"}`. Absent on
+    /// success, so default to None.
+    #[serde(default)]
+    message: Option<String>,
     #[serde(default)]
     results: Vec<WigleResult>,
     #[serde(rename = "totalResults")]
@@ -129,25 +133,135 @@ impl WigleClient {
             .await
             .map_err(|e| WigleError::Network(e.into()))?;
 
-        if body.total_results == 0 || body.results.is_empty() {
-            return Err(WigleError::NotFound);
+        interpret_response(body, bssid)
+    }
+}
+
+/// Classify a parsed WiGLE search body into an ApInfo or a WigleError.
+///
+/// Pure (no I/O) so the success / not-found / quota policy is unit-testable
+/// without a live HTTP call. WiGLE reports query errors and (historically)
+/// daily-quota exhaustion as HTTP 200 with `{"success": false, ...}`; that
+/// is NOT an authoritative "not found" and must never be negative-cached.
+/// Only `success:true` with zero results is a genuine NotFound (task-0188).
+fn interpret_response(body: WigleSearchResponse, bssid: &str) -> Result<ApInfo, WigleError> {
+    if !body.success {
+        let message = body.message.unwrap_or_default();
+        // Quota exhaustion maps to RateLimited so the reserved slot is
+        // refunded and the chain hard-stops (see provider.rs), mirroring the
+        // HTTP 429 path. Any other success:false is a transient query/server
+        // error: still never a NotFound, so the BSSID is not negative-cached
+        // and the reserved slot is refunded.
+        if looks_like_quota(&message) {
+            return Err(WigleError::RateLimited);
         }
+        return Err(WigleError::Network(anyhow::anyhow!(
+            "WiGLE returned success:false: {message}"
+        )));
+    }
 
-        let r = &body.results[0];
-        let lat = r.trilat.ok_or(WigleError::NotFound)?;
-        let lon = r.trilong.ok_or(WigleError::NotFound)?;
+    if body.total_results == 0 || body.results.is_empty() {
+        return Err(WigleError::NotFound);
+    }
 
-        Ok(ApInfo {
-            bssid: bssid.to_string(),
-            ssid: r.ssid.clone(),
-            lat,
-            lon,
-            encryption: r.encryption.clone(),
-            channel: r.channel,
-            frequency: r.frequency,
-            city: r.city.clone(),
-            country: r.country.clone(),
-            source: crate::db::Source::Wigle,
-        })
+    let r = &body.results[0];
+    let lat = r.trilat.ok_or(WigleError::NotFound)?;
+    let lon = r.trilong.ok_or(WigleError::NotFound)?;
+
+    Ok(ApInfo {
+        bssid: bssid.to_string(),
+        ssid: r.ssid.clone(),
+        lat,
+        lon,
+        encryption: r.encryption.clone(),
+        channel: r.channel,
+        frequency: r.frequency,
+        city: r.city.clone(),
+        country: r.country.clone(),
+        source: crate::db::Source::Wigle,
+    })
+}
+
+/// Heuristic: does a WiGLE `success:false` message indicate quota/rate
+/// exhaustion (vs a query/auth error)? WiGLE reports daily-quota exhaustion
+/// as `{"success":false,"message":"too many queries today"}`. Matching is
+/// case-insensitive and substring-based; on no match the caller falls back
+/// to a transient Network error (still never a negative-cache), so a miss
+/// only costs a retry, never a poisoned not_found row.
+fn looks_like_quota(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("too many queries") || m.contains("quota") || m.contains("rate limit")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(body: &str) -> WigleSearchResponse {
+        serde_json::from_str(body).expect("valid WiGLE JSON")
+    }
+
+    /// A quota-style success:false maps to RateLimited, which provider.rs
+    /// turns into slot-refund + chain HardStop (mirroring HTTP 429). It is
+    /// never NotFound. task-0188 AC#2/#3.
+    #[test]
+    fn success_false_quota_maps_to_rate_limited() {
+        let body = parse(r#"{"success":false,"message":"too many queries today"}"#);
+        let err = interpret_response(body, "aa:bb:cc:dd:ee:ff").unwrap_err();
+        assert!(
+            matches!(err, WigleError::RateLimited),
+            "quota success:false must be RateLimited, got {err:?}"
+        );
+    }
+
+    /// A non-quota success:false (query/server error) is a transient Network
+    /// error, never NotFound, so the BSSID is not negative-cached.
+    /// task-0188 AC#1.
+    #[test]
+    fn success_false_generic_is_not_not_found() {
+        let body = parse(r#"{"success":false,"message":"query failed: malformed netid"}"#);
+        let err = interpret_response(body, "aa:bb:cc:dd:ee:ff").unwrap_err();
+        assert!(
+            !matches!(err, WigleError::NotFound),
+            "success:false must never be NotFound, got {err:?}"
+        );
+        assert!(
+            matches!(err, WigleError::Network(_)),
+            "non-quota success:false should be transient Network, got {err:?}"
+        );
+    }
+
+    /// success:false with no message is still never NotFound. task-0188 AC#1.
+    #[test]
+    fn success_false_no_message_is_not_not_found() {
+        let body = parse(r#"{"success":false}"#);
+        let err = interpret_response(body, "aa:bb:cc:dd:ee:ff").unwrap_err();
+        assert!(
+            !matches!(err, WigleError::NotFound),
+            "success:false must never be NotFound, got {err:?}"
+        );
+    }
+
+    /// Control: success:true with zero results is the ONLY genuine NotFound.
+    #[test]
+    fn success_true_zero_results_is_not_found() {
+        let body = parse(r#"{"success":true,"totalResults":0,"results":[]}"#);
+        let err = interpret_response(body, "aa:bb:cc:dd:ee:ff").unwrap_err();
+        assert!(
+            matches!(err, WigleError::NotFound),
+            "success:true zero results must be NotFound, got {err:?}"
+        );
+    }
+
+    /// Control: success:true with a positioned result resolves to ApInfo.
+    #[test]
+    fn success_true_with_result_is_found() {
+        let body = parse(
+            r#"{"success":true,"totalResults":1,"results":[{"netid":"AA:BB:CC:DD:EE:FF","ssid":"net","trilat":12.34,"trilong":56.78}]}"#,
+        );
+        let ap = interpret_response(body, "aa:bb:cc:dd:ee:ff").expect("should resolve");
+        assert_eq!(ap.lat, 12.34);
+        assert_eq!(ap.lon, 56.78);
+        assert!(matches!(ap.source, crate::db::Source::Wigle));
     }
 }
