@@ -375,7 +375,12 @@ pub(crate) fn geometric_median(coords: &[(f64, f64)]) -> Option<(f64, f64)> {
 #[allow(clippy::manual_is_multiple_of)]
 fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // total_cmp, not partial_cmp().unwrap(): a NaN element (a near-antipodal
+    // haversine distance, or a NaN lat/lon read from a cached AP row — SQLite
+    // REAL admits NaN) would make partial_cmp return None and panic the
+    // unwrap in the locate hot path. total_cmp is a total order over all f64
+    // (NaN sorts to an end) so the sort can never panic. task-0185.
+    sorted.sort_by(|a, b| a.total_cmp(b));
     let n = sorted.len();
     if n % 2 == 0 {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
@@ -547,6 +552,17 @@ mod tests {
     #[test]
     fn test_empty_aps_error() {
         assert!(trilaterate(&[]).is_err());
+    }
+
+    /// task-0185: median must not panic when the slice contains NaN — which
+    /// can arrive from a near-antipodal haversine distance or a NaN lat/lon
+    /// read from a cached AP row. total_cmp gives a total order (the +NaN
+    /// sorts last), so the two central finite values are still averaged.
+    #[test]
+    fn median_does_not_panic_on_nan() {
+        let m = median(&[f64::NAN, 5.0, 1.0, 3.0]);
+        // total_cmp order: [1.0, 3.0, 5.0, NaN]; even length → (3.0+5.0)/2.
+        assert_eq!(m, 4.0, "median should be 4.0 despite the NaN, got {m}");
     }
 
     #[test]

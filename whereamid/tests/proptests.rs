@@ -26,6 +26,36 @@ proptest! {
         prop_assert!(!filtered.is_empty(), "filter_outliers returned empty for {} APs", aps.len());
     }
 
+    /// task-0185: haversine_m must stay finite for near-antipodal inputs.
+    /// The antipode of (lat1, lon1) is (-lat1, lon1±180); jittering both
+    /// points by up to ~1e-6° around that makes the haversine `a` term
+    /// straddle 1.0 — where the un-clamped formula returned NaN via
+    /// asin(x>1). Every result must be finite and within [0, πR].
+    #[test]
+    fn haversine_finite_near_antipodal(
+        lat1 in -90.0f64..90.0,
+        lon1 in -180.0f64..180.0,
+        dlat in -1e-6f64..1e-6,
+        dlon in -1e-6f64..1e-6,
+    ) {
+        const R: f64 = 6_371_000.0;
+        let max = std::f64::consts::PI * R;
+        let lat2 = -lat1 + dlat;
+        let mut lon2 = lon1 + 180.0 + dlon;
+        if lon2 > 180.0 {
+            lon2 -= 360.0;
+        }
+        let d = haversine_m_test(lat1, lon1, lat2, lon2);
+        prop_assert!(
+            d.is_finite(),
+            "haversine non-finite at near-antipode: ({lat1},{lon1})->({lat2},{lon2}) = {d}"
+        );
+        prop_assert!(
+            (0.0..=max + 1.0).contains(&d),
+            "haversine {d} outside [0, piR={max}]"
+        );
+    }
+
     /// Trilateration result lies within the spherical convex hull of input APs:
     /// its haversine distance to every input AP is bounded by the diameter of
     /// the input cluster.
