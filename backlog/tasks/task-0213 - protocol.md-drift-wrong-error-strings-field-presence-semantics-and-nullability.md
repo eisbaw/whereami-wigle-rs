@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:54'
-updated_date: '2026-07-02 17:27'
+updated_date: '2026-07-02 17:47'
 labels:
   - docs
   - protocol
@@ -35,4 +35,6 @@ forward-carried from task-0183/0198/0199 (all Done):
 - New CLI-synthesized shape to document: when the daemon is unreachable OR returns a non-JSON line, `whereami --json` prints exactly {"ok":false,"error":"<message>"} (serde-escaped) to stdout and exits 1. This is the ONLY --json line not produced verbatim by the daemon; note it as a client-side transport-error convention, not part of the wire protocol.
 - Exit codes: --json exits 1 on ok:false or transport error, matching human mode; success exits 0.
 - task-0199: `whereami` now dies on SIGPIPE (status 141) under early-closed pipes; if protocol.md mentions CLI exit codes, 141 is a new documented value.
+
+forward-carried from 0183 review: also document the passthrough asymmetry - under --json the client validates nothing but the ok field, so a malformed-but-ok:true daemon line passes through with exit 0 (dumb relay by design), while human mode fails its typed parse with exit 1. Belongs next to the synthesized transport-error object documentation.
 <!-- SECTION:NOTES:END -->

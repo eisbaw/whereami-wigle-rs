@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@mped-architect'
 created_date: '2026-07-02 04:52'
-updated_date: '2026-07-02 17:22'
+updated_date: '2026-07-02 17:47'
 labels:
   - security
   - cli
@@ -46,6 +46,8 @@ Implemented human-renderer sanitization.
 - --json path untouched (AC#2): after task-0183 it is byte-identical passthrough.
 Key UTF-8 subtlety for AC#4: C1 controls U+0080..U+009F encode as 0xC2 0x80..0x9F; a naive "no byte 0x80..0x9F" check would false-fail on emoji/© continuation bytes. The test checks C0/DEL at byte level and C1 as the exact 0xC2,0x80..0x9F pair, so it bites without flagging legit UTF-8.
 Live verify: --json version/locate byte-identical to raw daemon line (json untouched); two consecutive RAW daemon scans differ (scan state volatile) which is why comparing --json scan to a *separate* raw scan shows a diff — not a passthrough bug. Human scan renders real SSID "DIRECT-qPC460 Series" readably.
+
+Review gate GO. Reviewer verified the AC#4 test bites (byte-level C0/DEL/C1 asserts, UTF-8-aware C1 windowing) and that every daemon-sourced string in every human renderer is wrapped; db_status/provenance are typed enums so not injectable. Post-review hardening (fc54f0d): transport-error strings through fatal()/run_version now sanitized too (CLI/OS-origin today, closes the class).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

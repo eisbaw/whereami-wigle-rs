@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@mped-architect'
 created_date: '2026-07-02 04:49'
-updated_date: '2026-07-02 17:14'
+updated_date: '2026-07-02 17:47'
 labels:
   - correctness
   - cli
@@ -47,6 +47,8 @@ Implemented raw passthrough.
 Gotcha: `return emit_json(...)` tripped clippy::diverging_sub_expression + rustc unreachable_expression (emit_json is -> !). Fixed by calling emit_json() in statement position (no return) inside `if json {}`; the following dispatch() stays reachable on the json==false path.
 Live verify (daemon up): --json locate byte-identical to raw /dev/tcp line (exit 0); --json history from>to passes ok:false through (exit 1); --json version valid JSON (exit 0); human locate unchanged.
 Limitation: daemon-DOWN path (AC#3) could not be live-tested without stopping the owner's running daemon; it is the same emit_json/synth path covered by json_output_transport_error_is_synthesized_valid_json.
+
+Review gate (qa-test-runner + mped-architect, both GO): --json version and error passthrough verified byte-identical live against daemon 533c2c8; exit codes 0/1 confirmed; gate 235 tests green, clippy/fmt clean. Boundaries on AC#3 disclosed for the record: (a) CLI-side usage errors print to stderr with empty stdout (deliberate, TASK-0228); (b) daemon accepts-then-closes mid-write dies 141 via SIGPIPE instead of synthesized JSON (documented at the SIG_DFL site, task-0199 comment); (c) a malformed-but-ok:true line passes through with exit 0 by design (--json is a dumb relay, no schema validation). Post-review hardening in fc54f0d: if/else at all emit_json sites, transport-error sanitization, render_locate byte-pin.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

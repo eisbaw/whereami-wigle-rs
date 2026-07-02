@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@mped-architect'
 created_date: '2026-07-02 04:52'
-updated_date: '2026-07-02 17:27'
+updated_date: '2026-07-02 17:47'
 labels:
   - cli
 dependencies: []
@@ -44,6 +44,8 @@ Implemented SIGPIPE reset.
 - tests/sigpipe.rs closes the pipe read end pre-spawn so the child's first stdout write EPIPEs; asserts status.signal()==SIGPIPE and no "panicked". Deterministic because the read end is gone before the child writes. Depends on task-0183 (daemon-down --json version writes one synthesized line).
 Flakiness verdict: NOT flaky. Ran the compiled test binary 40x (daemon up) = 40/40 pass; also passes in full `just e2e`. Kept the test.
 Note: `scan | head -1` exits 0 (not 141) here because scan output is tiny and fully buffered before head closes — this is correct Unix-filter behavior (same as `cat smallfile | head`) and AC#2 explicitly allows 0. The 141/SIGPIPE path is exercised deterministically by the integration test.
+
+Review gate GO. sigpipe test 40/40 + 8/8 across two independent reviewers, zero flakes; live `scan | true` = 141 (real SIGPIPE path), `scan | head -1` = 0. Caveat documented in-code (fc54f0d): SIG_DFL is process-wide, so a daemon that accepts-then-closes mid-write also kills the CLI with 141 instead of a synthesized-JSON transport error - loud nonzero failure, accepted trade-off; revisit only if strict JSON-always is ever required (alternative per AC#2: map BrokenPipe to clean exit instead of SIG_DFL).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
