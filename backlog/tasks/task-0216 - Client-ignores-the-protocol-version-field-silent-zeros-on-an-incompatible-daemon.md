@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:54'
+updated_date: '2026-07-02 17:27'
 labels:
   - protocol
   - cli
@@ -25,3 +26,9 @@ protocol.md says the version field v is integer-bumped on incompatible changes, 
 - [ ] #2 protocol.md tells client authors what to do on unknown v
 - [ ] #3 a test feeds a v:2 response and asserts the error path, not zeros
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from task-0183 (Done): under --json the client now intentionally parses ONLY the `ok` field of the response (as serde_json::Value) to derive the exit code, and passes the raw line through byte-identically — it does NOT read `v`. So protocol-version checking is a concern for the TYPED/HUMAN path only (the typed structs still deserialize `v`). Any version-mismatch guard you add should live in the typed accessors / render path, not in the --json passthrough (which must remain verbatim and must not start rejecting lines based on `v`).
+<!-- SECTION:NOTES:END -->

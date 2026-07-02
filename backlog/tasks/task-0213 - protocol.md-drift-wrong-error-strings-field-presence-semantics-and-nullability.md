@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:54'
+updated_date: '2026-07-02 17:27'
 labels:
   - docs
   - protocol
@@ -25,3 +26,13 @@ Multiple doc-vs-code contradictions in the canonical wire reference: (1) documen
 - [ ] #2 every optional locate/scan/debug field documents whether it is omitted or null and under which condition; address semantics match the cache-miss behavior
 - [ ] #3 a wire-golden test asserts stale is absent on a fresh fix and pins the unknown-cmd error string
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from task-0183/0198/0199 (all Done):
+- --json is now a BYTE-IDENTICAL passthrough of the daemon response line (not a re-serialized struct). protocol.md should state this explicitly: the CLI parses only `ok` to pick the exit code and does not add/drop/reorder fields.
+- New CLI-synthesized shape to document: when the daemon is unreachable OR returns a non-JSON line, `whereami --json` prints exactly {"ok":false,"error":"<message>"} (serde-escaped) to stdout and exits 1. This is the ONLY --json line not produced verbatim by the daemon; note it as a client-side transport-error convention, not part of the wire protocol.
+- Exit codes: --json exits 1 on ok:false or transport error, matching human mode; success exits 0.
+- task-0199: `whereami` now dies on SIGPIPE (status 141) under early-closed pipes; if protocol.md mentions CLI exit codes, 141 is a new documented value.
+<!-- SECTION:NOTES:END -->

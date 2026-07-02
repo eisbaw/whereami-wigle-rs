@@ -4,6 +4,7 @@ title: Extract whereami-protocol crate to deduplicate wire types
 status: To Do
 assignee: []
 created_date: '2026-05-20 21:13'
+updated_date: '2026-07-02 17:28'
 labels:
   - refactor
   - wire-format
@@ -25,3 +26,9 @@ Every JSON struct exists twice: whereamid/src/server.rs (175-308) AND whereami-c
 - [ ] #5 docs/protocol.md updates references
 - [ ] #6 Existing 179 tests still pass; the daemon+client serde round-trips are now structurally guaranteed identical
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from task-0183 (Done): whereami-client now has a strict single source of truth for each request's wire bytes — every command has one *_raw() method that serializes its request struct (LocateRequest/SimpleRequest/ResolveRequest/HistoryRequest) exactly once and calls raw_command(); the typed method delegates via parse_response_line(&self.*_raw()?). If you extract a whereami-protocol crate, keep this shape: the request structs are the single definition shared by both the typed and --json-passthrough paths, so they cannot drift. Don't reintroduce per-path request construction.
+<!-- SECTION:NOTES:END -->

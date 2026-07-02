@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:54'
+updated_date: '2026-07-02 17:27'
 labels:
   - cli
   - protocol
@@ -25,3 +26,12 @@ protocol.md documents resolve as one of seven commands and calls whereami the of
 - [ ] #2 --json works for resolve; ResolveResponse derives Serialize
 - [ ] #3 README and whereami-client README list the subcommand; >256 BSSIDs fails client-side with the documented limit message
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from task-0183 (Done): the raw --json passthrough plumbing is your template for a resolve subcommand.
+- lib.rs already has resolve_raw(bssids) -> Result<String> (mirrors locate_raw/scan_raw/etc.): it serializes the existing ResolveRequest struct once and calls raw_command(). The typed resolve() delegates through parse_response_line(&self.resolve_raw(...)?). Reuse this — do NOT hand-build request JSON a second time (single source of truth).
+- In main.rs, a run_resolve should follow the run_scan/run_locate shape: `if json { emit_json(client.resolve_raw(bssids)); }` for the passthrough, and a pure render_resolve(&ResolveResponse)->String for the human path.
+- IMPORTANT (task-0198): sanitize() every daemon-sourced string you print in the human renderer — for resolve that means the ssid and bssid fields of each ResolveResultEntry. The --json path must stay untouched (byte-identical).
+<!-- SECTION:NOTES:END -->
