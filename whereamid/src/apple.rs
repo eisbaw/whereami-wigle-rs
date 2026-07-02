@@ -208,12 +208,17 @@ pub fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
             pos = new_pos;
             bssid = Some(String::from_utf8_lossy(s_data).to_string());
         } else if field_num == 2 && wire_type == 2 {
-            // Location submessage
+            // Location submessage. latitude/longitude are optional int64 in
+            // the proto, so parse_location returns None for an absent field.
+            // Propagate the Options directly: a device whose Location is
+            // empty or carries only one coordinate leaves the other None and
+            // is skipped by the (Some, Some, Some) match below — it must not
+            // become a (0,0) Null Island fix (task-0187).
             let (loc_data, new_pos) = decode_length_delimited(data, pos)?;
             pos = new_pos;
             let (lt, ln) = parse_location(loc_data)?;
-            lat = Some(lt);
-            lon = Some(ln);
+            lat = lt;
+            lon = ln;
         } else {
             pos = skip_field(data, pos, wire_type)?;
         }
@@ -258,10 +263,15 @@ pub fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
 }
 
 /// Parse a Location submessage — fields 1 (lat) and 2 (lon) are varint int64.
-/// Apple encodes these as plain signed varints (not zigzag), so we cast directly.
-pub fn parse_location(data: &[u8]) -> Result<(i64, i64)> {
-    let mut lat: i64 = 0;
-    let mut lon: i64 = 0;
+/// Apple encodes these as plain signed varints (not zigzag), so we cast
+/// directly. Both are `optional` in AppleWLoc.proto, so a field that is
+/// absent (empty or partial Location on format drift / truncation) is
+/// reported as `None` rather than defaulting to 0. Defaulting to 0 would
+/// fabricate a (0,0) Null Island fix that passes the sentinel check and
+/// poisons the cache under Source::Apple (task-0187).
+pub fn parse_location(data: &[u8]) -> Result<(Option<i64>, Option<i64>)> {
+    let mut lat: Option<i64> = None;
+    let mut lon: Option<i64> = None;
     let mut pos = 0;
 
     while pos < data.len() {
@@ -272,8 +282,8 @@ pub fn parse_location(data: &[u8]) -> Result<(i64, i64)> {
             let (val, new_pos) = decode_varint(data, pos)?;
             pos = new_pos;
             match field_num {
-                1 => lat = val as i64,
-                2 => lon = val as i64,
+                1 => lat = Some(val as i64),
+                2 => lon = Some(val as i64),
                 _ => {}
             }
         } else {
@@ -605,6 +615,41 @@ mod tests {
         assert!(
             parse_wifi_device(&wd).unwrap().is_none(),
             "(-180,-180) sentinel must remain not-found"
+        );
+    }
+
+    // --- Location optional-field tests (task-0187) ---
+
+    /// parse_location reports absent fields as None (not 0), so callers can
+    /// distinguish "coordinate missing" from "coordinate is literally 0"
+    /// (task-0187).
+    #[test]
+    fn parse_location_empty_is_none_none() {
+        assert_eq!(parse_location(&[]).unwrap(), (None, None));
+    }
+
+    /// A WifiDevice whose Location submessage carries neither latitude
+    /// (field 1) nor longitude (field 2) must NOT fabricate a (0,0) Null
+    /// Island fix — parse_wifi_device returns None (task-0187 AC#1/#2).
+    #[test]
+    fn empty_location_produces_no_apinfo() {
+        let empty_loc: Vec<u8> = Vec::new();
+        let wd = encode_wifi_device_msg("aa:bb:cc:dd:ee:ff", Some(&empty_loc));
+        assert!(
+            parse_wifi_device(&wd).unwrap().is_none(),
+            "empty Location must not become a (0,0) Null Island fix"
+        );
+    }
+
+    /// A Location with only latitude present (longitude absent) yields no
+    /// ApInfo — both coordinates are required (task-0187 AC#1).
+    #[test]
+    fn location_with_only_latitude_produces_no_apinfo() {
+        let loc = encode_location_msg(Some(scaled(55.68)), None);
+        let wd = encode_wifi_device_msg("aa:bb:cc:dd:ee:ff", Some(&loc));
+        assert!(
+            parse_wifi_device(&wd).unwrap().is_none(),
+            "missing longitude must skip the device"
         );
     }
 }
