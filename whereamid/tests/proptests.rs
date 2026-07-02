@@ -213,37 +213,37 @@ proptest! {
         }
     }
 
-    /// split_nmcli_fields panic-freedom plus a shape invariant. The output
-    /// must never contain a literal "\:" escape sequence — those are the
-    /// inputs being escaped.
+    /// split_nmcli_fields is TOTAL: it never panics on arbitrary input,
+    /// including malformed escape sequences, and always yields at least one
+    /// field. Panic-freedom on arbitrary bytes is otherwise only asserted by
+    /// the `cfg(kani)` harness, which is not run in normal CI.
+    ///
+    /// (This replaces an earlier `!field.contains("\\:")` assertion, which
+    /// was a false-positive proxy: correct decoding of the wire sequence
+    /// `\\` followed by `\:` legitimately yields a field containing a literal
+    /// backslash-colon, so that assertion flagged correct output as a failure
+    /// and made `just e2e` flakily red. task-0226.)
     #[test]
-    fn split_nmcli_no_unescaped_backslash_colon(input in ".*") {
+    fn split_nmcli_fields_is_total(input in ".*") {
         let fields = split_nmcli_fields(&input);
-        for f in &fields {
-            prop_assert!(
-                !f.contains("\\:"),
-                "split_nmcli_fields left an unprocessed \\: escape in field {:?}", f
-            );
-        }
+        prop_assert!(!fields.is_empty(), "must always yield at least one field");
     }
 
-    /// split_nmcli_fields correctly splits on unescaped colons even when
-    /// fields contain backslashes and escaped colons. The previous version
-    /// of this property tested only `[a-zA-Z0-9]{0,10}`, which never
-    /// exercised the escape logic — a vacuous regression.
+    /// split_nmcli_fields is the exact inverse of nmcli terse escaping over
+    /// the FULL escape set: a literal '\' is escaped as '\\' and a literal
+    /// ':' as '\:'. The field alphabet now INCLUDES '\\' — the earlier
+    /// version excluded it "to avoid modelling lookahead", which dodged the
+    /// exact `\\` handling that task-0226 fixed.
     #[test]
     fn split_nmcli_round_trips_with_escapes(
-        // Each "field" is built from raw chars that can include literal ':',
-        // which we'll then escape as '\:' to compose a wire-format line.
-        // We exclude '\\' itself so we don't have to model lookahead in
-        // round-trip; the escape semantics under '\\' are tested in the unit
-        // test for split_nmcli_fields directly.
-        fields in prop::collection::vec("[a-zA-Z0-9: ]{0,10}", 1..6)
+        fields in prop::collection::vec("[a-zA-Z0-9:\\\\ ]{0,10}", 1..6)
     ) {
-        // Compose: every literal ':' in a field becomes '\:' on the wire.
+        // Compose the wire form the way nmcli does: escape '\' -> '\\' FIRST,
+        // then ':' -> '\:' (order matters: escaping ':' first would introduce
+        // backslashes that the '\' pass would then double-escape).
         let line = fields
             .iter()
-            .map(|f| f.replace(':', "\\:"))
+            .map(|f| f.replace('\\', "\\\\").replace(':', "\\:"))
             .collect::<Vec<_>>()
             .join(":");
         let split = split_nmcli_fields(&line);

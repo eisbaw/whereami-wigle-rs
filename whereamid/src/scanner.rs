@@ -142,15 +142,22 @@ pub fn split_nmcli_fields(line: &str) -> Vec<String> {
 
     while let Some(ch) = chars.next() {
         if ch == '\\' {
-            if let Some(&next) = chars.peek() {
-                if next == ':' {
+            // nmcli terse mode escapes both the separator (`:` -> `\:`) and
+            // the escape char itself (`\` -> `\\`). Consume the escaped char
+            // so a literal backslash (`\\`) does not leave a dangling `\` that
+            // re-triggers escape handling on the following byte (which would
+            // mis-parse `\\:` into a field containing `\:`). task-0226.
+            match chars.peek() {
+                Some(&':') => {
                     current.push(':');
                     chars.next();
-                } else {
-                    current.push(ch);
                 }
-            } else {
-                current.push(ch);
+                Some(&'\\') => {
+                    current.push('\\');
+                    chars.next();
+                }
+                // Lone/other backslash: emit it verbatim, best-effort.
+                _ => current.push('\\'),
             }
         } else if ch == ':' {
             fields.push(std::mem::take(&mut current));
@@ -423,6 +430,25 @@ BSS 11:22:33:44:55:66(on wlan0)
             fields,
             vec!["AA:BB:CC:DD:EE:FF", "MySSID", "75", "6", "2437"]
         );
+    }
+
+    /// task-0226: nmcli escapes `\` as `\\`. A field ending in a literal
+    /// backslash (`SSID\` -> wire `SSID\\`) followed by the separator must
+    /// yield the backslash and a clean split, NOT leave a dangling `\:`
+    /// escape. The `.*` proptest `split_nmcli_no_unescaped_backslash_colon`
+    /// catches this flakily; this pins it deterministically.
+    #[test]
+    fn split_nmcli_handles_escaped_backslash() {
+        // Wire: field "a\" (a + literal backslash) then separator then "b".
+        // "a" + "\\" (escaped backslash) + ":" (separator) + "b"
+        assert_eq!(split_nmcli_fields("a\\\\:b"), vec!["a\\", "b"]);
+        // Escaped backslash immediately followed by an escaped colon:
+        // "\\" -> "\", "\:" -> ":", all one field.
+        assert_eq!(split_nmcli_fields("\\\\\\:"), vec!["\\:"]);
+        // No field may retain an unprocessed "\:" escape.
+        for f in split_nmcli_fields("a\\\\:b\\:c") {
+            assert!(!f.contains("\\:"), "unprocessed escape in {f:?}");
+        }
     }
 
     #[test]
