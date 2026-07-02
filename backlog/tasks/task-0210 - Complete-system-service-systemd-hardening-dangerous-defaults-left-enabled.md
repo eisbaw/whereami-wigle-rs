@@ -4,6 +4,7 @@ title: Complete system-service systemd hardening (dangerous defaults left enable
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:53'
+updated_date: '2026-07-02 23:06'
 labels:
   - nix
   - security
@@ -23,3 +24,9 @@ module.nix serviceConfig omits PrivateDevices, SystemCallArchitectures, Restrict
 - [ ] #2 SystemCallArchitectures=native is set alongside the syscall allow-list; PrivateDevices/RestrictSUIDSGID/ProtectProc/ProcSubset/ProtectHostname/ProtectClock added
 - [ ] #3 Wi-Fi scanning still succeeds via both nmcli and iw under the tightened sandbox
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Forward-carried from task-0197: nix/module.nix serviceConfig already gained UMask="0077" and StateDirectoryMode="0700" (for the location-history DB privacy). Do NOT double-add these when completing the systemd hardening; extend the remaining directives (e.g. ProtectProc, ProcSubset, SystemCallArchitectures, RestrictSUIDSGID, PrivateDevices, etc.) around them. hm-module.nix Service gained UMask="0077" too.
+<!-- SECTION:NOTES:END -->

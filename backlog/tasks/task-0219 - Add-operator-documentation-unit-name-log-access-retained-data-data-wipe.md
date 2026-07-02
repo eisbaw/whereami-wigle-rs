@@ -4,6 +4,7 @@ title: 'Add operator documentation: unit name, log access, retained data, data-w
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:54'
+updated_date: '2026-07-02 23:06'
 labels:
   - docs
 dependencies: []
@@ -22,3 +23,9 @@ README documents enabling the service but never states the unit name whereamid, 
 - [ ] #2 docs enumerate retained personal data (tables, default retention, path) and a verified wipe procedure
 - [ ] #3 man page/completions either shipped (clap_mangen/clap_complete) or explicitly declared out of scope
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Forward-carried from task-0197: retained data at rest is now owner-only. Document that aps.sqlite (fixes location-history, last_fix, all BSSID/SSID seen) is created mode 0600 and its state directory 0700, on system (/var/lib/whereami), hm (%h/.local/share/whereami) and manual/--db paths. The daemon also tightens an existing loose DB to 0600 on startup and warns if a pre-existing state dir is group/other-accessible. Relevant for the retained-data and data-access sections of the operator docs.
+<!-- SECTION:NOTES:END -->

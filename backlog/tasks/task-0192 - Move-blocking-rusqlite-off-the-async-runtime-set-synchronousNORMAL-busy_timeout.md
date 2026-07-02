@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:51'
+updated_date: '2026-07-02 23:06'
 labels:
   - correctness
   - performance
@@ -26,3 +27,9 @@ Database sits behind std::sync::Mutex and every call runs directly on tokio work
 - [ ] #3 PRAGMA synchronous=NORMAL and a busy_timeout are set; concurrent stats/version stay responsive under a slowed DB or large prune
 - [ ] #4 try_reserve_api_call uses (or documents) the correct transaction mode
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Forward-carried from task-0197: db.rs Database::open() now calls tighten_db_file_permissions(path) (chmod DB file to 0600) IMMEDIATELY after Connection::open and BEFORE the journal_mode=WAL pragma. This ordering is load-bearing: SQLite copies the main DB files perms onto the -wal/-shm sidecars it creates on WAL activation, so the chmod must precede WAL. When you add synchronous=NORMAL + busy_timeout pragmas (and/or move rusqlite onto spawn_blocking), keep the tighten call before the journal_mode pragma. There is an in-code NOTE(task-0192) marking this constraint at the call site.
+<!-- SECTION:NOTES:END -->
