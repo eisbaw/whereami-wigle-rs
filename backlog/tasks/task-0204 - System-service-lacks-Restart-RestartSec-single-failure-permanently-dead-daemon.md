@@ -1,0 +1,26 @@
+---
+id: TASK-0204
+title: >-
+  System service lacks Restart=/RestartSec= (single failure = permanently dead
+  daemon)
+status: To Do
+assignee: []
+created_date: '2026-07-02 04:53'
+labels:
+  - nix
+dependencies: []
+priority: medium
+---
+
+## Description
+
+<!-- SECTION:DESCRIPTION:BEGIN -->
+nix/module.nix serviceConfig omits Restart, so systemd default Restart=no applies. The daemon ?-propagates fatal startup errors (load_config_file?, Database::open?) and can panic mid-run; any such exit leaves the unit failed until manual restart or reboot. The hm-module already sets Restart=on-failure/RestartSec=5 - the production unit is worse than the user one. Ref nix/module.nix:20-39 vs hm-module.nix:25-26.
+<!-- SECTION:DESCRIPTION:END -->
+
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [ ] #1 SIGKILL of the daemon results in an automatic restart within a few seconds
+- [ ] #2 a non-zero exit puts the unit through auto-restart, not terminal failed
+- [ ] #3 restart backoff is bounded (StartLimitIntervalSec/Burst) so a hard-failing binary does not hot-loop
+<!-- AC:END -->

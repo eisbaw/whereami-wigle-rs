@@ -4,6 +4,7 @@ title: 'Introduce Bssid([u8;6]) newtype; pre-filter locally-administered MACs'
 status: To Do
 assignee: []
 created_date: '2026-05-20 21:18'
+updated_date: '2026-07-02 04:55'
 labels:
   - correctness
   - domain
@@ -26,4 +27,6 @@ Compass-domain finding #1. BSSID is a 48-bit IEEE 802 MAC. Its U/L bit (second-l
 - [ ] #6 Test: F6:B1:9C:0A:3A:60 (the Brazilian poisoner) is recognized as locally-administered and excluded from trilateration even before drop_isolated
 - [ ] #7 Test: well-known BSSIDs (B8:50:01:... TP-Link) are universally-administered and pass
 - [ ] #8 Note in task notes: this strictly subsumes task-0093 (SSID denylist). 0093 can be closed when this lands.
+- [ ] #9 resolve rejects any BSSID that is not a well-formed 6-octet MAC (error) before any provider/network call
+- [ ] #10 a BSSID containing & # ? / or whitespace cannot alter the outbound WiGLE request query parameters (validate at Bssid construction; percent-encode as belt-and-suspenders)
 <!-- AC:END -->
