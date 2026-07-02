@@ -122,11 +122,26 @@ fn tighten_db_file_permissions(path: &Path) {
 }
 
 /// chmod a single file to 0600. A missing file is a silent no-op (an absent
-/// sidecar is normal); any other error warns and is swallowed.
+/// sidecar is normal); any other error warns and is swallowed. After a
+/// successful chmod the mode is re-checked: some filesystems (FUSE, network
+/// mounts) accept chmod and ignore it, and a location-history DB that stays
+/// world-readable must never be SILENTLY loose (task-0197 review).
 fn tighten_file_to_0600(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        Ok(()) => {}
+        Ok(()) => {
+            if let Ok(meta) = std::fs::metadata(path) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    tracing::warn!(
+                        "{} remains group/other-accessible (mode {mode:o}) after \
+                         chmod 0600 — the filesystem ignored the permission change; \
+                         it may be readable by other local users",
+                        path.display()
+                    );
+                }
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             tracing::warn!(
@@ -222,9 +237,13 @@ impl Database {
                 // already has the v3 single-row (id = 1) shape — reaching v4
                 // required migrate_v3_to_v4, which addresses the row by id.
                 // (This block only fires when satisfied < version, i.e.
-                // version >= 4.) A schema_version table manually corrupted to
-                // a non-id shape while stamped >= 4 is out of contract; the
-                // UPDATE below would then fail loudly, not silently mis-heal.
+                // version >= 4.) A schema_version table manually corrupted
+                // out of that contract makes the UPDATE below either error
+                // (id column gone) or match zero rows (row re-keyed/absent);
+                // in the zero-row case the stale stamp persists for the next
+                // open to retry, but the chain below still rebuilds the
+                // missing tables either way — it never mis-heals a healthy
+                // row.
                 self.conn
                     .execute(
                         "UPDATE schema_version SET version = ?1 WHERE id = 1",
@@ -2102,6 +2121,39 @@ mod tests {
         std::fs::remove_file(&wal).unwrap();
         tighten_db_file_permissions(&path);
         assert_eq!(mode_bits(&path), 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// task-0197 review follow-up: prove the chmod-before-WAL ordering claim
+    /// against REAL SQLite behavior — a -wal sidecar created by SQLite itself
+    /// (not hand-made by the test) must be born without group/other bits,
+    /// because SQLite copies the main DB file's mode (0600 after the tighten
+    /// in open()). Observed while the connection is still open: a clean close
+    /// checkpoints and deletes the sidecar. Under a 0077 umask this passes
+    /// trivially; under the common 0022 it is exactly the inheritance that
+    /// keeps the sidecar owner-only.
+    #[test]
+    fn real_wal_sidecar_is_born_owner_only() {
+        let dir = unique_tempdir("perms-walborn");
+        let path = dir.join("aps.sqlite");
+        let wal = sidecar(&path, "-wal");
+        {
+            let db = Database::open(&path).unwrap();
+            // open() already writes through WAL (schema creation), but pin an
+            // explicit post-open write so the sidecar's existence is not an
+            // artifact of migration internals.
+            db.set_metadata("walborn-probe", "1").unwrap();
+            assert!(
+                wal.exists(),
+                "-wal sidecar must exist while the connection is open"
+            );
+            assert_eq!(
+                mode_bits(&wal) & 0o077,
+                0,
+                "SQLite-created -wal must not be group/other accessible (mode {:o})",
+                mode_bits(&wal)
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
