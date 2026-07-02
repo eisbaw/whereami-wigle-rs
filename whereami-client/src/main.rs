@@ -37,6 +37,10 @@ use whereami_client::{DaemonResponse, LocateResponse, ScanResponse, WhereAmIClie
     // top-level --version flag both route to handle_version().
     disable_version_flag = true,
     arg_required_else_help = false,
+    // task-0199: document the Unix-filter pipe behavior in `whereami --help`.
+    after_help = "Pipes: whereami behaves like a standard Unix filter. If a downstream \
+                  reader closes the pipe early (e.g. `whereami scan | head`), the process \
+                  is terminated by SIGPIPE (exit status 141) rather than printing a panic.",
 )]
 struct Cli {
     /// Print the raw JSON daemon response instead of the human renderer.
@@ -260,6 +264,22 @@ fn render_locate(resp: &LocateResponse) -> String {
 }
 
 fn main() {
+    // Restore the default SIGPIPE disposition (task-0199). The Rust runtime
+    // installs SIG_IGN for SIGPIPE before main(), which turns a closed
+    // downstream pipe (e.g. `whereami scan | head`) into an EPIPE that
+    // println! escalates into a panic ("failed printing to stdout: Broken
+    // pipe") and exit code 101. Resetting to SIG_DFL makes the process die
+    // quietly from SIGPIPE (exit status 141), matching cat/grep and every
+    // other well-behaved Unix filter.
+    //
+    // Safety: signal() is async-signal-safe; we call it exactly once, before
+    // spawning threads or doing any I/O, with a constant handler — nothing
+    // can race with it.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     // Use try_parse so we can normalise the exit code. clap's default
     // is 2 for parse errors; the prior CLI exited 1 for unknown
     // subcommands. Preserving exit code 1 keeps shell wrappers (e.g.
