@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@mped-architect'
 created_date: '2026-07-02 04:51'
-updated_date: '2026-07-02 18:18'
+updated_date: '2026-07-02 18:35'
 labels:
   - correctness
   - protocol
@@ -48,6 +48,8 @@ Implemented in commit accf3b7 (resolver.rs, server.rs, whereami-client/src/lib.r
 Deviation from brief: did NOT add a separate ResolveResult.deferred field. handle_resolve subsumes deferred into the else->unresolved bucket, so a deferred field would be unused wire-facing state (YAGNI / minimize-state). AC#2 is verified via the inflight-claim path instead. Renamed server test module history_dispatch_tests -> dispatch_tests to reuse its test_state (SSOT) rather than duplicate it a 4th time.
 Tests: resolver resolve_chain_not_found_set_is_authoritative_only + augmented inflight-dedup test (deferred not in not_found); server dispatch_tests resolve_uncached_wigle_unconfigured_is_unresolved (AC1), resolve_racing_inflight_claim_is_unresolved (AC2), resolve_table_not_found_is_reported_as_not_found (AC3 positive); daemon+client provenance wire round-trips include unresolved.
 Gate: whereamid lib 78 / bin 128 / proptests 11; client bins 7/22/1; clippy -D warnings clean; cargo fmt --check clean.
+
+Review gate GO. Wire mapping verified honest both directions (nothing authoritative lands in unresolved, nothing non-authoritative in not_found; table-hit path traced). protocol.md nuance noted by QA: docs advise treating unknown source values "like unresolved" while the typed client maps them to a distinct Unknown variant - semantically compatible, no action.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

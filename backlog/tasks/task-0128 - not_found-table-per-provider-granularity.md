@@ -4,7 +4,7 @@ title: 'not_found table: per-provider granularity'
 status: To Do
 assignee: []
 created_date: '2026-05-20 21:20'
-updated_date: '2026-07-02 18:19'
+updated_date: '2026-07-02 18:35'
 labels:
   - correctness
   - domain
@@ -31,4 +31,6 @@ Compass-domain finding #7. db.rs:434 not_found is keyed on (bssid) only. is_not_
 
 <!-- SECTION:NOTES:BEGIN -->
 Forward-carried from task-0189/task-0194: resolve_chain now builds authoritative_nf: HashSet<String> (BSSIDs a provider authoritatively returned NotFound for, this pass) and ResolveResult.not_found (task-0194). This is the natural seed for per-provider granularity: today the not_found decision is boolean (>=1 provider NotFound AND no hard-transient => mark). To make it per-provider, carry WHICH provider said NotFound (e.g. HashMap<bssid, provider_set>), and make the not_found table + is_not_found() provider-scoped. Motivating case introduced by task-0189: when Apple says NotFound and WiGLE was merely Skipped (unconfigured/quota-exhausted), the chain now marks not_found for the whole TTL; per-provider granularity is exactly what would let the daemon record 'Apple: no' without suppressing a later WiGLE retry. See whereamid/src/resolver.rs chain-end block.
+
+forward-carried from 0189 review: the stopped-provider shadow fix (369429a) makes ALL hard-stop-shadowed BSSIDs transient, which is safe but coarse - per-provider not_found granularity would let Apple-definitive absence be recorded as "apple: no" while WiGLE recovers, resolving both the quota-day 30d-mark tradeoff and the shadow conservatism in one model.
 <!-- SECTION:NOTES:END -->

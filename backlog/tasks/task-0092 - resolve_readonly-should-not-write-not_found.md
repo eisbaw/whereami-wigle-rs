@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@mped-architect'
 created_date: '2026-05-13 21:55'
-updated_date: '2026-07-02 18:18'
+updated_date: '2026-07-02 18:35'
 labels:
   - correctness
   - server
@@ -46,6 +46,8 @@ Implemented in commit 8b2197e (whereamid/src/resolver.rs).
 Honesty note (AC#2/AC#4 deviation from brief): the brief suggested doc text "writes nothing: no aps, no pending, no not_found". That is FALSE: resolve_chain skip_cached path calls touch_ap on a cache hit, bumping aps.last_seen. Verified in code (resolver.rs cache-hit block). Doc comment now states it writes no positions/pending/not_found but DOES bump last_seen (benign; stored position untouched, not part of ApInfo). AC#4 test asserts the stored position is unchanged and no not_found/pending write, NOT last_seen invariance.
 Tests (whereamid bin binary): resolve_readonly_policy_is_never (AC1), resolve_readonly_unknown_bssid_does_not_write_not_found (AC3), resolve_readonly_cached_bssid_returns_without_state_writes (AC4).
 Gate: lib 78 / bin 124 / proptests 11 passed; clippy -D warnings clean; cargo fmt --check clean.
+
+Review gate GO. Deviation validated: testing via resolve_chain(readonly_policy()) with a mock NotFound is stronger than driving resolve_readonly itself (real WiGLE would Skip and pass vacuously). touch_ap last_seen bump on cache hits disclosed in doc comment - intentional, out of scope here.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

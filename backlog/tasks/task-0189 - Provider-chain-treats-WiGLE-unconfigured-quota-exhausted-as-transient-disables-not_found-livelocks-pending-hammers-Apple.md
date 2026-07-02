@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@mped-architect'
 created_date: '2026-07-02 04:50'
-updated_date: '2026-07-02 18:18'
+updated_date: '2026-07-02 18:35'
 labels:
   - correctness
 dependencies: []
@@ -49,6 +49,8 @@ Implemented in commit e6da573 (whereamid/src/resolver.rs + pending.rs).
 - Removed NetErrorAction::IncrementPending (dead after drain policy -> Ignore) + its match arm.
 Tests (whereamid bin binary): drain_chain_marks_not_found_when_apple_nf_and_wigle_skipped (AC1), drain_chain_all_skipped_leaves_pending_unmarked (AC1 twin), drain_chain_marks_not_found_when_apple_nf_and_wigle_quota_exhausted (AC4), drain_once_ages_out_perpetually_unresolved_row (AC2), drain_once_rotates_across_batches_no_head_of_line_monopoly (AC3). Existing transient-suppression tests still green.
 Gate: lib 78 / bin 121 / proptests 11 passed; clippy -D warnings clean; cargo fmt --check clean.
+
+Review gate (qa-test-runner + mped-architect, both GO): all new tests independently confirmed to bite via revert-analysis; drain tests 34/34 runs, full suite 3x green. Architect found one latent pre-existing gap this task exposed: the stopped-provider shadow (WiGLE HardStop on B1 leaves B2..Bn unprotected - Apple-NF alone marked them). Fixed in-thread post-review (369429a): stopped[idx] now feeds hard_transient for shadowed BSSIDs; pinned by drain_chain_hard_stop_shadow_does_not_mark_later_bssids. The quota-day 30d-mark tradeoff stands as designed (ACs demand it); task-0128 remains the durable fix.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
