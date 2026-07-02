@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:54'
-updated_date: '2026-07-02 17:27'
+updated_date: '2026-07-02 18:19'
 labels:
   - cli
   - protocol
@@ -34,4 +34,6 @@ forward-carried from task-0183 (Done): the raw --json passthrough plumbing is yo
 - lib.rs already has resolve_raw(bssids) -> Result<String> (mirrors locate_raw/scan_raw/etc.): it serializes the existing ResolveRequest struct once and calls raw_command(). The typed resolve() delegates through parse_response_line(&self.resolve_raw(...)?). Reuse this — do NOT hand-build request JSON a second time (single source of truth).
 - In main.rs, a run_resolve should follow the run_scan/run_locate shape: `if json { emit_json(client.resolve_raw(bssids)); }` for the passthrough, and a pure render_resolve(&ResolveResponse)->String for the human path.
 - IMPORTANT (task-0198): sanitize() every daemon-sourced string you print in the human renderer — for resolve that means the ssid and bssid fields of each ResolveResultEntry. The --json path must stay untouched (byte-identical).
+
+Forward-carried from task-0194: the client Provenance enum (whereami-client/src/lib.rs) now has an Unresolved variant (Display -> "unresolved") alongside Api/Cache/NotFound/Unknown. When implementing the `whereami resolve` subcommand, render Unresolved DISTINCTLY from NotFound: unresolved = absence NOT established (deferred / WiGLE unconfigured / quota-exhausted / transient), user should retry; NotFound = authoritative absence. Do not print unresolved as "not found" — that reintroduces the exact client-side blacklisting bug task-0194 fixed on the wire.
 <!-- SECTION:NOTES:END -->

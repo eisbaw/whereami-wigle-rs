@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:54'
-updated_date: '2026-07-02 17:27'
+updated_date: '2026-07-02 18:19'
 labels:
   - protocol
   - cli
@@ -31,4 +31,6 @@ protocol.md says the version field v is integer-bumped on incompatible changes, 
 
 <!-- SECTION:NOTES:BEGIN -->
 forward-carried from task-0183 (Done): under --json the client now intentionally parses ONLY the `ok` field of the response (as serde_json::Value) to derive the exit code, and passes the raw line through byte-identically — it does NOT read `v`. So protocol-version checking is a concern for the TYPED/HUMAN path only (the typed structs still deserialize `v`). Any version-mismatch guard you add should live in the typed accessors / render path, not in the --json passthrough (which must remain verbatim and must not start rejecting lines based on `v`).
+
+Forward-carried from task-0194: protocol.md now documents that new enum values in existing string fields (e.g. resolve `source`) are additive and keep v=1, and that clients should treat an unrecognised `source` value like 'unresolved' (retry) rather than erroring. The client already tolerates this for Provenance via #[serde(other)] -> Unknown. When task-0216 adds `v` handling: a daemon emitting the newly-added 'unresolved' source value against an older client must NOT trip a version-mismatch/incompatible path — it is an additive change, not a v bump.
 <!-- SECTION:NOTES:END -->
