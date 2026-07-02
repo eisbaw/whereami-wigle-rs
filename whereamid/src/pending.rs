@@ -30,13 +30,24 @@ pub async fn run_pending_drain(state: Arc<DaemonState>) {
     );
 
     loop {
-        // Cooperative shutdown (task-0075): break at the next iteration
-        // boundary when main() calls state.shutdown.notify_waiters().
+        // Level-triggered shutdown (task-0190): wake immediately on cancel
+        // instead of waiting out `interval`. `biased` checks cancel first.
         tokio::select! {
-            _ = sleep(interval) => {},
-            _ = state.shutdown.notified() => break,
+            biased;
+            _ = state.shutdown.cancelled() => break,
+            _ = sleep(interval) => {}
         }
-        drain_once(&state, max_attempts, &[Provider::Apple, Provider::Wigle]).await;
+        // Run one pass, abandoning it promptly if shutdown fires mid-pass.
+        // Dropping drain_once mid-flight is safe: resolve_chain never holds the
+        // DB lock across an await, each per-BSSID write is atomic, and a WiGLE
+        // quota slot reserved but not yet consumed is refunded by its RAII
+        // guard on drop (task-0190). This does not change resolve_chain
+        // semantics — it only cancels the in-flight pass.
+        tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => break,
+            _ = drain_once(&state, max_attempts, &[Provider::Apple, Provider::Wigle]) => {}
+        }
     }
 }
 
@@ -182,7 +193,9 @@ mod tests {
             inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
             db_write_failures: std::sync::atomic::AtomicU64::new(0),
-            shutdown: tokio::sync::Notify::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -495,6 +508,32 @@ mod tests {
         assert!(
             all.iter().all(|(_, attempts)| *attempts >= 1),
             "every pending row must advance across two passes (no starvation): {all:?}"
+        );
+    }
+
+    /// task-0190 AC#1: cancelling during the sleep phase wakes the drain loop
+    /// immediately (level-triggered CancellationToken) instead of waiting out
+    /// the 300s interval. Paused clock makes this exact: no wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn run_pending_drain_wakes_from_sleep_on_cancel() {
+        let state = test_state(); // pending_interval defaults to 300s
+        let loop_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move { run_pending_drain(loop_state).await });
+
+        // Let the spawned loop reach its sleep select (virtual 10ms).
+        sleep(Duration::from_millis(10)).await;
+        let start = tokio::time::Instant::now();
+        state.shutdown.cancel();
+
+        // The loop must exit promptly, well before the 300s interval elapses.
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("drain loop must exit promptly after cancel")
+            .expect("drain loop task must not panic");
+        assert!(
+            start.elapsed() < Duration::from_secs(300),
+            "must not wait out the pending interval (elapsed {:?})",
+            start.elapsed()
         );
     }
 }

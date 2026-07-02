@@ -13,6 +13,10 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+# CancellationToken lives in tokio-util's ungated `pub mod sync`; there is NO
+# "sync" feature, so default features suffice. Already in the lock graph as a
+# transitive dep (reqwest/hyper), so this only promotes it to a direct dep.
+tokio-util = "0.7"
 reqwest = { version = "0.12", features = ["json"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
@@ -26,6 +30,10 @@ anyhow = "1"
 
 [dev-dependencies]
 proptest = "1.11.0"
+# test-util enables tokio's paused clock (`#[tokio::test(start_paused = true)]`)
+# for deterministic shutdown-drain / loop-cancellation tests (task-0190). Only
+# compiled for tests, so the release binary is unaffected.
+tokio = { version = "1", features = ["test-util"] }
 
 # The Kani proof harnesses (src/*.rs `#[cfg(kani)]` modules) are gated on the
 # `kani` cfg, which Kani injects at proof time but which is unknown to a normal

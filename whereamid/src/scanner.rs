@@ -38,6 +38,9 @@ async fn wifi_scan_nmcli(interface: &str) -> Result<Vec<ScannedNetwork>> {
         IW_TIMEOUT,
         Command::new("nmcli")
             .args(["device", "wifi", "rescan", "ifname", interface])
+            // task-0190: kill the child if this future is dropped mid-scan on
+            // shutdown, so a cancelled scan leaves no orphaned nmcli process.
+            .kill_on_drop(true)
             .output(),
     )
     .await;
@@ -59,6 +62,7 @@ async fn wifi_scan_nmcli(interface: &str) -> Result<Vec<ScannedNetwork>> {
                 "ifname",
                 interface,
             ])
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -178,6 +182,7 @@ async fn wifi_scan_iw(interface: &str) -> Result<Vec<ScannedNetwork>> {
             IW_TIMEOUT,
             Command::new("iw")
                 .args(["dev", interface, "scan", "trigger"])
+                .kill_on_drop(true)
                 .output(),
         )
         .await
@@ -207,6 +212,7 @@ async fn wifi_scan_iw(interface: &str) -> Result<Vec<ScannedNetwork>> {
         IW_TIMEOUT,
         Command::new("iw")
             .args(["dev", interface, "scan", "dump"])
+            .kill_on_drop(true)
             .output(),
     )
     .await

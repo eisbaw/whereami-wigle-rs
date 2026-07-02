@@ -98,12 +98,27 @@ pub struct DaemonState {
     /// sites). Surfaced via the stats endpoint (task-0076) so silent
     /// corruption is visible without scraping the journal.
     pub db_write_failures: std::sync::atomic::AtomicU64,
-    /// Cooperative shutdown signal. Background loops that sleep between
-    /// iterations should `tokio::select!` between their timer and
-    /// `state.shutdown.notified()`; on a SIGTERM/SIGINT main() calls
-    /// `notify_waiters()` so loops exit at the next iteration boundary
-    /// instead of being cut off mid-await. task-0075.
-    pub shutdown: tokio::sync::Notify,
+    /// Level-triggered cooperative shutdown signal (task-0190).
+    ///
+    /// Replaces the previous `tokio::sync::Notify`, whose `notify_waiters()`
+    /// stored no permit: a SIGTERM landing while a background loop was
+    /// mid-iteration (not parked in its `select!`) was lost, so the loop
+    /// re-parked and ran forever. A `CancellationToken` is *sticky*: once
+    /// `cancel()` is called, `cancelled()` is always-ready and
+    /// `is_cancelled()` returns true, so no wakeup can be missed. Loops select
+    /// their work/sleep against `cancelled()` and refuse to start new work
+    /// once cancelled.
+    pub shutdown: tokio_util::sync::CancellationToken,
+    /// Detached background tasks (proactive `resolve_background` from the scan
+    /// loop and the locate handler, plus the Nominatim address backfill) are
+    /// tracked here so the shutdown drain can wait for them under one budget
+    /// and force-abort any stragglers (task-0102). A `std::sync::Mutex` guards
+    /// the `JoinSet` because it is not `Sync` for concurrent spawn; the guard
+    /// is only ever held to spawn/reap/take, never across an await.
+    pub tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// Count of tracked tasks force-aborted at shutdown because they did not
+    /// finish within the drain budget (task-0102). Surfaced via stats.
+    pub orphan_tasks_aborted: std::sync::atomic::AtomicU64,
 }
 
 /// A cached last-known position with timestamp.
@@ -1141,7 +1156,9 @@ mod dispatch_tests {
             inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
             db_write_failures: std::sync::atomic::AtomicU64::new(0),
-            shutdown: tokio::sync::Notify::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
             args,
         })
     }

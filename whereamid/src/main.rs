@@ -115,12 +115,14 @@ async fn main() -> Result<()> {
         last_fix: tokio::sync::Mutex::new(initial_last_fix),
         inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         db_write_failures: std::sync::atomic::AtomicU64::new(0),
-        shutdown: tokio::sync::Notify::new(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+        orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
     });
 
-    // Background tasks. Each respects state.shutdown via tokio::select!
-    // around its sleep, so they exit at the next iteration boundary rather
-    // than being cut off mid-await on SIGTERM (task-0075).
+    // Background tasks. Each selects its work/sleep against
+    // state.shutdown.cancelled() (level-triggered, task-0190), so they exit at
+    // the next await boundary on SIGTERM rather than missing the wakeup.
     let scan_state = Arc::clone(&state);
     let scan_handle = tokio::spawn(async move {
         run_scan_loop(scan_state).await;
@@ -138,9 +140,13 @@ async fn main() -> Result<()> {
     let history_handle = tokio::spawn(async move {
         let interval = Duration::from_secs(24 * 60 * 60);
         loop {
+            // Level-triggered shutdown (task-0190): `biased` checks
+            // cancellation first, so a cancel that lands during the interval
+            // wakes the loop immediately instead of waiting out the full 24h.
             tokio::select! {
-                _ = sleep(interval) => {},
-                _ = history_state.shutdown.notified() => break,
+                biased;
+                _ = history_state.shutdown.cancelled() => break,
+                _ = sleep(interval) => {}
             }
             let retention = history_state.args.history_retention_days;
             let pruned = {
@@ -171,41 +177,112 @@ async fn main() -> Result<()> {
     // to SQLite or mid-API-call.
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
-    tokio::select! {
+    let server_exited = tokio::select! {
         _ = signal::ctrl_c() => {
             info!("received SIGINT, shutting down");
+            false
         }
         _ = sigterm.recv() => {
             info!("received SIGTERM, shutting down");
+            false
         }
-        _ = &mut server_handle => {
-            error!("server task exited unexpectedly");
+        res = &mut server_handle => {
+            // The server task ended on its own (e.g. bind failure). This arm
+            // consumes the JoinHandle's output; it must NOT be awaited again
+            // or tokio panics on the second poll (task-0195).
+            match res {
+                Ok(()) => error!("server task exited unexpectedly"),
+                Err(e) => error!("server task join error: {e}"),
+            }
+            true
         }
+    };
+
+    // task-0190: level-triggered cancel. Sticky, so a loop that is mid-
+    // iteration (not parked in its select!) still observes it at the next
+    // await instead of missing the wakeup and running forever.
+    state.shutdown.cancel();
+
+    // Collect the loop handles to drain. The server is special-cased for
+    // task-0195: if it already exited above, its handle is spent — drop it
+    // without a second poll; otherwise abort it (accept() has no state to
+    // flush) and drain it with the rest.
+    let mut named = vec![scan_handle, pending_handle, history_handle];
+    if !server_exited {
+        server_handle.abort();
+        named.push(server_handle);
     }
 
-    // task-0075: cooperative drain. Notify all background loops to exit at
-    // their next iteration, then wait up to 5s for them to finish. Tasks
-    // that are between iterations (sleep) return promptly; tasks mid-DB-
-    // write return after the write completes. After the timeout we abort
-    // anything still running.
-    state.shutdown.notify_waiters();
-    server_handle.abort();
-    let drain_timeout = Duration::from_secs(5);
-    let drain = async {
-        let _ = scan_handle.await;
-        let _ = pending_handle.await;
-        let _ = history_handle.await;
-        let _ = server_handle.await;
-    };
-    if tokio::time::timeout(drain_timeout, drain).await.is_err() {
-        tracing::warn!(
-            "background tasks did not drain within {}s; aborting",
-            drain_timeout.as_secs()
-        );
+    // Take the tracked-spawn JoinSet out of shared state so we can drive it to
+    // completion here (a std::sync::Mutex guard cannot be held across await).
+    let tracked = std::mem::take(&mut *state.tasks.lock().unwrap_or_else(|e| e.into_inner()));
+
+    // task-0190/0102: wait up to the budget, then force-abort survivors and
+    // count them so the leak is observable via stats.
+    let aborted = run_shutdown_drain(Duration::from_secs(5), named, tracked).await;
+    if aborted > 0 {
+        state
+            .orphan_tasks_aborted
+            .fetch_add(aborted, std::sync::atomic::Ordering::Relaxed);
     }
 
     info!("whereamid stopped");
     Ok(())
+}
+
+/// Drive the cooperative shutdown drain (task-0190/0102/0195).
+///
+/// The caller has already signalled `state.shutdown.cancel()`. This waits up
+/// to `budget` for the `named` loop handles and the `tracked` JoinSet to
+/// finish cooperatively; on timeout it force-aborts everything still running
+/// and returns the number of tasks that had to be aborted (named loops +
+/// tracked spawns), which the caller records into `orphan_tasks_aborted`.
+///
+/// Every JoinHandle is polled at most once (task-0195): the graceful future
+/// consumes the `named` handles, and the pre-extracted `AbortHandle`s are the
+/// only thing touched on the timeout path — the handles are never re-awaited.
+async fn run_shutdown_drain(
+    budget: Duration,
+    named: Vec<tokio::task::JoinHandle<()>>,
+    mut tracked: tokio::task::JoinSet<()>,
+) -> u64 {
+    let named_aborts: Vec<tokio::task::AbortHandle> =
+        named.iter().map(|h| h.abort_handle()).collect();
+
+    // Graceful phase. `named` is moved in and consumed (owned `JoinHandle`s,
+    // awaited once each); `tracked` is borrowed so it survives a timeout for
+    // the force-abort + count below.
+    let graceful = async {
+        for h in named {
+            let _ = h.await;
+        }
+        while tracked.join_next().await.is_some() {}
+    };
+
+    if tokio::time::timeout(budget, graceful).await.is_ok() {
+        // Everything drained cooperatively; nothing to abort.
+        return 0;
+    }
+
+    tracing::warn!(
+        "background tasks did not drain within {}s; aborting",
+        budget.as_secs()
+    );
+
+    let mut aborted: u64 = 0;
+    for a in &named_aborts {
+        if !a.is_finished() {
+            a.abort();
+            aborted += 1;
+        }
+    }
+    // JoinSet::len() is the number of not-yet-joined tasks; on timeout these
+    // are the survivors. Abort them and reap so the aborts are observed.
+    aborted += tracked.len() as u64;
+    tracked.abort_all();
+    while tracked.join_next().await.is_some() {}
+
+    aborted
 }
 
 /// Background scan loop with fast/slow phase.
@@ -227,7 +304,17 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
             slow_interval
         };
 
-        match scanner::wifi_scan(&state.args.interface).await {
+        // Race the scan against cancellation: a SIGTERM landing mid-scan
+        // drops the wifi_scan future at this await (task-0190) instead of
+        // running it to completion. scanner sets kill_on_drop on its nmcli/iw
+        // children, so a dropped scan leaves no orphaned subprocess.
+        let scan_result = tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => break,
+            r = scanner::wifi_scan(&state.args.interface) => r,
+        };
+
+        match scan_result {
             Ok(networks) => {
                 let count = networks.len();
                 let sample = scanner::scan_to_sample(&networks);
@@ -243,8 +330,10 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
                     count, stable_count, sample_count
                 );
 
-                // Proactively resolve newly-stable APs in the background
-                if !stable.is_empty() {
+                // Proactively resolve newly-stable APs in the background.
+                // task-0190 AC#2: never start new resolver work once shutdown
+                // has been signalled.
+                if !stable.is_empty() && !state.shutdown.is_cancelled() {
                     let resolve_state = Arc::clone(&state);
                     let stable_vec: Vec<String> = stable.into_iter().collect();
                     tokio::spawn(async move {
@@ -257,11 +346,85 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
             }
         }
 
-        // Cooperative shutdown (task-0075): break out at the next iteration
-        // boundary when main() calls state.shutdown.notify_waiters().
+        // Sleep between scans, waking immediately on shutdown (task-0190).
         tokio::select! {
-            _ = sleep(interval) => {},
-            _ = state.shutdown.notified() => break,
+            biased;
+            _ = state.shutdown.cancelled() => break,
+            _ = sleep(interval) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_drain_tests {
+    //! Deterministic (paused-clock) tests for the shutdown drain
+    //! (task-0190/0102/0195). No wall-clock waits: the runtime auto-advances
+    //! virtual time to the earliest pending timer, so the budget timeout fires
+    //! exactly when expected.
+    use super::run_shutdown_drain;
+    use tokio::task::JoinSet;
+    use tokio::time::{Duration, Instant};
+
+    /// Fast path: every named handle and tracked task finishes cooperatively
+    /// within the budget, so nothing is force-aborted and the count is 0.
+    #[tokio::test(start_paused = true)]
+    async fn drain_returns_zero_when_all_finish() {
+        let named = vec![tokio::spawn(async {}), tokio::spawn(async {})];
+        let mut tracked = JoinSet::new();
+        tracked.spawn(async {});
+        tracked.spawn(async {});
+        let aborted = run_shutdown_drain(Duration::from_secs(5), named, tracked).await;
+        assert_eq!(aborted, 0);
+    }
+
+    /// task-0102 AC#4: five tracked tasks that sleep past the budget are all
+    /// force-aborted and counted, and the drain returns at ~budget rather than
+    /// waiting out the 10s sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn drain_aborts_five_stuck_tracked_tasks() {
+        let mut tracked = JoinSet::new();
+        for _ in 0..5 {
+            tracked.spawn(async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            });
+        }
+        let start = Instant::now();
+        let aborted = run_shutdown_drain(Duration::from_secs(1), Vec::new(), tracked).await;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            aborted, 5,
+            "all five stuck tracked tasks must be force-aborted and counted"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "drain must return at ~budget, not wait out the 10s sleeps (elapsed {elapsed:?})"
+        );
+    }
+
+    /// task-0190 AC#3: a stuck *named* loop handle is force-aborted via its
+    /// pre-extracted AbortHandle and counted.
+    #[tokio::test(start_paused = true)]
+    async fn drain_aborts_stuck_named_handle() {
+        let named = vec![tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })];
+        let aborted = run_shutdown_drain(Duration::from_secs(1), named, JoinSet::new()).await;
+        assert_eq!(aborted, 1);
+    }
+
+    /// Only survivors are counted: a task that finished before the timeout was
+    /// reaped and does not count; the still-running one does.
+    #[tokio::test(start_paused = true)]
+    async fn drain_counts_only_survivors() {
+        let mut tracked = JoinSet::new();
+        tracked.spawn(async {}); // finishes immediately
+        tracked.spawn(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }); // still running at the budget
+        let aborted = run_shutdown_drain(Duration::from_secs(1), Vec::new(), tracked).await;
+        assert_eq!(
+            aborted, 1,
+            "only the still-running task counts; the finished one was reaped"
+        );
     }
 }

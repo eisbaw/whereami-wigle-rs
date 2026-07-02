@@ -552,7 +552,9 @@ mod tests {
             inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
             db_write_failures: std::sync::atomic::AtomicU64::new(0),
-            shutdown: tokio::sync::Notify::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
