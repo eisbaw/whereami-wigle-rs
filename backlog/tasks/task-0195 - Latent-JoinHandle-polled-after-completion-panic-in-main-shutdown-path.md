@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-07-02 04:51'
-updated_date: '2026-07-02 22:22'
+updated_date: '2026-07-02 22:43'
 labels:
   - correctness
 dependencies: []
@@ -38,6 +38,8 @@ Fixed structurally as part of the shutdown redesign (commit 62d7957) and verifie
 The select arm `res = &mut server_handle` now yields a bool `server_exited`. If true, the handle is spent (its output was consumed by the arm) and is dropped WITHOUT a second poll. If false (SIGINT/SIGTERM path), the handle is aborted and pushed into the drained `named` vec, where run_shutdown_drain awaits it exactly once; on drain timeout it is force-aborted via a pre-extracted AbortHandle, never re-awaited. So no JoinHandle can be polled after completion regardless of which shutdown trigger fires.
 
 Lesson: `&mut handle` in a non-firing select arm only POLLS (safe, repeatable) — the panic is specifically re-polling after Ready took the output. The flag cleanly encodes the XOR.
+
+Review gate (orchestrator, 2026-07-03): qa-test-runner GO + mped-architect GO on both ACs (structurally single-poll: server_exited flag XOR drain; named handles move-consumed, timeout path touches only pre-extracted AbortHandles). Reviewer nit N1: bool flag instead of Option<JoinHandle> is correct today but not type-enforced — accepted as-is.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

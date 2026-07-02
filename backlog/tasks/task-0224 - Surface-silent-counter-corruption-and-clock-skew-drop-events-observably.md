@@ -4,7 +4,7 @@ title: Surface silent counter-corruption and clock-skew-drop events observably
 status: To Do
 assignee: []
 created_date: '2026-07-02 05:27'
-updated_date: '2026-07-02 22:23'
+updated_date: '2026-07-02 22:43'
 labels:
   - correctness
   - observability
@@ -30,4 +30,6 @@ Two P3 observability gaps surfaced during the task-0097/0100 review gate: (1) af
 
 <!-- SECTION:NOTES:BEGIN -->
 Forward-carried from task-0102: a new observability counter orphan_tasks_aborted (AtomicU64 on DaemonState) is now surfaced in StatsResponse + handle_stats and documented in docs/protocol.md, following the db_write_failures pattern. Use the same pattern for the counter-corruption / clock-skew-drop events this task tracks: AtomicU64 field -> load(Relaxed) in handle_stats -> StatsResponse field -> protocol.md bullet.
+
+forward-carried from task-0102 review fix (bd0cb9f): the persist-at-shutdown/reload-at-startup pattern for counters now exists — metadata key orphans_aborted_last_shutdown + db::set_metadata/get_metadata + load_orphan_count in main.rs. If 0224 surfaces counter-corruption/clock-skew events via stats, reuse this pattern; an in-memory-only AtomicU64 bumped near shutdown is unobservable (that was exactly the 0102 AC#3 defect).
 <!-- SECTION:NOTES:END -->

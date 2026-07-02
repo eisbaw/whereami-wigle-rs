@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-07-02 04:50'
-updated_date: '2026-07-02 22:21'
+updated_date: '2026-07-02 22:43'
 labels:
   - correctness
 dependencies: []
@@ -51,6 +51,8 @@ Gotchas / lessons (forward-carry):
 - run_shutdown_drain relies on edition-2021 disjoint closure capture: the graceful async block MOVES `named` (owned JoinHandles, awaited once) but BORROWS `tracked` (JoinSet) so it survives the timeout for force-abort + count. Verified it compiles.
 - Used `biased;` in every loop select so cancellation is checked first (deterministic under paused clock; never runs one extra work iteration when both arms are ready).
 - pending loop races drain_once vs cancelled at the LOOP level (did not touch resolve_chain/drain_once internals per steer). Safe to drop mid-pass: per-BSSID DB writes are atomic and the WiGLE quota slot is refunded by its RAII guard on drop.
+
+Review gate (orchestrator, 2026-07-03): qa-test-runner GO + mped-architect GO on all 4 ACs (verdict: concurrency design sound — no Notify remnants, no double-poll, quota guard single-refund-path poison-safe). Reviewer T1 note: the SIGTERM integration test uses a nonexistent interface so "mid-scan" cancellation is proven by stuck-task proxies, not a real multi-second scan — accepted hermetic-testing limit. In-thread hardening bd0cb9f (orphan-count persistence) rode on this batch; see task-0102 notes.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

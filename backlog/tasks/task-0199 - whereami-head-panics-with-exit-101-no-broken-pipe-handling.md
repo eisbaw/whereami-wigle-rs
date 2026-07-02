@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@mped-architect'
 created_date: '2026-07-02 04:52'
-updated_date: '2026-07-02 17:47'
+updated_date: '2026-07-02 22:43'
 labels:
   - cli
 dependencies: []
@@ -46,6 +46,8 @@ Flakiness verdict: NOT flaky. Ran the compiled test binary 40x (daemon up) = 40/
 Note: `scan | head -1` exits 0 (not 141) here because scan output is tiny and fully buffered before head closes — this is correct Unix-filter behavior (same as `cat smallfile | head`) and AC#2 explicitly allows 0. The 141/SIGPIPE path is exercised deterministically by the integration test.
 
 Review gate GO. sigpipe test 40/40 + 8/8 across two independent reviewers, zero flakes; live `scan | true` = 141 (real SIGPIPE path), `scan | head -1` = 0. Caveat documented in-code (fc54f0d): SIG_DFL is process-wide, so a daemon that accepts-then-closes mid-write also kills the CLI with 141 instead of a synthesized-JSON transport error - loud nonzero failure, accepted trade-off; revisit only if strict JSON-always is ever required (alternative per AC#2: map BrokenPipe to clean exit instead of SIG_DFL).
+
+forward-carried from shutdown-batch QA review: the sigpipe test this task added connects to the live daemon at 127.0.0.1:4747 (via whereami --json version) — hermeticity defect, filed as task-0231.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

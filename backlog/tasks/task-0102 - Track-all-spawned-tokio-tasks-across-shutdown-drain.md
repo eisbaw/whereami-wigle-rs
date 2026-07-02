@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-05-20 21:11'
-updated_date: '2026-07-02 22:22'
+updated_date: '2026-07-02 22:43'
 labels:
   - robustness
   - shutdown
@@ -43,6 +43,8 @@ Implemented in commit 414a048 (spawn_tracked + stat) on top of the drain from 62
 - main mem::takes the JoinSet out of the std::sync::Mutex (cannot hold that guard across await) and drains it in run_shutdown_drain within the 5s budget; survivors are abort_all()d and counted.
 
 Gotcha: JoinSet<()> tasks capture Arc<DaemonState>; the JoinHandle in the set does not, and the task future (with its Arc) is dropped by the runtime on completion, so no DaemonState reference cycle leaks — only a tiny () slot lingers until the next spawn_tracked reaps it.
+
+Review gate (orchestrator, 2026-07-03): qa-test-runner GO (259 tests green, clippy -D warnings clean, fmt clean, shutdown.rs stable across 4 runs ~0.34s vs 4s budget; paused-clock tests 3x stable). mped-architect NO-GO scoped to AC#3: orphan_tasks_aborted was write-only — bumped only after the server socket closed and reset to 0 at startup, so "surfaced via stats" was unobservable-by-construction (comment-vs-code overclaim class). FIXED in-thread, commit bd0cb9f: count persisted to metadata key orphans_aborted_last_shutdown at clean shutdown (0 included) and rehydrated at startup, so stats reports the LAST clean shutdown; count also logged at shutdown; timeout path now reaps finished-but-unjoined tracked tasks before counting (review C1 overcount); docs/protocol.md + StatsResponse doc corrected to real semantics incl. named loops (review H2). Post-fix gate: 264 tests green (bin 139->143), clippy clean, fmt clean. AC#3 now genuinely met.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
