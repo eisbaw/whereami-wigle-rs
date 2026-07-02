@@ -69,6 +69,33 @@ impl DaemonState {
         });
         f(&db)
     }
+
+    /// Spawn a detached background task tracked by the shutdown drain
+    /// (task-0102). The scan loop's proactive resolve, the locate handler's
+    /// fallback resolve, and the Nominatim address backfill all route through
+    /// here so a SIGTERM can wait for them under one budget and force-abort any
+    /// stragglers instead of killing them mid-API-call at process exit.
+    ///
+    /// Refuses to spawn once shutdown has been signalled — this structurally
+    /// enforces "no new work after shutdown began" (task-0190 AC#2); the future
+    /// is dropped, not run. Completed tasks are reaped on each call so the
+    /// JoinSet does not accumulate finished-task slots (a JoinSet only frees a
+    /// slot when the task is joined).
+    ///
+    /// Per-connection handlers are deliberately NOT tracked here — they are
+    /// bounded by READ/WRITE timeouts and owning them is task-0201's concern.
+    pub fn spawn_tracked<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if self.shutdown.is_cancelled() {
+            debug!("spawn_tracked refused: shutdown in progress");
+            return;
+        }
+        let mut set = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        while set.try_join_next().is_some() {}
+        set.spawn(fut);
+    }
 }
 
 /// Shared daemon state, accessible from connection handlers.
@@ -314,6 +341,11 @@ struct StatsResponse {
     /// warned-only. Helps spot silent corruption (full disk, missing
     /// write permissions, etc.). Reset on daemon restart. task-0076.
     db_write_failures: u64,
+    /// Cumulative count of tracked background tasks force-aborted at shutdown
+    /// because they did not finish within the drain budget. Non-zero means the
+    /// daemon killed in-flight resolve/backfill work on the last shutdown.
+    /// Reset on daemon restart. task-0102.
+    orphan_tasks_aborted: u64,
 }
 
 fn error_json(msg: &str) -> String {
@@ -342,6 +374,9 @@ pub async fn run_server(state: Arc<DaemonState>) -> Result<()> {
             Ok((stream, addr)) => {
                 debug!("connection from {addr}");
                 let state = Arc::clone(&state);
+                // Per-connection handlers stay detached (NOT spawn_tracked):
+                // they are bounded by READ_TIMEOUT/WRITE_TIMEOUT, and tracking
+                // them across shutdown is task-0201's scope (task-0102).
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(stream, state).await {
                         warn!("connection error: {e}");
@@ -484,9 +519,12 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
     if cached_aps.is_empty() {
         // Nothing cached. If using fallback, queue all for background resolution.
         if using_fallback {
+            // task-0102: track so the shutdown drain waits for this resolve
+            // instead of killing it mid-API-call (which would leak a WiGLE
+            // quota slot / leave partial writes).
             let resolve_state = Arc::clone(state);
             let bssids_clone = bssids.clone();
-            tokio::spawn(async move {
+            state.spawn_tracked(async move {
                 resolver::resolve_background(&bssids_clone, &resolve_state).await;
             });
         }
@@ -531,10 +569,12 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                     cache.get(pos.lat, pos.lon)
                 };
                 if cached.is_none() {
+                    // task-0102: track the backfill so shutdown drains it
+                    // rather than aborting it mid-Nominatim-call.
                     let bg_state = Arc::clone(state);
                     let bg_lat = pos.lat;
                     let bg_lon = pos.lon;
-                    tokio::spawn(async move {
+                    state.spawn_tracked(async move {
                         match bg_state.nominatim.reverse_geocode(bg_lat, bg_lon).await {
                             Ok(addr) => {
                                 let display = addr.display;
@@ -1009,6 +1049,9 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
     let db_write_failures = state
         .db_write_failures
         .load(std::sync::atomic::Ordering::Relaxed);
+    let orphan_tasks_aborted = state
+        .orphan_tasks_aborted
+        .load(std::sync::atomic::Ordering::Relaxed);
     // task-0078: with_db scopes the lock + poison recovery. Each
     // .unwrap_or(0) here logs nothing on failure — see db_write_failures
     // (task-0076) for cumulative visibility on silent write failures.
@@ -1022,6 +1065,7 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
         api_calls_today: db.api_calls_today().unwrap_or(0),
         inflight,
         db_write_failures,
+        orphan_tasks_aborted,
     });
     ok_json(&resp)
 }
@@ -1266,6 +1310,53 @@ mod dispatch_tests {
             resolve_source(&resp),
             "not_found",
             "table-authoritative absence must be reported as not_found, got {resp}"
+        );
+    }
+
+    /// task-0102: spawn_tracked runs the future and tracks it in the JoinSet
+    /// so the shutdown drain can observe it.
+    #[tokio::test]
+    async fn spawn_tracked_runs_the_future() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let state = test_state();
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let ran2 = std::sync::Arc::clone(&ran);
+        state.spawn_tracked(async move {
+            ran2.store(true, Ordering::SeqCst);
+        });
+        // Drain the tracked set to force the task to completion.
+        let mut set = std::mem::take(&mut *state.tasks.lock().unwrap());
+        while set.join_next().await.is_some() {}
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "spawn_tracked must actually run the future"
+        );
+    }
+
+    /// task-0190 AC#2 (structural): once shutdown is signalled, spawn_tracked
+    /// refuses new work — the future is dropped unrun and nothing is added to
+    /// the tracked JoinSet. This is the enforcement point for "no new resolver
+    /// work after the shutdown signal".
+    #[tokio::test]
+    async fn spawn_tracked_refuses_after_cancel() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let state = test_state();
+        state.shutdown.cancel();
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let ran2 = std::sync::Arc::clone(&ran);
+        state.spawn_tracked(async move {
+            ran2.store(true, Ordering::SeqCst);
+        });
+        // Give any erroneously-spawned task a chance to run.
+        tokio::task::yield_now().await;
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "future must not run after shutdown was signalled"
+        );
+        assert_eq!(
+            state.tasks.lock().unwrap().len(),
+            0,
+            "nothing may be tracked after a refused spawn"
         );
     }
 }

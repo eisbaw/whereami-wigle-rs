@@ -331,12 +331,14 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
                 );
 
                 // Proactively resolve newly-stable APs in the background.
-                // task-0190 AC#2: never start new resolver work once shutdown
-                // has been signalled.
+                // Tracked so the shutdown drain waits for it (task-0102);
+                // spawn_tracked also refuses once cancelled (task-0190 AC#2).
+                // The is_cancelled() guard here just avoids the needless
+                // Arc/Vec clone when we already know we are shutting down.
                 if !stable.is_empty() && !state.shutdown.is_cancelled() {
                     let resolve_state = Arc::clone(&state);
                     let stable_vec: Vec<String> = stable.into_iter().collect();
-                    tokio::spawn(async move {
+                    state.spawn_tracked(async move {
                         resolver::resolve_background(&stable_vec, &resolve_state).await;
                     });
                 }
