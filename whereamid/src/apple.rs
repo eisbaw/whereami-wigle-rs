@@ -91,6 +91,13 @@ const APPLE_RESPONSE_HEADER_LEN: usize = 10;
 /// 1e-8 conversion's last-bit shift can't escape detection. task-0063.
 const APPLE_NOT_FOUND_THRESHOLD: f64 = -179.0;
 
+/// Physically valid coordinate bounds after 1e-8 scaling. A reading beyond
+/// these is protocol garbage (field drift, truncation, corruption), not a
+/// real fix, and must never be persisted under the top-priority
+/// Source::Apple. task-0098.
+const MAX_ABS_LATITUDE: f64 = 90.0;
+const MAX_ABS_LONGITUDE: f64 = 180.0;
+
 /// Encode the Apple WPS protobuf request.
 /// Hand-encoded to avoid protobuf dependency.
 pub fn encode_request(bssids: &[String]) -> Vec<u8> {
@@ -216,11 +223,21 @@ pub fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
         (Some(b), Some(lt), Some(ln)) => {
             let lat_f = lt as f64 * 1e-8;
             let lon_f = ln as f64 * 1e-8;
-            // Apple returns (-180, -180) for not-found. Use a tolerant
-            // threshold (-179.0) rather than exact equality because the
-            // 1e-8 fixed-point conversion can shift the bottom bit
-            // (task-0063 named the threshold).
-            if lat_f < APPLE_NOT_FOUND_THRESHOLD && lon_f < APPLE_NOT_FOUND_THRESHOLD {
+            // Apple returns (-180, -180) for not-found. Reject when EITHER
+            // coordinate falls below the threshold (OR, not AND): a
+            // truncated/misparsed response that yields one sentinel-ish and
+            // one plausible coordinate (e.g. (-179.99, 12.34)) must still be
+            // treated as "no position" rather than persisted under the
+            // top-priority Source::Apple (task-0098). The tolerant -179.0
+            // threshold (not exact -180) absorbs the 1e-8 fixed-point
+            // conversion's bottom-bit shift (task-0063).
+            if lat_f < APPLE_NOT_FOUND_THRESHOLD || lon_f < APPLE_NOT_FOUND_THRESHOLD {
+                return Ok(None);
+            }
+            // Range sanity: valid latitude is within +/-90, longitude within
+            // +/-180. Anything beyond is malformed protobuf; drop it rather
+            // than cache a bogus fix (task-0098).
+            if lat_f.abs() > MAX_ABS_LATITUDE || lon_f.abs() > MAX_ABS_LONGITUDE {
                 return Ok(None);
             }
             Ok(Some(ApInfo {
@@ -505,6 +522,90 @@ mod tests {
         let len_bytes: [u8; 4] = envelope[LEN_OFFSET..PAYLOAD_OFFSET].try_into().unwrap();
         let declared = u32::from_be_bytes(len_bytes) as usize;
         assert_eq!(declared, envelope.len() - PAYLOAD_OFFSET);
+    }
+
+    // --- parse_wifi_device sentinel / range-sanity tests (task-0098) ---
+
+    /// Encode a Location submessage with optional latitude (field 1) and
+    /// longitude (field 2) as Apple's plain signed varints. Used to
+    /// hand-build decoder inputs for the sentinel/range-sanity tests.
+    fn encode_location_msg(lat: Option<i64>, lon: Option<i64>) -> Vec<u8> {
+        let mut loc = Vec::new();
+        if let Some(lt) = lat {
+            encode_varint_field(&mut loc, 1, lt as u64);
+        }
+        if let Some(ln) = lon {
+            encode_varint_field(&mut loc, 2, ln as u64);
+        }
+        loc
+    }
+
+    /// Encode a WifiDevice message: field 1 = bssid string, optional field 2
+    /// = Location submessage.
+    fn encode_wifi_device_msg(bssid: &str, location: Option<&[u8]>) -> Vec<u8> {
+        let mut wd = Vec::new();
+        encode_string(&mut wd, 1, bssid);
+        if let Some(loc) = location {
+            encode_bytes(&mut wd, 2, loc);
+        }
+        wd
+    }
+
+    /// Raw fixed-point value for a degree coordinate (Apple scales by 1e-8).
+    fn scaled(deg: f64) -> i64 {
+        (deg / 1e-8).round() as i64
+    }
+
+    /// (-179.99, 12.34): latitude is sentinel-ish (< -179), longitude is a
+    /// plausible real value. With the OR gate this is not-found, so no
+    /// ApInfo (hence no aps row) is produced. task-0098 AC#3.
+    #[test]
+    fn one_sentinelish_coordinate_is_not_found() {
+        let loc = encode_location_msg(Some(scaled(-179.99)), Some(scaled(12.34)));
+        let wd = encode_wifi_device_msg("aa:bb:cc:dd:ee:ff", Some(&loc));
+        assert!(
+            parse_wifi_device(&wd).unwrap().is_none(),
+            "one sentinel-ish coordinate must be treated as not-found"
+        );
+    }
+
+    /// (lat=91, lon=12): latitude out of physical range. Treated as
+    /// malformed; no ApInfo produced. task-0098 AC#4.
+    #[test]
+    fn out_of_range_latitude_is_malformed() {
+        let loc = encode_location_msg(Some(scaled(91.0)), Some(scaled(12.0)));
+        let wd = encode_wifi_device_msg("aa:bb:cc:dd:ee:ff", Some(&loc));
+        assert!(
+            parse_wifi_device(&wd).unwrap().is_none(),
+            "out-of-range latitude must be rejected as malformed"
+        );
+    }
+
+    /// Control: a well-formed real coordinate still yields an ApInfo, so the
+    /// stricter gate did not become over-aggressive.
+    #[test]
+    fn valid_coordinate_still_resolves() {
+        let loc = encode_location_msg(Some(scaled(55.68)), Some(scaled(12.57)));
+        let wd = encode_wifi_device_msg("aa:bb:cc:dd:ee:ff", Some(&loc));
+        let ap = parse_wifi_device(&wd)
+            .unwrap()
+            .expect("valid coordinate must resolve to an ApInfo");
+        assert!((ap.lat - 55.68).abs() < 1e-6, "lat={}", ap.lat);
+        assert!((ap.lon - 12.57).abs() < 1e-6, "lon={}", ap.lon);
+        assert!(matches!(ap.source, crate::db::Source::Apple));
+    }
+
+    /// The (-180, -180) sentinel remains not-found: regression guard that
+    /// the OR/range changes preserve the original behavior (also task-0187
+    /// AC#3).
+    #[test]
+    fn double_sentinel_still_not_found() {
+        let loc = encode_location_msg(Some(scaled(-180.0)), Some(scaled(-180.0)));
+        let wd = encode_wifi_device_msg("aa:bb:cc:dd:ee:ff", Some(&loc));
+        assert!(
+            parse_wifi_device(&wd).unwrap().is_none(),
+            "(-180,-180) sentinel must remain not-found"
+        );
     }
 }
 
