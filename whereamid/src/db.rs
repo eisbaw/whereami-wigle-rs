@@ -138,6 +138,54 @@ impl Database {
     fn migrate(&self) -> Result<()> {
         let mut version = self.get_schema_version();
 
+        // task-0191 AC#3: heal a DB whose stored version is newer than its
+        // actual table shape. This is exactly the corruption the old
+        // migrate_v2_to_v3 SCHEMA_VERSION-stamping bug could produce: a crash
+        // between the v2->v3 commit and the v3->v4 commit left version=5 on
+        // disk with neither last_fix (v4) nor fixes (v5) present, after which
+        // every later open read 5, skipped both migrations, and stranded the
+        // daemon permanently with no self-heal.
+        //
+        // Repair = reset the stored version DOWN to the highest version whose
+        // shape is actually satisfied, then let the normal chain below re-run
+        // and rebuild the missing tables. This is safe ONLY because every
+        // migration is idempotency-guarded (v1->v2 has_priority probe, v2->v3
+        // already_constrained probe, v3->v4/v4->v5 CREATE TABLE IF NOT EXISTS),
+        // so re-running heals rather than harms.
+        //
+        // Guard rail: only repair when version <= SCHEMA_VERSION. A version
+        // STRICTLY greater than SCHEMA_VERSION is a genuinely-newer schema
+        // written by a future binary; its tables are simply unknown to us and
+        // must NOT be "repaired" down (that would corrupt a forward-compatible
+        // DB). The forward-compat warning at the end of migrate() handles that
+        // case instead. A missing shape can only be observed at v4+ (last_fix)
+        // and v5 (fixes); v1..v3 touch only tables create_schema_v1 always
+        // creates, so there is no sub-v4 shape to lose.
+        if version <= SCHEMA_VERSION {
+            let satisfied = self.highest_satisfied_shape_version(version);
+            if satisfied < version {
+                tracing::warn!(
+                    "database stamped v{version} but its table shape only satisfies \
+                     v{satisfied} (missing last_fix/fixes); resetting the stored \
+                     version down and re-running migrations to heal (task-0191)"
+                );
+                // A stored version >= 4 implies the schema_version table
+                // already has the v3 single-row (id = 1) shape — reaching v4
+                // required migrate_v3_to_v4, which addresses the row by id.
+                // (This block only fires when satisfied < version, i.e.
+                // version >= 4.) A schema_version table manually corrupted to
+                // a non-id shape while stamped >= 4 is out of contract; the
+                // UPDATE below would then fail loudly, not silently mis-heal.
+                self.conn
+                    .execute(
+                        "UPDATE schema_version SET version = ?1 WHERE id = 1",
+                        params![satisfied],
+                    )
+                    .context("failed to reset schema_version during shape repair")?;
+                version = satisfied;
+            }
+        }
+
         if version == 0 {
             info!("initializing database schema v{SCHEMA_VERSION}");
             self.create_schema_v1()?;
@@ -278,17 +326,24 @@ impl Database {
             .map(|s| s.contains("CHECK (id = 1)"))
             .unwrap_or(false);
         if already_constrained {
-            // Still bump version-row content to SCHEMA_VERSION below if needed.
-            let updated = self.conn.execute(
-                "UPDATE schema_version SET version = ?1 WHERE id = 1",
-                params![SCHEMA_VERSION],
+            // Idempotent, no-downgrade stamp of the literal 3 — this
+            // migration's postcondition version, NOT the moving SCHEMA_VERSION
+            // constant (task-0191, mirroring migrate_v1_to_v2's literal 2):
+            // stamping SCHEMA_VERSION here strands a crash-interrupted DB at a
+            // version whose v4/v5 tables do not exist yet. INSERT OR IGNORE
+            // creates the row iff absent (the id = 1 PK makes a second insert a
+            // no-op); the guarded UPDATE then advances it to 3 only when it is
+            // behind. Together they never downgrade a row a later migration
+            // already moved to 4/5 (if this path is ever reached out of order),
+            // and never error on a pre-existing row.
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 3)",
+                [],
             )?;
-            if updated == 0 {
-                self.conn.execute(
-                    "INSERT INTO schema_version (id, version) VALUES (1, ?1)",
-                    params![SCHEMA_VERSION],
-                )?;
-            }
+            self.conn.execute(
+                "UPDATE schema_version SET version = 3 WHERE id = 1 AND version < 3",
+                [],
+            )?;
             return Ok(());
         }
 
@@ -309,12 +364,16 @@ impl Database {
         )
         .context("failed to rebuild schema_version with single-row constraint")?;
 
-        // Stamp the (now single) row to SCHEMA_VERSION. The version field
-        // could already be >= 3 if this migration was somehow applied out of
-        // order; in that case keep the higher value.
+        // Stamp the (now single) row to the literal 3 — this migration's
+        // postcondition version, NOT SCHEMA_VERSION (task-0191). The row was
+        // just seeded from COALESCE(MAX(old version), 0), which could already
+        // be >= 3 if a malformed source held a higher value; the `version < 3`
+        // guard keeps that higher value rather than downgrading it. Stamping
+        // SCHEMA_VERSION here was the original defect: a crash before the
+        // v3->v4 commit left version=5 on disk with no last_fix/fixes table.
         tx.execute(
-            "UPDATE schema_version SET version = ?1 WHERE id = 1 AND version < ?1",
-            params![SCHEMA_VERSION],
+            "UPDATE schema_version SET version = 3 WHERE id = 1 AND version < 3",
+            [],
         )?;
         tx.commit()?;
         Ok(())
@@ -380,6 +439,39 @@ impl Database {
                     row.get(0)
                 });
         result.unwrap_or(0)
+    }
+
+    /// Does a table named `name` exist? Used by the shape-repair in migrate()
+    /// (task-0191). A query error (e.g. a locked or corrupt catalog) is
+    /// treated as "absent" — the conservative choice, since the migration
+    /// chain that follows re-creates the table idempotently anyway.
+    fn table_exists(&self, name: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                params![name],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|o| o.is_some())
+            .unwrap_or(false)
+    }
+
+    /// task-0191 AC#3: the highest schema version whose on-disk *table shape*
+    /// is actually present, capped at the `stamped` version (we never claim a
+    /// shape newer than the stored stamp). v4 introduced `last_fix` and v5
+    /// introduced `fixes`; v5 layers on v4, so a missing `last_fix` caps us at
+    /// 3 even if `fixes` somehow exists. Versions below 4 touch only tables
+    /// create_schema_v1 always creates, so anything < 4 is shape-satisfied by
+    /// definition and returned unchanged (no sqlite_master probe needed).
+    fn highest_satisfied_shape_version(&self, stamped: i32) -> i32 {
+        if stamped >= 4 && !self.table_exists("last_fix") {
+            return 3;
+        }
+        if stamped >= 5 && !self.table_exists("fixes") {
+            return 4;
+        }
+        stamped
     }
 
     fn create_schema_v1(&self) -> Result<()> {
@@ -1089,6 +1181,134 @@ mod tests {
                 || format!("{err}").contains("constraint")
                 || format!("{err}").contains("UNIQUE"),
             "expected constraint violation, got: {err}"
+        );
+    }
+
+    /// Helper: is the schema_version table the v3 single-row shape?
+    fn schema_version_is_single_row_constrained(db: &Database) -> bool {
+        db.conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='schema_version'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|s| s.contains("CHECK (id = 1)"))
+            .unwrap_or(false)
+    }
+
+    /// Build a genuine v2 database in memory: create_schema_v1 then
+    /// migrate_v1_to_v2. Private fns, reachable from this in-module test.
+    fn fresh_v2_db() -> Database {
+        let db = Database {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.create_schema_v1().unwrap();
+        db.migrate_v1_to_v2().unwrap();
+        assert_eq!(db.get_schema_version(), 2, "fixture must start at v2");
+        db
+    }
+
+    /// task-0191 AC#1/#2: step through the migration chain one version at a
+    /// time, asserting the stored stamp AND the table shape after EACH step.
+    /// This is the direct regression guard for the v2->v3
+    /// SCHEMA_VERSION-stamping bug: applied in isolation, migrate_v2_to_v3
+    /// must leave the stamp at EXACTLY 3 (not 5), with neither last_fix nor
+    /// fixes present yet.
+    #[test]
+    fn migration_chain_stamps_each_version_in_lockstep() {
+        let db = fresh_v2_db();
+        // v2 shape: multi-row schema_version, no v4/v5 tables.
+        assert!(!db.table_exists("last_fix"));
+        assert!(!db.table_exists("fixes"));
+
+        // --- v2 -> v3 (in isolation): stamp is exactly 3, shape is v3 ---
+        db.migrate_v2_to_v3().unwrap();
+        assert_eq!(
+            db.get_schema_version(),
+            3,
+            "migrate_v2_to_v3 must stamp exactly 3, not SCHEMA_VERSION"
+        );
+        assert!(
+            schema_version_is_single_row_constrained(&db),
+            "v3 shape: schema_version must be single-row constrained"
+        );
+        assert!(
+            !db.table_exists("last_fix"),
+            "last_fix must NOT exist at v3"
+        );
+        assert!(!db.table_exists("fixes"), "fixes must NOT exist at v3");
+
+        // --- v3 -> v4: stamp 4, last_fix appears, fixes still absent ---
+        db.migrate_v3_to_v4().unwrap();
+        assert_eq!(db.get_schema_version(), 4);
+        assert!(db.table_exists("last_fix"), "last_fix present at v4");
+        assert!(!db.table_exists("fixes"), "fixes still absent at v4");
+
+        // --- v4 -> v5: stamp 5, fixes appears ---
+        db.migrate_v4_to_v5().unwrap();
+        assert_eq!(db.get_schema_version(), 5);
+        assert!(db.table_exists("last_fix"));
+        assert!(db.table_exists("fixes"), "fixes present at v5");
+    }
+
+    /// task-0191 AC#3 (positive): a DB stamped newer than its shape — the
+    /// exact strand the old SCHEMA_VERSION bug produced — is detected and
+    /// repaired on migrate(), not silently skipped. We manufacture the strand:
+    /// a real v3 DB whose stored version is hand-forced to 5 with no v4/v5
+    /// tables. migrate() must reset down, re-run the chain, and rebuild the
+    /// missing tables.
+    #[test]
+    fn migrate_repairs_version_stamped_ahead_of_shape() {
+        let db = fresh_v2_db();
+        db.migrate_v2_to_v3().unwrap();
+        assert_eq!(db.get_schema_version(), 3);
+        assert!(!db.table_exists("last_fix"));
+        assert!(!db.table_exists("fixes"));
+
+        // Forge the strand: stamp 5 while last_fix/fixes still do not exist.
+        db.conn
+            .execute("UPDATE schema_version SET version = 5 WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(db.get_schema_version(), 5);
+
+        // Heal: warn + reset to 3 + re-run v3->v4->v5.
+        db.migrate().unwrap();
+        assert_eq!(db.get_schema_version(), 5, "healed DB ends at v5");
+        assert!(db.table_exists("last_fix"), "repair must create last_fix");
+        assert!(db.table_exists("fixes"), "repair must create fixes");
+    }
+
+    /// task-0191 AC#3 (negative): an intact v5 DB passes the shape check
+    /// untouched — no spurious repair. Re-running migrate() is a no-op:
+    /// version stays 5 and both tables remain present.
+    #[test]
+    fn migrate_does_not_repair_intact_v5() {
+        let db = Database::open_memory().unwrap();
+        assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
+        assert!(db.table_exists("last_fix"));
+        assert!(db.table_exists("fixes"));
+
+        db.migrate().unwrap();
+        assert_eq!(db.get_schema_version(), 5, "intact v5 must stay at 5");
+        assert!(db.table_exists("last_fix"));
+        assert!(db.table_exists("fixes"));
+    }
+
+    /// task-0191 AC#3 guard rail: a genuinely-newer schema from a FUTURE
+    /// binary (version > SCHEMA_VERSION) must NOT be repaired down, even
+    /// though its unknown tables are "missing" from our point of view.
+    /// Forward-compatibility: we leave it exactly as found.
+    #[test]
+    fn migrate_leaves_future_schema_untouched() {
+        let db = Database::open_memory().unwrap();
+        db.conn
+            .execute("UPDATE schema_version SET version = 99 WHERE id = 1", [])
+            .unwrap();
+        db.migrate().unwrap();
+        assert_eq!(
+            db.get_schema_version(),
+            99,
+            "a version > SCHEMA_VERSION must be left untouched (no down-repair)"
         );
     }
 
