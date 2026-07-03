@@ -1,10 +1,17 @@
-//! TCP server: JSON-lines protocol, one-shot connections.
+//! Control-channel server: JSON-lines protocol, one-shot connections.
+//!
+//! The canonical transport is a Unix domain socket, gated by filesystem
+//! permissions (the Unix-native access-control model — see ADR-003). TCP is an
+//! opt-in, unauthenticated secondary transport (`--bind`). Both share one
+//! accept loop and identical timeouts/limits; `handle_connection` is generic
+//! over the stream type. task-0196.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -367,34 +374,241 @@ fn ok_json<T: Serialize>(t: &T) -> String {
     serde_json::to_string(t).unwrap_or_else(|_| error_json("serialization failed"))
 }
 
-/// Start the TCP server. Runs until cancelled.
-pub async fn run_server(state: Arc<DaemonState>) -> Result<()> {
-    let listener = TcpListener::bind(&state.args.bind).await?;
-    info!("listening on {}", state.args.bind);
+// --- Unix socket transport setup (task-0196) ---
+
+/// systemd socket-activation fd number. `sd_listen_fds(3)` hands the first
+/// passed socket as fd 3 (`SD_LISTEN_FDS_START`).
+pub const SD_LISTEN_FDS_START: i32 = 3;
+
+/// Minimal `sd_listen_fds` parse (avoids a libsystemd dependency). Returns the
+/// activated fd when systemd passed us exactly one socket addressed to THIS
+/// process, else `None` (task-0196).
+///
+/// - `LISTEN_PID` must equal our pid: systemd sets it to the service PID so a
+///   forked child does not accidentally inherit the listening fds.
+/// - `LISTEN_FDS` must be exactly 1; whereamid uses a single control socket, so
+///   more than one is a misconfiguration and a hard startup error.
+pub fn sd_listen_fd() -> Result<Option<i32>> {
+    parse_listen_fds(
+        std::env::var("LISTEN_PID").ok().as_deref(),
+        std::env::var("LISTEN_FDS").ok().as_deref(),
+        std::process::id(),
+    )
+}
+
+/// Pure core of [`sd_listen_fd`] (env reads split out so the parse logic is
+/// unit-testable without mutating the process environment). task-0196.
+fn parse_listen_fds(
+    listen_pid: Option<&str>,
+    listen_fds: Option<&str>,
+    my_pid: u32,
+) -> Result<Option<i32>> {
+    let (pid, fds) = match (listen_pid, listen_fds) {
+        (Some(p), Some(f)) => (p, f),
+        _ => return Ok(None), // not socket-activated
+    };
+    let pid: u32 = pid
+        .parse()
+        .with_context(|| format!("LISTEN_PID={pid:?} is not an integer"))?;
+    if pid != my_pid {
+        // The fds were meant for a different process (we inherited the env);
+        // ignore socket activation and fall through to self-bind.
+        return Ok(None);
+    }
+    let fds: i32 = fds
+        .parse()
+        .with_context(|| format!("LISTEN_FDS={fds:?} is not an integer"))?;
+    if fds < 1 {
+        return Ok(None);
+    }
+    if fds > 1 {
+        anyhow::bail!("LISTEN_FDS={fds}: whereamid accepts exactly one socket-activated fd");
+    }
+    Ok(Some(SD_LISTEN_FDS_START))
+}
+
+/// Bind a Unix domain socket at `path`, recovering from a stale socket file and
+/// tightening the result to owner-only (0600). Fails closed (task-0196):
+///
+/// - Path exists and a live daemon answers a connect probe → REFUSE (never
+///   steal a live socket).
+/// - Path exists but connect is refused → stale inode from a daemon that died
+///   without cleanup; unlink and bind.
+/// - Path exists but is not a socket → REFUSE (never clobber an unrelated file).
+/// - After bind, chmod 0600 and RE-STAT; a filesystem that silently ignored the
+///   chmod (FUSE, some network mounts) would leave the control channel
+///   world-accessible, so bail rather than serve it loose (mirrors the
+///   fail-closed DB chmod in db.rs, commit 53aba50).
+///
+/// Returns a std listener; the caller sets non-blocking and adopts it into
+/// tokio. Kept sync + std so it is unit-testable without a runtime.
+pub fn self_bind_unix(path: &Path) -> Result<std::os::unix::net::UnixListener> {
+    handle_stale_socket(path)?;
+    let listener = std::os::unix::net::UnixListener::bind(path)
+        .with_context(|| format!("binding unix socket {}", path.display()))?;
+    chmod_socket_0600_or_bail(path)?;
+    Ok(listener)
+}
+
+/// Probe an existing socket path and either clear a stale inode or refuse.
+fn handle_stale_socket(path: &Path) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+    };
+    // Only ever unlink a socket. A regular file / symlink at this path is not
+    // ours to remove — fail loudly instead of clobbering it.
+    if !meta.file_type().is_socket() {
+        anyhow::bail!(
+            "{} exists and is not a socket; refusing to remove it. Choose a different --socket \
+             path or remove the file manually.",
+            path.display()
+        );
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => anyhow::bail!(
+            "another process is already listening on {} (connect probe succeeded); refusing to \
+             steal a live control socket. Stop the running whereamid or pass a different --socket.",
+            path.display()
+        ),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            // Stale socket inode from a daemon that exited without cleanup.
+            info!("removing stale socket file {}", path.display());
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                // Vanished between stat and unlink (race): fine, it is gone.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => {
+                    Err(e).with_context(|| format!("removing stale socket {}", path.display()))
+                }
+            }
+        }
+        Err(e) => Err(e)
+            .with_context(|| format!("probing existing socket {} before bind", path.display())),
+    }
+}
+
+/// chmod a freshly-bound socket to 0600 and verify the mode actually took.
+fn chmod_socket_0600_or_bail(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 on socket {}", path.display()))?;
+    let mode = std::fs::metadata(path)
+        .with_context(|| format!("re-stat socket {} after chmod", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "socket {} is still group/other-accessible (mode {mode:o}) after chmod 0600 — the \
+             filesystem ignored the permission change; the control channel would be exposed to \
+             other local users. Refusing to start.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Run the control-channel accept loop until cancelled. The unix listener (the
+/// mandatory transport) is bound by the caller — a bind failure there aborts
+/// startup with a non-zero exit. TCP is opt-in and bound HERE so its failure
+/// flows through the existing task-0195 server-task self-exit path (clean
+/// exit) rather than aborting daemon startup. task-0196.
+pub async fn run_server(state: Arc<DaemonState>, unix: UnixListener) -> Result<()> {
+    let tcp: Option<TcpListener> = match state.args.parsed_bind()? {
+        Some(addr) => {
+            let listener = TcpListener::bind(addr).await?;
+            let bound = listener.local_addr().unwrap_or(addr);
+            if bound.ip().is_loopback() {
+                warn!(
+                    "TCP listening on {bound}: this transport has NO peer authentication — every \
+                     local user can read location history, live position and Wi-Fi scans and \
+                     drive WiGLE quota. The unix socket is the access-controlled transport."
+                );
+            } else {
+                warn!(
+                    "TCP listening on {bound} (non-loopback): location history, live position, \
+                     Wi-Fi scans and WiGLE quota are reachable by every host that can reach \
+                     {bound}, with NO authentication."
+                );
+            }
+            Some(listener)
+        }
+        None => None,
+    };
+    info!("control channel: unix socket ready");
 
     loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                debug!("connection from {addr}");
-                let state = Arc::clone(&state);
-                // Per-connection handlers stay detached (NOT spawn_tracked):
-                // they are bounded by READ_TIMEOUT/WRITE_TIMEOUT, and tracking
-                // them across shutdown is task-0201's scope (task-0102).
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, state).await {
-                        warn!("connection error: {e}");
+        tokio::select! {
+            r = unix.accept() => match r {
+                Ok((stream, _addr)) => {
+                    // SO_PEERCRED is logged for auditability only. We do NOT
+                    // enforce same-UID in-process: the system-service model has
+                    // systemd hand a group-readable socket (0660 root:whereami)
+                    // to a DynamicUser daemon, so the connecting UID legitimately
+                    // differs from the daemon UID. Filesystem permissions on the
+                    // socket ARE the access control (ADR-003).
+                    match stream.peer_cred() {
+                        Ok(cred) => debug!(
+                            "unix connection uid={} gid={} pid={:?}",
+                            cred.uid(),
+                            cred.gid(),
+                            cred.pid()
+                        ),
+                        Err(e) => debug!("unix connection (peer_cred unavailable: {e})"),
                     }
-                });
-            }
-            Err(e) => {
-                error!("accept error: {e}");
-            }
+                    spawn_handler(stream, Arc::clone(&state));
+                }
+                Err(e) => error!("unix accept error: {e}"),
+            },
+            r = async {
+                match &tcp {
+                    Some(l) => l.accept().await,
+                    // No TCP configured: never resolve, so this branch is inert
+                    // and the unix branch drives the loop (task-0196).
+                    None => std::future::pending().await,
+                }
+            } => match r {
+                Ok((stream, addr)) => {
+                    debug!("tcp connection from {addr}");
+                    spawn_handler(stream, Arc::clone(&state));
+                }
+                Err(e) => error!("tcp accept error: {e}"),
+            },
         }
     }
 }
 
-async fn handle_connection(stream: TcpStream, state: Arc<DaemonState>) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
+/// Spawn a detached per-connection handler generic over the stream type.
+/// Detached (NOT spawn_tracked): each is bounded by READ_TIMEOUT/WRITE_TIMEOUT,
+/// and tracking them across shutdown is task-0201's scope (task-0102).
+fn spawn_handler<S>(stream: S, state: Arc<DaemonState>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = handle_connection(stream, state).await {
+            warn!("connection error: {e}");
+        }
+    });
+}
+
+/// Handle one request/response exchange. Generic over the transport so the unix
+/// socket and opt-in TCP share identical framing, limits and timeouts
+/// (task-0196). `tokio::io::split` works for any `AsyncRead + AsyncWrite`,
+/// unlike the type-specific `into_split`.
+async fn handle_connection<S>(stream: S, state: Arc<DaemonState>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let limited = reader.take(MAX_REQUEST_BYTES);
     let mut buf_reader = BufReader::new(limited);
     let mut line = String::new();
@@ -1075,6 +1289,33 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
 
 // Address-cache tests moved to server/address_cache.rs alongside the impl.
 
+/// Build a minimal, side-effect-free `DaemonState` backed by an in-memory
+/// SQLite DB, shared by the in-file test modules. The network clients construct
+/// HTTP clients only (no I/O at construction), so this is cheap and hermetic.
+#[cfg(test)]
+pub(crate) fn test_state() -> std::sync::Arc<DaemonState> {
+    use clap::Parser;
+    let args = crate::config::Args::parse_from(["whereamid"]);
+    std::sync::Arc::new(DaemonState {
+        db: std::sync::Mutex::new(crate::db::Database::open_memory().unwrap()),
+        debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(
+            args.debounce_window,
+            args.debounce_threshold,
+        )),
+        wigle: crate::wigle::WigleClient::new("", ""),
+        apple: crate::apple::AppleClient::new(),
+        nominatim: crate::nominatim::NominatimClient::new(),
+        last_fix: tokio::sync::Mutex::new(None),
+        inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        address_cache: std::sync::Mutex::new(AddressCache::new()),
+        db_write_failures: std::sync::atomic::AtomicU64::new(0),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+        orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
+        args,
+    })
+}
+
 #[cfg(test)]
 mod wire_enum_tests {
     //! task-0062: wire-format round-trip for the typed enums that
@@ -1182,33 +1423,8 @@ mod dispatch_tests {
     //! Full-dispatch integration tests (Request -> dispatch_command -> handler
     //! -> JSON) against a real in-memory DaemonState. Covers history overflow
     //! (task-0184) and resolve provenance mapping (task-0194).
+    use super::test_state;
     use super::*;
-    use clap::Parser;
-
-    /// Build a minimal, side-effect-free DaemonState backed by an in-memory
-    /// SQLite DB. The network clients construct HTTP clients only (no I/O at
-    /// construction), so this is cheap and hermetic.
-    fn test_state() -> std::sync::Arc<DaemonState> {
-        let args = crate::config::Args::parse_from(["whereamid"]);
-        std::sync::Arc::new(DaemonState {
-            db: std::sync::Mutex::new(crate::db::Database::open_memory().unwrap()),
-            debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(
-                args.debounce_window,
-                args.debounce_threshold,
-            )),
-            wigle: crate::wigle::WigleClient::new("", ""),
-            apple: crate::apple::AppleClient::new(),
-            nominatim: crate::nominatim::NominatimClient::new(),
-            last_fix: tokio::sync::Mutex::new(None),
-            inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
-            address_cache: std::sync::Mutex::new(AddressCache::new()),
-            db_write_failures: std::sync::atomic::AtomicU64::new(0),
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
-            orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
-            args,
-        })
-    }
 
     /// Extract `results[0].source` from a resolve dispatch response.
     fn resolve_source(resp: &str) -> String {
@@ -1360,6 +1576,166 @@ mod dispatch_tests {
             state.tasks.lock().unwrap().len(),
             0,
             "nothing may be tracked after a refused spawn"
+        );
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    //! task-0196: unix-socket transport setup — self-bind + 0600, stale-socket
+    //! recovery, non-socket refusal, socket-activation env parsing, and a full
+    //! request/response round-trip over the unix socket.
+    //!
+    //! HERMETICITY: every socket lives under a unique per-test tempdir; nothing
+    //! touches the default socket path, the real filesystem defaults, or a live
+    //! daemon.
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    fn unique_tempdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "whereamid-xport-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mode_bits(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn self_bind_creates_0600_socket() {
+        let dir = unique_tempdir("mode");
+        let sock = dir.join("whereamid.sock");
+        let listener = self_bind_unix(&sock).expect("self-bind must succeed on a clean path");
+        assert_eq!(
+            mode_bits(&sock),
+            0o600,
+            "self-bound control socket must be owner-only (0600)"
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_bind_recovers_from_stale_socket() {
+        let dir = unique_tempdir("stale");
+        let sock = dir.join("whereamid.sock");
+        // Create a stale socket inode: bind a std listener, then drop it. std
+        // does NOT unlink on drop, so the socket file remains with no listener —
+        // exactly the leftover a daemon that was SIGKILLed leaves behind.
+        {
+            let dead = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            drop(dead);
+        }
+        assert!(
+            sock.exists(),
+            "stale socket inode must persist after the listener is dropped"
+        );
+        // Must detect the stale inode (connect refused), unlink, bind, chmod.
+        let listener = self_bind_unix(&sock).expect("must recover from a stale socket file");
+        assert_eq!(mode_bits(&sock), 0o600);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_bind_refuses_live_socket() {
+        // Holding a LIVE (bound, listening) socket makes the connect probe
+        // succeed even without an accept() — the kernel completes the handshake
+        // up to the backlog — so self-bind must refuse rather than steal it.
+        let dir = unique_tempdir("live");
+        let sock = dir.join("whereamid.sock");
+        let live = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let err = self_bind_unix(&sock).expect_err("must refuse to steal a live socket");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already listening") || msg.contains("live control socket"),
+            "error must explain the live-socket refusal, got: {msg}"
+        );
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_bind_refuses_non_socket_file() {
+        let dir = unique_tempdir("notsock");
+        let path = dir.join("whereamid.sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+        let err = self_bind_unix(&path).expect_err("must refuse to clobber a non-socket file");
+        assert!(
+            format!("{err:#}").contains("not a socket"),
+            "error must explain the non-socket refusal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_listen_fds_cases() {
+        // Not socket-activated (env absent).
+        assert_eq!(parse_listen_fds(None, None, 42).unwrap(), None);
+        // Addressed to a different pid → ignored (fall through to self-bind).
+        assert_eq!(parse_listen_fds(Some("999"), Some("1"), 42).unwrap(), None);
+        // Exactly one fd for us → fd 3.
+        assert_eq!(
+            parse_listen_fds(Some("42"), Some("1"), 42).unwrap(),
+            Some(SD_LISTEN_FDS_START)
+        );
+        // More than one fd is a hard error (whereamid uses a single socket).
+        assert!(parse_listen_fds(Some("42"), Some("2"), 42).is_err());
+        // Garbage values fail fast.
+        assert!(parse_listen_fds(Some("notanum"), Some("1"), 42).is_err());
+        assert!(parse_listen_fds(Some("42"), Some("x"), 42).is_err());
+    }
+
+    /// Full round-trip: run_server accepts on a self-bound unix socket and
+    /// answers a `version` request. Uses a std blocking client on a blocking
+    /// thread (faithful to the real client), so a multi-thread runtime is
+    /// required. Also re-asserts the 0600 mode on the live socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unix_round_trip_version() {
+        let dir = unique_tempdir("roundtrip");
+        let sock = dir.join("whereamid.sock");
+        let std_listener = self_bind_unix(&sock).unwrap();
+        assert_eq!(mode_bits(&sock), 0o600, "live socket must be 0600");
+        std_listener.set_nonblocking(true).unwrap();
+        let listener = UnixListener::from_std(std_listener).unwrap();
+
+        // test_state's args have bind=None, so run_server opens no TCP listener.
+        let state = test_state();
+        let server = tokio::spawn(run_server(state, listener));
+
+        let sock2 = sock.clone();
+        let line = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let mut s = std::os::unix::net::UnixStream::connect(&sock2).expect("connect");
+            s.write_all(b"{\"cmd\":\"version\"}\n").unwrap();
+            s.flush().unwrap();
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut line = String::new();
+            BufReader::new(s).read_line(&mut line).unwrap();
+            line
+        })
+        .await
+        .unwrap();
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let v: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("response must be one JSON line");
+        assert_eq!(v["ok"], serde_json::json!(true), "got {line}");
+        assert_eq!(v["v"], serde_json::json!(1));
+        assert!(
+            v.get("version").and_then(|x| x.as_str()).is_some(),
+            "version response must carry a version string, got {line}"
         );
     }
 }

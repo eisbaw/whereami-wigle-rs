@@ -1,7 +1,9 @@
 //! whereamid: Wi-Fi geolocation daemon.
 //!
-//! Scans Wi-Fi in the background, caches AP positions in SQLite,
-//! and answers "where am I?" queries over TCP + JSON-lines.
+//! Scans Wi-Fi in the background, caches AP positions in SQLite, and answers
+//! "where am I?" queries over a JSON-lines control channel. The canonical
+//! transport is a Unix domain socket gated by filesystem permissions (ADR-003);
+//! TCP is opt-in and unauthenticated (`--bind`).
 
 mod apple;
 mod config;
@@ -19,13 +21,15 @@ mod server;
 mod trilaterate;
 mod wigle;
 
+use std::os::unix::io::FromRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::signal;
 use tokio::time::{sleep, Duration, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use config::{load_config_file, Args};
 use db::Database;
@@ -50,7 +54,10 @@ async fn main() -> Result<()> {
     // and a non-zero exit, not a runtime assert deep inside Debouncer.
     args.validate().context("invalid CLI arguments")?;
     info!("whereamid starting");
-    info!("bind: {}", args.bind);
+    match &args.bind {
+        Some(b) => info!("bind (TCP, opt-in, unauthenticated): {b}"),
+        None => info!("bind: TCP disabled (unix control socket only)"),
+    }
     info!("db: {}", args.db.display());
     info!("interface: {}", args.interface);
 
@@ -182,9 +189,19 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Set up the mandatory control-channel unix listener BEFORE spawning the
+    // server task. A failure here — a live socket already owns the path, or the
+    // chmod could not be verified — must abort startup with a non-zero exit
+    // rather than run degraded (task-0196). We handle stale socket files at
+    // startup (not on run_server's exit, which is an abort at shutdown with no
+    // chance to clean up); `cleanup_socket_path` is a best-effort unlink after
+    // the drain for self-bound sockets (None when systemd owns the socket).
+    let (unix_listener, cleanup_socket_path) =
+        setup_unix_listener(&args).context("setting up the control-channel unix socket")?;
+
     let server_state = Arc::clone(&state);
     let mut server_handle = tokio::spawn(async move {
-        if let Err(e) = server::run_server(server_state).await {
+        if let Err(e) = server::run_server(server_state, unix_listener).await {
             error!("server error: {e}");
         }
     });
@@ -258,6 +275,22 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Best-effort: remove the self-bound socket file so the next start does not
+    // have to treat it as stale. Socket-activated sockets (cleanup path None)
+    // are owned by systemd and left untouched (task-0196). A stale leftover is
+    // harmless anyway — the next startup detects and clears it — so a failure
+    // here is warn-only.
+    if let Some(path) = &cleanup_socket_path {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                "failed to remove socket file {} at shutdown: {e}",
+                path.display()
+            ),
+        }
+    }
+
     info!("whereamid stopped");
     Ok(())
 }
@@ -304,6 +337,72 @@ fn warn_if_dir_accessible(dir: &std::path::Path) {
             tracing::warn!("could not stat state directory {} ({e})", dir.display());
         }
     }
+}
+
+/// Resolve the effective unix control-socket path when the daemon self-binds.
+/// Pure (env is passed in) so the resolution order is unit-testable. The
+/// explicit `--socket` flag wins; otherwise `$XDG_RUNTIME_DIR/whereamid.sock`;
+/// otherwise `/run/whereami/whereamid.sock`. task-0196.
+fn resolve_socket_path(
+    socket_flag: Option<&str>,
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if let Some(s) = socket_flag {
+        return PathBuf::from(s);
+    }
+    if let Some(dir) = xdg_runtime_dir {
+        if !dir.is_empty() {
+            return Path::new(dir).join("whereamid.sock");
+        }
+    }
+    PathBuf::from("/run/whereami/whereamid.sock")
+}
+
+/// Build the control-channel unix listener, honoring systemd socket activation
+/// (task-0196). Returns the tokio listener and, for a self-bound socket, the
+/// path to unlink at shutdown (None when systemd owns the socket). Must run
+/// inside the tokio runtime (`from_std` registers with the reactor).
+fn setup_unix_listener(args: &Args) -> Result<(tokio::net::UnixListener, Option<PathBuf>)> {
+    // systemd socket activation: an inherited fd wins over --socket. systemd
+    // created the socket with the exact owner/group/mode from the .socket unit
+    // and owns its lifecycle, so we skip stale-handling, chmod and cleanup.
+    if let Some(fd) = server::sd_listen_fd()? {
+        if args.socket.is_some() {
+            warn!("--socket is ignored: systemd passed a socket-activated fd (the fd wins)");
+        }
+        info!("control channel: adopting systemd socket-activated fd {fd}");
+        // Safety: sd_listen_fd verified LISTEN_PID == our pid and LISTEN_FDS ==
+        // 1, so fd `SD_LISTEN_FDS_START` is an open, listening AF_UNIX socket
+        // owned by this process. We take sole ownership of it here.
+        let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+        std_listener
+            .set_nonblocking(true)
+            .context("set_nonblocking on socket-activated fd")?;
+        let listener = tokio::net::UnixListener::from_std(std_listener)
+            .context("adopting socket-activated fd into tokio")?;
+        return Ok((listener, None));
+    }
+
+    // Self-bind path. Compute the socket path and make sure its parent exists
+    // and is owner-only (a no-op when it already exists, e.g. /run/user/<uid>).
+    let path = resolve_socket_path(
+        args.socket.as_deref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+    );
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            ensure_private_dir(parent)
+                .with_context(|| format!("preparing socket directory {}", parent.display()))?;
+        }
+    }
+    info!("control channel: unix socket {}", path.display());
+    let std_listener = server::self_bind_unix(&path)?;
+    std_listener
+        .set_nonblocking(true)
+        .context("set_nonblocking on unix socket")?;
+    let listener = tokio::net::UnixListener::from_std(std_listener)
+        .context("adopting unix socket into tokio")?;
+    Ok((listener, Some(path)))
 }
 
 /// Metadata key holding the number of tasks force-aborted at the end of the
@@ -655,5 +754,43 @@ mod state_dir_tests {
         assert_eq!(mode_bits(&nested), 0o700);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod socket_path_tests {
+    //! task-0196: unix control-socket path resolution order (pure; env passed
+    //! in, so it never reads the host's real XDG_RUNTIME_DIR).
+    use super::resolve_socket_path;
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    #[test]
+    fn explicit_socket_flag_wins_over_xdg() {
+        assert_eq!(
+            resolve_socket_path(Some("/tmp/custom.sock"), Some(OsStr::new("/run/user/1000"))),
+            PathBuf::from("/tmp/custom.sock")
+        );
+    }
+
+    #[test]
+    fn xdg_runtime_dir_used_when_no_flag() {
+        assert_eq!(
+            resolve_socket_path(None, Some(OsStr::new("/run/user/1000"))),
+            PathBuf::from("/run/user/1000/whereamid.sock")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_run_when_no_xdg() {
+        assert_eq!(
+            resolve_socket_path(None, None),
+            PathBuf::from("/run/whereami/whereamid.sock")
+        );
+        // An empty XDG_RUNTIME_DIR is treated as unset.
+        assert_eq!(
+            resolve_socket_path(None, Some(OsStr::new(""))),
+            PathBuf::from("/run/whereami/whereamid.sock")
+        );
     }
 }

@@ -9,9 +9,28 @@ use std::path::PathBuf;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "whereamid", version, about)]
 pub struct Args {
-    /// TCP bind address
-    #[arg(long, default_value = "127.0.0.1:4747")]
-    pub bind: String,
+    /// Unix domain socket path for the control channel (the canonical
+    /// transport). When unset, the path is computed at startup:
+    /// `$XDG_RUNTIME_DIR/whereamid.sock`, or `/run/whereami/whereamid.sock`
+    /// if `XDG_RUNTIME_DIR` is unset. Access is gated by filesystem
+    /// permissions (0600 when the daemon self-binds). task-0196.
+    #[arg(long)]
+    pub socket: Option<String>,
+
+    /// TCP bind address (`host:port`). OPT-IN: when unset the daemon serves
+    /// only on the unix socket. TCP has NO peer authentication — every local
+    /// user (or, for a non-loopback address, every reachable host) can read
+    /// location history / live position / Wi-Fi scans and drive WiGLE quota.
+    /// A non-loopback address additionally requires `--allow-nonlocal-bind`.
+    /// task-0196.
+    #[arg(long)]
+    pub bind: Option<String>,
+
+    /// Permit binding `--bind` to a non-loopback address. Without it a
+    /// non-loopback `--bind` is rejected at startup, because it exposes the
+    /// unauthenticated daemon to other hosts. task-0196.
+    #[arg(long)]
+    pub allow_nonlocal_bind: bool,
 
     /// Path to SQLite database
     #[arg(long, default_value = "/var/lib/whereami/aps.sqlite")]
@@ -110,6 +129,21 @@ impl Args {
     /// where clap can render the help text; this method is for invariants
     /// across multiple fields.
     pub fn validate(&self) -> Result<()> {
+        // --bind is opt-in TCP. Parse it here (fail fast on garbage — the
+        // field used to be a raw String that silently accepted any junk) and
+        // require an explicit opt-in for any non-loopback address. A
+        // non-loopback bind exposes location history, live position, Wi-Fi
+        // scans and WiGLE quota to every host that can reach it, over a
+        // transport with no peer authentication (task-0196).
+        if let Some(addr) = self.parsed_bind()? {
+            if !addr.ip().is_loopback() && !self.allow_nonlocal_bind {
+                anyhow::bail!(
+                    "--bind {addr} is a non-loopback address; TCP has no peer authentication, so \
+                     this exposes location history, live position, Wi-Fi scans and WiGLE quota to \
+                     every host that can reach it. Pass --allow-nonlocal-bind to confirm."
+                );
+            }
+        }
         if self.debounce_window == 0 {
             anyhow::bail!("--debounce-window must be > 0");
         }
@@ -160,6 +194,23 @@ impl Args {
             anyhow::bail!("--history-segment-min-duration-secs must be > 0");
         }
         Ok(())
+    }
+
+    /// Parse `--bind` into a `SocketAddr`, or `None` when TCP is disabled (the
+    /// default: the daemon serves only on the unix socket). Single source of
+    /// truth for the bind string so `validate()` and `run_server` cannot drift
+    /// on how the address is interpreted. Errors if a bind string was given
+    /// but does not parse (task-0196).
+    pub fn parsed_bind(&self) -> Result<Option<std::net::SocketAddr>> {
+        match &self.bind {
+            None => Ok(None),
+            Some(s) => {
+                let addr: std::net::SocketAddr = s.parse().with_context(|| {
+                    format!("--bind {s:?} is not a valid host:port socket address")
+                })?;
+                Ok(Some(addr))
+            }
+        }
     }
 }
 
@@ -252,5 +303,69 @@ mod tests {
     #[test]
     fn zero_scan_interval_fast_rejected() {
         assert!(parse(&["--scan-interval-fast", "0"]).validate().is_err());
+    }
+
+    // --- task-0196: --bind opt-in TCP + non-loopback guard ---
+
+    #[test]
+    fn no_bind_is_valid_and_tcp_disabled() {
+        // TCP is opt-in: the default (no --bind) must validate and report no
+        // TCP address.
+        let args = parse(&[]);
+        args.validate().expect("no --bind must validate");
+        assert_eq!(args.parsed_bind().unwrap(), None);
+    }
+
+    #[test]
+    fn bind_garbage_rejected() {
+        // The old raw-String field accepted any junk; now a malformed bind
+        // fails fast at validation time.
+        let err = parse(&["--bind", "not-an-address"])
+            .validate()
+            .expect_err("garbage --bind must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--bind"),
+            "error must name the offending flag, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bind_loopback_accepted_without_flag() {
+        parse(&["--bind", "127.0.0.1:4747"])
+            .validate()
+            .expect("loopback --bind must be allowed without the opt-in flag");
+        parse(&["--bind", "[::1]:4747"])
+            .validate()
+            .expect("IPv6 loopback --bind must be allowed without the opt-in flag");
+    }
+
+    #[test]
+    fn bind_nonloopback_without_flag_rejected_names_flag() {
+        let err = parse(&["--bind", "0.0.0.0:4747"])
+            .validate()
+            .expect_err("non-loopback --bind must require the opt-in flag");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--allow-nonlocal-bind"),
+            "error must name the opt-in flag so the user knows how to proceed, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bind_nonloopback_with_flag_accepted() {
+        parse(&["--bind", "0.0.0.0:4747", "--allow-nonlocal-bind"])
+            .validate()
+            .expect("non-loopback --bind must be allowed once explicitly opted in");
+    }
+
+    #[test]
+    fn parsed_bind_is_single_source_of_truth() {
+        // The parsed address run_server will bind must match exactly what
+        // validate() inspected.
+        let args = parse(&["--bind", "127.0.0.1:4747"]);
+        let addr = args.parsed_bind().unwrap().unwrap();
+        assert_eq!(addr.port(), 4747);
+        assert!(addr.ip().is_loopback());
     }
 }

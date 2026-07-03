@@ -1,16 +1,20 @@
 //! End-to-end shutdown tests driving the real `whereamid` binary
 //! (task-0190/0195).
 //!
-//! SAFETY: every test uses an ephemeral 127.0.0.1 port and NEVER binds or
-//! contacts 127.0.0.1:4747, where a production daemon serves the owner on this
-//! machine. `--config` points at a nonexistent file so WiGLE stays
-//! unconfigured (zero quota spend / no network), `--db` is a throwaway
-//! tempdir, and `--interface` is bogus so no real Wi-Fi scan runs. No test
-//! ever sends the daemon a `resolve`.
+//! SAFETY / HERMETICITY: every test uses an ephemeral 127.0.0.1 port and NEVER
+//! binds or contacts 127.0.0.1:4747, where a production daemon serves the owner
+//! on this machine. Each test also passes an explicit `--socket` under its own
+//! throwaway tempdir, so the daemon never touches the DEFAULT unix-socket path
+//! ($XDG_RUNTIME_DIR/whereamid.sock or /run/whereami/...) and parallel tests
+//! cannot collide. `--config` points at a nonexistent file so WiGLE stays
+//! unconfigured (zero quota spend / no network), `--db` is a throwaway tempdir,
+//! and `--interface` is bogus so no real Wi-Fi scan runs. No test ever sends
+//! the daemon a `resolve`.
 #![cfg(unix)]
 
 use std::io::Read;
 use std::net::TcpListener;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -35,13 +39,18 @@ fn make_tempdir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Spawn the daemon bound to `addr`, with hermetic flags, stderr -> file.
-fn spawn_daemon(addr: &str, dir: &Path) -> Child {
+/// Spawn the daemon with an explicit unix `--socket`, an optional TCP `--bind`,
+/// and hermetic flags (throwaway DB, no config, bogus interface). stderr ->
+/// file. Passing an explicit `--socket` keeps the daemon off the default
+/// socket path (task-0196 hermeticity).
+fn spawn_daemon(bind: Option<&str>, socket: &Path, dir: &Path) -> Child {
     let err = std::fs::File::create(dir.join("stderr.log")).expect("create stderr.log");
-    Command::new(env!("CARGO_BIN_EXE_whereamid"))
-        .arg("--bind")
-        .arg(addr)
-        .arg("--db")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_whereamid"));
+    cmd.arg("--socket").arg(socket);
+    if let Some(addr) = bind {
+        cmd.arg("--bind").arg(addr);
+    }
+    cmd.arg("--db")
         .arg(dir.join("aps.sqlite"))
         // Nonexistent config -> defaults -> WiGLE unconfigured (no network).
         .arg("--config")
@@ -76,14 +85,16 @@ fn wait_for_exit(child: &mut Child, budget: Duration) -> Option<(Duration, ExitS
     }
 }
 
-/// task-0195 AC#1: when the server task exits on its own (here: the port is
-/// already bound, so `TcpListener::bind` returns EADDRINUSE), the daemon must
-/// shut down cleanly — NOT panic on a double-polled JoinHandle.
+/// task-0195 AC#1 (now the TCP-opt-in variant, task-0196): the unix socket
+/// binds fine, but the requested TCP `--bind` port is already taken, so
+/// `run_server`'s `TcpListener::bind` returns EADDRINUSE and the server task
+/// exits on its own. The daemon must shut down cleanly — NOT panic on a
+/// double-polled JoinHandle, and NOT hang.
 #[test]
 fn bind_failure_exits_cleanly_without_panic() {
     let dir = make_tempdir("bindfail");
 
-    // Hold the port for the daemon's whole life so its bind fails. Two live
+    // Hold the port for the daemon's whole life so its TCP bind fails. Two live
     // listeners on the same 127.0.0.1:port need SO_REUSEPORT (which neither
     // std nor tokio set), so the daemon's bind reliably fails.
     let listener = TcpListener::bind("127.0.0.1:0").expect("probe bind");
@@ -94,7 +105,8 @@ fn bind_failure_exits_cleanly_without_panic() {
         "must never collide with the production daemon's port"
     );
 
-    let mut child = spawn_daemon(&addr.to_string(), &dir);
+    let sock = dir.join("whereamid.sock");
+    let mut child = spawn_daemon(Some(&addr.to_string()), &sock, &dir);
     let outcome = wait_for_exit(&mut child, Duration::from_secs(15));
     let stderr = read_stderr(&dir);
 
@@ -143,7 +155,8 @@ fn sigterm_exits_within_drain_budget() {
     assert_ne!(port, 4747, "must never collide with the production port");
     let addr = format!("127.0.0.1:{port}");
 
-    let mut child = spawn_daemon(&addr, &dir);
+    let sock = dir.join("whereamid.sock");
+    let mut child = spawn_daemon(Some(&addr), &sock, &dir);
 
     // Let it finish startup and install the SIGTERM handler.
     std::thread::sleep(Duration::from_millis(300));
@@ -182,5 +195,53 @@ fn sigterm_exits_within_drain_budget() {
         status.code(),
         Some(0),
         "clean shutdown expected on SIGTERM, got {status:?}; stderr:\n{stderr}"
+    );
+}
+
+/// task-0196: refusing to steal a LIVE control socket. Holding a bound unix
+/// listener at the daemon's `--socket` path makes the daemon's startup connect
+/// probe succeed, so it must REFUSE to bind (never unlink a live socket) and
+/// exit non-zero with a clear error — the fail-fast counterpart to the TCP
+/// bind-collision test above.
+#[test]
+fn live_socket_refused_nonzero_exit() {
+    let dir = make_tempdir("livesock");
+    let sock = dir.join("whereamid.sock");
+
+    // Hold a LIVE (bound, listening) unix socket for the daemon's whole
+    // startup. The kernel completes connect handshakes up to the backlog even
+    // without accept(), so the daemon's connect probe sees a live owner.
+    let live = UnixListener::bind(&sock).expect("hold a live socket at the daemon's path");
+
+    // No --bind: the unix socket is the mandatory transport, and its failure
+    // must abort startup by itself.
+    let mut child = spawn_daemon(None, &sock, &dir);
+    let outcome = wait_for_exit(&mut child, Duration::from_secs(15));
+    let stderr = read_stderr(&dir);
+
+    if outcome.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    drop(live);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (elapsed, status) =
+        outcome.expect("daemon must exit on its own when the socket is already live, not hang");
+    assert!(
+        !stderr.contains("panicked"),
+        "daemon panicked on live-socket refusal; stderr:\n{stderr}"
+    );
+    assert!(
+        !status.success(),
+        "live-socket refusal must be a non-zero exit (fail-fast), got {status:?}; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("already listening") || stderr.contains("live control socket"),
+        "stderr must explain the live-socket refusal; stderr:\n{stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "daemon took {elapsed:?} to refuse a live socket"
     );
 }
