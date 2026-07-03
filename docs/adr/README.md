@@ -1,8 +1,9 @@
 # Architecture Decision Records
 
 ## Communication
-- [ADR-001](001-tcp-json-lines.md) — TCP JSON-lines, not HTTP
+- [ADR-001](001-tcp-json-lines.md) — TCP JSON-lines, not HTTP (amended by ADR-003)
 - [ADR-002](002-daemon-client-separation.md) — Daemon + client lib separation
+- [ADR-003](003-unix-socket-access-control.md) — Unix socket + filesystem-permission access control
 
 ## Scanning
 - [ADR-010](010-nmcli-over-iw.md) — nmcli as primary scanner, iw as fallback

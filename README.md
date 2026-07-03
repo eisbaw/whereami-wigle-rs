@@ -33,7 +33,7 @@ adds coverage; `wigle.net` gives a free key.
 
 ## CLI usage
 
-The `whereami` binary speaks the daemon's TCP protocol so you don't have to.
+The `whereami` binary speaks the daemon's socket protocol so you don't have to.
 
 ```bash
 whereami locate              # where am I?
@@ -61,7 +61,9 @@ api_key  = "..."
 Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
 
 ```
---bind <ADDR>                       TCP bind address [127.0.0.1:4747]
+--socket <PATH>                     Unix control socket [$XDG_RUNTIME_DIR/whereamid.sock]
+--bind <ADDR>                       TCP bind address (opt-in, unauthenticated; off by default)
+--allow-nonlocal-bind               Permit a non-loopback --bind (exposes the daemon)
 --db <PATH>                         SQLite database [/var/lib/whereami/aps.sqlite]
 --interface <NAME>                  Wi-Fi interface [wlan0]
 --config <PATH>                     Config file [~/.config/whereami/config.toml]
@@ -87,7 +89,7 @@ Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
 ## How it works
 
 ```
-                    TCP :4747
+                 unix socket (0600/0660)
   any client  ------>  whereamid  ----> local SQLite cache
   (whereami CLI,         |                    |
    curl, Python…)        |              cache miss?
@@ -196,8 +198,9 @@ per-user installations on non-NixOS systems.
 ## Protocol
 
 For language-agnostic clients: see [docs/protocol.md](docs/protocol.md). The
-wire format is JSON-lines on a one-shot TCP connection. Any language with a
-TCP socket can talk to the daemon.
+wire format is JSON-lines on a one-shot connection over a Unix domain socket
+(access-controlled by filesystem permissions; opt-in TCP via `--bind`). Any
+language with a unix-socket client can talk to the daemon.
 
 ## Architecture
 

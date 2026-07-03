@@ -11,7 +11,7 @@ We want: scan local Wi-Fi, resolve MAC addresses to coordinates, cache results l
 Two components:
 
 ```
-                    TCP :4747
+                 unix socket (fs-perm gated)
   any client  ------>  whereamid  ----> local SQLite cache
   (CLI, curl,            |                    |
    Python, etc.)         |              cache miss?
@@ -32,7 +32,7 @@ applies to Apple WPS and WiGLE) and `--nominatim-timeout-secs` (default
 
 ### whereamid (daemon)
 
-Long-running process. Listens on a TCP socket (default `127.0.0.1:4747`). Newline-delimited JSON protocol (one JSON object per line, one JSON response per line). No HTTP overhead — just raw TCP + JSON lines.
+Long-running process. Listens on a Unix domain control socket gated by filesystem permissions (default `$XDG_RUNTIME_DIR/whereamid.sock`; TCP via `--bind` is opt-in and unauthenticated — see [ADR-003](docs/adr/003-unix-socket-access-control.md)). Newline-delimited JSON protocol (one JSON object per line, one JSON response per line). No HTTP overhead — just raw sockets + JSON lines.
 
 Responsibilities:
 - Accept queries over TCP
@@ -364,7 +364,7 @@ All operational parameters are **CLI args only** — no config file for these. S
 
 ```
 whereamid \
-  --bind 127.0.0.1:4747 \
+  --socket $XDG_RUNTIME_DIR/whereamid.sock \  # default; TCP via --bind is opt-in
   --db /var/lib/whereami/aps.sqlite \
   --interface wlan0 \
   --config ~/.config/whereami/config.toml \
@@ -448,7 +448,8 @@ A NixOS module at `nix/module.nix` that provides:
 ```nix
 services.whereami = {
   enable = true;
-  bind = "127.0.0.1:4747";
+  allowedUsers = [ "alice" ];   # users allowed to query the unix socket
+  # bind = "127.0.0.1:4747";    # opt-in, unauthenticated TCP (off by default)
   wifiInterface = "wlan0";
   wigle = {
     apiUser = "";    # or read from a secrets file

@@ -3,6 +3,37 @@
 All notable changes to whereami. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows semver.
 
+## [Unreleased]
+
+### Security / Changed — BREAKING: control channel is now a Unix domain socket
+
+The daemon's control channel moved from unauthenticated loopback TCP to a **Unix
+domain socket gated by filesystem permissions** (task-0196,
+[ADR-003](docs/adr/003-unix-socket-access-control.md)). Previously any local user
+could `nc 127.0.0.1:4747` and read location history, live position and Wi-Fi
+scans, and drive WiGLE lookups under the owner's credentials. **Daemon and
+client must be upgraded together.**
+
+- **Daemon:** serves on a unix socket by default (`--socket`, else
+  `$XDG_RUNTIME_DIR/whereamid.sock`, else `/run/whereami/whereamid.sock`),
+  chmodded 0600 on self-bind with a fail-closed re-stat. Supports systemd socket
+  activation (fd 3) so the system `DynamicUser` service can be reached by members
+  of the new `whereami` group via a `root:whereami` 0660 socket.
+- **`--bind` is now opt-in** (`Option`, default off) and **parsed** (garbage is
+  rejected at startup, not silently accepted). A non-loopback bind requires the
+  new `--allow-nonlocal-bind`; loopback TCP still warns that it is
+  unauthenticated. `SO_PEERCRED` is logged (debug) for auditability but not
+  enforced (the group model needs cross-UID connects).
+- **Client / `whereami` CLI:** resolves the daemon via `$WHEREAMI_SOCKET` →
+  `$WHEREAMI_ADDR` (TCP, for old daemons) → the default socket paths, with **no**
+  implicit fallback to `127.0.0.1:4747` (port-squatting impersonation). Reach an
+  old TCP daemon with `WHEREAMI_ADDR=127.0.0.1:4747`.
+- **NixOS / home-manager:** `services.whereami.bind` is now `nullOr` (default
+  `null`); new options `socketPath`, `allowNonlocalBind`, and `allowedUsers`
+  (system-only: populates the `whereami` group). The system module adds a
+  `whereamid.socket` unit; the home-manager service self-binds under
+  `%t` (`$XDG_RUNTIME_DIR`).
+
 ## [0.6.2] — 2026-05-21
 
 Documentation + planning release. No code changes.

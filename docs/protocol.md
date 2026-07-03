@@ -5,13 +5,80 @@ link here rather than describing the protocol redundantly.
 
 ## Transport
 
-- TCP, default `127.0.0.1:4747` (configurable via `--bind`).
-- One-shot connection: connect, send one JSON object as a UTF-8 line
-  terminated by `\n`, read one JSON response as a UTF-8 line, close.
+The canonical transport is a **Unix domain socket**. Access is gated by
+filesystem permissions on the socket — the Unix-native access-control model (see
+[ADR-003](adr/003-unix-socket-access-control.md)). This replaced the original
+loopback-TCP transport ([ADR-001](adr/001-tcp-json-lines.md)) because *any* local
+user could `nc 127.0.0.1:4747` and read location history, live position and
+Wi-Fi scans, and drive WiGLE lookups under the owner's credentials — TCP on
+localhost has no peer authentication.
+
+- One-shot connection: connect, send one JSON object as a UTF-8 line terminated
+  by `\n`, read one JSON response as a UTF-8 line, close.
 - Maximum request size: **64 KiB**. Larger payloads are rejected with
   `invalid request: EOF while parsing a value`.
 - Read timeout: **5 s** (server gives up if the request line doesn't arrive).
 - Write timeout: **5 s** (server gives up if the client reads slowly).
+
+### Socket path (daemon)
+
+The daemon serves on a unix socket, chosen at startup in this order:
+
+1. `--socket <path>` if given.
+2. else `$XDG_RUNTIME_DIR/whereamid.sock` if `XDG_RUNTIME_DIR` is set.
+3. else `/run/whereami/whereamid.sock`.
+
+When the daemon self-binds, it tightens the socket to mode **0600** (owner-only)
+and fails to start if the mode does not take (a FUSE/network filesystem that
+ignores `chmod` must not silently leave the control channel exposed). A stale
+socket file from a crashed daemon is detected (connect refused) and removed; a
+socket a *live* daemon still owns is never stolen — startup fails instead.
+
+**systemd socket activation.** When `whereamid` is started with `LISTEN_FDS`/
+`LISTEN_PID` set, it adopts the passed fd (fd 3) as its listener and skips
+unlink/chmod/cleanup entirely (systemd owns the socket file). The NixOS system
+service uses this: systemd creates `/run/whereami/whereamid.sock` as
+`root:whereami` mode **0660** *before* the (DynamicUser) daemon starts, so
+members of the `whereami` group can connect without the daemon needing a fixed
+UID. `LISTEN_FDS > 1` is a startup error.
+
+### Access-control model
+
+- **Self-bound (home-manager / manual):** socket is mode 0600 under
+  `$XDG_RUNTIME_DIR` (itself 0700, user-owned) — single-user by construction.
+- **System service:** socket is mode 0660 `root:whereami`; the operator lists
+  the permitted users in `services.whereami.allowedUsers`, which populates the
+  `whereami` group. Non-members get `EACCES`/connection-refused on connect.
+
+The daemon logs the connecting peer's `SO_PEERCRED` (uid/gid/pid) at debug level
+for auditability but does **not** enforce same-UID in-process — that would break
+the system-service group model, where systemd hands a group-readable socket to a
+DynamicUser daemon whose UID legitimately differs from the caller's. Filesystem
+permissions on the socket are the sole access-control mechanism.
+
+### Client socket resolution
+
+The `whereami` CLI / `whereami-client` library resolve the daemon target as:
+
+1. `$WHEREAMI_SOCKET` — a unix socket path, used verbatim (no existence check).
+2. `$WHEREAMI_ADDR` — a TCP `host:port` (for old TCP daemons / custom setups).
+3. the first EXISTING of `$XDG_RUNTIME_DIR/whereamid.sock`,
+   `/run/whereami/whereamid.sock`.
+4. otherwise an error naming the probed paths and the two overrides.
+
+There is **no** automatic fallback to `127.0.0.1:4747`: after the daemon vacates
+that port any local user could squat it and impersonate the daemon (an integrity
+downgrade). Point the client at an old TCP daemon explicitly via `WHEREAMI_ADDR`.
+
+### TCP (opt-in, unauthenticated)
+
+TCP is available via `--bind <host:port>` but is **off by default**. It has no
+peer authentication: every local user (loopback) — or, for a non-loopback
+address, every reachable host — can read location history / live position /
+Wi-Fi scans and drive WiGLE quota. The daemon warns loudly at startup when TCP
+is enabled, and **refuses** a non-loopback bind unless `--allow-nonlocal-bind`
+is also passed. Prefer the unix socket; use TCP only for deliberate remote
+access you have otherwise secured.
 
 ## Request format
 
@@ -220,18 +287,22 @@ whereami --json locate         # raw JSON
 whereami history 24h
 ```
 
-### Bash + `nc` / `socat`
+### Bash + `nc` / `socat` (unix socket)
 
 ```bash
-printf '{"cmd":"locate"}\n' | nc -q1 127.0.0.1 4747
-echo '{"cmd":"history","range":"7d"}' | socat - TCP:127.0.0.1:4747
+SOCK="${XDG_RUNTIME_DIR:-/run/whereami}/whereamid.sock"
+printf '{"cmd":"locate"}\n' | nc -q1 -U "$SOCK"
+echo '{"cmd":"history","range":"7d"}' | socat - UNIX-CONNECT:"$SOCK"
 ```
 
 ### Python (no dependencies)
 
 ```python
-import json, socket
-with socket.create_connection(("127.0.0.1", 4747)) as s:
+import json, os, socket
+sock_path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/run/whereami"),
+                         "whereamid.sock")
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+    s.connect(sock_path)
     s.sendall(b'{"cmd":"locate"}\n')
     s.shutdown(socket.SHUT_WR)
     line = s.makefile("r").readline()
@@ -242,9 +313,14 @@ print(json.loads(line))
 
 ```rust
 use whereami_client::WhereAmIClient;
-let resp = WhereAmIClient::default_addr().locate()?;
+// Resolves the socket from the environment (WHEREAMI_SOCKET / WHEREAMI_ADDR /
+// the default paths). Use WhereAmIClient::unix(path) or ::tcp(addr) to pin one.
+let resp = WhereAmIClient::from_env()?.locate()?;
 println!("{:.6}, {:.6}  ±{}m", resp.lat, resp.lon, resp.accuracy_m as i64);
 ```
+
+(For an old TCP-only daemon, export `WHEREAMI_ADDR=127.0.0.1:4747` or use
+`WhereAmIClient::tcp("127.0.0.1:4747")`.)
 
 ## Versioning
 

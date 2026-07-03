@@ -15,7 +15,7 @@ Long-running daemon (whereamid) owns all state. A thin Rust client library wraps
 
 - Daemon accumulates scan history and cache independently of callers. No cold-start penalty per query.
 - Background tasks (scanning, pending drain) run regardless of whether anyone is asking.
-- Client lib is optional — the protocol is simple enough that `echo '{"cmd":"locate"}' | nc localhost 4747` works.
+- Client lib is optional — the protocol is simple enough that `echo '{"cmd":"locate"}' | nc -qU1 "$XDG_RUNTIME_DIR/whereamid.sock"` works (the transport is now a unix socket; see ADR-003).
 - Separating the daemon from callers means a Python script, a shell alias, and a Rust binary can all consume the same service.
 
 ## Consequences

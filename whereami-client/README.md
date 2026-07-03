@@ -1,8 +1,9 @@
 # whereami-client
 
 Typed Rust client for the [whereamid](https://github.com/anthropics/whereami)
-geolocation daemon. Speaks the JSON-lines TCP protocol documented in
-[docs/protocol.md](../docs/protocol.md).
+geolocation daemon. Speaks the JSON-lines protocol documented in
+[docs/protocol.md](../docs/protocol.md) — a Unix domain socket by default, with
+opt-in TCP.
 
 The crate ships two artefacts:
 - A library with typed request/response structs (`LocateResponse`,
@@ -15,7 +16,10 @@ The crate ships two artefacts:
 ```rust
 use whereami_client::WhereAmIClient;
 
-let client = WhereAmIClient::default_addr();   // 127.0.0.1:4747
+// Resolve the daemon from the environment: WHEREAMI_SOCKET / WHEREAMI_ADDR /
+// the default unix-socket paths ($XDG_RUNTIME_DIR/whereamid.sock, then
+// /run/whereami/whereamid.sock).
+let client = WhereAmIClient::from_env()?;
 
 // Where am I?
 let resp = client.locate()?;
@@ -27,9 +31,10 @@ for seg in &h.segments {
     println!("{} -> {}  {} fixes", seg.start_rfc3339, seg.end_rfc3339, seg.n_fixes);
 }
 
-// Custom address.
-let other = WhereAmIClient::new("10.0.0.5:4747");
-let stats = other.stats()?;
+// Pin a specific transport instead of resolving from the environment:
+let via_socket = WhereAmIClient::unix("/run/whereami/whereamid.sock");
+let via_tcp = WhereAmIClient::tcp("10.0.0.5:4747"); // opt-in, unauthenticated
+let stats = via_socket.stats()?;
 ```
 
 All daemon responses share an `ok: bool` flag and an `error: Option<String>`
@@ -56,8 +61,11 @@ whereami --json locate                   # raw JSON output for any subcommand
 whereami help
 ```
 
-The CLI assumes the daemon is on `127.0.0.1:4747`. For non-default addresses
-use the library directly.
+The CLI reaches the daemon over its unix control socket by default
+(`$XDG_RUNTIME_DIR/whereamid.sock`, else `/run/whereami/whereamid.sock`).
+Override with `WHEREAMI_SOCKET=<path>`, or point at an old TCP daemon with
+`WHEREAMI_ADDR=<host:port>` (e.g. `127.0.0.1:4747`). See
+[docs/protocol.md](../docs/protocol.md) for the access-control model.
 
 ## Wire protocol
 
