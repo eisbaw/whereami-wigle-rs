@@ -1971,6 +1971,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "libc",
  "proptest",
  "reqwest",
  "rusqlite",

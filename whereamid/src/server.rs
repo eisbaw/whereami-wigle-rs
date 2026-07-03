@@ -427,6 +427,66 @@ fn parse_listen_fds(
     Ok(Some(SD_LISTEN_FDS_START))
 }
 
+/// Verify an adopted fd really is a *listening AF_UNIX* socket (what
+/// `sd_is_socket_unix` does in libsystemd). `parse_listen_fds` only validates
+/// the LISTEN_* env integers; a wrong fd from a broken parent would otherwise
+/// surface later as a confusing accept/epoll error instead of a clean startup
+/// failure (task-0196 review hardening, mped M3).
+///
+/// - `local_addr()` (getsockname) fails with ENOTSOCK on a non-socket fd and
+///   with an address-family error on a non-unix socket.
+/// - `SO_ACCEPTCONN` distinguishes a listening socket from a connected one.
+pub fn verify_unix_listener_fd(listener: &std::os::unix::net::UnixListener) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    listener
+        .local_addr()
+        .context("socket-activated fd is not an AF_UNIX socket (getsockname failed)")?;
+    let fd = listener.as_raw_fd();
+    let mut accepting: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // Safety: fd is owned by `listener` (open for its lifetime); `accepting`
+    // and `len` are valid, correctly-sized out-parameters for this sockopt.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ACCEPTCONN,
+            &mut accepting as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("getsockopt(SO_ACCEPTCONN) on socket-activated fd");
+    }
+    if accepting == 0 {
+        anyhow::bail!(
+            "socket-activated fd is an AF_UNIX socket but is not listening (SO_ACCEPTCONN=0); \
+             expected a ListenStream= socket from systemd"
+        );
+    }
+    Ok(())
+}
+
+/// Set FD_CLOEXEC on an adopted fd. systemd passes activation fds WITHOUT
+/// close-on-exec (by design — the service is meant to inherit them), but this
+/// daemon spawns `nmcli`/`iw` children that must not inherit the control
+/// socket. Self-bound sockets are unaffected (Rust binds with SOCK_CLOEXEC);
+/// only the socket-activation path needs this (task-0196 review hardening,
+/// mped L1).
+pub fn set_cloexec(fd: i32) -> Result<()> {
+    // Safety: plain fcntl on an fd the caller owns; no memory is passed.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error()).context("fcntl(F_GETFD)");
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).context("fcntl(F_SETFD, FD_CLOEXEC)");
+    }
+    Ok(())
+}
+
 /// Bind a Unix domain socket at `path`, recovering from a stale socket file and
 /// tightening the result to owner-only (0600). Fails closed (task-0196):
 ///
@@ -444,8 +504,20 @@ fn parse_listen_fds(
 /// tokio. Kept sync + std so it is unit-testable without a runtime.
 pub fn self_bind_unix(path: &Path) -> Result<std::os::unix::net::UnixListener> {
     handle_stale_socket(path)?;
-    let listener = std::os::unix::net::UnixListener::bind(path)
-        .with_context(|| format!("binding unix socket {}", path.display()))?;
+    // Bind under a tightened umask so the socket is never observable looser
+    // than 0600, even for an instant. Without this, a caller umask of e.g.
+    // 0022 leaves a group/other-writable socket in the window before the
+    // chmod below (task-0196 review hardening, mped L2). Tightening is the
+    // safe direction for any file another thread might create concurrently.
+    // Safety: umask() only swaps an integer in process state; no memory.
+    let old_umask = unsafe { libc::umask(0o077) };
+    let bind_result = std::os::unix::net::UnixListener::bind(path);
+    unsafe { libc::umask(old_umask) };
+    let listener =
+        bind_result.with_context(|| format!("binding unix socket {}", path.display()))?;
+    // Belt and braces: the umask handles the window; the chmod + fail-closed
+    // re-stat guarantees the FINAL mode even on filesystems that ignore mode
+    // bits at bind time.
     chmod_socket_0600_or_bail(path)?;
     Ok(listener)
 }
@@ -1678,6 +1750,82 @@ mod transport_tests {
     }
 
     #[test]
+    fn verify_listener_fd_accepts_listening_unix_socket() {
+        let dir = unique_tempdir("verify-ok");
+        let sock = dir.join("whereamid.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        verify_unix_listener_fd(&listener).expect("a bound+listening unix socket must pass");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_listener_fd_rejects_connected_socket() {
+        // A CONNECTED unix socket (socketpair-style) is AF_UNIX but not
+        // listening: SO_ACCEPTCONN must catch it. This is the "systemd handed
+        // us a Connect= / wrong fd" case.
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Reborrow the stream fd as a listener WITHOUT taking ownership:
+        // ManuallyDrop never runs the listener's close, so `a` closes the fd
+        // exactly once even if an assertion below panics.
+        let fd = a.as_raw_fd();
+        // Safety: the fake listener is ManuallyDrop, so ownership stays with
+        // `a`; the fd outlives every use of `fake` in this scope.
+        let fake = std::mem::ManuallyDrop::new(unsafe {
+            std::os::unix::net::UnixListener::from_raw_fd(fd)
+        });
+        let err = verify_unix_listener_fd(&fake).expect_err("connected socket must be rejected");
+        assert!(
+            format!("{err:#}").contains("not listening"),
+            "error must say the fd is not listening, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn verify_listener_fd_rejects_regular_file() {
+        // A non-socket fd (regular file) must fail cleanly at getsockname
+        // instead of surfacing later as a confusing accept/epoll error.
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        let dir = unique_tempdir("verify-file");
+        let path = dir.join("plain-file");
+        std::fs::write(&path, b"x").unwrap();
+        let fd = std::fs::File::open(&path).unwrap().into_raw_fd();
+        // Safety: we own fd (into_raw_fd released it); the fake listener now
+        // owns it and closes it exactly once on drop.
+        let fake = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+        let err = verify_unix_listener_fd(&fake).expect_err("regular file must be rejected");
+        assert!(
+            format!("{err:#}").contains("not an AF_UNIX socket"),
+            "error must say the fd is not a unix socket, got: {err:#}"
+        );
+        drop(fake);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_cloexec_sets_the_flag() {
+        use std::os::unix::io::AsRawFd;
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = a.as_raw_fd();
+        // Rust creates sockets with SOCK_CLOEXEC already; clear it first so the
+        // test proves set_cloexec SETS the flag rather than observing a default.
+        // Safety: plain fcntl on an fd we own; no memory passed.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            assert!(flags >= 0);
+            assert_eq!(libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC), 0);
+        }
+        set_cloexec(fd).expect("set_cloexec must succeed on an open fd");
+        // Safety: as above.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags >= 0 && (flags & libc::FD_CLOEXEC) != 0,
+            "FD_CLOEXEC must be set after set_cloexec (flags={flags})"
+        );
+    }
+
+    #[test]
     fn parse_listen_fds_cases() {
         // Not socket-activated (env absent).
         assert_eq!(parse_listen_fds(None, None, 42).unwrap(), None);
@@ -1737,5 +1885,43 @@ mod transport_tests {
             v.get("version").and_then(|x| x.as_str()).is_some(),
             "version response must carry a version string, got {line}"
         );
+    }
+
+    /// Behavioral parity for the opt-in TCP transport: the same generic
+    /// `handle_connection` answers a `version` request over a TcpStream
+    /// (QA review LOW-3 — before this, TCP was exercised only via bind
+    /// success/failure, never a real exchange). Binds an ephemeral kernel-
+    /// assigned port on loopback; hermetic, never port 4747.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tcp_round_trip_version_via_handle_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert_ne!(addr.port(), 4747, "must never test against the real port");
+
+        let state = test_state();
+        let server = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            handle_connection(stream, state).await.unwrap();
+        });
+
+        let line = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let mut s = std::net::TcpStream::connect(addr).expect("connect");
+            s.write_all(b"{\"cmd\":\"version\"}\n").unwrap();
+            s.flush().unwrap();
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut line = String::new();
+            BufReader::new(s).read_line(&mut line).unwrap();
+            line
+        })
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("response must be one JSON line");
+        assert_eq!(v["ok"], serde_json::json!(true), "got {line}");
+        assert_eq!(v["v"], serde_json::json!(1));
     }
 }

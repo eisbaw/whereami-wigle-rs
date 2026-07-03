@@ -27,6 +27,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
+# Raw fcntl/getsockopt/umask for the socket-activation fd checks and the
+# self-bind umask tightening (task-0196 review hardening). Already in the lock
+# graph transitively; this only promotes it to a direct dep.
+libc = "0.2"
 
 [dev-dependencies]
 proptest = "1.11.0"

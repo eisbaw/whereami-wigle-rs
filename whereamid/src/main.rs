@@ -372,9 +372,16 @@ fn setup_unix_listener(args: &Args) -> Result<(tokio::net::UnixListener, Option<
         }
         info!("control channel: adopting systemd socket-activated fd {fd}");
         // Safety: sd_listen_fd verified LISTEN_PID == our pid and LISTEN_FDS ==
-        // 1, so fd `SD_LISTEN_FDS_START` is an open, listening AF_UNIX socket
-        // owned by this process. We take sole ownership of it here.
+        // 1, so fd `SD_LISTEN_FDS_START` is addressed to this process and
+        // nothing else in this program uses it — we take sole ownership here.
+        // That the fd actually IS a listening AF_UNIX socket is NOT implied by
+        // the env vars; verify_unix_listener_fd checks it explicitly below.
         let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+        server::verify_unix_listener_fd(&std_listener)?;
+        // systemd passes activation fds without close-on-exec; set it so the
+        // nmcli/iw child processes this daemon spawns cannot inherit the
+        // control socket.
+        server::set_cloexec(fd).context("setting FD_CLOEXEC on socket-activated fd")?;
         std_listener
             .set_nonblocking(true)
             .context("set_nonblocking on socket-activated fd")?;

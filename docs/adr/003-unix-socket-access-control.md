@@ -75,6 +75,14 @@ opt-in.
   `WHEREAMI_ADDR`; a new client can reach an old TCP daemon the same way.
 - The daemon is Linux/Unix-only (already true: tokio unix signals, nmcli/iw).
 - Non-loopback bind now requires an explicit `--allow-nonlocal-bind` opt-in.
+- **Startup-failure asymmetry:** a unix-socket bind failure aborts startup with
+  a non-zero exit (it is the mandatory transport), but an opt-in TCP `--bind`
+  failure currently flows through the server task's self-exit path and the
+  daemon exits **0** — an operator who explicitly requested TCP gets a daemon
+  that died claiming success, and the working unix socket goes down with it.
+  Task-0233 tracks the fix (graceful degrade: keep serving unix, warn loudly),
+  chosen over making TCP failure fatal so the optional transport can never kill
+  the mandatory one.
 - The `whereami` group and the socket's mode/owner are the security-critical
   surface for the system service; the NixOS VM test (task-0209) must assert
   them (socket 0660 `root:whereami`; non-member refused; member served; the

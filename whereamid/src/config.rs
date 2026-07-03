@@ -143,6 +143,15 @@ impl Args {
                      every host that can reach it. Pass --allow-nonlocal-bind to confirm."
                 );
             }
+        } else if self.allow_nonlocal_bind {
+            // Silent no-ops are how misconfigurations hide: the operator who
+            // passes this flag believes TCP is on (task-0196 review, mped L3).
+            anyhow::bail!("--allow-nonlocal-bind has no effect without --bind");
+        }
+        if let Some(socket) = &self.socket {
+            if socket.trim().is_empty() {
+                anyhow::bail!("--socket must not be empty");
+            }
         }
         if self.debounce_window == 0 {
             anyhow::bail!("--debounce-window must be > 0");
@@ -367,5 +376,27 @@ mod tests {
         let addr = args.parsed_bind().unwrap().unwrap();
         assert_eq!(addr.port(), 4747);
         assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn allow_nonlocal_bind_without_bind_rejected() {
+        // The flag alone would be a silent no-op — the operator who passes it
+        // believes TCP is on. Fail fast instead (task-0196 review, mped L3).
+        let err = parse(&["--allow-nonlocal-bind"])
+            .validate()
+            .expect_err("--allow-nonlocal-bind without --bind must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--bind"),
+            "error must point at the missing flag, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_socket_path_rejected() {
+        // An empty --socket would otherwise fail later at bind time with a
+        // confusing error instead of at validation (task-0196 review, mped L4).
+        assert!(parse(&["--socket", ""]).validate().is_err());
+        assert!(parse(&["--socket", "  "]).validate().is_err());
     }
 }
