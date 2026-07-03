@@ -38,6 +38,18 @@ e2e:
 # Full pre-commit gate including format check and short fuzz smoke
 qa: e2e fmt fuzz
 
+# --- Nix flake checks (reproducible, run in the Nix sandbox; task-0209) ---
+# These are minutes-long (they build the workspace and boot a NixOS VM), so
+# they are deliberately kept OUT of `e2e` — e2e stays the fast pre-commit gate.
+
+# Run all flake checks: package build, clippy (-D warnings), tests, fmt, VM test
+nix-check:
+    nix flake check -L
+
+# Build just the NixOS VM module test (x86_64-linux, needs KVM); iterate here
+vm-test:
+    nix build .#checks.x86_64-linux.vm -L
+
 # --- Fuzz targets (nightly Rust via flake devShell) ---
 # Each fuzz-<name> recipe runs indefinitely; Ctrl-C to stop.
 # `fuzz` is a short smoke (15s/target); `fuzz-all` is 60s/target.

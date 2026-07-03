@@ -37,9 +37,18 @@
       });
 
       # `nix flake check` runs these for every supported system: the package
-      # build, clippy (-D warnings), the test suite and a format check. They
-      # share the crane cargoArtifacts (built once per system). task-0209.
-      checks = forAllSystems (system: (whereamiFor system).checks);
+      # build, clippy (-D warnings), the test suite and a format check, plus a
+      # NixOS VM test that boots the module (x86_64-linux only — needs KVM).
+      # They share the crane cargoArtifacts (built once per system). task-0209.
+      checks = forAllSystems (system:
+        (whereamiFor system).checks
+        // lib.optionalAttrs (system == "x86_64-linux") {
+          vm = import ./nix/vm-test.nix {
+            inherit self;
+            pkgs = pkgsFor system;
+          };
+        }
+      );
 
       devShells = forAllSystems (system:
         let
