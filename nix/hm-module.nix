@@ -8,18 +8,41 @@ let
   # (/run/user/<uid>, mode 0700, user-owned), so the socket is single-user by
   # construction and the daemon tightens it to 0600.
   execStart = import ./exec-start.nix { inherit lib cfg; socketFlag = true; };
+
+  # task-0208: the USER service can only scan Wi-Fi via NetworkManager. The
+  # scanner (scanner.rs wifi_scan) tries nmcli then falls back to `iw scan`, but
+  # the iw path needs CAP_NET_ADMIN — a systemd --user unit cannot be granted
+  # AmbientCapabilities, so iw can never succeed here. On hosts where
+  # NetworkManager does not manage the device the daemon silently never scans.
+  # Surfaced BOTH as a build-time warning and in the wifiInterface option docs
+  # (single source of truth for the text). There is no hm VM test yet (task-0234).
+  nmOnlyNote =
+    "whereami home-manager (user service): Wi-Fi scanning requires NetworkManager"
+    + " to be actively managing the interface. The scanner uses nmcli and falls"
+    + " back to `iw scan`, but the iw path needs CAP_NET_ADMIN, which a systemd"
+    + " --user unit cannot be granted (no AmbientCapabilities). On hosts where"
+    + " NetworkManager does not manage the Wi-Fi device (iwd, bare wpa_supplicant,"
+    + " headless), the daemon can never scan and only logs 'wifi scan failed'.";
 in {
   options.services.whereami = import ./options.nix {
     inherit lib;
     dbPathDefault = "%h/.local/share/whereami/aps.sqlite";
     credentialsFileDefault = "%h/.config/whereami/config.toml";
     socketPathDefault = "%t/whereamid.sock";
+    # Append the NetworkManager-only caveat to the wifiInterface docs (task-0208).
+    wifiInterfaceExtraDoc = "\n\n" + nmOnlyNote;
   };
 
   config = lib.mkIf cfg.enable {
     # Cross-field option invariants mirroring Args::validate() (task-0207). Shared
     # with the NixOS module. home-manager implements `assertions` like NixOS.
     assertions = import ./assertions.nix { inherit lib cfg; };
+
+    # task-0208: make the NetworkManager-only scanning dependency visible at
+    # `home-manager switch` time, not just discoverable in the option docs. This
+    # daemon's whole product is a location database, so a service that silently
+    # never scans is the failure mode most worth surfacing loudly.
+    warnings = [ nmOnlyNote ];
 
     home.packages = [ cfg.package ];
 

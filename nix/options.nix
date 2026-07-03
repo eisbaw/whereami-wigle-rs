@@ -1,4 +1,7 @@
-{ lib, dbPathDefault, credentialsFileDefault, socketPathDefault }:
+# `wifiInterfaceExtraDoc` lets a caller append module-specific caveats to the
+# wifiInterface description. Default "" keeps the system module's docs clean; the
+# home-manager module passes the NetworkManager-only scanning caveat (task-0208).
+{ lib, dbPathDefault, credentialsFileDefault, socketPathDefault, wifiInterfaceExtraDoc ? "" }:
 
 # Numeric option types MIRROR whereamid's Args::validate() (config.rs) so a bad
 # value fails `nixos-rebuild` evaluation instead of crash-looping the daemon at
@@ -65,7 +68,7 @@
   wifiInterface = lib.mkOption {
     type = lib.types.str;
     default = "wlan0";
-    description = "Wi-Fi interface to scan.";
+    description = "Wi-Fi interface to scan." + wifiInterfaceExtraDoc;
   };
 
   dbPath = lib.mkOption {
