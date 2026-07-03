@@ -16,6 +16,10 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    # Cross-field option invariants mirroring Args::validate() (task-0207), so a
+    # bad combination fails `nixos-rebuild` rather than crash-looping the daemon.
+    assertions = import ./assertions.nix { inherit lib cfg; };
+
     # The `whereami` group owns the 0660 control socket; its members are the
     # users allowed to query the daemon (task-0196 / ADR-003). Empty by default,
     # so only root can connect until the owner opts users in via allowedUsers.

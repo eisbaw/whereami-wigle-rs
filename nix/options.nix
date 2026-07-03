@@ -1,5 +1,14 @@
 { lib, dbPathDefault, credentialsFileDefault, socketPathDefault }:
 
+# Numeric option types MIRROR whereamid's Args::validate() (config.rs) so a bad
+# value fails `nixos-rebuild` evaluation instead of crash-looping the daemon at
+# boot (task-0207). Policy:
+#   - lib.types.ints.positive  (>= 1): the daemon bails when the value is 0/<=0.
+#   - lib.types.ints.unsigned  (>= 0): the daemon accepts 0 — either because
+#     validate() has NO check for it (scanFastDuration, dailyLimit) or because 0
+#     is the documented "disabled" value (addressCacheTtlDays, historyRetentionDays).
+# Upper bounds are intentionally omitted: validate() has none, so the daemon's
+# clap u32/i32 range parse stays the (runtime) guard for absurdly-large values.
 {
   enable = lib.mkEnableOption "whereami Wi-Fi geolocation daemon";
 
@@ -81,61 +90,64 @@
   };
 
   dailyLimit = lib.mkOption {
-    type = lib.types.int;
+    # u32, no validate() check: 0 is accepted (effectively disables WiGLE calls).
+    type = lib.types.ints.unsigned;
     default = 100;
     description = "Maximum WiGLE API calls per day.";
   };
 
   scanIntervalFast = lib.mkOption {
-    type = lib.types.int;
+    type = lib.types.ints.positive;
     default = 10;
     description = "Scan interval during fast phase (seconds).";
   };
 
   scanFastDuration = lib.mkOption {
-    type = lib.types.int;
+    # u64, no validate() check: 0 is accepted (fast phase lasts 0s -> straight to slow).
+    type = lib.types.ints.unsigned;
     default = 60;
     description = "Duration of fast scan phase (seconds).";
   };
 
   scanIntervalSlow = lib.mkOption {
-    type = lib.types.int;
+    type = lib.types.ints.positive;
     default = 60;
     description = "Scan interval during steady phase (seconds).";
   };
 
   debounceWindow = lib.mkOption {
-    type = lib.types.int;
+    type = lib.types.ints.positive;
     default = 10;
     description = "Number of scan samples in debounce ring buffer.";
   };
 
   debounceThreshold = lib.mkOption {
-    type = lib.types.int;
+    # Also constrained <= debounceWindow by a module assertion (nix/assertions.nix).
+    type = lib.types.ints.positive;
     default = 5;
     description = "Minimum appearances to be considered stable.";
   };
 
   topN = lib.mkOption {
-    type = lib.types.int;
+    type = lib.types.ints.positive;
     default = 10;
     description = "Number of strongest APs to use for trilateration.";
   };
 
   pendingInterval = lib.mkOption {
-    type = lib.types.int;
+    type = lib.types.ints.positive;
     default = 300;
     description = "Seconds between pending queue drain runs.";
   };
 
   pendingMaxAttempts = lib.mkOption {
-    type = lib.types.int;
+    type = lib.types.ints.positive;
     default = 20;
     description = "Drop from pending after this many failed attempts.";
   };
 
   notFoundTtlDays = lib.mkOption {
-    type = lib.types.int;
+    type = lib.types.ints.positive;
     default = 30;
     description = "Days before re-checking a not-found BSSID.";
   };

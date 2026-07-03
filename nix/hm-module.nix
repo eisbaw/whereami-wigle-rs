@@ -17,6 +17,10 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    # Cross-field option invariants mirroring Args::validate() (task-0207). Shared
+    # with the NixOS module. home-manager implements `assertions` like NixOS.
+    assertions = import ./assertions.nix { inherit lib cfg; };
+
     home.packages = [ cfg.package ];
 
     systemd.user.services.whereamid = {
