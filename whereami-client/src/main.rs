@@ -23,9 +23,11 @@ use whereami_client::{DaemonResponse, LocateResponse, ScanResponse, WhereAmIClie
 
 /// `whereami` — Wi-Fi geolocation CLI.
 ///
-/// Talks JSON over TCP to the local whereamid daemon (default
-/// 127.0.0.1:4747). Output is human-readable by default; pass `--json`
-/// to get the raw daemon response on stdout.
+/// Talks JSON-lines to the local whereamid daemon over its Unix domain socket
+/// (default `$XDG_RUNTIME_DIR/whereamid.sock`, else `/run/whereami/whereamid.sock`).
+/// Override with `WHEREAMI_SOCKET=<path>`; point at an old TCP daemon with
+/// `WHEREAMI_ADDR=<host:port>`. Output is human-readable by default; pass
+/// `--json` for the raw daemon response on stdout.
 #[derive(Parser, Debug)]
 #[command(
     name = "whereami",
@@ -282,9 +284,9 @@ fn main() {
     // other well-behaved Unix filter.
     //
     // The disposition is process-wide, so it also covers writes to the
-    // daemon TCP socket (lib.rs raw_command): a daemon that accepts the
-    // connection and then closes mid-write kills the process with 141
-    // instead of the clean synthesized-JSON transport error. Still a
+    // daemon socket (unix or opt-in TCP; lib.rs raw_command): a daemon that
+    // accepts the connection and then closes mid-write kills the process with
+    // 141 instead of the clean synthesized-JSON transport error. Still a
     // loud, nonzero failure — an accepted trade-off for pipe correctness.
     //
     // Safety: signal() is async-signal-safe; we call it exactly once, before
@@ -317,7 +319,21 @@ fn main() {
         }
     };
     let json = cli.json;
-    let client = WhereAmIClient::default_addr();
+    // Resolve the daemon target (unix socket by default; TCP via WHEREAMI_ADDR).
+    // A resolution failure (no socket found and no override set) is routed
+    // through the SAME json/human split as a transport error, so `--json` still
+    // emits a single synthesized JSON line to stdout (task-0183) rather than
+    // only a stderr message — and the sigpipe/pipe semantics stay identical.
+    let client = match WhereAmIClient::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            if json {
+                emit_json(Err(e));
+            } else {
+                fatal(&sanitize(&format!("error: {e}")));
+            }
+        }
+    };
 
     // --version short-circuits all other subcommands. We render the same
     // banner the `version` subcommand produces.

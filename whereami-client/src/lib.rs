@@ -1,16 +1,111 @@
-//! whereami-client: thin TCP client for the whereamid daemon.
+//! whereami-client: thin client for the whereamid daemon.
 //!
-//! Connect to the daemon, send a JSON command, read a JSON response.
-//! Each method opens a new TCP connection (one-shot protocol).
+//! Connect to the daemon, send a JSON command, read a JSON response. Each
+//! method opens a new connection (one-shot protocol). The default transport is
+//! a Unix domain socket, gated by filesystem permissions (ADR-003); TCP is
+//! opt-in via `$WHEREAMI_ADDR` for old daemons or custom deployments.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+
+/// Where the client connects to reach the daemon (task-0196). The default
+/// transport is a Unix domain socket; TCP is opt-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectTarget {
+    /// Unix domain socket path (the default, access-controlled transport).
+    Unix(PathBuf),
+    /// TCP `host:port` (opt-in, unauthenticated).
+    Tcp(String),
+}
+
+/// Environment override naming an explicit unix socket path (highest priority).
+const ENV_SOCKET: &str = "WHEREAMI_SOCKET";
+/// Environment override naming a TCP `host:port` (old TCP daemons / custom
+/// deployments).
+const ENV_ADDR: &str = "WHEREAMI_ADDR";
+/// Default socket filename under `$XDG_RUNTIME_DIR` and `/run/whereami`.
+const SOCKET_FILENAME: &str = "whereamid.sock";
+/// System-wide default socket path (used when `$XDG_RUNTIME_DIR` is unset).
+const RUN_SOCKET: &str = "/run/whereami/whereamid.sock";
 
 /// Client for the whereamid daemon.
 pub struct WhereAmIClient {
-    addr: String,
+    target: ConnectTarget,
+}
+
+/// Resolve the default connect target from the environment (task-0196). Pure:
+/// env values and the existence probe are injected, so it never reads the
+/// host's real `$XDG_RUNTIME_DIR` in tests.
+///
+/// Order: `$WHEREAMI_SOCKET` (unix path, verbatim) → `$WHEREAMI_ADDR` (TCP) →
+/// first EXISTING of `$XDG_RUNTIME_DIR/whereamid.sock`, `/run/whereami/whereamid.sock`
+/// → error naming the probed paths and the overrides.
+///
+/// There is deliberately NO fallback to `127.0.0.1:4747`: after the daemon
+/// vacates that port, any local user could squat it and impersonate the daemon
+/// (an integrity downgrade). See ADR-003.
+fn resolve_target(
+    whereami_socket: Option<std::ffi::OsString>,
+    whereami_addr: Option<std::ffi::OsString>,
+    xdg_runtime_dir: Option<std::ffi::OsString>,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<ConnectTarget> {
+    if let Some(s) = whereami_socket {
+        if !s.is_empty() {
+            return Ok(ConnectTarget::Unix(PathBuf::from(s)));
+        }
+    }
+    if let Some(a) = whereami_addr {
+        if !a.is_empty() {
+            return Ok(ConnectTarget::Tcp(a.to_string_lossy().into_owned()));
+        }
+    }
+    let mut probed: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = xdg_runtime_dir {
+        if !dir.is_empty() {
+            let p = Path::new(&dir).join(SOCKET_FILENAME);
+            if exists(&p) {
+                return Ok(ConnectTarget::Unix(p));
+            }
+            probed.push(p);
+        }
+    }
+    let run = PathBuf::from(RUN_SOCKET);
+    if exists(&run) {
+        return Ok(ConnectTarget::Unix(run));
+    }
+    probed.push(run);
+
+    let probed_list = probed
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "no whereamid control socket found (probed: {probed_list}). Start whereamid, or set \
+         {ENV_SOCKET}=<socket path> or {ENV_ADDR}=<host:port> to point at it."
+    )
+}
+
+/// Transport abstraction so the write→shutdown→read exchange is written once
+/// for both TCP and unix streams (their `shutdown` is an inherent method, not a
+/// shared trait). task-0196.
+trait Transport: Read + Write {
+    fn shutdown_write(&self) -> std::io::Result<()>;
+}
+impl Transport for TcpStream {
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        self.shutdown(Shutdown::Write)
+    }
+}
+impl Transport for UnixStream {
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        self.shutdown(Shutdown::Write)
+    }
 }
 
 /// Common shape of every daemon response (ok flag + optional error). Used
@@ -317,30 +412,68 @@ pub struct StatsResponse {
 }
 
 impl WhereAmIClient {
-    /// Create a new client connecting to the given address (e.g. "127.0.0.1:4747").
-    pub fn new(addr: &str) -> Self {
-        Self {
-            addr: addr.to_string(),
+    /// Create a client for an explicit connect target.
+    pub fn new(target: ConnectTarget) -> Self {
+        Self { target }
+    }
+
+    /// Convenience: a TCP client for `host:port` (opt-in, unauthenticated).
+    pub fn tcp(addr: &str) -> Self {
+        Self::new(ConnectTarget::Tcp(addr.to_string()))
+    }
+
+    /// Convenience: a unix-socket client for `path`.
+    pub fn unix(path: impl Into<PathBuf>) -> Self {
+        Self::new(ConnectTarget::Unix(path.into()))
+    }
+
+    /// Resolve the default target from the environment (see [`resolve_target`]).
+    /// Errors when no daemon socket can be found and no override is set; the
+    /// caller decides how to surface that (the CLI routes it through the same
+    /// `--json`/human path as a transport error, task-0183).
+    pub fn from_env() -> Result<Self> {
+        let target = resolve_target(
+            std::env::var_os(ENV_SOCKET),
+            std::env::var_os(ENV_ADDR),
+            std::env::var_os("XDG_RUNTIME_DIR"),
+            |p| p.exists(),
+        )?;
+        Ok(Self::new(target))
+    }
+
+    /// The target this client connects to.
+    pub fn target(&self) -> &ConnectTarget {
+        &self.target
+    }
+
+    /// Send a raw JSON command and return the raw response string. Dispatches
+    /// on the transport; the exchange itself is transport-agnostic.
+    pub fn raw_command(&self, json: &str) -> Result<String> {
+        match &self.target {
+            ConnectTarget::Tcp(addr) => {
+                let stream = TcpStream::connect(addr)
+                    .with_context(|| format!("connecting to whereamid at {addr}"))?;
+                Self::exchange(stream, json)
+            }
+            ConnectTarget::Unix(path) => {
+                let stream = UnixStream::connect(path)
+                    .with_context(|| format!("connecting to whereamid at {}", path.display()))?;
+                Self::exchange(stream, json)
+            }
         }
     }
 
-    /// Create a client with the default address (127.0.0.1:4747).
-    pub fn default_addr() -> Self {
-        Self::new("127.0.0.1:4747")
-    }
-
-    /// Send a raw JSON command and return the raw response string.
-    pub fn raw_command(&self, json: &str) -> Result<String> {
-        let mut stream = TcpStream::connect(&self.addr)
-            .with_context(|| format!("connecting to whereamid at {}", self.addr))?;
+    /// One-shot request/response over any transport: write the request +
+    /// newline, half-close the write side so the daemon sees EOF, then read
+    /// exactly one response line. There is intentionally no read timeout —
+    /// parity across BOTH transports; task-0090 tracks adding one to each.
+    fn exchange<S: Transport>(mut stream: S, json: &str) -> Result<String> {
         stream
             .write_all(json.as_bytes())
             .context("sending request")?;
         stream.write_all(b"\n").context("sending newline")?;
         stream.flush().context("flushing")?;
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .context("shutdown write")?;
+        stream.shutdown_write().context("shutdown write")?;
         let mut reader = BufReader::new(stream);
         let mut response_line = String::new();
         reader
@@ -560,5 +693,112 @@ mod wire_enum_tests {
         let s = serde_json::to_string(&d).unwrap();
         let d2: DebugBssid = serde_json::from_str(&s).unwrap();
         assert_eq!(d2.db_status, DbStatus::Cached);
+    }
+}
+
+#[cfg(test)]
+mod target_resolution_tests {
+    //! task-0196: default connect-target resolution order, exercised purely —
+    //! env values and the existence probe are injected, so the tests never
+    //! touch the host's real XDG_RUNTIME_DIR, filesystem defaults, or a live
+    //! daemon.
+    use super::*;
+    use std::ffi::OsString;
+
+    fn os(s: &str) -> Option<OsString> {
+        Some(OsString::from(s))
+    }
+
+    #[test]
+    fn socket_env_wins_over_everything() {
+        let t = resolve_target(
+            os("/run/user/1000/custom.sock"),
+            os("10.0.0.5:4747"),
+            os("/run/user/1000"),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(
+            t,
+            ConnectTarget::Unix(PathBuf::from("/run/user/1000/custom.sock"))
+        );
+    }
+
+    #[test]
+    fn socket_env_used_verbatim_without_existence_check() {
+        // WHEREAMI_SOCKET is used even when the path does not exist (exists
+        // closure returns false); the connect error surfaces naturally later.
+        let t = resolve_target(os("/nonexistent/x.sock"), None, None, |_| false).unwrap();
+        assert_eq!(t, ConnectTarget::Unix(PathBuf::from("/nonexistent/x.sock")));
+    }
+
+    #[test]
+    fn addr_env_selects_tcp_when_no_socket_env() {
+        let t = resolve_target(None, os("10.0.0.5:4747"), os("/run/user/1000"), |_| true).unwrap();
+        assert_eq!(t, ConnectTarget::Tcp("10.0.0.5:4747".to_string()));
+    }
+
+    #[test]
+    fn xdg_socket_used_when_it_exists() {
+        let t = resolve_target(None, None, os("/run/user/1000"), |p| {
+            p == Path::new("/run/user/1000/whereamid.sock")
+        })
+        .unwrap();
+        assert_eq!(
+            t,
+            ConnectTarget::Unix(PathBuf::from("/run/user/1000/whereamid.sock"))
+        );
+    }
+
+    #[test]
+    fn falls_back_to_run_socket_when_xdg_socket_absent() {
+        let t = resolve_target(None, None, os("/run/user/1000"), |p| {
+            p == Path::new(RUN_SOCKET)
+        })
+        .unwrap();
+        assert_eq!(t, ConnectTarget::Unix(PathBuf::from(RUN_SOCKET)));
+    }
+
+    #[test]
+    fn errors_listing_both_probed_paths_and_overrides() {
+        let err = resolve_target(None, None, os("/run/user/1000"), |_| false).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/run/user/1000/whereamid.sock"),
+            "must list the probed XDG path: {msg}"
+        );
+        assert!(
+            msg.contains(RUN_SOCKET),
+            "must list the probed /run path: {msg}"
+        );
+        assert!(
+            msg.contains(ENV_SOCKET) && msg.contains(ENV_ADDR),
+            "must mention both env overrides: {msg}"
+        );
+    }
+
+    #[test]
+    fn never_falls_back_to_tcp_4747() {
+        // Integrity-critical: no implicit 127.0.0.1:4747 (port-squat
+        // impersonation, ADR-003). With nothing set the result is an error, and
+        // it must not suggest the old TCP port.
+        let err = resolve_target(None, None, None, |_| false).unwrap_err();
+        assert!(
+            !format!("{err}").contains("4747"),
+            "resolution must never mention the old default TCP port"
+        );
+    }
+
+    #[test]
+    fn empty_env_values_are_ignored() {
+        // Empty WHEREAMI_SOCKET / WHEREAMI_ADDR must not select an empty target.
+        let t = resolve_target(os(""), os(""), os("/run/user/1000"), |p| {
+            p == Path::new("/run/user/1000/whereamid.sock")
+        })
+        .unwrap();
+        assert_eq!(
+            t,
+            ConnectTarget::Unix(PathBuf::from("/run/user/1000/whereamid.sock"))
+        );
     }
 }

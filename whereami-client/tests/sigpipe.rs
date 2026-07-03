@@ -9,10 +9,16 @@
 //!
 //! This test spawns the real binary with its stdout pointed at a pipe whose
 //! read end is already closed, so the very first write to stdout triggers
-//! EPIPE. It depends on task-0183: with the daemon down, `--json version`
-//! still writes exactly one synthesized JSON line to stdout, which is what
-//! provokes the EPIPE. If a daemon happens to be live, the real response
-//! line provokes it just the same, so the test holds either way.
+//! EPIPE. It depends on task-0183: with the daemon unreachable, `--json
+//! version` still writes exactly one synthesized JSON line to stdout, which is
+//! what provokes the EPIPE.
+//!
+//! HERMETICITY (task-0231): the child is pointed at a guaranteed-ABSENT unix
+//! socket via `WHEREAMI_SOCKET`, and `WHEREAMI_ADDR` is cleared, so it can
+//! never reach the production daemon (or any daemon). `WHEREAMI_SOCKET` is used
+//! verbatim without an existence check, so `raw_command` gets a clean connect
+//! failure → one synthesized JSON line → the EPIPE we assert on. The test now
+//! behaves identically on hosts with and without a live daemon.
 
 #![cfg(unix)]
 
@@ -38,8 +44,27 @@ fn json_write_to_closed_pipe_dies_by_sigpipe_not_panic() {
     // Safety: write_fd is a fresh, open fd we own and reference nowhere else.
     let child_stdout = unsafe { Stdio::from_raw_fd(write_fd) };
 
+    // Point the child at a guaranteed-absent unix socket so it never touches a
+    // live daemon (task-0231). No `tempfile` dependency: a unique path under
+    // the temp dir that we never create is sufficient — WHEREAMI_SOCKET is used
+    // verbatim, so the connect simply fails with ENOENT.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let absent_socket = std::env::temp_dir().join(format!(
+        "whereami-absent-{}-{nanos}.sock",
+        std::process::id()
+    ));
+    assert!(
+        !absent_socket.exists(),
+        "the hermetic socket path must not exist"
+    );
+
     let child = Command::new(env!("CARGO_BIN_EXE_whereami"))
         .args(["--json", "version"])
+        .env("WHEREAMI_SOCKET", &absent_socket)
+        .env_remove("WHEREAMI_ADDR")
         .stdout(child_stdout)
         .stderr(Stdio::piped())
         .spawn()
