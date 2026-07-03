@@ -4,6 +4,7 @@ title: NixOS module integer options accept negatives/zero -> runtime crash
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:53'
+updated_date: '2026-07-03 07:12'
 labels:
   - nix
 dependencies: []
@@ -22,3 +23,9 @@ All numeric options in options.nix use lib.types.int, which accepts negatives an
 - [ ] #2 option numeric bounds mirror the daemon's validate() invariants
 - [ ] #3 valid configurations continue to evaluate unchanged
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Forward-carry from task-0209: the NixOS VM test (nix/vm-test.nix) is the natural place to prove this. The nonloopback node already demonstrates the pattern — boot the module with a bad option and assert the unit fails (poll `systemctl is-failed`, since a failed unit hangs wait_for_unit). options.nix uses lib.types.int with no lower bound; the daemon's clap value_parser + Args::validate() is the current runtime guard. A VM assertion (boot with e.g. debounceWindow=0 or a negative int, expect the unit to fail naming the offending flag) would lock the guard in. Same runNixOSTest gotchas apply: gate journal reads on the daemon `... unix socket ready` line; do not name a node after a Python keyword.
+<!-- SECTION:NOTES:END -->

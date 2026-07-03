@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:53'
+updated_date: '2026-07-03 07:12'
 labels:
   - nix
   - security
@@ -25,3 +26,12 @@ module.nix sets DynamicUser=true (transient UID unknowable at file-creation time
 - [ ] #2 no plaintext secret needs world-readable permissions for the service to work
 - [ ] #3 startup with a valid secrets file logs WiGLE as configured, not the not-configured warning
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Forward-carry from task-0209: nix/vm-test.nix now exists (pkgs.testers.runNixOSTest, 2 nodes: machine + nonloopback). Extend THAT test here rather than writing a new one. Gotchas learned:
+- Node names become Python variables in the test script; never name a node after a Python keyword (`nonlocal` broke the mypy type-check AND would break at runtime).
+- Type=simple socket-activated services report `active` at exec, before the daemon finishes DB migrations / reaches its listener. Gate journal assertions on the daemon's own `control channel: unix socket ready` line (wait_until_succeeds), not just wait_for_unit.
+- A failed unit hangs wait_for_unit; poll `systemctl is-failed --quiet` instead (see the nonloopback node).
+<!-- SECTION:NOTES:END -->

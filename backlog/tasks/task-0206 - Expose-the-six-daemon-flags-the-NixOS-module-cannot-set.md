@@ -4,7 +4,7 @@ title: Expose the six daemon flags the NixOS module cannot set
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:53'
-updated_date: '2026-07-03 05:50'
+updated_date: '2026-07-03 07:12'
 labels:
   - nix
 dependencies: []
@@ -28,4 +28,9 @@ options.nix (17 options) + exec-start.nix (13 flags) vs config.rs (21 flags): --
 
 <!-- SECTION:NOTES:BEGIN -->
 forward-carried from task-0196: options.nix gained socketPath, bind (now nullOr, default null), allowNonlocalBind, and allowedUsers; exec-start.nix now conditionally emits --socket/--bind/--allow-nonlocal-bind via a socketFlag param (fixed list + optionalString appends). Re-derive the missing-flag list against the CURRENT exec-start.nix before implementing — the structure changed and some targeted flags may now be covered.
+
+Forward-carry from task-0209: nix/vm-test.nix now exists (pkgs.testers.runNixOSTest, 2 nodes: machine + nonloopback). Extend THAT test here rather than writing a new one. Gotchas learned:
+- Node names become Python variables in the test script; never name a node after a Python keyword (`nonlocal` broke the mypy type-check AND would break at runtime).
+- Type=simple socket-activated services report `active` at exec, before the daemon finishes DB migrations / reaches its listener. Gate journal assertions on the daemon's own `control channel: unix socket ready` line (wait_until_succeeds), not just wait_for_unit.
+- A failed unit hangs wait_for_unit; poll `systemctl is-failed --quiet` instead (see the nonloopback node).
 <!-- SECTION:NOTES:END -->

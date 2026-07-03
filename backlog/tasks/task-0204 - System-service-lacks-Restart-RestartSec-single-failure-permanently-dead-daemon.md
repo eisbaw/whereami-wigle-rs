@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:53'
-updated_date: '2026-07-02 22:23'
+updated_date: '2026-07-03 07:12'
 labels:
   - nix
 dependencies: []
@@ -30,4 +30,9 @@ nix/module.nix serviceConfig omits Restart, so systemd default Restart=no applie
 
 <!-- SECTION:NOTES:BEGIN -->
 Forward-carried from task-0195: DECISION POINT for systemd Restart=. The daemon now exits 0 (clean Ok(())) on a bind failure — the server task logs the error and main runs the normal shutdown drain. With Restart=on-failure that clean exit-0 would NOT trigger a restart, so a transient port conflict leaves the daemon permanently dead. Either use Restart=always, OR change main to propagate a non-zero exit when the server task ends on its own (bind failure) rather than via a shutdown signal. The `server_exited` flag in main.rs already distinguishes that case cleanly.
+
+Forward-carry from task-0209: nix/vm-test.nix now exists (pkgs.testers.runNixOSTest, 2 nodes: machine + nonloopback). Extend THAT test here rather than writing a new one. Gotchas learned:
+- Node names become Python variables in the test script; never name a node after a Python keyword (`nonlocal` broke the mypy type-check AND would break at runtime).
+- Type=simple socket-activated services report `active` at exec, before the daemon finishes DB migrations / reaches its listener. Gate journal assertions on the daemon's own `control channel: unix socket ready` line (wait_until_succeeds), not just wait_for_unit.
+- A failed unit hangs wait_for_unit; poll `systemctl is-failed --quiet` instead (see the nonloopback node).
 <!-- SECTION:NOTES:END -->
