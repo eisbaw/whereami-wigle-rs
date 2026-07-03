@@ -4,6 +4,7 @@ title: Expose the six daemon flags the NixOS module cannot set
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:53'
+updated_date: '2026-07-03 05:50'
 labels:
   - nix
 dependencies: []
@@ -22,3 +23,9 @@ options.nix (17 options) + exec-start.nix (13 flags) vs config.rs (21 flags): --
 - [ ] #2 services.whereami.historyRetentionDays measurably changes the daemon's --history-retention-days
 - [ ] #3 a parity check (test or comment) guards against future flag/option drift
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+forward-carried from task-0196: options.nix gained socketPath, bind (now nullOr, default null), allowNonlocalBind, and allowedUsers; exec-start.nix now conditionally emits --socket/--bind/--allow-nonlocal-bind via a socketFlag param (fixed list + optionalString appends). Re-derive the missing-flag list against the CURRENT exec-start.nix before implementing — the structure changed and some targeted flags may now be covered.
+<!-- SECTION:NOTES:END -->
