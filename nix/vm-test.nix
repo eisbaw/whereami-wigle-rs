@@ -213,7 +213,9 @@ pkgs.testers.runNixOSTest {
             f'[ "$p" != 0 ] && [ "$p" != {old_pid} ]'
         )
         machine.wait_for_unit("whereamid.service")
-        # Re-adopted the socket-activated fd and answers again.
+        # Settle wait only: this grep also matches the PRE-kill ready line in the
+        # unit's journal history, so it does NOT prove the restarted instance is
+        # ready — the live query below is the actual proof of re-adoption.
         machine.wait_until_succeeds(
             "journalctl -u whereamid.service --no-pager | "
             "grep -F 'control channel: unix socket ready'"

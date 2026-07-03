@@ -77,8 +77,11 @@ in {
         # non-zero exit and signal death (incl. SIGKILL) but NOT a clean exit(0);
         # a self-exit on a runtime TCP-bind failure is exit(0) by design
         # (task-0195, pinned by tests/shutdown.rs) and is therefore NOT retried —
-        # a documented residual gap for the opt-in `bind` case, tracked by the
-        # fail-fast follow-up task-0237 (make server self-exit propagate non-zero).
+        # a documented residual gap for the opt-in `bind` case, tracked by
+        # task-0233. NOTE the review-endorsed fix there is graceful degrade (keep
+        # serving the mandatory unix socket, warn loudly on TCP failure) — NOT
+        # making the exit non-zero, which would let a busy opt-in TCP port
+        # crash-loop the whole daemon to start-limit-hit.
         # RestartSec is kept small so recovery is fast and the start-limit above
         # is reached quickly for a persistently-failing config.
         Restart = "on-failure";

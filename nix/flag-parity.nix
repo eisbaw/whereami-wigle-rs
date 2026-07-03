@@ -22,6 +22,9 @@ let
   # Every option exec-start.nix reads, set so all conditional flags fire. Values
   # are dummies (only the flag NAMES matter); none start with "--" so they are
   # never mistaken for flags by the prefix filter below.
+  # DELIBERATE duplication of the option list: if exec-start.nix grows a cfg
+  # field missing here, the import below throws `attribute missing` — a loud
+  # eval error, never a silent pass.
   cfg = {
     package = "/flag-parity-dummy";
     dbPath = "/flag-parity/aps.sqlite";
