@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@mped-architect'
 created_date: '2026-07-02 04:53'
-updated_date: '2026-07-03 07:13'
+updated_date: '2026-07-03 07:37'
 labels:
   - nix
   - testing
@@ -77,6 +77,21 @@ Gotchas: dirty-tree embedded rev is `aa014bf-dirty` (self.dirtyShortRev); fallba
 hm item (d): NOT done here (needs a test-scoped home-manager flake input; disproportionate). Filed task-0234 with precise ACs (self-bind socket 0600, self-bind vs socket-activation, %h DB perms). Forward-carried notes to 0204-0208 (extend this VM test) and 0229 (GIT_REV embedding).
 
 Commits: eee3816 feat(nix) checks infra + self-rev; 77735b4 test(nix) VM test + Justfile recipes.
+
+Review gate (cycle 9): qa-test-runner GO + mped-architect GO on aa014bf..77735b4. QA: nix flake check exit 0 twice (92.0s cold, 7.2s fully-cached — VM derivation reused), all 8 VM subtests confirmed executed and non-vacuous, packages.default.drvPath == checks.build.drvPath (same drv, independently reproduced by mped), 312 Rust tests + clippy + fmt clean, hermeticity confirmed (isolated NixOS-test network; both runs completed while the host daemon held 4747), host end-state pristine.
+
+In-thread hardening commit 445955f addressed:
+- mped L1: cleanCargoSource silently dropped whereamid/tests/proptests.proptest-regressions (the task-0071 corpus) — the nix test check ran proptests WITHOUT deterministic regression pins. Source filter now keeps *.proptest-regressions.
+- QA L1: VM subtest (c) now asserts the version response embeds the flake gitRev — the whole threading chain (flake binding -> preBuild -> build.rs env! -> daemon response) is machine-pinned; a broken embedding can no longer pass silently. Self-consistent on dirty trees (daemon and assert share one binding).
+- mped M1: cargoClippy comment no longer claims to "mirror" the just gate — nix checks are stable+release, devShell is nightly+debug; complementary, not mirrors. Filed task-0235 (unify-vs-keep decision).
+Re-verified after hardening: nix flake check exit 0 (full rebuild — src filter re-keyed cargoArtifacts), VM green with the new assert, just e2e + fmt exit 0.
+
+Accepted/disclosed (not code-fixed):
+- mped L2: eee3816 commit message says "byte-identical" unscoped — true for clean trees; dirty trees now embed <rev>-dirty where fetchGit embedded HEAD's rev. Disclosed here; not worth rebasing a pushed-nowhere but merged-locally commit.
+- mped L3: VM greps couple to exact daemon log strings (ready line, adopting-fd, NO peer authentication, --allow-nonlocal-bind). Breakage is loud (grep fail/timeout), accepted.
+- mped L4: scanner-failure resilience is asserted indirectly (daemon serves despite no wlan0 — visible in the run log: "scan trigger failed: command failed: No such device" followed by successful subtests). No dedicated subtest; acceptable.
+- mped L5: package.nix exposes {package, checks} rather than the plan's five-field attrset — deliberate encapsulation; new cargo-level checks are added inside package.nix.
+- QA L5: client -V/--version queries the daemon (surprising UX) — filed task-0236.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
