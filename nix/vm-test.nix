@@ -157,6 +157,33 @@ pkgs.testers.runNixOSTest {
             m = machine.succeed(f"stat -L -c %a /var/lib/whereami/{sidecar}").strip()
             assert m == "600", f"{sidecar} mode is {m}, expected 600"
 
+    with subtest("task-0204: SIGKILL triggers auto-restart and the daemon answers again"):
+        # AC#1/#2: hard-kill the running daemon and confirm Restart=on-failure
+        # brings it back with a NEW main PID that still answers on the socket.
+        # A restart that leaves a broken/silent socket is a failure, so we assert
+        # a live version response from the restarted instance (not just active).
+        old_pid = machine.succeed(
+            "systemctl show -p MainPID --value whereamid.service"
+        ).strip()
+        machine.succeed("systemctl kill --signal=SIGKILL whereamid.service")
+        # New instance == MainPID becomes nonzero AND differs from the killed one.
+        machine.wait_until_succeeds(
+            "p=$(systemctl show -p MainPID --value whereamid.service); "
+            f'[ "$p" != 0 ] && [ "$p" != {old_pid} ]'
+        )
+        machine.wait_for_unit("whereamid.service")
+        # Re-adopted the socket-activated fd and answers again.
+        machine.wait_until_succeeds(
+            "journalctl -u whereamid.service --no-pager | "
+            "grep -F 'control channel: unix socket ready'"
+        )
+        out = machine.succeed(
+            "runuser -u alice -- env WHEREAMI_SOCKET=/run/whereami/whereamid.sock "
+            "whereami version --json"
+        )
+        assert '"ok":true' in out.replace(" ", ""), \
+            f"restarted daemon must answer alice, got: {out!r}"
+
     with subtest("(e) non-loopback bind without allowNonlocalBind refuses to start"):
         nonloopback.wait_for_unit("whereamid.socket")
         # The service fails at validate() before adopting the fd; a plain

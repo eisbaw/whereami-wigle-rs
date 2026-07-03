@@ -50,8 +50,31 @@ in {
       # merely USES the socket-activated fd.
       wantedBy = [ "multi-user.target" ];
 
+      # task-0204: bound the restart backoff. StartLimit* live at the UNIT level
+      # in systemd (NixOS exposes them as these top-level attrs, NOT under
+      # serviceConfig — putting them in serviceConfig silently no-ops). If the
+      # daemon fails to start more than `Burst` times within `IntervalSec`,
+      # systemd stops retrying and leaves the unit `failed` (so a hard-failing
+      # binary cannot hot-loop). 5 starts / 60s is well clear of 5 x RestartSec
+      # (10s), so the limit is reached deterministically for a persistently
+      # failing config while a single SIGKILL restart never approaches it.
+      startLimitIntervalSec = 60;
+      startLimitBurst = 5;
+
       serviceConfig = {
         ExecStart = execStart;
+        # task-0204: without this the systemd default Restart=no applies, so a
+        # single fatal error (panic, killed process, failed DB open) leaves the
+        # daemon permanently dead until manual restart or reboot — worse than the
+        # hm unit, which already sets Restart=on-failure. on-failure covers a
+        # non-zero exit and signal death (incl. SIGKILL) but NOT a clean exit(0);
+        # a self-exit on a runtime TCP-bind failure is exit(0) by design
+        # (task-0195, pinned by tests/shutdown.rs) and is therefore NOT retried —
+        # a documented residual gap for the opt-in `bind` case (see task-0204).
+        # RestartSec is kept small so recovery is fast and the start-limit above
+        # is reached quickly for a persistently-failing config.
+        Restart = "on-failure";
+        RestartSec = 2;
         DynamicUser = true;
         StateDirectory = "whereami";
         # task-0197: the state dir and DB hold Wi-Fi location history. Make the
