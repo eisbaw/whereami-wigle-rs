@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@mped-architect'
 created_date: '2026-07-02 04:52'
-updated_date: '2026-07-03 05:51'
+updated_date: '2026-07-03 06:14'
 labels:
   - security
   - privacy
@@ -73,6 +73,19 @@ GOTCHAS: (1) tempfile is NOT a direct dev-dep (only transitive) despite the brie
 Follow-ups filed: task-0232 (first-class client --socket/--addr flags; today env-var only), task-0233 (explicit --bind failure exit code). Forward-carried notes appended to 0209, 0090, 0206, 0216.
 
 NIX honesty: modules are code-reviewed and nix-eval-verified (exec-start both variants; system socket unit + ExecStart + group + service wiring) but NOT machine-verified via flake checks / VM (task-0209).
+
+Review gate (cycle 8): qa-test-runner GO + mped-architect GO, both on range 6083ae7..f907340. QA: two full gate runs byte-identical, 305/305 pass, clippy+fmt clean, hermeticity audit clean (no test can reach a live daemon; counterfactual construction attempted and failed), security tests verified non-tautological (0600 assertion proven load-bearing under umask 0022; live-socket refusal traced to nonzero exit through three independent guards).
+
+In-thread hardening commit 946e266 addressed all actionable findings:
+- M2: the earlier note here claimed the TCP-bind-failure exit-0 asymmetry was documented in ADR-003 — it was NOT at that time. ADR-003 Consequences now actually documents it (with the task-0233 ref). Doc-honesty defect class, caught by review.
+- M3: socket-activated fd 3 is now VERIFIED to be a listening AF_UNIX socket (getsockname + SO_ACCEPTCONN, libsystemd sd_is_socket_unix parity) instead of trusted from LISTEN_* env; the unsafe comment no longer overclaims. Unit tests: listening socket passes, connected socketpair rejected, regular file rejected.
+- L1: FD_CLOEXEC set on the adopted fd (systemd passes it without CLOEXEC; nmcli/iw children no longer inherit the control socket). Test proves the flag is SET, not defaulted.
+- L2: self-bind now happens under umask 0077 (saved/restored) so the socket is never observable looser than 0600 even pre-chmod; chmod+re-stat kept as belt-and-braces.
+- L3/L4: validate() rejects --allow-nonlocal-bind without --bind and empty/whitespace --socket.
+- QA LOW-3: added tcp_round_trip_version_via_handle_connection (generic handler answers over a real TcpStream, ephemeral port).
+Gate after hardening: 174 whereamid-bin tests (up from 167), all 9 binaries green x2 runs, clippy -D warnings clean, fmt clean.
+
+Accepted/not-chased: QA LOW-4 (non-loopback bind covered at validate()+wiring level, no spawned-daemon e2e), QA LOW-5 (sigterm 300ms sleep pre-existing theoretical flake, stable across runs), QA MEDIUM-1 (real-systemd fd adoption untestable locally, 0209 VM scope; the new fd verification narrows the untested surface to tokio from_std registration).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

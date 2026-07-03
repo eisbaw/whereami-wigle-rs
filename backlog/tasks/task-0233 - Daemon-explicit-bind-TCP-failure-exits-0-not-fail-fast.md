@@ -4,10 +4,12 @@ title: 'Daemon: explicit --bind TCP failure exits 0, not fail-fast'
 status: To Do
 assignee: []
 created_date: '2026-07-03 05:49'
+updated_date: '2026-07-03 06:14'
 labels:
   - daemon
   - robustness
 dependencies: []
+priority: medium
 ---
 
 ## Description
@@ -22,3 +24,9 @@ task-0196 kept the pre-existing behavior that a TCP --bind failure inside run_se
 - [ ] #2 the unix socket remains the mandatory transport; its bind failure stays fatal
 - [ ] #3 shutdown.rs test updated to encode the chosen behavior
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Review gate (cycle 8, mped-architect M1): rated MEDIUM, acceptable-as-filed but prioritize BEFORE anyone deploys with --bind. Preferred fix direction from review: graceful degrade (keep serving the mandatory unix socket, warn loudly on TCP failure) rather than making TCP failure fatal — the optional transport must never kill the mandatory one. Note the hm unit has Restart=on-failure (exit 0 = no restart) and the system unit has no Restart= at all (task-0204), so today the failure mode is a dead daemon reported as success.
+<!-- SECTION:NOTES:END -->

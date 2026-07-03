@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@mped-architect'
 created_date: '2026-07-02 22:42'
-updated_date: '2026-07-03 05:52'
+updated_date: '2026-07-03 06:14'
 labels:
   - testing
 dependencies: []
@@ -40,6 +40,8 @@ NOTE: the brief said tempfile is a workspace dev-dep; it is NOT (only transitive
 AC#2 verification (grep of test code): the only 4747 references in tests are shutdown.rs SAFETY doc + two assert_ne!(port, 4747) guards (never connect), config.rs --bind ARG VALUES (pure Args::parse_from, no network), and lib.rs resolve_target unit tests using a MOCK 10.0.0.5:4747 with an injected exists-closure (no network) plus the never_falls_back_to_tcp_4747 assertion. `grep TcpStream::connect|create_connection` across tests/: none. No test connects to 127.0.0.1:4747.
 
 Gate: sigpipe test passes (1 passed) in the full e2e run.
+
+Review gate (cycle 8): QA verified hermeticity end-to-end — WHEREAMI_SOCKET override is honored before any default probing (unit test socket_env_used_verbatim_without_existence_check), WHEREAMI_ADDR is neutralized in the test env, and no workspace test can construct a connection to a live daemon on either transport. GO.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
