@@ -12,17 +12,34 @@
 
   outputs = { self, nixpkgs, crane, fenix }:
     let
+      lib = nixpkgs.lib;
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
-      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+      forAllSystems = lib.genAttrs supportedSystems;
       pkgsFor = system: nixpkgs.legacyPackages.${system};
+
+      # The flake's own git revision, resolved PURELY (no fetchGit) so
+      # `nix flake check` can evaluate. Clean tree -> shortRev; dirty working
+      # tree (e.g. mid-development) -> dirtyShortRev; detached/unknown ->
+      # "unknown". Threaded into package.nix's preBuild. task-0209.
+      gitRev = self.shortRev or self.dirtyShortRev or "unknown";
+
+      # Single entry point for the crane-built package + its checks, so the
+      # dependency artifacts are computed once and shared (package.nix).
+      whereamiFor = system:
+        let pkgs = pkgsFor system; in
+        pkgs.callPackage ./nix/package.nix {
+          craneLib = crane.mkLib pkgs;
+          inherit gitRev;
+        };
     in {
-      packages = forAllSystems (system:
-        let pkgs = pkgsFor system; in {
-          default = pkgs.callPackage ./nix/package.nix {
-            craneLib = crane.mkLib pkgs;
-          };
-        }
-      );
+      packages = forAllSystems (system: {
+        default = (whereamiFor system).package;
+      });
+
+      # `nix flake check` runs these for every supported system: the package
+      # build, clippy (-D warnings), the test suite and a format check. They
+      # share the crane cargoArtifacts (built once per system). task-0209.
+      checks = forAllSystems (system: (whereamiFor system).checks);
 
       devShells = forAllSystems (system:
         let
@@ -66,14 +83,16 @@
         imports = [ ./nix/module.nix ];
         services.whereami.package = lib.mkDefault (pkgs.callPackage ./nix/package.nix {
           craneLib = crane.mkLib pkgs;
-        });
+          inherit gitRev;
+        }).package;
       };
 
       homeManagerModules.default = { pkgs, lib, ... }: {
         imports = [ ./nix/hm-module.nix ];
         services.whereami.package = lib.mkDefault (pkgs.callPackage ./nix/package.nix {
           craneLib = crane.mkLib pkgs;
-        });
+          inherit gitRev;
+        }).package;
       };
     };
 }
