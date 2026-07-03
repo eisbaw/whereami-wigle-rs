@@ -6,7 +6,14 @@ let
   # The system service uses systemd socket activation (fd 3), so ExecStart must
   # NOT pass --socket (socketFlag = false); cfg.socketPath is instead the socket
   # unit's ListenStream path.
-  execStart = import ./exec-start.nix { inherit lib cfg; socketFlag = false; };
+  execStart = import ./exec-start.nix {
+    inherit lib cfg;
+    socketFlag = false;
+    # DynamicUser's random UID cannot read a 0600 root config, so secrets are
+    # delivered via systemd LoadCredential and --config points at the credentials
+    # directory rather than cfg.credentialsFile (task-0205).
+    credentialsFromSystemd = true;
+  };
 in {
   options.services.whereami = import ./options.nix {
     inherit lib;
@@ -70,7 +77,8 @@ in {
         # non-zero exit and signal death (incl. SIGKILL) but NOT a clean exit(0);
         # a self-exit on a runtime TCP-bind failure is exit(0) by design
         # (task-0195, pinned by tests/shutdown.rs) and is therefore NOT retried —
-        # a documented residual gap for the opt-in `bind` case (see task-0204).
+        # a documented residual gap for the opt-in `bind` case, tracked by the
+        # fail-fast follow-up task-0237 (make server self-exit propagate non-zero).
         # RestartSec is kept small so recovery is fast and the start-limit above
         # is reached quickly for a persistently-failing config.
         Restart = "on-failure";
@@ -100,6 +108,13 @@ in {
         MemoryDenyWriteExecute = true;
         RestrictRealtime = true;
         SystemCallFilter = [ "@system-service" "@network-io" ];
+      } // lib.optionalAttrs (cfg.credentialsFile != null) {
+        # task-0205: deliver the WiGLE secrets to the DynamicUser via systemd
+        # credentials. The manager (root) reads the source — which may stay
+        # 0600 root:root — and exposes a 0400 copy under $CREDENTIALS_DIRECTORY;
+        # ExecStart reads --config ${CREDENTIALS_DIRECTORY}/config. The source
+        # file's own mode is never widened (no world-readable secret required).
+        LoadCredential = [ "config:${cfg.credentialsFile}" ];
       };
     };
   };

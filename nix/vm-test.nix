@@ -33,6 +33,24 @@ pkgs.testers.runNixOSTest {
         # task-0206: pin one of the six newly-exposed flags end-to-end (option ->
         # exec-start.nix -> unit ExecStart), asserted below via `systemctl cat`.
         historyRetentionDays = 7;
+        # task-0205: a 0600 root:root secrets file the DynamicUser must reach only
+        # via LoadCredential (the module wires --config to $CREDENTIALS_DIRECTORY).
+        credentialsFile = "/etc/whereami/secrets.toml";
+      };
+      # task-0205: 0600 root:root secrets with DUMMY WiGLE creds (NEVER real).
+      # environment.etc routes `text` through the world-readable nix store, which
+      # is acceptable ONLY because the values are dummies — a real deployment must
+      # use an out-of-store 0600 file. The /etc file itself is a 0600 root:root
+      # copy, which is what the daemon must be unable to read without LoadCredential.
+      environment.etc."whereami/secrets.toml" = {
+        mode = "0600";
+        user = "root";
+        group = "root";
+        text = ''
+          [wigle]
+          api_user = "AID-dummy-not-a-real-credential"
+          api_key = "dummy-not-a-real-key"
+        '';
       };
       # Put the `whereami` client on PATH so the socket-access assertions use
       # the real client path-resolution, not a hand-rolled socket poke.
@@ -128,6 +146,29 @@ pkgs.testers.runNixOSTest {
         machine.succeed(
             "systemctl cat whereamid.service | grep -F -- '--history-retention-days 7'"
         )
+
+    with subtest("task-0205: WiGLE secrets load via LoadCredential without widening the source"):
+        # AC#1/#3: the 0600 root:root file reaches the DynamicUser through systemd
+        # credentials, so the daemon finds it (NOT the "config file not found"
+        # warning) and reports WiGLE configured. A broken credentials-directory
+        # expansion would surface as the not-found warning, failing this subtest.
+        machine.fail(
+            "journalctl -u whereamid.service --no-pager | grep -F 'config file not found'"
+        )
+        machine.succeed(
+            "journalctl -u whereamid.service --no-pager | "
+            "grep -F 'WiGLE credentials configured'"
+        )
+        machine.fail(
+            "journalctl -u whereamid.service --no-pager | "
+            "grep -F 'WiGLE credentials not configured'"
+        )
+        # AC#1/#2: LoadCredential COPIES the source; the original must stay
+        # 0600 root:root (nothing widened it to make it world-readable).
+        mode = machine.succeed("stat -c %a /etc/whereami/secrets.toml").strip()
+        owner = machine.succeed("stat -c %U:%G /etc/whereami/secrets.toml").strip()
+        assert mode == "600", f"secrets file mode is {mode}, expected 600 (unwidened)"
+        assert owner == "root:root", f"secrets file owner is {owner}, expected root:root"
 
     with subtest("AC#2: explicit TCP bind answers on 127.0.0.1:4747 with a warning"):
         out = machine.succeed("env WHEREAMI_ADDR=127.0.0.1:4747 whereami version --json")

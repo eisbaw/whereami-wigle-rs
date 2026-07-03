@@ -123,7 +123,13 @@ async fn main() -> Result<()> {
         http_timeout,
     );
 
-    if !wigle_client.is_configured() {
+    if wigle_client.is_configured() {
+        // Positive counterpart to the not-configured warning, so a successful
+        // secrets load (incl. via systemd LoadCredential) is observable in the
+        // journal rather than only its absence (task-0205 AC#3). Never logs the
+        // credential values.
+        info!("WiGLE credentials configured - remote lookups enabled");
+    } else {
         tracing::warn!("WiGLE credentials not configured - remote lookups disabled");
     }
 
