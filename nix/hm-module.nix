@@ -3,12 +3,17 @@
 let
   cfg = config.services.whereami;
 
-  execStart = import ./exec-start.nix { inherit lib cfg; };
+  # The user service self-binds its own socket (socketFlag = true → ExecStart
+  # passes --socket cfg.socketPath). No group is needed: %t is $XDG_RUNTIME_DIR
+  # (/run/user/<uid>, mode 0700, user-owned), so the socket is single-user by
+  # construction and the daemon tightens it to 0600.
+  execStart = import ./exec-start.nix { inherit lib cfg; socketFlag = true; };
 in {
   options.services.whereami = import ./options.nix {
     inherit lib;
     dbPathDefault = "%h/.local/share/whereami/aps.sqlite";
     credentialsFileDefault = "%h/.config/whereami/config.toml";
+    socketPathDefault = "%t/whereamid.sock";
   };
 
   config = lib.mkIf cfg.enable {

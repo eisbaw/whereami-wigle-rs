@@ -1,4 +1,4 @@
-{ lib, dbPathDefault, credentialsFileDefault }:
+{ lib, dbPathDefault, credentialsFileDefault, socketPathDefault }:
 
 {
   enable = lib.mkEnableOption "whereami Wi-Fi geolocation daemon";
@@ -9,9 +9,48 @@
   };
 
   bind = lib.mkOption {
+    type = lib.types.nullOr lib.types.str;
+    default = null;
+    description = ''
+      TCP bind address (host:port) for whereamid. OPT-IN and UNAUTHENTICATED:
+      when null (the default) the daemon serves ONLY on the unix control socket,
+      whose access is gated by filesystem permissions. Any TCP listener exposes
+      location history, live position, Wi-Fi scans and WiGLE quota with no
+      authentication; a non-loopback address additionally requires
+      allowNonlocalBind. See ADR-003.
+    '';
+  };
+
+  allowNonlocalBind = lib.mkOption {
+    type = lib.types.bool;
+    default = false;
+    description = ''
+      Permit binding `bind` to a non-loopback address. Without it the daemon
+      refuses to start on a non-loopback bind, because that exposes the
+      unauthenticated TCP transport to other hosts. See ADR-003.
+    '';
+  };
+
+  socketPath = lib.mkOption {
     type = lib.types.str;
-    default = "127.0.0.1:4747";
-    description = "TCP bind address for whereamid.";
+    default = socketPathDefault;
+    description = ''
+      Path to the unix domain control socket (the canonical transport). For the
+      system service this is the systemd socket-unit ListenStream path (created
+      0660 root:whereami so members of the `whereami` group may connect); for the
+      home-manager service the daemon self-binds it 0600 under $XDG_RUNTIME_DIR.
+    '';
+  };
+
+  allowedUsers = lib.mkOption {
+    type = lib.types.listOf lib.types.str;
+    default = [ ];
+    description = ''
+      Users permitted to query the daemon (SYSTEM module ONLY): they are added to
+      the `whereami` group that owns the 0660 control socket. The home-manager
+      module IGNORES this option — its socket lives under $XDG_RUNTIME_DIR
+      (0700, user-owned), so it is single-user by construction.
+    '';
   };
 
   wifiInterface = lib.mkOption {

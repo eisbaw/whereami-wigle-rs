@@ -3,18 +3,47 @@
 let
   cfg = config.services.whereami;
 
-  execStart = import ./exec-start.nix { inherit lib cfg; };
+  # The system service uses systemd socket activation (fd 3), so ExecStart must
+  # NOT pass --socket (socketFlag = false); cfg.socketPath is instead the socket
+  # unit's ListenStream path.
+  execStart = import ./exec-start.nix { inherit lib cfg; socketFlag = false; };
 in {
   options.services.whereami = import ./options.nix {
     inherit lib;
     dbPathDefault = "/var/lib/whereami/aps.sqlite";
     credentialsFileDefault = null;
+    socketPathDefault = "/run/whereami/whereamid.sock";
   };
 
   config = lib.mkIf cfg.enable {
+    # The `whereami` group owns the 0660 control socket; its members are the
+    # users allowed to query the daemon (task-0196 / ADR-003). Empty by default,
+    # so only root can connect until the owner opts users in via allowedUsers.
+    users.groups.whereami.members = cfg.allowedUsers;
+
+    # Socket activation is what makes the DynamicUser daemon reachable by the
+    # owner: systemd creates the socket as root:whereami mode 0660 BEFORE the
+    # (random-UID) service starts and hands it fd 3, so members of `whereami` can
+    # connect while the daemon needs no fixed UID. The socket's filesystem
+    # permissions ARE the access control (ADR-003).
+    systemd.sockets.whereamid = {
+      description = "whereami control socket";
+      wantedBy = [ "sockets.target" ];
+      socketConfig = {
+        ListenStream = cfg.socketPath;
+        SocketMode = "0660";
+        SocketUser = "root";
+        SocketGroup = "whereami";
+      };
+    };
+
     systemd.services.whereamid = {
       description = "whereami Wi-Fi geolocation daemon";
-      after = [ "network.target" "NetworkManager.service" ];
+      after = [ "network.target" "NetworkManager.service" "whereamid.socket" ];
+      requires = [ "whereamid.socket" ];
+      # Scanning must run 24/7 (continuously build the AP cache + history), so
+      # the service is always started at boot rather than purely on-demand — it
+      # merely USES the socket-activated fd.
       wantedBy = [ "multi-user.target" ];
 
       serviceConfig = {
