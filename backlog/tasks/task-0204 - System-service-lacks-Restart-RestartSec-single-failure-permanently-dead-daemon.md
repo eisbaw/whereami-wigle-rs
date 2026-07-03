@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@mped-architect'
 created_date: '2026-07-02 04:53'
-updated_date: '2026-07-03 09:09'
+updated_date: '2026-07-03 09:59'
 labels:
   - nix
 dependencies: []
@@ -64,6 +64,10 @@ VM (machine node, new subtest): record MainPID, systemctl kill --signal=SIGKILL,
 Gate: nix flake check exit=0 (6 checks). Rust untouched.
 
 RESIDUAL (from 0195 forward-carry): on-failure does NOT retry a clean exit(0); a runtime TCP-bind self-exit is exit(0) by deliberate, test-pinned 0195 design, so the opt-in bind case is not auto-restarted. Default system config (bind=null, socket-activated) has no such path. Filed follow-up (see below).
+
+Review gate (cycle 10, batch 0204-0208, range 596f068..b50ab0e): qa-test-runner GO + mped-architect GO (mped re-run after an API-error death; QA evidence logs in /tmp/qa-*.log). QA: nix flake check exit 0 x2 (24s/12s cached), all 11 VM subtests executed and non-vacuous (SIGKILL subtest killed PID 1156 -> new PID 1387 re-adopted fd 3 and answered alice; LoadCredential pinned affirmative log + absent not-found warning + source still 0600 root:root; nonloopback traversed restart counters to start-limit-hit then is-failed), flag-parity "23 flags OK", Rust diff confirmed log-only, host end-state pristine. mped verified: startLimit* correctly UNIT-level; option types mirror validate() EXACTLY (no invented bounds; scanFastDuration/dailyLimit correctly unsigned — dailyLimit=0 proven to disable WiGLE via db.rs reserve logic); parity guard bites both directions and cannot vacuously pass; assertions.nix shared by both modules.
+
+In-thread hardening 48647e0: module.nix residual comment redirected to task-0233 graceful-degrade direction (mped M-1: the 0237 filed this cycle was a duplicate of 0233 with a review-REJECTED fail-fast direction — archived, id later recycled by the CLI for the new sigterm task); vm-test SIGKILL settle-wait comment de-overclaimed (QA M1); flag-parity duplication comment (L-2). Filed (new) 0237: sigterm test de-flake — QA H1, pre-existing 300ms-sleep race, 1/4 failure under ambient load, intermittently blocks just e2e; ALSO flags a real early-SIGTERM window in the daemon. Accepted: L-1 u32/i32 upper-bound eval gap (disclosed in options.nix), L-4 start-limit transitively asserted, L-5 $CREDENTIALS_DIRECTORY env-expansion form (VM-proven).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-03 08:48'
+updated_date: '2026-07-03 09:55'
 labels:
   - nix
   - correctness
@@ -30,3 +31,9 @@ Ref: nix/module.nix task-0204 residual comment, whereamid/src/main.rs server_exi
 - [ ] #2 SIGINT/SIGTERM shutdown still exits 0 (server_exited=false path unchanged)
 - [ ] #3 tests/shutdown.rs bind-failure test updated to expect the new non-zero exit; still asserts no panic (not exit 101)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Archived as duplicate of task-0233 (review gate cycle 10, mped M-1). 0233 is older, carries the cycle-8 review-endorsed graceful-degrade direction, and now absorbs this task 0237 context. The fail-fast direction proposed here was REJECTED by review: making the TCP self-exit non-zero would crash-loop the whole daemon (incl. the mandatory unix socket) on a busy opt-in port.
+<!-- SECTION:NOTES:END -->
