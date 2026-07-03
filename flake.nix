@@ -47,6 +47,13 @@
             inherit self gitRev;
             pkgs = pkgsFor system;
           };
+          # Guards against clap-flag / module-option drift (task-0206). Execs the
+          # built binary's --help, so host-arch only (like the VM check).
+          flag-parity = import ./nix/flag-parity.nix {
+            pkgs = pkgsFor system;
+            inherit lib;
+            package = (whereamiFor system).package;
+          };
         }
       );
 

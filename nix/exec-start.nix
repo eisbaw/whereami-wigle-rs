@@ -31,6 +31,12 @@ lib.concatStringsSep " " ([
   "--pending-max-attempts" (toString cfg.pendingMaxAttempts)
   "--daily-limit" (toString cfg.dailyLimit)
   "--not-found-ttl-days" (toString cfg.notFoundTtlDays)
+  "--address-cache-ttl-days" (toString cfg.addressCacheTtlDays)
+  "--http-timeout-secs" (toString cfg.httpTimeoutSecs)
+  "--nominatim-timeout-secs" (toString cfg.nominatimTimeoutSecs)
+  "--history-retention-days" (toString cfg.historyRetentionDays)
+  "--history-segment-distance-m" (toString cfg.historySegmentDistanceM)
+  "--history-segment-min-duration-secs" (toString cfg.historySegmentMinDurationSecs)
 ] ++ lib.optional (socketArg != "") socketArg
   ++ lib.optional (bindArg != "") bindArg
   ++ lib.optional (nonlocalArg != "") nonlocalArg

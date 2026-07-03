@@ -157,4 +157,61 @@
     default = false;
     description = "Include approximate street address in locate responses via OSM Nominatim.";
   };
+
+  addressCacheTtlDays = lib.mkOption {
+    # i64, validate() bails on <0; 0 is the documented "disable the cache" value.
+    type = lib.types.ints.unsigned;
+    default = 7;
+    description = ''
+      TTL for cached reverse-geocoded addresses (days). After this, an entry is
+      re-resolved on the next locate at that grid cell. 0 disables the cache.
+    '';
+  };
+
+  httpTimeoutSecs = lib.mkOption {
+    type = lib.types.ints.positive;
+    default = 15;
+    description = ''
+      Total HTTP request timeout for fast endpoints (Apple WPS, WiGLE) in
+      seconds. The connect timeout is fixed at 5s.
+    '';
+  };
+
+  nominatimTimeoutSecs = lib.mkOption {
+    type = lib.types.ints.positive;
+    default = 30;
+    description = ''
+      Total HTTP request timeout for the OSM Nominatim endpoint in seconds.
+      Nominatim's public instance is frequently slow under load.
+    '';
+  };
+
+  historyRetentionDays = lib.mkOption {
+    # i64, validate() bails on <0; 0 disables pruning (fixes kept indefinitely).
+    type = lib.types.ints.unsigned;
+    default = 30;
+    description = ''
+      Days to retain rows in the location-history `fixes` table. Older rows are
+      pruned periodically. 0 disables retention (no pruning); fixes are kept
+      indefinitely. This governs how long location PII lives on disk.
+    '';
+  };
+
+  historySegmentDistanceM = lib.mkOption {
+    type = lib.types.ints.positive;
+    default = 100;
+    description = ''
+      Maximum distance (meters) between consecutive fixes for them to be grouped
+      into the same stay-point segment.
+    '';
+  };
+
+  historySegmentMinDurationSecs = lib.mkOption {
+    type = lib.types.ints.positive;
+    default = 300;
+    description = ''
+      Minimum duration (seconds) for a history segment to be reported. Shorter
+      runs (e.g. driving past a coffee shop) are dropped.
+    '';
+  };
 }

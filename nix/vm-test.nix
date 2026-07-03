@@ -30,6 +30,9 @@ pkgs.testers.runNixOSTest {
         enable = true;
         allowedUsers = [ "alice" ];
         bind = "127.0.0.1:4747";
+        # task-0206: pin one of the six newly-exposed flags end-to-end (option ->
+        # exec-start.nix -> unit ExecStart), asserted below via `systemctl cat`.
+        historyRetentionDays = 7;
       };
       # Put the `whereami` client on PATH so the socket-access assertions use
       # the real client path-resolution, not a hand-rolled socket poke.
@@ -117,6 +120,14 @@ pkgs.testers.runNixOSTest {
         # was built with.
         assert '"git_rev":"${gitRev}"' in out.replace(" ", ""), \
             f"expected embedded git_rev ${gitRev}, got: {out!r}"
+
+    with subtest("task-0206: a newly-exposed flag reaches the unit ExecStart"):
+        # historyRetentionDays=7 on the node must appear as --history-retention-days
+        # 7 in the generated unit. Cheap end-to-end pin of option -> exec-start ->
+        # ExecStart for the six flags added in task-0206.
+        machine.succeed(
+            "systemctl cat whereamid.service | grep -F -- '--history-retention-days 7'"
+        )
 
     with subtest("AC#2: explicit TCP bind answers on 127.0.0.1:4747 with a warning"):
         out = machine.succeed("env WHEREAMI_ADDR=127.0.0.1:4747 whereami version --json")
