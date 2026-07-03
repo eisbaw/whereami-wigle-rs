@@ -15,7 +15,7 @@
 # Uses `pkgs.testers.runNixOSTest` (the maintained nixpkgs entry point) rather
 # than the older `import <nixpkgs/nixos/lib/testing-python.nix>` boilerplate: it
 # wires `hostPkgs`/defaults for us and takes the test as a plain module.
-{ self, pkgs }:
+{ self, pkgs, gitRev }:
 
 pkgs.testers.runNixOSTest {
   name = "whereami-module";
@@ -110,6 +110,13 @@ pkgs.testers.runNixOSTest {
         )
         assert '"ok":true' in out.replace(" ", ""), \
             f"expected ok:true from alice, got: {out!r}"
+        # Pin the WHOLE rev-threading chain end-to-end (flake gitRev ->
+        # package preBuild -> build.rs env! -> daemon version response), so a
+        # broken embedding can never pass the VM silently (task-0209 review,
+        # QA L1). ${gitRev} is the SAME flake binding the module's package
+        # was built with.
+        assert '"git_rev":"${gitRev}"' in out.replace(" ", ""), \
+            f"expected embedded git_rev ${gitRev}, got: {out!r}"
 
     with subtest("AC#2: explicit TCP bind answers on 127.0.0.1:4747 with a warning"):
         out = machine.succeed("env WHEREAMI_ADDR=127.0.0.1:4747 whereami version --json")

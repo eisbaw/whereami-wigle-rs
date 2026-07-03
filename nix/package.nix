@@ -18,7 +18,18 @@
 
 let
   cargoToml = builtins.fromTOML (builtins.readFile ../whereamid/Cargo.toml);
-  src = craneLib.cleanCargoSource ./..;
+  # crane's cleanCargoSource keeps only Cargo files and *.rs — which silently
+  # DROPS whereamid/tests/proptests.proptest-regressions, the committed
+  # proptest counterexample corpus (task-0071). Without it the `test` check
+  # runs proptests WITHOUT the deterministic regression pins that `just test`
+  # has. Same default filter, plus that corpus (task-0209 review, mped L1).
+  src = lib.cleanSourceWith {
+    src = ./..;
+    filter = path: type:
+      (craneLib.filterCargoSources path type)
+      || lib.hasSuffix ".proptest-regressions" path;
+    name = "source";
+  };
 
   commonArgs = {
     pname = "whereamid";
@@ -79,7 +90,12 @@ in
 
     clippy = craneLib.cargoClippy (commonArgs // {
       inherit cargoArtifacts;
-      # `-D warnings` mirrors the `just lint` gate: any lint is a build failure.
+      # Same flags as `just lint` (any lint is a build failure), but NOT the
+      # same toolchain or profile: this runs nixpkgs STABLE clippy in crane's
+      # default RELEASE profile, while the devShell just-gate runs fenix
+      # NIGHTLY in debug. Lint sets differ across channels and debug_assert!/
+      # overflow semantics differ across profiles, so the two gates are
+      # complementary, not mirrors. task-0235 tracks unify-vs-keep.
       cargoClippyExtraArgs = "--all-targets -- --deny warnings";
     });
 

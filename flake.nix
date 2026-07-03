@@ -44,7 +44,7 @@
         (whereamiFor system).checks
         // lib.optionalAttrs (system == "x86_64-linux") {
           vm = import ./nix/vm-test.nix {
-            inherit self;
+            inherit self gitRev;
             pkgs = pkgsFor system;
           };
         }
