@@ -77,12 +77,11 @@ opt-in.
 - Non-loopback bind now requires an explicit `--allow-nonlocal-bind` opt-in.
 - **Startup-failure asymmetry:** a unix-socket bind failure aborts startup with
   a non-zero exit (it is the mandatory transport), but an opt-in TCP `--bind`
-  failure currently flows through the server task's self-exit path and the
-  daemon exits **0** — an operator who explicitly requested TCP gets a daemon
-  that died claiming success, and the working unix socket goes down with it.
-  Task-0233 tracks the fix (graceful degrade: keep serving unix, warn loudly),
-  chosen over making TCP failure fatal so the optional transport can never kill
-  the mandatory one.
+  failure is non-fatal: the daemon logs a loud warning and degrades to serving
+  the unix socket only (task-0233), so the optional transport can never take the
+  mandatory one down with it. Graceful degrade was chosen over making TCP
+  failure fatal, which would let a momentarily-busy opt-in port crash-loop the
+  whole daemon into systemd's start-limit under `Restart=on-failure` (task-0204).
 - The `whereami` group and the socket's mode/owner are the security-critical
   surface for the system service; the NixOS VM test (task-0209) must assert
   them (socket 0660 `root:whereami`; non-member refused; member served; the

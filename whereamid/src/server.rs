@@ -590,29 +590,47 @@ fn chmod_socket_0600_or_bail(path: &Path) -> Result<()> {
 
 /// Run the control-channel accept loop until cancelled. The unix listener (the
 /// mandatory transport) is bound by the caller — a bind failure there aborts
-/// startup with a non-zero exit. TCP is opt-in and bound HERE so its failure
-/// flows through the existing task-0195 server-task self-exit path (clean
-/// exit) rather than aborting daemon startup. task-0196.
+/// startup with a non-zero exit. TCP is opt-in and bound HERE; if its bind
+/// fails the daemon degrades to unix-only and warns loudly rather than exiting,
+/// so a busy opt-in port never takes down the mandatory transport (task-0233,
+/// amending the task-0196 behaviour where a TCP-bind failure self-exited).
 pub async fn run_server(state: Arc<DaemonState>, unix: UnixListener) -> Result<()> {
     let tcp: Option<TcpListener> = match state.args.parsed_bind()? {
-        Some(addr) => {
-            let listener = TcpListener::bind(addr).await?;
-            let bound = listener.local_addr().unwrap_or(addr);
-            if bound.ip().is_loopback() {
-                warn!(
-                    "TCP listening on {bound}: this transport has NO peer authentication — every \
-                     local user can read location history, live position and Wi-Fi scans and \
-                     drive WiGLE quota. The unix socket is the access-controlled transport."
-                );
-            } else {
-                warn!(
-                    "TCP listening on {bound} (non-loopback): location history, live position, \
-                     Wi-Fi scans and WiGLE quota are reachable by every host that can reach \
-                     {bound}, with NO authentication."
-                );
+        Some(addr) => match TcpListener::bind(addr).await {
+            Ok(listener) => {
+                let bound = listener.local_addr().unwrap_or(addr);
+                if bound.ip().is_loopback() {
+                    warn!(
+                        "TCP listening on {bound}: this transport has NO peer authentication — \
+                         every local user can read location history, live position and Wi-Fi \
+                         scans and drive WiGLE quota. The unix socket is the access-controlled \
+                         transport."
+                    );
+                } else {
+                    warn!(
+                        "TCP listening on {bound} (non-loopback): location history, live position, \
+                         Wi-Fi scans and WiGLE quota are reachable by every host that can reach \
+                         {bound}, with NO authentication."
+                    );
+                }
+                Some(listener)
             }
-            Some(listener)
-        }
+            // task-0233: the opt-in TCP transport failed to bind (e.g.
+            // EADDRINUSE from a squatted port). Do NOT abort the daemon —
+            // degrade to unix-only and warn loudly. The unix socket is the
+            // mandatory, access-controlled transport and is already bound; the
+            // operator asked for TCP as an ADDITION, so its failure must not
+            // take the whole daemon down. Making it fatal would also crash-loop
+            // the daemon to start-limit-hit under systemd Restart=on-failure
+            // (task-0204) whenever the opt-in port is momentarily busy.
+            Err(e) => {
+                warn!(
+                    "requested --bind {addr} failed to bind ({e}); continuing on the unix \
+                     control socket ONLY. The opt-in TCP transport is UNAVAILABLE this run."
+                );
+                None
+            }
+        },
         None => None,
     };
     info!("control channel: unix socket ready");

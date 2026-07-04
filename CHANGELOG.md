@@ -24,6 +24,11 @@ client must be upgraded together.**
   new `--allow-nonlocal-bind`; loopback TCP still warns that it is
   unauthenticated. `SO_PEERCRED` is logged (debug) for auditability but not
   enforced (the group model needs cross-UID connects).
+- **Opt-in TCP `--bind` failure is non-fatal** (task-0233): if the requested
+  TCP port cannot be bound at runtime (e.g. already in use), the daemon logs a
+  loud warning and keeps serving the mandatory unix socket instead of exiting,
+  so a busy opt-in port can neither take the daemon down nor be reported (under
+  systemd `Restart=on-failure`) as a dead-but-"successful" exit 0.
 - **Client / `whereami` CLI:** resolves the daemon via `$WHEREAMI_SOCKET` →
   `$WHEREAMI_ADDR` (TCP, for old daemons) → the default socket paths, with **no**
   implicit fallback to `127.0.0.1:4747` (port-squatting impersonation). Reach an

@@ -246,9 +246,12 @@ async fn main() -> Result<()> {
             false
         }
         res = &mut server_handle => {
-            // The server task ended on its own (e.g. bind failure). This arm
-            // consumes the JoinHandle's output; it must NOT be awaited again
-            // or tokio panics on the second poll (task-0195).
+            // The server task ended on its own — realistically a panic in the
+            // accept loop: since task-0233 a TCP-bind failure degrades instead
+            // of exiting, and a unix-bind failure aborts before this task is
+            // even spawned. This arm consumes the JoinHandle's output; it must
+            // NOT be awaited again or tokio panics on the second poll
+            // (task-0195).
             match res {
                 Ok(()) => error!("server task exited unexpectedly"),
                 Err(e) => error!("server task join error: {e}"),

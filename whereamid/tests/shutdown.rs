@@ -40,10 +40,13 @@ fn make_tempdir(tag: &str) -> PathBuf {
 }
 
 /// Spawn the daemon with an explicit unix `--socket`, an optional TCP `--bind`,
-/// and hermetic flags (throwaway DB, no config, bogus interface). stderr ->
-/// file. Passing an explicit `--socket` keeps the daemon off the default
-/// socket path (task-0196 hermeticity).
+/// and hermetic flags (throwaway DB, no config, bogus interface). Both stdout
+/// and stderr are captured to files: the tracing subscriber writes lifecycle
+/// logs to STDOUT, while panics and a `main`-returned error go to STDERR, so a
+/// test may need either. Passing an explicit `--socket` keeps the daemon off
+/// the default socket path (task-0196 hermeticity).
 fn spawn_daemon(bind: Option<&str>, socket: &Path, dir: &Path) -> Child {
+    let out = std::fs::File::create(dir.join("stdout.log")).expect("create stdout.log");
     let err = std::fs::File::create(dir.join("stderr.log")).expect("create stderr.log");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_whereamid"));
     cmd.arg("--socket").arg(socket);
@@ -58,7 +61,7 @@ fn spawn_daemon(bind: Option<&str>, socket: &Path, dir: &Path) -> Child {
         // Bogus interface: wifi_scan fails fast, never touches real hardware.
         .arg("--interface")
         .arg("whereami-nonexistent0")
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
         .expect("spawn whereamid")
@@ -66,6 +69,20 @@ fn spawn_daemon(bind: Option<&str>, socket: &Path, dir: &Path) -> Child {
 
 fn read_stderr(dir: &Path) -> String {
     let mut s = String::new();
+    if let Ok(mut f) = std::fs::File::open(dir.join("stderr.log")) {
+        let _ = f.read_to_string(&mut s);
+    }
+    s
+}
+
+/// Combined daemon output (stdout ++ stderr). The tracing subscriber logs to
+/// stdout while panics / a `main`-returned error land on stderr, so a test
+/// observing a lifecycle log line or a warning must read both streams.
+fn read_output(dir: &Path) -> String {
+    let mut s = String::new();
+    if let Ok(mut f) = std::fs::File::open(dir.join("stdout.log")) {
+        let _ = f.read_to_string(&mut s);
+    }
     if let Ok(mut f) = std::fs::File::open(dir.join("stderr.log")) {
         let _ = f.read_to_string(&mut s);
     }
@@ -115,13 +132,42 @@ fn wait_until_socket_ready(child: &mut Child, socket: &Path, dir: &Path, budget:
     }
 }
 
-/// task-0195 AC#1 (now the TCP-opt-in variant, task-0196): the unix socket
-/// binds fine, but the requested TCP `--bind` port is already taken, so
-/// `run_server`'s `TcpListener::bind` returns EADDRINUSE and the server task
-/// exits on its own. The daemon must shut down cleanly — NOT panic on a
-/// double-polled JoinHandle, and NOT hang.
+/// Poll the daemon's combined output until it contains `needle`, or fail. Waits
+/// for a specific lifecycle line (control channel ready, a graceful-degrade
+/// warning) without a fixed sleep; fails fast if the daemon exits first. The
+/// 10ms cadence is a poll backoff, not a fixed delay.
+fn wait_until_output_contains(child: &mut Child, dir: &Path, needle: &str, budget: Duration) {
+    let start = Instant::now();
+    loop {
+        if read_output(dir).contains(needle) {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            panic!(
+                "daemon exited (status {status:?}) before output contained {needle:?}; \
+                 output:\n{}",
+                read_output(dir)
+            );
+        }
+        assert!(
+            start.elapsed() < budget,
+            "daemon output never contained {needle:?} within {budget:?}; output:\n{}",
+            read_output(dir)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// task-0233 (amending task-0195/0196): an explicitly-requested TCP `--bind`
+/// whose port is already taken must NOT take the daemon down. `run_server`'s
+/// `TcpListener::bind` returns EADDRINUSE, and the daemon must degrade to
+/// serving the mandatory unix socket ONLY — warning loudly — instead of
+/// self-exiting (which under systemd `Restart=on-failure` would report a dead
+/// daemon as a success). It must still shut down cleanly on SIGTERM. The unix
+/// socket (the mandatory transport) staying fatal on ITS failure is covered by
+/// `live_socket_refused_nonzero_exit`.
 #[test]
-fn bind_failure_exits_cleanly_without_panic() {
+fn tcp_bind_failure_degrades_to_unix_only() {
     let dir = make_tempdir("bindfail");
 
     // Hold the port for the daemon's whole life so its TCP bind fails. Two live
@@ -137,8 +183,37 @@ fn bind_failure_exits_cleanly_without_panic() {
 
     let sock = dir.join("whereamid.sock");
     let mut child = spawn_daemon(Some(&addr.to_string()), &sock, &dir);
-    let outcome = wait_for_exit(&mut child, Duration::from_secs(15));
-    let stderr = read_stderr(&dir);
+
+    // The daemon reaches its accept loop despite the TCP failure. "unix socket
+    // ready" is logged AFTER the TCP bind attempt (run_server), so observing it
+    // proves the daemon degraded rather than exited — and, being emitted after
+    // the degrade warn!, guarantees that warning is already in the log below.
+    wait_until_output_contains(
+        &mut child,
+        &dir,
+        "control channel: unix socket ready",
+        Duration::from_secs(10),
+    );
+
+    let output = read_output(&dir);
+    // The degrade is loud and names the failure (the operator must notice the
+    // requested TCP endpoint is unavailable).
+    assert!(
+        output.contains("failed to bind") && output.contains("unix control socket ONLY"),
+        "daemon must warn loudly that it degraded to unix-only; output:\n{output}"
+    );
+    // And it is STILL RUNNING — the opt-in TCP failure did not exit it.
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "daemon must keep serving the unix socket after a TCP bind failure, not exit; \
+         output:\n{output}"
+    );
+
+    // A degraded (unix-only) daemon still shuts down cleanly on SIGTERM.
+    let rc = unsafe { kill(child.id() as i32, SIGTERM) };
+    assert_eq!(rc, 0, "kill(SIGTERM) syscall failed");
+    let outcome = wait_for_exit(&mut child, Duration::from_secs(6));
+    let output = read_output(&dir);
 
     // Clean up before asserting so a failure does not leak a process/dir.
     if outcome.is_none() {
@@ -148,24 +223,15 @@ fn bind_failure_exits_cleanly_without_panic() {
     drop(listener);
     let _ = std::fs::remove_dir_all(&dir);
 
-    let (elapsed, status) =
-        outcome.expect("daemon must exit on its own after a bind failure, not hang");
+    let (_elapsed, status) = outcome.expect("degraded daemon must exit on SIGTERM, not hang");
     assert!(
-        !stderr.contains("panicked"),
-        "daemon panicked on bind failure (task-0195 double-poll); stderr:\n{stderr}"
+        !output.contains("panicked"),
+        "daemon panicked during degraded-mode shutdown; output:\n{output}"
     );
-    assert_ne!(
+    assert_eq!(
         status.code(),
-        Some(101),
-        "exit 101 indicates a panic; stderr:\n{stderr}"
-    );
-    assert!(
-        status.success(),
-        "bind-failure shutdown must be a clean exit, got {status:?}; stderr:\n{stderr}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(15),
-        "daemon took {elapsed:?} to exit after bind failure"
+        Some(0),
+        "clean shutdown expected on SIGTERM for a degraded daemon, got {status:?}; output:\n{output}"
     );
 }
 
