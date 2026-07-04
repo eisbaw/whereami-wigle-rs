@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-02 04:51'
-updated_date: '2026-07-02 23:06'
+updated_date: '2026-07-04 16:49'
 labels:
   - correctness
   - performance
@@ -32,4 +32,6 @@ Database sits behind std::sync::Mutex and every call runs directly on tokio work
 
 <!-- SECTION:NOTES:BEGIN -->
 Forward-carried from task-0197: db.rs Database::open() now calls tighten_db_file_permissions(path) (chmod DB file to 0600) IMMEDIATELY after Connection::open and BEFORE the journal_mode=WAL pragma. This ordering is load-bearing: SQLite copies the main DB files perms onto the -wal/-shm sidecars it creates on WAL activation, so the chmod must precede WAL. When you add synchronous=NORMAL + busy_timeout pragmas (and/or move rusqlite onto spawn_blocking), keep the tighten call before the journal_mode pragma. There is an in-code NOTE(task-0192) marking this constraint at the call site.
+
+Forward-carried from task-0237: daemon startup now depends on an ORDERING INVARIANT — the SIGTERM/SIGINT handlers are installed (main.rs, right after args.validate()) BEFORE Database::open + migrations and BEFORE the control-socket bind. Two consequences for this task: (1) tests/shutdown.rs uses "socket file exists" as a readiness proxy that is only sound because handler-install precedes the bind; if you move DB open/migrations onto a spawn_blocking thread or otherwise reorder startup, keep handlers installed before the socket bind. (2) A SIGTERM arriving during startup is currently DEFERRED (latched) until startup finishes, then drained — acceptable for tiny migrations. If migrations become long-running/blocking under this task, revisit whether startup should race against the signal instead of deferring, and re-run the shutdown.rs sigterm test 20x under load.
 <!-- SECTION:NOTES:END -->
