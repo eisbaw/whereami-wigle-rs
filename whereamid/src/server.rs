@@ -215,6 +215,77 @@ impl TryFrom<crate::db::LastFixRow> for LastFix {
     }
 }
 
+/// Update `last_fix.address` for a still-current position and persist the
+/// resulting row while the in-memory `last_fix` guard remains held.
+///
+/// `persist` is the real persistence boundary rather than a test-only hook:
+/// production passes the SQLite write, while the task-0046 regression wraps
+/// that same write with an exact pre-DB signal. The explicit `drop(last)`
+/// after `persist` is load-bearing — moving persistence below it recreates the
+/// stale-backfill race where a newer in-memory fix can be overwritten on disk.
+async fn backfill_last_fix_address_with<P>(
+    state: &Arc<DaemonState>,
+    lat: f64,
+    lon: f64,
+    display: &str,
+    persist: P,
+) -> Result<bool>
+where
+    P: FnOnce(&DaemonState, &crate::db::LastFixRow) -> Result<()> + Send,
+{
+    let mut last = state.last_fix.lock().await;
+    let Some(fix) = last.as_mut() else {
+        return Ok(false);
+    };
+
+    // Fail closed after task-0106 made address_cache_key return Option. Both
+    // keys must be finite and equal; a poisoned persisted fix can never pick
+    // up an address for an unrelated position.
+    let keys_match = address_cache_key(fix.lat, fix.lon)
+        .zip(address_cache_key(lat, lon))
+        .is_some_and(|(a, b)| a == b);
+    if !keys_match || fix.address.is_some() {
+        return Ok(false);
+    }
+
+    fix.address = Some(display.to_owned());
+    let row: crate::db::LastFixRow = (&*fix).into();
+    let result = persist(state, &row);
+    // task-0046: prove the guard spans the persistence call. Do not move this
+    // drop above `persist`; the concurrency regression asserts this ordering.
+    drop(last);
+    result?;
+    Ok(true)
+}
+
+/// Persist a newly computed fix to both the in-memory and SQLite last-fix
+/// stores (plus history) under the same `last_fix -> db` lock ordering used by
+/// address backfill. This is the handle_locate-side operation raced by the
+/// task-0046 regression.
+async fn persist_last_fix_and_history(state: &Arc<DaemonState>, new_fix: LastFix) {
+    let row: crate::db::LastFixRow = (&new_fix).into();
+    let mut last = state.last_fix.lock().await;
+    *last = Some(new_fix);
+
+    let db = lock_db(state);
+    if let Err(e) = db.set_last_fix(&row) {
+        warn!("failed to persist last_fix: {e}");
+        state.record_db_failure();
+    }
+    if let Err(e) = db.insert_fix(
+        &row.at_rfc3339,
+        row.lat,
+        row.lon,
+        row.accuracy_m,
+        row.sources,
+    ) {
+        warn!("failed to record fix in history: {e}");
+        state.record_db_failure();
+    }
+    drop(db);
+    drop(last);
+}
+
 #[cfg(test)]
 mod last_fix_rehydration_tests {
     use super::*;
@@ -978,47 +1049,20 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                                         });
                                     cache.insert(bg_lat, bg_lon, display.clone());
                                 }
-                                // Backfill last_fix.address if it still
-                                // matches the position we just resolved.
-                                // If a newer fix has overwritten it we
-                                // leave it alone (the newer one will
-                                // resolve its own address).
-                                //
-                                // The DB write happens *while we still hold*
-                                // the in-memory last_fix mutex (task-0046),
-                                // so a concurrent handle_locate cannot
-                                // replace the in-memory row, persist its own
-                                // newer row, and then have us overwrite that
-                                // newer row with stale lat/lon. Ordering is
-                                // last_fix (tokio) -> db (std), matching
-                                // handle_locate.
-                                let mut last = bg_state.last_fix.lock().await;
-                                if let Some(fix) = last.as_mut() {
-                                    // Fail-closed after task-0106 made
-                                    // address_cache_key return Option. In this
-                                    // caller bg_lat/bg_lon come from trilaterate
-                                    // (routed through finite_position), so their
-                                    // key is always Some; only fix.lat/lon can
-                                    // be non-finite (a poisoned last_fix row
-                                    // rehydrated from the DB). Requiring BOTH
-                                    // keys present and equal is a strict
-                                    // fail-closed guard: a non-finite fix (key
-                                    // None) can never backfill an address onto a
-                                    // garbage position.
-                                    let keys_match = address_cache_key(fix.lat, fix.lon)
-                                        .zip(address_cache_key(bg_lat, bg_lon))
-                                        .is_some_and(|(a, b)| a == b);
-                                    if keys_match && fix.address.is_none() {
-                                        fix.address = Some(display.clone());
-                                        let row: crate::db::LastFixRow = (&*fix).into();
-                                        let db = lock_db(&bg_state);
-                                        if let Err(e) = db.set_last_fix(&row) {
-                                            warn!(
-                                                "failed to persist last_fix address backfill: {e}"
-                                            );
-                                            bg_state.record_db_failure();
-                                        }
-                                    }
+                                // Backfill only if this is still the current
+                                // position. The helper keeps the last_fix
+                                // mutex live through the DB write (task-0046).
+                                if let Err(e) = backfill_last_fix_address_with(
+                                    &bg_state,
+                                    bg_lat,
+                                    bg_lon,
+                                    &display,
+                                    |state, row| lock_db(state).set_last_fix(row),
+                                )
+                                .await
+                                {
+                                    warn!("failed to persist last_fix address backfill: {e}");
+                                    bg_state.record_db_failure();
                                 }
                             }
                             Err(e) => warn!("background reverse geocode failed: {e}"),
@@ -1046,35 +1090,15 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
             // History insert (task-0031) shares the same critical section
             // because the cost of a second SQL statement is negligible vs
             // the cost of duplicating the lock-scoping logic.
-            let at = chrono::Utc::now();
-            {
-                let mut last = state.last_fix.lock().await;
-                let new_fix = LastFix {
-                    lat: pos.lat,
-                    lon: pos.lon,
-                    accuracy_m: pos.accuracy_m,
-                    address: address.clone(),
-                    at,
-                    sources: cached_count,
-                };
-                let row: crate::db::LastFixRow = (&new_fix).into();
-                *last = Some(new_fix);
-                let db = lock_db(state);
-                if let Err(e) = db.set_last_fix(&row) {
-                    warn!("failed to persist last_fix: {e}");
-                    state.record_db_failure();
-                }
-                if let Err(e) = db.insert_fix(
-                    &at.to_rfc3339(),
-                    pos.lat,
-                    pos.lon,
-                    pos.accuracy_m,
-                    cached_count as i64,
-                ) {
-                    warn!("failed to record fix in history: {e}");
-                    state.record_db_failure();
-                }
-            }
+            let new_fix = LastFix {
+                lat: pos.lat,
+                lon: pos.lon,
+                accuracy_m: pos.accuracy_m,
+                address: address.clone(),
+                at: chrono::Utc::now(),
+                sources: cached_count,
+            };
+            persist_last_fix_and_history(state, new_fix).await;
 
             let resp = LocateResponse {
                 ok: true,
@@ -1516,6 +1540,147 @@ pub(crate) fn test_state() -> std::sync::Arc<DaemonState> {
         orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
         args,
     })
+}
+
+#[cfg(test)]
+mod last_fix_concurrency_tests {
+    //! TASK-0046 AC#3: race address backfill against a newer fix on one real
+    //! DaemonState. Synchronisation is at the exact persistence boundary, not
+    //! a timing sleep, so moving the DB write outside the last_fix guard makes
+    //! the guard-retention assertion fail deterministically.
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_backfill_and_new_fix_keep_memory_and_db_consistent() {
+        const OLD_LAT: f64 = 55.6684;
+        const OLD_LON: f64 = 12.5541;
+        const NEW_LAT: f64 = 55.6761;
+        const NEW_LON: f64 = 12.5683;
+
+        let state = test_state();
+        // Equal timestamps are intentional: task-0100's monotonic UPSERT must
+        // not mask this lock-scoping regression by rejecting a stale row.
+        let at = chrono::DateTime::parse_from_rfc3339("2026-07-05T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let old_fix = LastFix {
+            lat: OLD_LAT,
+            lon: OLD_LON,
+            accuracy_m: 20.0,
+            address: None,
+            at,
+            sources: 3,
+        };
+        let old_row: crate::db::LastFixRow = (&old_fix).into();
+        {
+            let mut last = state.last_fix.lock().await;
+            *last = Some(old_fix);
+        }
+        lock_db(&state).set_last_fix(&old_row).unwrap();
+
+        // Hold the DB mutex on a plain OS thread. This avoids carrying a
+        // std::sync::MutexGuard across await while making the backfill block at
+        // its real SQLite boundary.
+        let (db_held_tx, db_held_rx) = std::sync::mpsc::channel();
+        let (release_db_tx, release_db_rx) = std::sync::mpsc::channel();
+        let blocker_state = Arc::clone(&state);
+        let blocker = std::thread::spawn(move || {
+            let db = lock_db(&blocker_state);
+            let _ = db_held_tx.send(());
+            let _ = release_db_rx.recv();
+            drop(db);
+        });
+        db_held_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("DB blocker thread must acquire the mutex");
+
+        // Signal from the injected *real persistence closure* immediately
+        // before it asks for the blocked DB. The helper contract requires the
+        // last_fix guard to remain alive at this exact point.
+        let (persist_reached_tx, persist_reached_rx) = tokio::sync::oneshot::channel();
+        let backfill_state = Arc::clone(&state);
+        let backfill = tokio::spawn(async move {
+            backfill_last_fix_address_with(
+                &backfill_state,
+                OLD_LAT,
+                OLD_LON,
+                "old address",
+                move |state, row| {
+                    let _ = persist_reached_tx.send(());
+                    lock_db(state).set_last_fix(row)
+                },
+            )
+            .await
+        });
+
+        let persist_reached = matches!(
+            tokio::time::timeout(Duration::from_secs(2), persist_reached_rx).await,
+            Ok(Ok(()))
+        );
+        let backfill_retained_last_fix = persist_reached && state.last_fix.try_lock().is_err();
+
+        // This is the handle_locate-side operation on the SAME DaemonState.
+        // It must wait for the backfill's last_fix guard, then atomically make
+        // both memory and disk point at NEW.
+        let replacement_state = Arc::clone(&state);
+        let new_fix = LastFix {
+            lat: NEW_LAT,
+            lon: NEW_LON,
+            accuracy_m: 8.0,
+            address: None,
+            at,
+            sources: 7,
+        };
+        let replacement = tokio::spawn(async move {
+            persist_last_fix_and_history(&replacement_state, new_fix).await;
+        });
+
+        // Cleanup precedes every assertion: a failing discriminator must not
+        // strand the blocker thread or either Tokio task.
+        let _ = release_db_tx.send(());
+        blocker.join().expect("DB blocker thread panicked");
+        let joined = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(backfill, replacement)
+        })
+        .await;
+
+        assert!(persist_reached, "backfill never reached its DB boundary");
+        assert!(
+            backfill_retained_last_fix,
+            "last_fix guard was released before backfill persistence (the old task-0046 race)"
+        );
+        let (backfill_join, replacement_join) =
+            joined.expect("concurrent last_fix operations exceeded the 2s watchdog");
+        assert!(
+            backfill_join
+                .expect("backfill task panicked")
+                .expect("backfill persistence failed"),
+            "matching old fix should have been backfilled"
+        );
+        replacement_join.expect("replacement task panicked");
+
+        let memory_row = {
+            let last = state.last_fix.lock().await;
+            crate::db::LastFixRow::from(last.as_ref().expect("last_fix missing in memory"))
+        };
+        let disk_row = lock_db(&state)
+            .get_last_fix()
+            .unwrap()
+            .expect("last_fix missing on disk");
+
+        assert_eq!(memory_row.lat, NEW_LAT);
+        assert_eq!(memory_row.lon, NEW_LON);
+        assert_eq!(memory_row.accuracy_m, 8.0);
+        assert_eq!(memory_row.address, None);
+        assert_eq!(memory_row.sources, 7);
+        assert_eq!(disk_row.lat, memory_row.lat);
+        assert_eq!(disk_row.lon, memory_row.lon);
+        assert_eq!(disk_row.accuracy_m, memory_row.accuracy_m);
+        assert_eq!(disk_row.address, memory_row.address);
+        assert_eq!(disk_row.at_rfc3339, memory_row.at_rfc3339);
+        assert_eq!(disk_row.sources, memory_row.sources);
+    }
 }
 
 #[cfg(test)]
