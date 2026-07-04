@@ -224,39 +224,35 @@ async fn main() -> Result<()> {
         setup_unix_listener(&args).context("setting up the control-channel unix socket")?;
 
     let server_state = Arc::clone(&state);
-    let mut server_handle = tokio::spawn(async move {
-        if let Err(e) = server::run_server(server_state, unix_listener).await {
-            error!("server error: {e}");
-        }
-    });
+    let mut server_handle =
+        tokio::spawn(async move { server::run_server(server_state, unix_listener).await });
 
-    // Wait for a shutdown signal. Both SIGINT (Ctrl-C) and SIGTERM (systemctl
-    // stop, docker stop, etc.) are handled; their handlers were installed early
-    // (see above), so a signal that arrived during startup is latched and
-    // handled here once startup finishes, and one arriving now is handled
-    // immediately — either way via the normal drain, never a default-
-    // disposition kill mid-write to SQLite or mid-API-call.
-    let server_exited = tokio::select! {
+    // Wait for a shutdown signal or an unexpected server-task termination.
+    // Both SIGINT (Ctrl-C) and SIGTERM (systemctl stop, docker stop, etc.) are
+    // handled; their handlers were installed early (see above), so a signal
+    // that arrived during startup is latched and handled here once startup
+    // finishes. A server failure uses the SAME orderly drain, but is carried
+    // through to the final Result so #[tokio::main] exits non-zero and
+    // systemd Restart=on-failure can recover it (task-0241).
+    let server_failure = tokio::select! {
+        // If a signal and server failure become ready together, the failure
+        // must win. An unbiased select could randomly misclassify a panicked
+        // accept loop as a successful signal shutdown (exit 0).
+        biased;
+        res = &mut server_handle => {
+            // This arm consumes the JoinHandle's output; it must NOT be
+            // awaited again or tokio panics on the second poll (task-0195).
+            let failure = server_exit_error(res);
+            error!("{failure:#}");
+            Some(failure)
+        }
         _ = sigint.recv() => {
             info!("received SIGINT, shutting down");
-            false
+            None
         }
         _ = sigterm.recv() => {
             info!("received SIGTERM, shutting down");
-            false
-        }
-        res = &mut server_handle => {
-            // The server task ended on its own — realistically a panic in the
-            // accept loop: since task-0233 a TCP-bind failure degrades instead
-            // of exiting, and a unix-bind failure aborts before this task is
-            // even spawned. This arm consumes the JoinHandle's output; it must
-            // NOT be awaited again or tokio panics on the second poll
-            // (task-0195).
-            match res {
-                Ok(()) => error!("server task exited unexpectedly"),
-                Err(e) => error!("server task join error: {e}"),
-            }
-            true
+            None
         }
     };
 
@@ -265,22 +261,26 @@ async fn main() -> Result<()> {
     // await instead of missing the wakeup and running forever.
     state.shutdown.cancel();
 
-    // Collect the loop handles to drain. The server is special-cased for
-    // task-0195: if it already exited above, its handle is spent — drop it
-    // without a second poll; otherwise abort it (accept() has no state to
-    // flush) and drain it with the rest.
-    let mut named = vec![scan_handle, pending_handle, history_handle];
-    if !server_exited {
+    // The server is special-cased for task-0195. On the failure path the
+    // select arm already consumed its output, so touching it again would be a
+    // second poll. On a signal, select only observed Pending: request abort of
+    // the accept loop (it has no state to flush), then move the handle into the
+    // SAME bounded drain as every other task. Tokio abort is cooperative, so
+    // awaiting it here without the drain timeout would make SIGTERM unbounded.
+    let server_to_drain = if server_failure.is_none() {
         server_handle.abort();
-        named.push(server_handle);
-    }
+        Some(server_handle)
+    } else {
+        None
+    };
+    let named = vec![scan_handle, pending_handle, history_handle];
 
     // Take the tracked-spawn JoinSet out of shared state so we can drive it to
     // completion here (a std::sync::Mutex guard cannot be held across await).
     let tracked = std::mem::take(&mut *state.tasks.lock().unwrap_or_else(|e| e.into_inner()));
 
     // task-0190/0102: wait up to the budget, then force-abort survivors.
-    let aborted = run_shutdown_drain(Duration::from_secs(5), named, tracked).await;
+    let aborted = run_shutdown_drain(Duration::from_secs(5), named, server_to_drain, tracked).await;
     if aborted > 0 {
         // Journal observability, independent of the stats persist below.
         info!("shutdown drain force-aborted {aborted} orphaned tasks");
@@ -292,8 +292,10 @@ async fn main() -> Result<()> {
     // older shutdown cannot masquerade as current. The next run loads it at
     // startup and serves it via stats; the in-memory bump above happens after
     // the server socket has closed and is observable by nobody (task-0102
-    // review). A crash/SIGKILL skips this write, so the persisted value
-    // always describes the last CLEAN shutdown.
+    // review). A process-level crash/SIGKILL skips this write. A caught server
+    // task failure reaches this orderly cleanup before main returns Err, so
+    // the persisted value describes the last fully-drained shutdown even when
+    // its process status is non-zero.
     {
         let db = server::lock_db(&state);
         if let Err(e) = db.set_metadata(ORPHANS_ABORTED_KEY, &aborted.to_string()) {
@@ -318,8 +320,39 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("whereamid stopped");
-    Ok(())
+    match &server_failure {
+        Some(_) => error!("whereamid stopped after unexpected server task failure"),
+        None => info!("whereamid stopped"),
+    }
+    shutdown_result(server_failure)
+}
+
+/// Convert every way the server task can end into the fatal error propagated
+/// by `main` after the orderly shutdown drain.
+///
+/// `run_server` is an accept loop and has no successful terminal state. Its
+/// inner `Ok(())`, a returned error, and an outer Tokio `JoinError` (including
+/// panic) are therefore all unexpected. Keeping this classification in a
+/// small pure seam makes the process-status policy deterministic to test
+/// without adding a production crash flag solely for an integration test.
+fn server_exit_error(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> anyhow::Error {
+    match result {
+        Ok(Ok(())) => anyhow::anyhow!("server task exited unexpectedly"),
+        Ok(Err(error)) => error.context("server task failed"),
+        Err(error) => anyhow::anyhow!("server task join error: {error}"),
+    }
+}
+
+/// Final process result after every shutdown path has completed the same
+/// cancellation, drain, metadata persistence, and socket cleanup.
+/// `#[tokio::main]` maps `Err` to a non-zero process exit.
+fn shutdown_result(server_failure: Option<anyhow::Error>) -> Result<()> {
+    match server_failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Create every missing component of `dir` with mode 0700 (owner-only).
@@ -466,27 +499,35 @@ fn load_orphan_count(db: &Database) -> u64 {
 /// Drive the cooperative shutdown drain (task-0190/0102/0195).
 ///
 /// The caller has already signalled `state.shutdown.cancel()`. This waits up
-/// to `budget` for the `named` loop handles and the `tracked` JoinSet to
-/// finish cooperatively; on timeout it force-aborts everything still running
-/// and returns the number of tasks that had to be aborted (named loops +
-/// tracked spawns), which the caller records into `orphan_tasks_aborted`.
+/// to `budget` for the `named` loop handles, the optional server handle, and
+/// the `tracked` JoinSet to finish cooperatively; on timeout it force-aborts
+/// everything still running and returns the number of tasks that had to be
+/// aborted (named loops + server + tracked spawns), which the caller records
+/// into `orphan_tasks_aborted`.
 ///
 /// Every JoinHandle is polled at most once (task-0195): the graceful future
-/// consumes the `named` handles, and the pre-extracted `AbortHandle`s are the
-/// only thing touched on the timeout path — the handles are never re-awaited.
+/// consumes the `named`/`server` handles, and the pre-extracted `AbortHandle`s
+/// are the only thing touched on the timeout path — handles are never
+/// re-awaited. The server is separate because its output is `Result<()>`,
+/// unlike the background loops' `()`.
 async fn run_shutdown_drain(
     budget: Duration,
     named: Vec<tokio::task::JoinHandle<()>>,
+    server: Option<tokio::task::JoinHandle<Result<()>>>,
     mut tracked: tokio::task::JoinSet<()>,
 ) -> u64 {
     let named_aborts: Vec<tokio::task::AbortHandle> =
         named.iter().map(|h| h.abort_handle()).collect();
+    let server_abort = server.as_ref().map(|h| h.abort_handle());
 
     // Graceful phase. `named` is moved in and consumed (owned `JoinHandle`s,
     // awaited once each); `tracked` is borrowed so it survives a timeout for
     // the force-abort + count below.
     let graceful = async {
         for h in named {
+            let _ = h.await;
+        }
+        if let Some(h) = server {
             let _ = h.await;
         }
         while tracked.join_next().await.is_some() {}
@@ -504,6 +545,12 @@ async fn run_shutdown_drain(
 
     let mut aborted: u64 = 0;
     for a in &named_aborts {
+        if !a.is_finished() {
+            a.abort();
+            aborted += 1;
+        }
+    }
+    if let Some(a) = &server_abort {
         if !a.is_finished() {
             a.abort();
             aborted += 1;
@@ -594,11 +641,66 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
 }
 
 #[cfg(test)]
+mod server_exit_tests {
+    //! task-0241: deterministic policy tests for unexpected server-task
+    //! termination. The real accept loop is intentionally infinite and has no
+    //! safe external input that makes it return or panic, so exercising the
+    //! JoinHandle classification directly avoids a production fault-injection
+    //! flag. `tests/shutdown.rs::sigterm_exits_within_drain_budget` remains the
+    //! real-binary exit-0 control for the signal path.
+    use super::{server_exit_error, shutdown_result};
+    use anyhow::Result;
+
+    #[test]
+    fn unexpected_clean_server_completion_is_fatal() {
+        let failure = server_exit_error(Ok(Ok(())));
+        assert_eq!(failure.to_string(), "server task exited unexpectedly");
+        assert!(
+            shutdown_result(Some(failure)).is_err(),
+            "unexpected server completion must become main's non-zero result"
+        );
+    }
+
+    #[test]
+    fn returned_server_error_is_fatal_and_preserved() {
+        let failure = server_exit_error(Ok(Err(anyhow::anyhow!("accept loop failed"))));
+        assert_eq!(
+            format!("{failure:#}"),
+            "server task failed: accept loop failed"
+        );
+        assert!(shutdown_result(Some(failure)).is_err());
+    }
+
+    #[tokio::test]
+    async fn panicked_server_join_is_fatal() {
+        let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async {
+            panic!("synthetic accept-loop panic");
+        });
+        let failure = server_exit_error(handle.await);
+        let message = failure.to_string();
+        assert!(
+            message.contains("server task join error") && message.contains("panicked"),
+            "panic JoinError must remain diagnostic: {message}"
+        );
+        assert!(shutdown_result(Some(failure)).is_err());
+    }
+
+    #[test]
+    fn signal_shutdown_remains_successful() {
+        assert!(
+            shutdown_result(None).is_ok(),
+            "SIGINT/SIGTERM path must remain exit 0"
+        );
+    }
+}
+
+#[cfg(test)]
 mod shutdown_drain_tests {
-    //! Deterministic (paused-clock) tests for the shutdown drain
-    //! (task-0190/0102/0195). No wall-clock waits: the runtime auto-advances
-    //! virtual time to the earliest pending timer, so the budget timeout fires
-    //! exactly when expected.
+    //! Shutdown-drain tests for task-0190/0102/0195/0241. The ordinary async
+    //! cases use a paused clock, which auto-advances to the budget timeout.
+    //! The non-cooperative server regression deliberately uses real-time
+    //! `spawn_blocking` work (which paused Tokio time cannot model) and carries
+    //! an independent outer watchdog so a regression fails instead of hanging.
     use super::run_shutdown_drain;
     use tokio::task::JoinSet;
     use tokio::time::{Duration, Instant};
@@ -611,7 +713,7 @@ mod shutdown_drain_tests {
         let mut tracked = JoinSet::new();
         tracked.spawn(async {});
         tracked.spawn(async {});
-        let aborted = run_shutdown_drain(Duration::from_secs(5), named, tracked).await;
+        let aborted = run_shutdown_drain(Duration::from_secs(5), named, None, tracked).await;
         assert_eq!(aborted, 0);
     }
 
@@ -627,7 +729,7 @@ mod shutdown_drain_tests {
             });
         }
         let start = Instant::now();
-        let aborted = run_shutdown_drain(Duration::from_secs(1), Vec::new(), tracked).await;
+        let aborted = run_shutdown_drain(Duration::from_secs(1), Vec::new(), None, tracked).await;
         let elapsed = start.elapsed();
         assert_eq!(
             aborted, 5,
@@ -646,8 +748,53 @@ mod shutdown_drain_tests {
         let named = vec![tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(10)).await;
         })];
-        let aborted = run_shutdown_drain(Duration::from_secs(1), named, JoinSet::new()).await;
+        let aborted = run_shutdown_drain(Duration::from_secs(1), named, None, JoinSet::new()).await;
         assert_eq!(aborted, 1);
+    }
+
+    /// task-0241 review regression: abort is cooperative. A server task in
+    /// non-yielding/blocking work cannot be awaited outside the shutdown
+    /// budget, or SIGTERM may hang forever before metadata/socket cleanup.
+    /// `spawn_blocking` deliberately models work that has already started and
+    /// therefore ignores `JoinHandle::abort`; the bounded drain must time out,
+    /// count it, and return while the blocking closure is still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_bounds_non_cooperative_server_handle() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<(), anyhow::Error>(())
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking server task must start");
+        server.abort(); // Ineffective after spawn_blocking has started.
+
+        let start = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_shutdown_drain(
+                Duration::from_millis(50),
+                Vec::new(),
+                Some(server),
+                JoinSet::new(),
+            ),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // Release before unwrapping/asserting so a timeout or failed assertion
+        // cannot strand a blocking task during Tokio runtime teardown.
+        release_tx.send(()).unwrap();
+        let aborted = outcome.expect("bounded server drain exceeded its 2s test watchdog");
+        assert_eq!(aborted, 1, "the stuck server handle must be counted");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "server drain exceeded its 50ms budget: {elapsed:?}"
+        );
     }
 
     /// Only survivors are counted: a task that finished before the timeout was
@@ -659,7 +806,7 @@ mod shutdown_drain_tests {
         tracked.spawn(async {
             tokio::time::sleep(Duration::from_secs(10)).await;
         }); // still running at the budget
-        let aborted = run_shutdown_drain(Duration::from_secs(1), Vec::new(), tracked).await;
+        let aborted = run_shutdown_drain(Duration::from_secs(1), Vec::new(), None, tracked).await;
         assert_eq!(
             aborted, 1,
             "only the still-running task counts; the finished one was reaped"
@@ -682,7 +829,7 @@ mod shutdown_drain_tests {
         tracked.spawn(async {
             tokio::time::sleep(Duration::from_secs(60)).await;
         }); // genuine survivor
-        let aborted = run_shutdown_drain(Duration::from_secs(1), named, tracked).await;
+        let aborted = run_shutdown_drain(Duration::from_secs(1), named, None, tracked).await;
         assert_eq!(
             aborted, 2,
             "finished-but-unjoined tracked tasks must be reaped before counting"

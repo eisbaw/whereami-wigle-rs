@@ -81,6 +81,9 @@ in {
         # so a busy opt-in port can neither take the daemon down nor (had the
         # exit been made non-zero) crash-loop it to start-limit-hit. The unix
         # socket's own bind failure stays fatal (non-zero, and thus retried).
+        # task-0241: if the running server task later returns or panics, main
+        # completes its orderly drain and then exits non-zero, so on-failure
+        # restarts it instead of accepting a dead daemon as successful.
         # RestartSec is kept small so recovery is fast and the start-limit above
         # is reached quickly for a persistently-failing config.
         Restart = "on-failure";

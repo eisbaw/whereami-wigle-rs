@@ -29,6 +29,10 @@ client must be upgraded together.**
   loud warning and keeps serving the mandatory unix socket instead of exiting,
   so a busy opt-in port can neither take the daemon down nor be reported (under
   systemd `Restart=on-failure`) as a dead-but-"successful" exit 0.
+- **Unexpected server-task termination is fatal after cleanup** (task-0241):
+  an accept-loop return, error, or panic now runs the normal shutdown drain and
+  then exits non-zero, allowing systemd `Restart=on-failure` to recover it.
+  Normal SIGINT/SIGTERM shutdown still exits 0.
 - **Client / `whereami` CLI:** resolves the daemon via `$WHEREAMI_SOCKET` →
   `$WHEREAMI_ADDR` (TCP, for old daemons) → the default socket paths, with **no**
   implicit fallback to `127.0.0.1:4747` (port-squatting impersonation). Reach an
