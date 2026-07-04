@@ -85,6 +85,36 @@ fn wait_for_exit(child: &mut Child, budget: Duration) -> Option<(Duration, ExitS
     }
 }
 
+/// Block until the daemon has bound its control socket, then return. This
+/// replaces a blind fixed startup sleep (task-0237) with a poll on an actual
+/// readiness condition — the socket file appearing. The daemon installs its
+/// SIGTERM/SIGINT handlers BEFORE binding the socket, so a bound socket implies
+/// the handler is already installed: exactly the precondition the sigterm test
+/// needs before it signals. The 10ms cadence is a poll backoff, not a fixed
+/// readiness delay — the loop returns the instant the socket exists — and it
+/// fails fast if the daemon exits during startup.
+fn wait_until_socket_ready(child: &mut Child, socket: &Path, dir: &Path, budget: Duration) {
+    let start = Instant::now();
+    loop {
+        if socket.exists() {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            panic!(
+                "daemon exited during startup (status {status:?}) before binding its \
+                 socket; stderr:\n{}",
+                read_stderr(dir)
+            );
+        }
+        assert!(
+            start.elapsed() < budget,
+            "daemon did not bind its control socket within {budget:?}; stderr:\n{}",
+            read_stderr(dir)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// task-0195 AC#1 (now the TCP-opt-in variant, task-0196): the unix socket
 /// binds fine, but the requested TCP `--bind` port is already taken, so
 /// `run_server`'s `TcpListener::bind` returns EADDRINUSE and the server task
@@ -158,18 +188,21 @@ fn sigterm_exits_within_drain_budget() {
     let sock = dir.join("whereamid.sock");
     let mut child = spawn_daemon(Some(&addr), &sock, &dir);
 
-    // Let it finish startup and install the SIGTERM handler.
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        child.try_wait().expect("try_wait").is_none(),
-        "daemon exited before SIGTERM was sent; stderr:\n{}",
-        read_stderr(&dir)
-    );
+    // Readiness handshake: wait for the daemon to bind its control socket rather
+    // than sleeping a fixed interval and hoping startup finished. Since the
+    // daemon installs its signal handlers before the socket bind (task-0237), a
+    // bound socket guarantees the SIGTERM handler is live, so the signal below
+    // can never race an uninstalled handler.
+    wait_until_socket_ready(&mut child, &sock, &dir, Duration::from_secs(10));
 
     let rc = unsafe { kill(child.id() as i32, SIGTERM) };
     assert_eq!(rc, 0, "kill(SIGTERM) syscall failed");
 
-    let outcome = wait_for_exit(&mut child, Duration::from_secs(4));
+    // Wait past the daemon's 5s drain budget (6s) so a slow-but-correct drain is
+    // reported as "too slow" by the < 4s health assertion below rather than
+    // masquerading as a hang/timeout here; a healthy graceful shutdown finishes
+    // in well under 1s.
+    let outcome = wait_for_exit(&mut child, Duration::from_secs(6));
     let stderr = read_stderr(&dir);
 
     if outcome.is_none() {
@@ -179,8 +212,8 @@ fn sigterm_exits_within_drain_budget() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let (elapsed, status) = outcome.expect(
-        "daemon did not exit within 4s of SIGTERM — the drain budget is 5s but a \
-         graceful shutdown should finish near-instantly",
+        "daemon did not exit within 6s of SIGTERM (drain budget is 5s) — a graceful \
+         shutdown should finish near-instantly, so this indicates a hang",
     );
     assert!(
         !stderr.contains("panicked"),
@@ -188,7 +221,7 @@ fn sigterm_exits_within_drain_budget() {
     );
     assert!(
         elapsed < Duration::from_secs(4),
-        "SIGTERM shutdown took {elapsed:?}, expected < 4s"
+        "SIGTERM shutdown took {elapsed:?}, expected < 4s (drain should be near-instant)"
     );
     // Graceful path returns Ok(()) -> exit 0 (the signal is handled, not fatal).
     assert_eq!(

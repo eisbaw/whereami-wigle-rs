@@ -53,6 +53,24 @@ async fn main() -> Result<()> {
     // signals, threads). Bad combinations produce a clean error message
     // and a non-zero exit, not a runtime assert deep inside Debouncer.
     args.validate().context("invalid CLI arguments")?;
+
+    // Install the termination-signal handlers BEFORE any slow startup work
+    // (DB open + migrations, socket bind). tokio's `signal()` registers the
+    // OS-level handler at call time and latches a pending signal in a watch
+    // channel, so a SIGTERM/SIGINT that lands during startup is not fatal: the
+    // process finishes startup, then the select! below observes the latched
+    // signal and runs the normal shutdown drain — instead of the kernel
+    // terminating the daemon by default disposition (signal 15) mid-migration.
+    // The signal is deferred until startup completes, not acted on immediately;
+    // for this daemon's tiny migrations that is well inside systemd's stop
+    // timeout. Installing early also makes the readiness handshake in
+    // tests/shutdown.rs sound: once the socket is bound the handler is already
+    // installed (task-0237).
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
+    let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+        .context("installing SIGINT handler")?;
+
     info!("whereamid starting");
     match &args.bind {
         Some(b) => info!("bind (TCP, opt-in, unauthenticated): {b}"),
@@ -212,14 +230,14 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for shutdown signal. Listen for both SIGINT (Ctrl-C) and SIGTERM
-    // (systemctl stop, docker stop, etc.). Without a SIGTERM handler systemd
-    // would SIGKILL the daemon after the stop timeout, potentially mid-write
-    // to SQLite or mid-API-call.
-    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-        .context("installing SIGTERM handler")?;
+    // Wait for a shutdown signal. Both SIGINT (Ctrl-C) and SIGTERM (systemctl
+    // stop, docker stop, etc.) are handled; their handlers were installed early
+    // (see above), so a signal that arrived during startup is latched and
+    // handled here once startup finishes, and one arriving now is handled
+    // immediately — either way via the normal drain, never a default-
+    // disposition kill mid-write to SQLite or mid-API-call.
     let server_exited = tokio::select! {
-        _ = signal::ctrl_c() => {
+        _ = sigint.recv() => {
             info!("received SIGINT, shutting down");
             false
         }
