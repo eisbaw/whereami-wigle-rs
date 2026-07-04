@@ -826,9 +826,27 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
         .await;
     }
 
-    // Build trilateration input
+    // Build trilateration input.
+    //
+    // task-0227: SQLite REAL columns can hold NaN/±Inf, and a non-finite
+    // coordinate flows straight through to_unit_vec -> NaN vector -> the
+    // `mag > 0` guards are false-on-NaN -> from_unit_vec returns (NaN, NaN)
+    // as a "successful" Ok(Position). Skip such rows here (first line of
+    // defense) and name the offending bssid so the poisoned cache row is
+    // traceable. trilaterate() re-filters as defense in depth for callers
+    // that bypass this path.
     let positioned_aps: Vec<PositionedAp> = cached_aps
         .iter()
+        .filter(|ap| {
+            let finite = ap.lat.is_finite() && ap.lon.is_finite();
+            if !finite {
+                warn!(
+                    "skipping AP {}: non-finite cached position ({}, {})",
+                    ap.bssid, ap.lat, ap.lon
+                );
+            }
+            finite
+        })
         .map(|ap| PositionedAp {
             lat: ap.lat,
             lon: ap.lon,
@@ -894,10 +912,21 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                                 // handle_locate.
                                 let mut last = bg_state.last_fix.lock().await;
                                 if let Some(fix) = last.as_mut() {
-                                    if address_cache_key(fix.lat, fix.lon)
-                                        == address_cache_key(bg_lat, bg_lon)
-                                        && fix.address.is_none()
-                                    {
+                                    // Fail-closed after task-0106 made
+                                    // address_cache_key return Option. In this
+                                    // caller bg_lat/bg_lon come from trilaterate
+                                    // (routed through finite_position), so their
+                                    // key is always Some; only fix.lat/lon can
+                                    // be non-finite (a poisoned last_fix row
+                                    // rehydrated from the DB). Requiring BOTH
+                                    // keys present and equal is a strict
+                                    // fail-closed guard: a non-finite fix (key
+                                    // None) can never backfill an address onto a
+                                    // garbage position.
+                                    let keys_match = address_cache_key(fix.lat, fix.lon)
+                                        .zip(address_cache_key(bg_lat, bg_lon))
+                                        .is_some_and(|(a, b)| a == b);
+                                    if keys_match && fix.address.is_none() {
                                         fix.address = Some(display.clone());
                                         let row: crate::db::LastFixRow = (&*fix).into();
                                         let db = lock_db(&bg_state);

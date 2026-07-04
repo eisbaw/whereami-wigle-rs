@@ -438,6 +438,28 @@ fn missing_signal_dbm(aps: &[PositionedAp]) -> f64 {
     }
 }
 
+/// task-0227: final fail-closed gate on a computed trilateration result.
+///
+/// With the non-finite input filter at `trilaterate`'s entry this should
+/// never fire, but routing every `Ok` return through it makes the
+/// "trilaterate never yields a non-finite Position" invariant hold
+/// *structurally* for all return paths — including any future one — rather
+/// than only in the `cfg(test)` asserts. A non-finite Position is a bug, not
+/// a location, so we surface it as an `Err` instead of handing a caller
+/// `(NaN, NaN)` that looks like a successful fix.
+fn finite_position(pos: Position) -> Result<Position> {
+    if pos.lat.is_finite() && pos.lon.is_finite() && pos.accuracy_m.is_finite() {
+        Ok(pos)
+    } else {
+        bail!(
+            "trilaterate produced a non-finite position (lat={}, lon={}, accuracy_m={})",
+            pos.lat,
+            pos.lon,
+            pos.accuracy_m
+        );
+    }
+}
+
 /// Compute weighted centroid from positioned APs.
 ///
 /// Weight formula: `10^(signal_dbm / 20)` via `vote_weight`. Since signal_dbm
@@ -453,12 +475,37 @@ pub fn trilaterate(aps: &[PositionedAp]) -> Result<Position> {
         bail!("no positioned APs for trilateration");
     }
 
+    // task-0227: fail closed on non-finite coordinates BEFORE any math.
+    // A NaN/±Inf lat or lon (e.g. read from a corrupt SQLite REAL column)
+    // poisons to_unit_vec into a NaN vector; the `mag > 0` guards below are
+    // false-on-NaN, so from_unit_vec would return (NaN, NaN) as an
+    // Ok(Position). Dropping such APs here also makes the single-AP fast
+    // path and the strongest-AP fallback safe, since they can only echo an
+    // input coordinate that is now guaranteed finite. This is defense in
+    // depth behind the server-side cache-read filter (server.rs); direct
+    // callers (tests, future consumers) get the same guarantee.
+    let finite: Vec<PositionedAp> = aps
+        .iter()
+        .copied()
+        .filter(|ap| ap.lat.is_finite() && ap.lon.is_finite())
+        .collect();
+    if finite.is_empty() {
+        // Every input AP had a non-finite coordinate: nothing positionable,
+        // the same non-result as the empty-input case but reported distinctly
+        // so a direct caller can tell a poisoned batch from an empty one.
+        bail!(
+            "no positioned APs for trilateration: all {} input APs had non-finite coordinates",
+            aps.len()
+        );
+    }
+    let aps: &[PositionedAp] = &finite;
+
     // Filter outliers before computing centroid
     let filtered = filter_outliers(aps);
     let aps = if filtered.is_empty() { aps } else { &filtered };
 
     if aps.len() == 1 {
-        return Ok(Position {
+        return finite_position(Position {
             lat: aps[0].lat,
             lon: aps[0].lon,
             accuracy_m: 100.0,
@@ -494,7 +541,7 @@ pub fn trilaterate(aps: &[PositionedAp]) -> Result<Position> {
                 da.cmp(&db)
             })
             .expect("non-empty after guard above");
-        return Ok(Position {
+        return finite_position(Position {
             lat: strongest.lat,
             lon: strongest.lon,
             // Inflate accuracy to signal that the centroid was ambiguous.
@@ -506,7 +553,7 @@ pub fn trilaterate(aps: &[PositionedAp]) -> Result<Position> {
     // Estimate accuracy from the weighted spread of input positions
     let accuracy_m = estimate_accuracy(aps, lat, lon);
 
-    Ok(Position {
+    finite_position(Position {
         lat,
         lon,
         accuracy_m,
@@ -685,6 +732,79 @@ mod tests {
             "accuracy must be finite, got {}",
             pos.accuracy_m
         );
+    }
+
+    /// task-0227 AC#3: a non-finite coordinate must be EXCLUDED, never
+    /// returned as a fix. A lone NaN/Inf AP has nothing positionable left
+    /// after the entry filter, so trilaterate errors exactly like the
+    /// empty-input case — it must not hand back `Ok((NaN, NaN))`.
+    #[test]
+    fn lone_non_finite_ap_errors_not_returned() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let lat_bad = vec![PositionedAp {
+                lat: bad,
+                lon: 12.5,
+                signal_dbm: Some(-60),
+            }];
+            assert!(
+                trilaterate(&lat_bad).is_err(),
+                "lone AP with lat={bad} must error, not return a position"
+            );
+            let lon_bad = vec![PositionedAp {
+                lat: 55.6,
+                lon: bad,
+                signal_dbm: None,
+            }];
+            assert!(
+                trilaterate(&lon_bad).is_err(),
+                "lone AP with lon={bad} must error, not return a position"
+            );
+        }
+    }
+
+    /// task-0227 AC#3: a non-finite AP mixed into an otherwise-finite cluster
+    /// must not contribute — the result stays finite and sits inside the
+    /// finite cluster (the poisoned AP, despite a strong signal, pulls
+    /// nothing). Exercises the centroid path with the poisoned AP dropped.
+    #[test]
+    fn non_finite_ap_excluded_from_cluster() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let aps = vec![
+                // Poisoned AP with a strong signal that WOULD dominate the
+                // weighted centroid if it were not filtered out first.
+                PositionedAp {
+                    lat: bad,
+                    lon: bad,
+                    signal_dbm: Some(-30),
+                },
+                PositionedAp {
+                    lat: 55.700,
+                    lon: 12.580,
+                    signal_dbm: Some(-60),
+                },
+                PositionedAp {
+                    lat: 55.701,
+                    lon: 12.581,
+                    signal_dbm: Some(-65),
+                },
+            ];
+            let pos = trilaterate(&aps).unwrap();
+            assert!(
+                pos.lat.is_finite() && pos.lon.is_finite() && pos.accuracy_m.is_finite(),
+                "result must be finite with a {bad} AP present, got ({}, {}, {})",
+                pos.lat,
+                pos.lon,
+                pos.accuracy_m
+            );
+            // The centroid must land in the finite cluster, not near the
+            // poisoned coordinate — proof the bad AP contributed nothing.
+            assert!(
+                (pos.lat - 55.7005).abs() < 0.1 && (pos.lon - 12.5805).abs() < 0.1,
+                "centroid drifted from the finite cluster with a {bad} AP: ({}, {})",
+                pos.lat,
+                pos.lon
+            );
+        }
     }
 
     #[test]

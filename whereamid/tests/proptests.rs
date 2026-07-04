@@ -140,6 +140,47 @@ proptest! {
         }
     }
 
+    /// task-0227 AC#3: injecting a NaN / ±Inf coordinate AP into a finite
+    /// cluster must never surface as a non-finite `Ok(Position)`. trilaterate
+    /// drops non-finite inputs at its entry (defense in depth behind the
+    /// server-side cache-read filter), so the poisoned AP — despite a strong
+    /// signal meant to dominate the weighted centroid — contributes nothing.
+    /// This is the property form of the `non_finite_ap_excluded_from_cluster`
+    /// unit test: it must hold for ANY finite cluster and ANY non-finite
+    /// injection site (lat or lon).
+    #[test]
+    fn trilaterate_excludes_non_finite_coord_ap(
+        coords in prop::collection::vec((40.0f64..60.0, 5.0f64..20.0), 2..8),
+        bad in prop_oneof![
+            Just(f64::NAN),
+            Just(f64::INFINITY),
+            Just(f64::NEG_INFINITY),
+        ],
+        bad_in_lat in prop::bool::ANY,
+    ) {
+        let mut aps: Vec<PositionedAp> = coords
+            .iter()
+            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60) })
+            .collect();
+        // One poisoned AP with a strong signal (-30 dBm) that WOULD dominate
+        // the weighted centroid if it reached the math.
+        let poisoned = if bad_in_lat {
+            PositionedAp { lat: bad, lon: 12.0, signal_dbm: Some(-30) }
+        } else {
+            PositionedAp { lat: 55.0, lon: bad, signal_dbm: Some(-30) }
+        };
+        aps.push(poisoned);
+
+        // The finite cluster (>= 2 APs) survives the entry filter, so this is
+        // always Ok — never the empty-input Err.
+        let result = trilaterate(&aps).unwrap();
+        prop_assert!(
+            result.lat.is_finite() && result.lon.is_finite() && result.accuracy_m.is_finite(),
+            "non-finite result ({}, {}, {}) despite finite cluster + one {bad} AP",
+            result.lat, result.lon, result.accuracy_m
+        );
+    }
+
     /// Stronger-signal AP pulls the centroid toward itself.
     ///
     /// Generate one strong AP and one weak AP at distinct positions and assert

@@ -22,20 +22,23 @@ pub const ADDRESS_CACHE_TTL_DAYS_DEFAULT: i64 = 7;
 /// `(i32, i32)` rather than floats so equality is bit-exact and we
 /// don't have to worry about NaN comparisons.
 ///
-/// Trilateration only produces finite (lat, lon) and lat is bounded by
-/// [-90, 90], lon by [-180, 180]; with scale = 10^4 the absolute value
-/// is ≤ 1.8e6, well within i32 range. `f64 as i32` saturates on
-/// non-finite inputs (Rust 1.45+), so even a hypothetical NaN here would
-/// produce 0/0 — the cache would alias all NaNs to one cell, which is
-/// harmless because trilateration never produces NaN today and the cell
-/// would never be hit by a real query (task-0064).
-pub(crate) fn address_cache_key(lat: f64, lon: f64) -> (i32, i32) {
-    debug_assert!(
-        lat.is_finite() && lon.is_finite(),
-        "address_cache_key called with non-finite ({lat}, {lon})"
-    );
+/// Returns `None` on any non-finite input (NaN / ±Inf) — this is an
+/// explicit fail-closed guard, not a coincidence of the cast (task-0106).
+/// `f64 as i32` *saturates* non-finite values to 0, which would silently
+/// alias every NaN/Inf position to the (0, 0) grid cell and cache a bogus
+/// address there; the previous `debug_assert!` that was meant to catch
+/// this is compiled out in release. Callers (`get`/`insert`) treat `None`
+/// as a miss / no-op so a bad float can never mutate or read cache state.
+///
+/// For finite inputs the key is always in range: lat ∈ [-90, 90],
+/// lon ∈ [-180, 180]; with scale = 10^4 the absolute value is ≤ 1.8e6,
+/// well within i32.
+pub(crate) fn address_cache_key(lat: f64, lon: f64) -> Option<(i32, i32)> {
+    if !lat.is_finite() || !lon.is_finite() {
+        return None;
+    }
     let scale = 10f64.powi(ADDRESS_CACHE_DECIMALS);
-    ((lat * scale).round() as i32, (lon * scale).round() as i32)
+    Some(((lat * scale).round() as i32, (lon * scale).round() as i32))
 }
 
 struct AddressCacheEntry {
@@ -73,7 +76,8 @@ impl AddressCache {
     }
 
     pub fn get(&self, lat: f64, lon: f64) -> Option<String> {
-        let entry = self.map.get(&address_cache_key(lat, lon))?;
+        // Non-finite (lat, lon) has no key — treat as a miss (task-0106).
+        let entry = self.map.get(&address_cache_key(lat, lon)?)?;
         let age_days = (chrono::Utc::now() - entry.inserted_at).num_days();
         if age_days >= self.ttl_days {
             return None;
@@ -82,7 +86,11 @@ impl AddressCache {
     }
 
     pub fn insert(&mut self, lat: f64, lon: f64, addr: String) {
-        let key = address_cache_key(lat, lon);
+        // Non-finite (lat, lon) has no key — no-op rather than aliasing the
+        // bogus position onto some grid cell (task-0106).
+        let Some(key) = address_cache_key(lat, lon) else {
+            return;
+        };
         let entry = AddressCacheEntry {
             address: addr,
             inserted_at: chrono::Utc::now(),
@@ -108,13 +116,66 @@ mod tests {
     /// `round() as i32` performs.
     #[test]
     fn address_cache_key_rounds_to_grid() {
-        let a = address_cache_key(55.668412, 12.554123);
-        let b = address_cache_key(55.668415, 12.554118); // sub-meter offset
+        let a = address_cache_key(55.668412, 12.554123).unwrap();
+        let b = address_cache_key(55.668415, 12.554118).unwrap(); // sub-meter offset
         assert_eq!(a, b, "neighbouring sub-meter positions must share a cell");
 
-        let c = address_cache_key(55.6684, 12.5541);
-        let d = address_cache_key(55.6700, 12.5541);
+        let c = address_cache_key(55.6684, 12.5541).unwrap();
+        let d = address_cache_key(55.6700, 12.5541).unwrap();
         assert_ne!(c, d, "positions ~150m apart must NOT share a cell");
+    }
+
+    /// task-0106: the key helper fails closed (returns `None`) on any
+    /// non-finite coordinate instead of saturating the `f64 as i32` cast to
+    /// the (0, 0) cell. This is the release-mode guard that replaced the
+    /// compiled-out `debug_assert!`.
+    #[test]
+    fn address_cache_key_none_on_non_finite() {
+        assert_eq!(address_cache_key(f64::NAN, 12.5), None);
+        assert_eq!(address_cache_key(55.6, f64::NAN), None);
+        assert_eq!(address_cache_key(f64::INFINITY, 12.5), None);
+        assert_eq!(address_cache_key(55.6, f64::NEG_INFINITY), None);
+        // Sanity: finite input still yields a key.
+        assert!(address_cache_key(55.6, 12.5).is_some());
+    }
+
+    /// task-0106 AC#3: a non-finite `get`/`insert` must be inert — `get`
+    /// returns `None` and neither call may mutate `map` or `order`. Guards
+    /// against a future NaN/Inf coordinate silently reading or writing the
+    /// saturated (0, 0) cell.
+    #[test]
+    fn address_cache_non_finite_is_inert() {
+        let mut cache = AddressCache::new();
+        // Seed one real entry so we can prove the length is untouched.
+        cache.insert(55.6684, 12.5541, "Copenhagen".to_string());
+        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.order.len(), 1);
+
+        // get with non-finite coords: miss, no state change.
+        assert!(cache.get(f64::NAN, f64::NAN).is_none());
+        assert!(cache.get(55.6684, f64::INFINITY).is_none());
+
+        // insert with non-finite coords: no-op, no state change.
+        cache.insert(f64::NAN, f64::NAN, "garbage".to_string());
+        cache.insert(55.6684, f64::NEG_INFINITY, "garbage".to_string());
+        cache.insert(f64::INFINITY, 12.5541, "garbage".to_string());
+
+        assert_eq!(
+            cache.map.len(),
+            1,
+            "non-finite insert must not grow the map"
+        );
+        assert_eq!(
+            cache.order.len(),
+            1,
+            "non-finite insert must not grow the order queue"
+        );
+        // The real entry is still readable and unclobbered.
+        assert_eq!(
+            cache.get(55.6684, 12.5541).as_deref(),
+            Some("Copenhagen"),
+            "finite entry must survive intervening non-finite calls"
+        );
     }
 
     #[test]
@@ -150,7 +211,7 @@ mod tests {
         cache.insert(55.6684, 12.5541, "Copenhagen".to_string());
         assert_eq!(cache.get(55.6684, 12.5541).as_deref(), Some("Copenhagen"));
 
-        let key = address_cache_key(55.6684, 12.5541);
+        let key = address_cache_key(55.6684, 12.5541).unwrap();
         cache.map.get_mut(&key).unwrap().inserted_at =
             chrono::Utc::now() - chrono::TimeDelta::days(8);
 
