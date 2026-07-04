@@ -102,8 +102,8 @@ async fn main() -> Result<()> {
 
     // Rehydrate last_fix from disk so the daemon can answer "where am I"
     // immediately after a restart, before the first scan-and-resolve cycle
-    // completes. A malformed or out-of-range timestamp is treated as "no
-    // last fix" — better to skip than to crash on startup.
+    // completes. A malformed timestamp or non-finite coordinate is treated as
+    // "no last fix" — better to discard it than serve a poisoned stale fix.
     let initial_last_fix = match db.get_last_fix() {
         Ok(Some(row)) => match server::LastFix::try_from(row) {
             Ok(fix) => Some(fix),

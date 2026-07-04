@@ -188,6 +188,17 @@ impl From<&LastFix> for crate::db::LastFixRow {
 impl TryFrom<crate::db::LastFixRow> for LastFix {
     type Error = anyhow::Error;
     fn try_from(row: crate::db::LastFixRow) -> Result<Self, Self::Error> {
+        // task-0238: SQLite REAL columns can contain NaN/+-Inf. Reject the
+        // persisted row at the rehydration choke point so main.rs discards it
+        // (and warns with this root cause) instead of making a poisoned stale
+        // fix available to return_last_fix_or_error.
+        if !row.lat.is_finite() || !row.lon.is_finite() {
+            anyhow::bail!(
+                "non-finite last_fix coordinates: lat={}, lon={}",
+                row.lat,
+                row.lon
+            );
+        }
         let at = chrono::DateTime::parse_from_rfc3339(&row.at_rfc3339)
             .map_err(|e| {
                 anyhow::anyhow!("unparseable last_fix timestamp {:?}: {e}", row.at_rfc3339)
@@ -201,6 +212,59 @@ impl TryFrom<crate::db::LastFixRow> for LastFix {
             at,
             sources: row.sources.max(0) as usize,
         })
+    }
+}
+
+#[cfg(test)]
+mod last_fix_rehydration_tests {
+    use super::*;
+
+    fn row(lat: f64, lon: f64) -> crate::db::LastFixRow {
+        crate::db::LastFixRow {
+            lat,
+            lon,
+            accuracy_m: 25.0,
+            address: Some("Copenhagen".to_string()),
+            at_rfc3339: "2026-07-04T12:00:00+00:00".to_string(),
+            sources: 3,
+        }
+    }
+
+    /// task-0238 AC#1/#3: main.rs maps this conversion's Err to None. Cover
+    /// every non-finite class in either coordinate; a finite counterpart
+    /// remains present so this cannot regress into rejecting all persisted
+    /// fixes.
+    #[test]
+    fn last_fix_rehydration_discards_non_finite_coordinates() {
+        let poisoned = [
+            (f64::NAN, 12.5, "NaN latitude"),
+            (f64::INFINITY, 12.5, "+Inf latitude"),
+            (f64::NEG_INFINITY, 12.5, "-Inf latitude"),
+            (55.6, f64::NAN, "NaN longitude"),
+            (55.6, f64::INFINITY, "+Inf longitude"),
+            (55.6, f64::NEG_INFINITY, "-Inf longitude"),
+        ];
+
+        for (lat, lon, case) in poisoned {
+            let persisted = row(lat, lon);
+            let error = LastFix::try_from(persisted.clone())
+                .err()
+                .unwrap_or_else(|| panic!("{case} must return Err"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("non-finite last_fix coordinates"),
+                "{case} error must name the root cause, got {error}"
+            );
+            assert!(
+                LastFix::try_from(persisted).ok().is_none(),
+                "{case} must rehydrate as None at the startup call site"
+            );
+        }
+
+        let finite = LastFix::try_from(row(55.6, 12.5)).expect("finite row must rehydrate");
+        assert_eq!(finite.lat, 55.6);
+        assert_eq!(finite.lon, 12.5);
     }
 }
 
@@ -1098,8 +1162,8 @@ async fn handle_resolve(bssids: &[String], state: &Arc<DaemonState>) -> String {
     let results: Vec<ResolveResult> = normalized
         .iter()
         .map(|bssid| {
-            if let Some(ap) = result.positioned.iter().find(|a| &a.bssid == bssid) {
-                ResolveResult {
+            match result.positioned.iter().find(|a| &a.bssid == bssid) {
+                Some(ap) if ap.lat.is_finite() && ap.lon.is_finite() => ResolveResult {
                     bssid: bssid.clone(),
                     lat: Some(ap.lat),
                     lon: Some(ap.lon),
@@ -1109,26 +1173,45 @@ async fn handle_resolve(bssids: &[String], state: &Arc<DaemonState>) -> String {
                     } else {
                         Provenance::Cache
                     },
+                },
+                // task-0238: fail closed at the protocol boundary. A poisoned
+                // cache row is not authoritative absence, so classify it as
+                // unresolved (retryable), never not_found. This guard also
+                // protects against a future provider returning non-finite
+                // coordinates directly in this read-only path.
+                Some(ap) => {
+                    warn!(
+                        "discarding resolve position for {}: non-finite coordinates ({}, {})",
+                        ap.bssid, ap.lat, ap.lon
+                    );
+                    ResolveResult {
+                        bssid: bssid.clone(),
+                        lat: None,
+                        lon: None,
+                        ssid: None,
+                        provenance: Provenance::Unresolved,
+                    }
                 }
-            } else {
-                // task-0194: only report not_found when the resolver
-                // established *authoritative* absence for this call (a provider
-                // said NotFound, or the not_found table did within TTL).
-                // Everything else — deferred to an in-flight resolution, a
-                // provider skipped for missing creds / exhausted quota, or a
-                // transient failure — is `unresolved`: absence is NOT
-                // established, so a client must retry rather than blacklist it.
-                let provenance = if result.not_found.contains(bssid) {
-                    Provenance::NotFound
-                } else {
-                    Provenance::Unresolved
-                };
-                ResolveResult {
-                    bssid: bssid.clone(),
-                    lat: None,
-                    lon: None,
-                    ssid: None,
-                    provenance,
+                None => {
+                    // task-0194: only report not_found when the resolver
+                    // established *authoritative* absence for this call (a provider
+                    // said NotFound, or the not_found table did within TTL).
+                    // Everything else — deferred to an in-flight resolution, a
+                    // provider skipped for missing creds / exhausted quota, or a
+                    // transient failure — is `unresolved`: absence is NOT
+                    // established, so a client must retry rather than blacklist it.
+                    let provenance = if result.not_found.contains(bssid) {
+                        Provenance::NotFound
+                    } else {
+                        Provenance::Unresolved
+                    };
+                    ResolveResult {
+                        bssid: bssid.clone(),
+                        lat: None,
+                        lon: None,
+                        ssid: None,
+                        provenance,
+                    }
                 }
             }
         })
@@ -1541,12 +1624,12 @@ mod wire_enum_tests {
 mod dispatch_tests {
     //! Full-dispatch integration tests (Request -> dispatch_command -> handler
     //! -> JSON) against a real in-memory DaemonState. Covers history overflow
-    //! (task-0184) and resolve provenance mapping (task-0194).
+    //! (task-0184), resolve provenance mapping (task-0194), and poisoned
+    //! SQLite coordinates at the resolve serve boundary (task-0238).
     use super::test_state;
     use super::*;
 
-    /// Extract `results[0].source` from a resolve dispatch response.
-    fn resolve_source(resp: &str) -> String {
+    fn first_resolve_result(resp: &str) -> serde_json::Value {
         let v: serde_json::Value =
             serde_json::from_str(resp).expect("dispatch must return valid JSON");
         assert_eq!(
@@ -1554,10 +1637,36 @@ mod dispatch_tests {
             Some(true),
             "resolve must succeed, got {resp}"
         );
-        v["results"][0]["source"]
+        let results = v["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("resolve results missing in {resp}"));
+        assert_eq!(results.len(), 1, "expected one resolve result in {resp}");
+        results[0].clone()
+    }
+
+    /// Extract `results[0].source` from a resolve dispatch response.
+    fn resolve_source(resp: &str) -> String {
+        let result = first_resolve_result(resp);
+        result["source"]
             .as_str()
             .unwrap_or_else(|| panic!("results[0].source missing in {resp}"))
             .to_string()
+    }
+
+    fn cache_ap(state: &Arc<DaemonState>, bssid: &str, lat: f64, lon: f64) {
+        let ap = crate::db::ApInfo {
+            bssid: bssid.to_string(),
+            ssid: Some("test-ap".to_string()),
+            lat,
+            lon,
+            encryption: None,
+            channel: None,
+            frequency: None,
+            city: None,
+            country: None,
+            source: crate::db::Source::Manual,
+        };
+        lock_db(state).upsert_ap(&ap).unwrap();
     }
 
     /// task-0184: a history request whose range overflows chrono must return
@@ -1649,6 +1758,57 @@ mod dispatch_tests {
             "not_found",
             "table-authoritative absence must be reported as not_found, got {resp}"
         );
+    }
+
+    /// task-0238 AC#2/#3: use real SQLite cache rows and full protocol
+    /// dispatch. serde_json historically masked the defect by serializing
+    /// non-finite f64 values as null, so `source=unresolved` is the decisive
+    /// assertion: the poisoned row was rejected rather than served as cache.
+    #[tokio::test]
+    async fn resolve_non_finite_cached_position_is_unresolved() {
+        let state = test_state();
+        let poisoned = [
+            ("AA:BB:CC:DD:EE:04", f64::INFINITY, 12.5),
+            ("AA:BB:CC:DD:EE:05", 55.5, f64::NEG_INFINITY),
+        ];
+
+        for (bssid, lat, lon) in poisoned {
+            cache_ap(&state, bssid, lat, lon);
+            let req = Request::Resolve {
+                bssids: vec![bssid.to_string()],
+            };
+            let resp = dispatch_command(&req, &state).await;
+            let result = first_resolve_result(&resp);
+
+            assert_eq!(
+                result["source"], "unresolved",
+                "poisoned cache row must be retryable, never cache/not_found: {resp}"
+            );
+            assert!(
+                result["lat"].is_null() && result["lon"].is_null(),
+                "poisoned cache row must emit null coordinates: {resp}"
+            );
+        }
+    }
+
+    /// Positive control for task-0238: the serve-boundary guard must preserve
+    /// the established finite cache response and wire vocabulary.
+    #[tokio::test]
+    async fn resolve_finite_cached_position_remains_cache() {
+        let state = test_state();
+        let bssid = "AA:BB:CC:DD:EE:06";
+        cache_ap(&state, bssid, 55.6684, 12.5541);
+
+        let req = Request::Resolve {
+            bssids: vec![bssid.to_string()],
+        };
+        let resp = dispatch_command(&req, &state).await;
+        let result = first_resolve_result(&resp);
+
+        assert_eq!(result["source"], "cache", "finite cache hit: {resp}");
+        assert_eq!(result["lat"].as_f64(), Some(55.6684));
+        assert_eq!(result["lon"].as_f64(), Some(12.5541));
+        assert_eq!(result["ssid"].as_str(), Some("test-ap"));
     }
 
     /// task-0102: spawn_tracked runs the future and tracks it in the JoinSet
