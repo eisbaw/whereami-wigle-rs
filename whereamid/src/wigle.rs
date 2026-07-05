@@ -14,6 +14,8 @@ pub enum WigleError {
     NotFound,
     /// Rate limited (HTTP 429 or daily quota exceeded).
     RateLimited,
+    /// A successful HTTP response contained malformed or unexpected JSON.
+    ParseError(anyhow::Error),
     /// Network or other transient error.
     Network(anyhow::Error),
 }
@@ -23,15 +25,19 @@ impl std::fmt::Display for WigleError {
         match self {
             WigleError::NotFound => write!(f, "BSSID not found in WiGLE"),
             WigleError::RateLimited => write!(f, "WiGLE rate limit exceeded"),
+            WigleError::ParseError(e) => write!(f, "WiGLE response parse error: {e}"),
             WigleError::Network(e) => write!(f, "WiGLE network error: {e}"),
         }
     }
 }
 
+const WIGLE_SEARCH_URL: &str = "https://api.wigle.net/api/v2/network/search";
+
 pub struct WigleClient {
     client: Client,
     api_user: String,
     api_key: String,
+    search_url: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -78,6 +84,25 @@ impl WigleClient {
             client: client_with_timeout(total),
             api_user: api_user.to_string(),
             api_key: api_key.to_string(),
+            search_url: WIGLE_SEARCH_URL.to_string(),
+        }
+    }
+
+    /// Test-only constructor for exercising the complete HTTP and provider
+    /// path against a deterministic local endpoint. Production constructors
+    /// always use the real WiGLE search URL above.
+    #[cfg(test)]
+    pub(crate) fn with_test_endpoint(
+        api_user: &str,
+        api_key: &str,
+        search_url: String,
+        total: std::time::Duration,
+    ) -> Self {
+        Self {
+            client: client_with_timeout(total),
+            api_user: api_user.to_string(),
+            api_key: api_key.to_string(),
+            search_url,
         }
     }
 
@@ -97,10 +122,7 @@ impl WigleClient {
 
         debug!("WiGLE lookup for {bssid}");
 
-        let url = format!(
-            "https://api.wigle.net/api/v2/network/search?netid={}",
-            bssid
-        );
+        let url = format!("{}?netid={}", self.search_url, bssid);
 
         let response = self
             .client
@@ -128,10 +150,15 @@ impl WigleClient {
             )));
         }
 
-        let body: WigleSearchResponse = response
-            .json()
+        // Keep response-body transport failures refundable. Only a complete
+        // successful response whose bytes do not decode as WiGLE JSON is a
+        // ParseError and therefore known to have reached the upstream API.
+        let bytes = response
+            .bytes()
             .await
             .map_err(|e| WigleError::Network(e.into()))?;
+        let body: WigleSearchResponse =
+            serde_json::from_slice(&bytes).map_err(|e| WigleError::ParseError(e.into()))?;
 
         interpret_response(body, bssid)
     }

@@ -138,8 +138,16 @@ async fn wigle_lookup(state: &Arc<DaemonState>, bssid: &str) -> ProviderOutcome 
             slot.consume();
             ProviderOutcome::NotFound
         }
-        // RateLimited / Network: no real unit consumed (or rejected upstream).
-        // `slot` drops here and refunds, preserving prior accounting.
+        Err(WigleError::ParseError(error)) => {
+            // A complete 2xx response reached us, so WiGLE likely charged the
+            // request even though its JSON was malformed. Keep the reserved
+            // slot while surfacing a retryable provider failure.
+            slot.consume();
+            ProviderOutcome::NetworkError(error.context("WiGLE returned an invalid JSON response"))
+        }
+        // Keep the established RateLimited / Network policy refundable: there
+        // was no completed successful response confirming a likely charge.
+        // `slot` drops here and refunds prior accounting.
         Err(WigleError::RateLimited) => ProviderOutcome::HardStop,
         Err(WigleError::Network(e)) => ProviderOutcome::NetworkError(e),
     }
@@ -185,6 +193,10 @@ mod tests {
     }
 
     fn test_state_with_wigle(api_user: &str, api_key: &str) -> Arc<DaemonState> {
+        test_state_with_wigle_client(crate::wigle::WigleClient::new(api_user, api_key))
+    }
+
+    fn test_state_with_wigle_client(wigle: crate::wigle::WigleClient) -> Arc<DaemonState> {
         let (db_runtime, db, test_db) = crate::db::DbRuntime::open_test().unwrap();
         let args = Args::parse_from(["whereamid"]);
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -196,7 +208,7 @@ mod tests {
             privacy: crate::privacy::PrivacyCoordinator::new(),
             connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
             args,
-            wigle: crate::wigle::WigleClient::new(api_user, api_key),
+            wigle,
             apple: crate::apple::AppleClient::new(),
             nominatim: crate::nominatim::NominatimClient::new(),
             geocode: crate::server::geocode::GeocodeScheduler::new(shutdown.clone()),
@@ -236,6 +248,45 @@ mod tests {
         state.db.writer_barrier().await.unwrap();
         state.db.api_calls_today().await.unwrap()
     }
+
+    async fn malformed_json_server() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local WiGLE test server");
+        let address = listener.local_addr().expect("local test address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept WiGLE request");
+            let mut request = [0_u8; 4096];
+            let bytes_read = stream.read(&mut request).await.expect("read WiGLE request");
+            assert!(
+                request[..bytes_read].starts_with(b"GET "),
+                "test endpoint must receive an HTTP GET"
+            );
+
+            let body = b"this is not JSON";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write response headers");
+            stream
+                .write_all(body)
+                .await
+                .expect("write malformed JSON body");
+            stream.shutdown().await.expect("close test response");
+        });
+
+        (format!("http://{address}/api/v2/network/search"), server)
+    }
+
+    // Destination TCP port 0 cannot name a listening service, so this avoids
+    // the bind-after-drop race of probing an ephemeral port and releasing it.
+    const REFUSED_LOCAL_ENDPOINT: &str = "http://127.0.0.1:0/api/v2/network/search";
 
     fn seed_api_counter(state: &Arc<DaemonState>, raw: &str) {
         let db = crate::server::lock_db(state);
@@ -333,6 +384,68 @@ mod tests {
                 .api_counter_corruption_denials
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_success_response_consumes_wigle_quota() {
+        let (endpoint, server) = malformed_json_server().await;
+        let state = test_state_with_wigle_client(crate::wigle::WigleClient::with_test_endpoint(
+            "configured-user",
+            "configured-key",
+            endpoint,
+            std::time::Duration::from_secs(2),
+        ));
+        assert_eq!(calls_today(&state).await, 0);
+
+        let outcome = wigle_lookup(&state, "aa:bb:cc:dd:ee:ff").await;
+        let error = match outcome {
+            ProviderOutcome::NetworkError(error) => error,
+            _ => panic!("malformed 2xx JSON must be a provider network failure"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("WiGLE returned an invalid JSON response"),
+            "parse failure context was lost: {error:#}"
+        );
+        assert_eq!(
+            calls_today(&state).await,
+            1,
+            "WiGLE likely charged a completed 2xx request, so its slot must stay consumed"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("local WiGLE server must finish")
+            .expect("local WiGLE server must not panic");
+    }
+
+    #[tokio::test]
+    async fn connection_failure_refunds_wigle_quota() {
+        let state = test_state_with_wigle_client(crate::wigle::WigleClient::with_test_endpoint(
+            "configured-user",
+            "configured-key",
+            REFUSED_LOCAL_ENDPOINT.to_string(),
+            std::time::Duration::from_secs(1),
+        ));
+        assert_eq!(calls_today(&state).await, 0);
+
+        let outcome = wigle_lookup(&state, "aa:bb:cc:dd:ee:ff").await;
+        let error = match outcome {
+            ProviderOutcome::NetworkError(error) => error,
+            _ => panic!("connection refusal must be surfaced as a network failure"),
+        };
+        let request_error = error
+            .downcast_ref::<reqwest::Error>()
+            .expect("network failure must retain the reqwest error");
+        assert!(
+            request_error.is_connect(),
+            "destination port 0 must exercise reqwest's connect failure path: {error:#}"
+        );
+        assert_eq!(
+            calls_today(&state).await,
+            0,
+            "a request that never connected must refund its reserved WiGLE slot"
         );
     }
 
