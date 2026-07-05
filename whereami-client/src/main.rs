@@ -19,7 +19,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::process;
-use whereami_client::{DaemonResponse, LocateResponse, ScanResponse, WhereAmIClient};
+use whereami_client::{
+    DaemonResponse, LocateResponse, ScanResponse, StatsResponse, WhereAmIClient,
+};
 
 /// `whereami` — Wi-Fi geolocation CLI.
 ///
@@ -70,14 +72,14 @@ enum Command {
     /// List visible Wi-Fi networks from the most recent scan.
     #[command(alias = "s")]
     Scan {
-        /// Suppress the "scanned: <ts> (Ns ago)" header line. Defaults
+        /// Suppress the "scanned: TIMESTAMP (Ns ago)" header line. Defaults
         /// to `yes` (i.e. show the header). The legacy invocation
         /// `whereami scan --scan-time=no` still works.
         #[arg(long, value_enum, default_value_t = YesNo::Yes)]
         scan_time: YesNo,
     },
 
-    /// Cache, pending, and rate-limit statistics.
+    /// Cache/rate counters and tasks aborted at the last clean shutdown.
     #[command(alias = "st")]
     Stats,
 
@@ -274,6 +276,30 @@ fn render_locate(resp: &LocateResponse) -> String {
     out
 }
 
+/// Render the stats response exactly as the human CLI prints it. The final
+/// counter is explicitly labelled as belonging to the last clean shutdown:
+/// the daemon persists it while shutting down and reloads it on its next start.
+fn render_stats(resp: &StatsResponse) -> String {
+    format!(
+        "cached:        {}\n\
+         pending:       {}\n\
+         not_found:     {}\n\
+         inflight:      {}\n\
+         db size:       {} KB\n\
+         API today:     {}\n\
+         db write fail: {}\n\
+         tasks aborted at last clean shutdown: {}\n",
+        resp.cached_aps,
+        resp.pending_aps,
+        resp.not_found_aps,
+        resp.inflight,
+        resp.db_size_bytes / 1024,
+        resp.api_calls_today,
+        resp.db_write_failures,
+        resp.orphan_tasks_aborted,
+    )
+}
+
 fn main() {
     // Restore the default SIGPIPE disposition (task-0199). The Rust runtime
     // installs SIG_IGN for SIGPIPE before main(), which turns a closed
@@ -391,13 +417,7 @@ fn run_stats(client: &WhereAmIClient, json: bool) {
         emit_json(client.stats_raw());
     } else {
         dispatch(client.stats(), |resp| {
-            println!("cached:        {}", resp.cached_aps);
-            println!("pending:       {}", resp.pending_aps);
-            println!("not_found:     {}", resp.not_found_aps);
-            println!("inflight:      {}", resp.inflight);
-            println!("db size:       {} KB", resp.db_size_bytes / 1024);
-            println!("API today:     {}", resp.api_calls_today);
-            println!("db write fail: {}", resp.db_write_failures);
+            print!("{}", render_stats(resp));
         });
     }
 }
@@ -837,6 +857,35 @@ mod tests {
         assert_eq!(
             render_scan(&resp, true),
             "aa:bb:cc:dd:ee:ff   -55 dBm  ch11   HomeNet\n"
+        );
+    }
+
+    #[test]
+    fn render_stats_includes_last_clean_shutdown_abort_count_exactly() {
+        let resp = whereami_client::StatsResponse {
+            ok: true,
+            v: 1,
+            cached_aps: 42,
+            pending_aps: 3,
+            not_found_aps: 4,
+            db_size_bytes: 49_152,
+            api_calls_today: 5,
+            inflight: 6,
+            db_write_failures: 7,
+            orphan_tasks_aborted: 8,
+            error: None,
+        };
+
+        assert_eq!(
+            render_stats(&resp),
+            "cached:        42\n\
+             pending:       3\n\
+             not_found:     4\n\
+             inflight:      6\n\
+             db size:       48 KB\n\
+             API today:     5\n\
+             db write fail: 7\n\
+             tasks aborted at last clean shutdown: 8\n"
         );
     }
 

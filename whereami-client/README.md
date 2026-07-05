@@ -6,6 +6,7 @@ geolocation daemon. Speaks the JSON-lines protocol documented in
 opt-in TCP.
 
 The crate ships two artefacts:
+
 - A library with typed request/response structs (`LocateResponse`,
   `HistoryResponse`, etc.) and a `WhereAmIClient` that handles connection
   setup and parsing.
@@ -37,12 +38,20 @@ let via_tcp = WhereAmIClient::tcp("10.0.0.5:4747"); // opt-in, unauthenticated
 let stats = via_socket.stats()?;
 ```
 
-All daemon responses share an `ok: bool` flag and an `error: Option<String>`
-field. The crate exposes a `DaemonResponse` trait so generic dispatchers can
-inspect both uniformly:
+`StatsResponse::orphan_tasks_aborted` is the number of tasks force-aborted at
+the end of the last clean daemon shutdown. It is one persisted shutdown
+snapshot, neither a current count nor a cumulative total. The daemon loads it on
+startup; a crash or `SIGKILL` leaves the previous clean-shutdown value unchanged.
+Older daemons omit the field, which the typed client reads as `0`.
+
+All typed response structs expose an `ok: bool` flag and an
+`error: Option<String>` field so callers have one uniform model. Successful
+daemon wire objects omit `error`; daemon error objects include it. The crate
+exposes a `DaemonResponse` trait so generic dispatchers can inspect both
+uniformly:
 
 ```rust
-fn handle<T: serde::Serialize + whereami_client::DaemonResponse>(r: &T) {
+fn handle<T: whereami_client::DaemonResponse>(r: &T) {
     if !r.is_ok() { panic!("{}", r.error().unwrap_or("unknown error")); }
 }
 ```
@@ -70,7 +79,19 @@ Override with `WHEREAMI_SOCKET=<path>`, or point at an old TCP daemon with
 ## Wire protocol
 
 See [docs/protocol.md](../docs/protocol.md) for the full request/response
-schemas. The crate's response structs are 1:1 mirrors of those JSON shapes.
+schemas. The typed response structs model the fields consumed by this client;
+they are compatibility-oriented rather than byte-for-byte mirrors. Newer
+defaultable fields use their type default (`0`, `false`, empty, or `None`) when
+an older daemon omits them, and unknown fields from a newer daemon are ignored
+during typed deserialization.
+
+Each command also has a `*_raw` method. The CLI's `--json` mode uses that raw
+path: after the transport removes the framing newline and surrounding
+whitespace, syntactically valid daemon JSON is forwarded without typed
+re-serialization, preserving unknown fields and omission versus `null`. If the
+transport fails or the daemon returns non-JSON, the CLI instead emits its own
+`{"ok":false,"error":"..."}` object. Exact exit and framing behavior is
+documented in [the protocol reference](../docs/protocol.md#official-cli---json-behavior).
 
 ## License
 

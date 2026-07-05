@@ -407,6 +407,13 @@ pub struct StatsResponse {
     /// start. task-0076. Defaults to 0 for older daemons.
     #[serde(default)]
     pub db_write_failures: u64,
+    /// Number of tasks force-aborted at the end of the last clean daemon
+    /// shutdown. This is one persisted shutdown snapshot, neither a current
+    /// count nor a cumulative total. The daemon reloads it on startup; a crash
+    /// or SIGKILL does not update it. Defaults to 0 for older daemons that do
+    /// not emit the field.
+    #[serde(default)]
+    pub orphan_tasks_aborted: u64,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -427,7 +434,8 @@ impl WhereAmIClient {
         Self::new(ConnectTarget::Unix(path.into()))
     }
 
-    /// Resolve the default target from the environment (see [`resolve_target`]).
+    /// Resolve the default target from the environment using the documented
+    /// socket-resolution order.
     /// Errors when no daemon socket can be found and no override is set; the
     /// caller decides how to surface that (the CLI routes it through the same
     /// `--json`/human path as a transport error, task-0183).
@@ -502,7 +510,8 @@ impl WhereAmIClient {
         Self::parse_response_line(&self.locate_raw()?)
     }
 
-    /// Raw `locate`: the daemon's response line verbatim (feeds `--json`).
+    /// Raw `locate`: daemon JSON response body after transport framing and
+    /// surrounding-whitespace removal; feeds `--json`.
     pub fn locate_raw(&self) -> Result<String> {
         self.raw_command(&serde_json::to_string(&LocateRequest { cmd: "locate" })?)
     }
@@ -512,7 +521,8 @@ impl WhereAmIClient {
         Self::parse_response_line(&self.resolve_raw(bssids)?)
     }
 
-    /// Raw `resolve`: the daemon's response line verbatim (feeds `--json`).
+    /// Raw `resolve`: daemon JSON response body after transport framing and
+    /// surrounding-whitespace removal; feeds `--json`.
     pub fn resolve_raw(&self, bssids: Vec<String>) -> Result<String> {
         self.raw_command(&serde_json::to_string(&ResolveRequest {
             cmd: "resolve",
@@ -525,7 +535,8 @@ impl WhereAmIClient {
         Self::parse_response_line(&self.scan_raw()?)
     }
 
-    /// Raw `scan`: the daemon's response line verbatim (feeds `--json`).
+    /// Raw `scan`: daemon JSON response body after transport framing and
+    /// surrounding-whitespace removal; feeds `--json`.
     pub fn scan_raw(&self) -> Result<String> {
         self.raw_command(&serde_json::to_string(&SimpleRequest { cmd: "scan" })?)
     }
@@ -535,7 +546,8 @@ impl WhereAmIClient {
         Self::parse_response_line(&self.stats_raw()?)
     }
 
-    /// Raw `stats`: the daemon's response line verbatim (feeds `--json`).
+    /// Raw `stats`: daemon JSON response body after transport framing and
+    /// surrounding-whitespace removal; feeds `--json`.
     pub fn stats_raw(&self) -> Result<String> {
         self.raw_command(&serde_json::to_string(&SimpleRequest { cmd: "stats" })?)
     }
@@ -546,7 +558,8 @@ impl WhereAmIClient {
         Self::parse_response_line(&self.debug_raw()?)
     }
 
-    /// Raw `debug`: the daemon's response line verbatim (feeds `--json`).
+    /// Raw `debug`: daemon JSON response body after transport framing and
+    /// surrounding-whitespace removal; feeds `--json`.
     pub fn debug_raw(&self) -> Result<String> {
         self.raw_command(&serde_json::to_string(&SimpleRequest { cmd: "debug" })?)
     }
@@ -556,7 +569,8 @@ impl WhereAmIClient {
         Self::parse_response_line(&self.version_raw()?)
     }
 
-    /// Raw `version`: the daemon's response line verbatim (feeds `--json`).
+    /// Raw `version`: daemon JSON response body after transport framing and
+    /// surrounding-whitespace removal; feeds `--json`.
     pub fn version_raw(&self) -> Result<String> {
         self.raw_command(&serde_json::to_string(&SimpleRequest { cmd: "version" })?)
     }
@@ -572,7 +586,8 @@ impl WhereAmIClient {
         Self::parse_response_line(&self.history_raw(range, from, to)?)
     }
 
-    /// Raw `history`: the daemon's response line verbatim (feeds `--json`).
+    /// Raw `history`: daemon JSON response body after transport framing and
+    /// surrounding-whitespace removal; feeds `--json`.
     pub fn history_raw(
         &self,
         range: Option<String>,
@@ -609,6 +624,49 @@ impl_daemon_response!(StatsResponse);
 impl_daemon_response!(DebugResponse);
 impl_daemon_response!(VersionResponse);
 impl_daemon_response!(HistoryResponse);
+
+#[cfg(test)]
+mod stats_wire_tests {
+    //! TASK-0243: the typed stats response stays aligned with the canonical
+    //! daemon success shape while remaining compatible with older daemons.
+    use super::*;
+
+    #[test]
+    fn current_daemon_stats_shape_deserializes_every_typed_field() {
+        let json = r#"{"ok":true,"v":1,"cached_aps":41,"pending_aps":2,"not_found_aps":3,"db_size_bytes":49152,"api_calls_today":4,"inflight":5,"db_write_failures":6,"orphan_tasks_aborted":7}"#;
+        let stats: StatsResponse = WhereAmIClient::parse_response_line(json).unwrap();
+
+        assert!(stats.ok);
+        assert_eq!(stats.v, 1);
+        assert_eq!(stats.cached_aps, 41);
+        assert_eq!(stats.pending_aps, 2);
+        assert_eq!(stats.not_found_aps, 3);
+        assert_eq!(stats.db_size_bytes, 49_152);
+        assert_eq!(stats.api_calls_today, 4);
+        assert_eq!(stats.inflight, 5);
+        assert_eq!(stats.db_write_failures, 6);
+        assert_eq!(stats.orphan_tasks_aborted, 7);
+        assert!(stats.error.is_none());
+    }
+
+    #[test]
+    fn legacy_stats_shape_defaults_missing_last_shutdown_aborts_to_zero() {
+        let json = r#"{"ok":true,"v":1,"cached_aps":101,"pending_aps":102,"not_found_aps":103,"db_size_bytes":104,"api_calls_today":105,"inflight":106,"db_write_failures":107}"#;
+        let stats: StatsResponse = WhereAmIClient::parse_response_line(json).unwrap();
+
+        assert!(stats.ok);
+        assert_eq!(stats.v, 1);
+        assert_eq!(stats.cached_aps, 101);
+        assert_eq!(stats.pending_aps, 102);
+        assert_eq!(stats.not_found_aps, 103);
+        assert_eq!(stats.db_size_bytes, 104);
+        assert_eq!(stats.api_calls_today, 105);
+        assert_eq!(stats.inflight, 106);
+        assert_eq!(stats.db_write_failures, 107);
+        assert_eq!(stats.orphan_tasks_aborted, 0);
+        assert!(stats.error.is_none());
+    }
+}
 
 #[cfg(test)]
 mod wire_enum_tests {
