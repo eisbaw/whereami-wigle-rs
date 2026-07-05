@@ -25,7 +25,7 @@
 - [ADR-041](041-cli-args-toml-secrets.md) — CLI args for operations, TOML for secrets
 
 ## Enrichment
-- [ADR-060](060-reverse-geocode-nominatim.md) — Reverse geocoding via OSM Nominatim, opt-in
+- [ADR-060](060-reverse-geocode-nominatim.md) — Opt-in Nominatim reverse geocoding (amended: async, bounded, TTL-cached)
 
 ## Deployment
 - [ADR-050](050-nixos-native.md) — NixOS-native with systemd hardening

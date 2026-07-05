@@ -64,7 +64,7 @@ All responses include a `"v": 1` field for protocol versioning.
 
 Cache-only hot path: takes the current stable APs (debounce filter), trilaterates from whatever positions are already in the local `aps` cache, and responds immediately. Remote provider calls happen in background tasks (scan loop, pending drain, cold-start fallback) — `locate` itself never awaits an external API. If no stable APs have cached positions, the response is either an error or, if available, the previous known fix flagged with `stale: true` and `age_s`.
 
-If `--address-approx` is enabled, an approximate street address is attached when the rounded position is in the local address cache; on a miss the address resolves in the background and the next locate at the same rounded position will include it.
+If `--address-approx` is enabled, an approximate street address is attached when the rounded position is in the local address cache. A miss publishes bounded, latest-only background work; a later locate at the same rounded position may include the address only after a successful, still-current result populated the cache.
 
 ```json
 {"cmd": "locate"}
@@ -486,7 +486,7 @@ The implementation enforces a few invariants that are not obvious from the proto
 - **Source-priority enforcement on upserts.** `aps.source_priority` is stored alongside the `source` string. `upsert_ap` only overwrites the data fields when the incoming source's priority is greater than or equal to the stored row's. `last_seen` always advances. A later, lower-quality WiGLE write cannot clobber an Apple fix.
 - **In-flight de-duplication.** The scan loop, the pending drain, and a cold-start `locate` can all decide to resolve the same BSSID at the same time. `resolve_chain` claims each BSSID through an in-memory `inflight` set (RAII guard, panic-safe) so concurrent callers see a single remote round-trip; the losing caller defers to the cache once the winner finishes.
 - **Schema invariants.** `schema_version` is constrained to a single row (`CHECK (id = 1)`). Migrations are idempotent and run inside transactions.
-- **Decoupled reverse geocoding.** When `--address-approx` is set, `locate` uses an in-memory bounded cache keyed by rounded (lat, lon). Cache misses kick off a background Nominatim call so the response itself never blocks on the 1 req/s rate limiter.
+- **Decoupled reverse geocoding.** When `--address-approx` is set, `locate` uses an in-memory bounded cache keyed by rounded (lat, lon). Cache misses publish to a bounded, latest-only background scheduler; deduplication, supersession, shutdown, or queue age can prevent outbound dispatch, and `locate` never awaits the 1 req/s rate gate or Nominatim HTTP.
 
 ## Future work
 
