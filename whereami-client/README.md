@@ -15,6 +15,7 @@ The crate ships two artefacts:
 ## Library usage
 
 ```rust
+use std::time::Duration;
 use whereami_client::{WhereAmIClient, WipeConfirmation};
 
 // Resolve the daemon from the environment: WHEREAMI_SOCKET / WHEREAMI_ADDR /
@@ -37,12 +38,26 @@ let via_socket = WhereAmIClient::unix("/run/whereami/whereamid.sock");
 let via_tcp = WhereAmIClient::tcp("10.0.0.5:4747"); // opt-in, unauthenticated
 let stats = via_socket.stats()?;
 
+// Raise the per-read/write timeout for a long request, or explicitly disable
+// it when an outer supervisor provides the deadline.
+let long_request = WhereAmIClient::from_env()?
+    .with_io_timeout(Duration::from_secs(120))?;
+let externally_supervised = WhereAmIClient::from_env()?.without_io_timeout();
+
 // Destructive operations require an explicit confirmation marker at the call
 // site. This prevents accidents but is not authorization: every user allowed
 // to connect to the Unix socket can wipe. The daemon never accepts wipe on TCP.
 let deleted = via_socket.wipe(WipeConfirmation::Confirmed)?;
 println!("deleted {} AP rows", deleted.aps_deleted);
 ```
+
+New clients default to a 40-second timeout on each blocking socket read and
+write. That covers the nominal 35-second envelope for one provider chain at the
+daemon defaults (up to 15 seconds for Apple, 15 seconds for WiGLE, and 5 seconds
+to write the daemon response) plus 5 seconds of scheduling and database margin.
+It is not a total request deadline. Multi-BSSID requests, large history queries,
+or custom daemon provider timeouts can legitimately take longer; raise the
+timeout or disable it only when an outer supervisor supplies the deadline.
 
 `StatsResponse::orphan_tasks_aborted` is the number of tasks force-aborted at
 the end of the last clean daemon shutdown. It is one persisted shutdown
@@ -74,6 +89,8 @@ whereami history --from 2026-05-01T00:00:00+00:00 --to 2026-05-08T00:00:00+00:00
 whereami wipe --yes                      # delete stored location/AP data
 whereami version                         # CLI + daemon versions
 whereami --json locate                   # raw JSON output for any subcommand
+whereami --timeout-secs 120 history 30d  # raise socket I/O timeout
+whereami --timeout-secs 0 history 30d    # disable under an outer supervisor
 whereami help
 ```
 
@@ -82,6 +99,9 @@ The CLI reaches the daemon over its unix control socket by default
 Override with `WHEREAMI_SOCKET=<path>`, or point at an old TCP daemon with
 `WHEREAMI_ADDR=<host:port>` (e.g. `127.0.0.1:4747`). See
 [docs/protocol.md](../docs/protocol.md) for the access-control model.
+The CLI uses the library's 40-second default. `--timeout-secs N` changes the
+per-read/write timeout, while `--timeout-secs 0` disables it; use either for
+long batch/history operations whose legitimate duration exceeds the default.
 
 `wipe --yes` deletes persisted AP, pending, negative-cache, fix-history, and
 last-fix rows and clears the daemon's managed in-memory location state. It does

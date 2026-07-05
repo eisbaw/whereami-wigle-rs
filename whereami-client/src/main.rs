@@ -18,10 +18,10 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use std::process;
+use std::{process, time::Duration};
 use whereami_client::{
     DaemonResponse, LocateResponse, ScanResponse, StatsResponse, WhereAmIClient, WipeConfirmation,
-    WipeResponse,
+    WipeResponse, DEFAULT_SOCKET_IO_TIMEOUT,
 };
 
 /// `whereami` — Wi-Fi geolocation CLI.
@@ -51,6 +51,16 @@ struct Cli {
     /// Print the raw JSON daemon response instead of the human renderer.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Socket read/write timeout in seconds; use 0 to disable it for long
+    /// batch or history operations.
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECONDS",
+        default_value_t = DEFAULT_SOCKET_IO_TIMEOUT.as_secs()
+    )]
+    timeout_secs: u64,
 
     /// Print CLI + daemon version and exit. Equivalent to the `version`
     /// subcommand. Provided as a flag because `whereami --version` is
@@ -322,6 +332,16 @@ fn render_wipe(resp: &WipeResponse) -> String {
     )
 }
 
+/// Apply the CLI's seconds-based policy to the library client. Zero is an
+/// explicit opt-out; every positive value uses the validating builder.
+fn configure_client_timeout(client: WhereAmIClient, timeout_secs: u64) -> Result<WhereAmIClient> {
+    if timeout_secs == 0 {
+        Ok(client.without_io_timeout())
+    } else {
+        client.with_io_timeout(Duration::from_secs(timeout_secs))
+    }
+}
+
 fn main() {
     // Restore the default SIGPIPE disposition (task-0199). The Rust runtime
     // installs SIG_IGN for SIGPIPE before main(), which turns a closed
@@ -367,12 +387,15 @@ fn main() {
         }
     };
     let json = cli.json;
+    let timeout_secs = cli.timeout_secs;
     // Resolve the daemon target (unix socket by default; TCP via WHEREAMI_ADDR).
     // A resolution failure (no socket found and no override set) is routed
     // through the SAME json/human split as a transport error, so `--json` still
     // emits a single synthesized JSON line to stdout (task-0183) rather than
     // only a stderr message — and the sigpipe/pipe semantics stay identical.
-    let client = match WhereAmIClient::from_env() {
+    let client = match WhereAmIClient::from_env()
+        .and_then(|client| configure_client_timeout(client, timeout_secs))
+    {
         Ok(c) => c,
         Err(e) => {
             if json {
@@ -614,6 +637,37 @@ mod tests {
         assert!(cli.command.is_none());
         assert!(!cli.json);
         assert!(!cli.version_flag);
+        assert_eq!(
+            cli.timeout_secs,
+            DEFAULT_SOCKET_IO_TIMEOUT.as_secs(),
+            "CLI default must stay aligned with the library default"
+        );
+    }
+
+    #[test]
+    fn timeout_option_parses_and_wires_custom_and_disabled_values() {
+        let custom = Cli::try_parse_from(["whereami", "history", "--timeout-secs", "120"]).unwrap();
+        assert_eq!(custom.timeout_secs, 120);
+        let custom_client =
+            configure_client_timeout(WhereAmIClient::tcp("127.0.0.1:1"), custom.timeout_secs)
+                .unwrap();
+        assert_eq!(custom_client.io_timeout(), Some(Duration::from_secs(120)));
+
+        let disabled = Cli::try_parse_from(["whereami", "--timeout-secs", "0"]).unwrap();
+        assert_eq!(disabled.timeout_secs, 0);
+        let disabled_client =
+            configure_client_timeout(WhereAmIClient::tcp("127.0.0.1:1"), disabled.timeout_secs)
+                .unwrap();
+        assert_eq!(disabled_client.io_timeout(), None);
+    }
+
+    #[test]
+    fn timeout_help_documents_disable_and_long_operations() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--timeout-secs <SECONDS>"), "{help}");
+        assert!(help.contains("0 to disable"), "{help}");
+        assert!(help.contains("batch or history operations"), "{help}");
+        assert!(help.contains("[default: 40]"), "{help}");
     }
 
     #[test]

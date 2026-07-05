@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Where the client connects to reach the daemon (task-0196). The default
 /// transport is a Unix domain socket; TCP is opt-in.
@@ -31,10 +32,25 @@ const ENV_ADDR: &str = "WHEREAMI_ADDR";
 const SOCKET_FILENAME: &str = "whereamid.sock";
 /// System-wide default socket path (used when `$XDG_RUNTIME_DIR` is unset).
 const RUN_SOCKET: &str = "/run/whereami/whereamid.sock";
+/// Default timeout for each blocking socket read or write.
+///
+/// Forty seconds covers the nominal 35-second envelope for one default
+/// provider chain (up to 15 seconds each for Apple and WiGLE, then the daemon's
+/// five-second response-write budget) plus five seconds of scheduling and
+/// database margin. It is not an end-to-end upper bound: multi-BSSID requests,
+/// custom provider timeouts, and large history queries may legitimately need
+/// longer. Use [`WhereAmIClient::with_io_timeout`] to raise it or
+/// [`WhereAmIClient::without_io_timeout`] to disable it explicitly.
+pub const DEFAULT_SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Client for the whereamid daemon.
+///
+/// New clients use [`DEFAULT_SOCKET_IO_TIMEOUT`] for every blocking socket
+/// read and write. The setting applies uniformly to typed and raw commands over
+/// both TCP and Unix sockets.
 pub struct WhereAmIClient {
     target: ConnectTarget,
+    io_timeout: Option<Duration>,
 }
 
 /// Resolve the default connect target from the environment (task-0196). Pure:
@@ -96,15 +112,33 @@ fn resolve_target(
 /// shared trait). task-0196.
 trait Transport: Read + Write {
     fn shutdown_write(&self) -> std::io::Result<()>;
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
 }
 impl Transport for TcpStream {
     fn shutdown_write(&self) -> std::io::Result<()> {
         self.shutdown(Shutdown::Write)
     }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
 }
 impl Transport for UnixStream {
     fn shutdown_write(&self) -> std::io::Result<()> {
         self.shutdown(Shutdown::Write)
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_write_timeout(self, timeout)
     }
 }
 
@@ -459,9 +493,13 @@ pub struct WipeResponse {
 }
 
 impl WhereAmIClient {
-    /// Create a client for an explicit connect target.
+    /// Create a client for an explicit connect target, using
+    /// [`DEFAULT_SOCKET_IO_TIMEOUT`].
     pub fn new(target: ConnectTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            io_timeout: Some(DEFAULT_SOCKET_IO_TIMEOUT),
+        }
     }
 
     /// Convenience: a TCP client for `host:port` (opt-in, unauthenticated).
@@ -494,6 +532,36 @@ impl WhereAmIClient {
         &self.target
     }
 
+    /// Return the configured timeout for each blocking socket read and write.
+    /// `None` means socket I/O timeouts are disabled.
+    pub fn io_timeout(&self) -> Option<Duration> {
+        self.io_timeout
+    }
+
+    /// Set a positive timeout for each blocking socket read and write.
+    ///
+    /// This is not a total request deadline. Raise it for multi-BSSID requests,
+    /// large history queries, or daemons with longer provider timeouts. To
+    /// disable socket I/O timeouts explicitly, call
+    /// [`WhereAmIClient::without_io_timeout`] instead of passing zero.
+    pub fn with_io_timeout(mut self, timeout: Duration) -> Result<Self> {
+        if timeout.is_zero() {
+            bail!("socket I/O timeout must be positive; use without_io_timeout() to disable it");
+        }
+        self.io_timeout = Some(timeout);
+        Ok(self)
+    }
+
+    /// Disable socket read and write timeouts.
+    ///
+    /// A daemon that stalls or never responds can then block the calling thread
+    /// indefinitely. This is intended for explicitly supervised long-running
+    /// batch or history operations.
+    pub fn without_io_timeout(mut self) -> Self {
+        self.io_timeout = None;
+        self
+    }
+
     /// Send a raw JSON command and return the raw response string. Dispatches
     /// on the transport; the exchange itself is transport-agnostic.
     pub fn raw_command(&self, json: &str) -> Result<String> {
@@ -501,21 +569,26 @@ impl WhereAmIClient {
             ConnectTarget::Tcp(addr) => {
                 let stream = TcpStream::connect(addr)
                     .with_context(|| format!("connecting to whereamid at {addr}"))?;
-                Self::exchange(stream, json)
+                self.exchange(stream, json)
             }
             ConnectTarget::Unix(path) => {
                 let stream = UnixStream::connect(path)
                     .with_context(|| format!("connecting to whereamid at {}", path.display()))?;
-                Self::exchange(stream, json)
+                self.exchange(stream, json)
             }
         }
     }
 
-    /// One-shot request/response over any transport: write the request +
-    /// newline, half-close the write side so the daemon sees EOF, then read
-    /// exactly one response line. There is intentionally no read timeout —
-    /// parity across BOTH transports; task-0090 tracks adding one to each.
-    fn exchange<S: Transport>(mut stream: S, json: &str) -> Result<String> {
+    /// One-shot request/response over any transport: apply the common socket
+    /// I/O budget, write the request + newline, half-close the write side so
+    /// the daemon sees EOF, then read exactly one response line.
+    fn exchange<S: Transport>(&self, mut stream: S, json: &str) -> Result<String> {
+        stream
+            .set_read_timeout(self.io_timeout)
+            .context("configuring daemon socket read timeout")?;
+        stream
+            .set_write_timeout(self.io_timeout)
+            .context("configuring daemon socket write timeout")?;
         stream
             .write_all(json.as_bytes())
             .context("sending request")?;
@@ -524,9 +597,19 @@ impl WhereAmIClient {
         stream.shutdown_write().context("shutdown write")?;
         let mut reader = BufReader::new(stream);
         let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .context("reading response")?;
+        if let Err(error) = reader.read_line(&mut response_line) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                if let Some(timeout) = self.io_timeout {
+                    return Err(anyhow::Error::new(error).context(format!(
+                        "timed out after {timeout:?} waiting for a response from whereamid"
+                    )));
+                }
+            }
+            return Err(error).context("reading response");
+        }
         Ok(response_line.trim().to_string())
     }
 
@@ -657,6 +740,203 @@ impl WhereAmIClient {
             cmd: "wipe",
             confirm,
         })?)
+    }
+}
+
+#[cfg(test)]
+mod socket_timeout_tests {
+    use super::*;
+    use std::io;
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::thread::{self, JoinHandle};
+    use std::time::Instant;
+
+    /// A real TCP peer that consumes the half-closed request but deliberately
+    /// keeps its response side open. The release channel, rather than a sleep,
+    /// controls the peer lifetime so timeout assertions do not leak a thread.
+    struct SilentTcpServer {
+        address: SocketAddr,
+        request_rx: Receiver<String>,
+        release_tx: Option<Sender<()>>,
+        thread: Option<JoinHandle<io::Result<()>>>,
+    }
+
+    impl SilentTcpServer {
+        fn start() -> io::Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let (request_tx, request_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let thread = thread::spawn(move || {
+                let (mut stream, _) = listener.accept()?;
+                // Keep fixture cleanup finite even if request framing or the
+                // client's write-side half-close regresses.
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = String::new();
+                stream.read_to_string(&mut request)?;
+                request_tx.send(request).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("reporting observed request: {error}"),
+                    )
+                })?;
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("waiting for test release: {error}"),
+                        )
+                    })?;
+                Ok(())
+            });
+            Ok(Self {
+                address,
+                request_rx,
+                release_tx: Some(release_tx),
+                thread: Some(thread),
+            })
+        }
+
+        fn address(&self) -> SocketAddr {
+            self.address
+        }
+
+        fn release_and_join(&mut self) -> io::Result<()> {
+            let Some(thread) = self.thread.take() else {
+                return Ok(());
+            };
+
+            if let Some(release_tx) = self.release_tx.take() {
+                let _ = release_tx.send(());
+            }
+            // If the client failed before connecting, this cleanup connection
+            // unblocks accept/read so even a failing assertion can join.
+            if let Ok(stream) = TcpStream::connect(self.address) {
+                let _ = stream.shutdown(Shutdown::Write);
+            }
+            thread
+                .join()
+                .map_err(|_| io::Error::other("silent TCP server thread panicked"))?
+        }
+
+        fn finish(mut self) -> io::Result<String> {
+            let request = self
+                .request_rx
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|error| io::Error::other(format!("receiving observed request: {error}")));
+            let server_result = self.release_and_join();
+            server_result?;
+            request
+        }
+    }
+
+    impl Drop for SilentTcpServer {
+        fn drop(&mut self) {
+            let _ = self.release_and_join();
+        }
+    }
+
+    #[test]
+    fn unix_transport_forwards_socket_timeout_configuration() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let custom_timeout = Duration::from_secs(7);
+
+        Transport::set_read_timeout(&stream, Some(custom_timeout)).unwrap();
+        Transport::set_write_timeout(&stream, Some(custom_timeout)).unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), Some(custom_timeout));
+        assert_eq!(stream.write_timeout().unwrap(), Some(custom_timeout));
+
+        Transport::set_read_timeout(&stream, None).unwrap();
+        Transport::set_write_timeout(&stream, None).unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        assert_eq!(stream.write_timeout().unwrap(), None);
+    }
+
+    #[test]
+    fn client_timeout_builders_expose_default_custom_and_disabled_states() {
+        let default_client = WhereAmIClient::tcp("127.0.0.1:1");
+        assert_eq!(DEFAULT_SOCKET_IO_TIMEOUT, Duration::from_secs(40));
+        assert_eq!(default_client.io_timeout(), Some(Duration::from_secs(40)));
+
+        let custom_client = default_client
+            .with_io_timeout(Duration::from_secs(90))
+            .unwrap();
+        assert_eq!(custom_client.io_timeout(), Some(Duration::from_secs(90)));
+
+        let disabled_client = custom_client.without_io_timeout();
+        assert_eq!(disabled_client.io_timeout(), None);
+
+        let error = WhereAmIClient::tcp("127.0.0.1:1")
+            .with_io_timeout(Duration::ZERO)
+            .err()
+            .expect("zero must require the explicit disable builder");
+        assert_eq!(
+            error.to_string(),
+            "socket I/O timeout must be positive; use without_io_timeout() to disable it"
+        );
+    }
+
+    #[test]
+    fn typed_locate_times_out_when_tcp_daemon_never_responds() {
+        const TEST_IO_TIMEOUT: Duration = Duration::from_millis(250);
+        let server = SilentTcpServer::start().unwrap();
+        let address = server.address().to_string();
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let client_thread = thread::spawn(move || {
+            let client = WhereAmIClient::tcp(&address)
+                .with_io_timeout(TEST_IO_TIMEOUT)
+                .unwrap();
+            assert_eq!(client.io_timeout(), Some(TEST_IO_TIMEOUT));
+            let started = Instant::now();
+            let result = client.locate();
+            let _ = outcome_tx.send((result, started.elapsed()));
+        });
+
+        // This watchdog is deliberately independent of the production socket
+        // timeout. If timeout configuration regresses, releasing the silent
+        // peer closes its response side and lets us join the client thread
+        // before failing instead of hanging the test suite forever.
+        let outcome = outcome_rx.recv_timeout(Duration::from_secs(5));
+        let request_result = server.finish();
+        let client_thread_result = client_thread.join();
+        assert!(
+            client_thread_result.is_ok(),
+            "timeout-test client thread panicked"
+        );
+        let (result, elapsed) = outcome.unwrap_or_else(|error| {
+            panic!("client did not return within the independent 5s watchdog: {error}")
+        });
+        let request = request_result.unwrap();
+
+        assert_eq!(request, "{\"cmd\":\"locate\"}\n");
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "client returned before its configured 250ms timeout: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(2),
+            "client exceeded the bounded timeout allowance: {elapsed:?}"
+        );
+
+        let error = result.expect_err("a silent daemon must time out");
+        assert_eq!(
+            error.to_string(),
+            "timed out after 250ms waiting for a response from whereamid"
+        );
+        let io_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<io::Error>())
+            .expect("timeout must retain the original io::Error source");
+        assert!(
+            matches!(
+                io_error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "unexpected timeout error kind: {:?}",
+            io_error.kind()
+        );
     }
 }
 
