@@ -9,8 +9,9 @@
 //!      exactly equals the protobuf payload length (i.e. envelope.len() - 50).
 //!      This is the regression check for task-0019: the prior implementation
 //!      truncated the length to a single u8.
-//!   3. The encoded envelope round-trips through decode_response without
-//!      panicking (it may return Err for empty inputs, but must not crash).
+//!   3. The protobuf payload decodes successfully and produces no AP
+//!      observations: request WifiDevice entries contain a BSSID but no
+//!      Location.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -58,8 +59,13 @@ fuzz_target!(|data: &[u8]| {
         "payload_len field ({payload_len}) does not match actual payload ({actual_payload})"
     );
 
-    // Sanity: the encoded payload should be parseable by the decoder
-    // without panicking. We pass `&bssids` as the requested list so the
-    // decoder can attribute results.
-    let _ = whereamid::apple::decode_response(&envelope, &bssids);
+    // Invariant: the protobuf payload is structurally valid, but request
+    // WifiDevice entries contain no Location and therefore cannot decode to
+    // AP observations.
+    let decoded = whereamid::apple::decode_response(&envelope[PAYLOAD_OFFSET..], &bssids)
+        .expect("encoded request protobuf payload must decode successfully");
+    assert!(
+        decoded.is_empty(),
+        "encoded request payload unexpectedly produced AP observations"
+    );
 });
