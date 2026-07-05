@@ -38,6 +38,8 @@ async fn wifi_scan_nmcli(interface: &str) -> Result<Vec<ScannedNetwork>> {
         IW_TIMEOUT,
         Command::new("nmcli")
             .args(["device", "wifi", "rescan", "ifname", interface])
+            // FREQ is human-readable even in terse mode; pin its unit suffix.
+            .env("LC_ALL", "C")
             // task-0190: kill the child if this future is dropped mid-scan on
             // shutdown, so a cancelled scan leaves no orphaned nmcli process.
             .kill_on_drop(true)
@@ -62,6 +64,8 @@ async fn wifi_scan_nmcli(interface: &str) -> Result<Vec<ScannedNetwork>> {
                 "ifname",
                 interface,
             ])
+            // Keep the parsed ` MHz` suffix stable across host locales.
+            .env("LC_ALL", "C")
             .kill_on_drop(true)
             .output(),
     )
@@ -83,6 +87,8 @@ async fn wifi_scan_nmcli(interface: &str) -> Result<Vec<ScannedNetwork>> {
 /// Parse nmcli terse output. In -t mode, nmcli escapes ':' in field values as '\:'.
 /// The field separator is an unescaped ':'.
 /// Fields: BSSID:SSID:SIGNAL:CHAN:FREQ
+/// Under the C locale requested by `wifi_scan_nmcli`, NetworkManager renders
+/// FREQ as an integer followed by the literal ` MHz` suffix.
 /// Signal is 0-100 percentage, convert to approximate dBm.
 pub fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
     let mut networks = Vec::new();
@@ -115,7 +121,7 @@ pub fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
             Err(_) => continue,
         };
         let channel: Option<i32> = fields[3].parse().ok();
-        let freq: Option<i32> = fields[4].parse().ok();
+        let freq = parse_nmcli_frequency(&fields[4]);
 
         // Convert signal percentage (0-100) to approximate dBm:
         // 100 ≈ -30 dBm, 0 ≈ -90 dBm via the linear map below.
@@ -135,6 +141,14 @@ pub fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
         });
     }
     networks
+}
+
+/// Parse nmcli's C-locale `<integer> MHz` frequency representation.
+///
+/// Bare integers remain accepted for compatibility with older callers of the
+/// public parser, but no other suffix or trailing content is accepted.
+fn parse_nmcli_frequency(field: &str) -> Option<i32> {
+    field.strip_suffix(" MHz").unwrap_or(field).parse().ok()
 }
 
 /// Split an nmcli -t line on unescaped ':' characters.
@@ -390,7 +404,7 @@ BSS 11:22:33:44:55:66(on wlan0)
     #[test]
     fn test_parse_nmcli_output() {
         // nmcli -t escapes colons in BSSIDs as \:
-        let output = "AA\\:BB\\:CC\\:DD\\:EE\\:01:TestNet_2G:65:11:2462\nAA\\:BB\\:CC\\:DD\\:EE\\:02:TestNet_5G:49:100:5500\n";
+        let output = "AA\\:BB\\:CC\\:DD\\:EE\\:01:TestNet_2G:65:11:2462 MHz\nAA\\:BB\\:CC\\:DD\\:EE\\:02:TestNet_5G:49:100:5500 MHz\n";
         let networks = parse_nmcli_output(output);
         assert_eq!(networks.len(), 2);
         assert_eq!(networks[0].bssid, "AA:BB:CC:DD:EE:01");
@@ -401,6 +415,8 @@ BSS 11:22:33:44:55:66(on wlan0)
         assert_eq!(networks[0].signal_dbm, -51);
         assert_eq!(networks[1].bssid, "AA:BB:CC:DD:EE:02");
         assert_eq!(networks[1].ssid, Some("TestNet_5G".to_string()));
+        assert_eq!(networks[1].channel, Some(100));
+        assert_eq!(networks[1].frequency, Some(5500));
     }
 
     #[test]
@@ -408,8 +424,8 @@ BSS 11:22:33:44:55:66(on wlan0)
         // First row has no signal field; second row has it. Only the second
         // row should be emitted — empty signal must NOT be coerced to 0%/-90 dBm.
         let output = concat!(
-            "AA\\:BB\\:CC\\:DD\\:EE\\:01:NoSig::6:2437\n",
-            "AA\\:BB\\:CC\\:DD\\:EE\\:02:HasSig:50:6:2437\n",
+            "AA\\:BB\\:CC\\:DD\\:EE\\:01:NoSig::6:2437 MHz\n",
+            "AA\\:BB\\:CC\\:DD\\:EE\\:02:HasSig:50:6:2437 MHz\n",
         );
         let networks = parse_nmcli_output(output);
         assert_eq!(
@@ -423,7 +439,7 @@ BSS 11:22:33:44:55:66(on wlan0)
     #[test]
     fn test_parse_nmcli_skips_garbage_signal() {
         // Non-numeric signal field also skipped, not coerced to 0.
-        let output = "AA\\:BB\\:CC\\:DD\\:EE\\:03:Bad:not_a_number:6:2437\n";
+        let output = "AA\\:BB\\:CC\\:DD\\:EE\\:03:Bad:not_a_number:6:2437 MHz\n";
         let networks = parse_nmcli_output(output);
         assert!(
             networks.is_empty(),
@@ -433,12 +449,28 @@ BSS 11:22:33:44:55:66(on wlan0)
 
     #[test]
     fn test_split_nmcli_fields() {
-        let line = "AA\\:BB\\:CC\\:DD\\:EE\\:FF:MySSID:75:6:2437";
+        let line = "AA\\:BB\\:CC\\:DD\\:EE\\:FF:MySSID:75:6:2437 MHz";
         let fields = split_nmcli_fields(line);
         assert_eq!(
             fields,
-            vec!["AA:BB:CC:DD:EE:FF", "MySSID", "75", "6", "2437"]
+            vec!["AA:BB:CC:DD:EE:FF", "MySSID", "75", "6", "2437 MHz"]
         );
+    }
+
+    #[test]
+    fn test_parse_nmcli_keeps_rows_with_malformed_frequency() {
+        let output = concat!(
+            "AA\\:BB\\:CC\\:DD\\:EE\\:01:WrongUnit:50:100:5500 GHz\n",
+            "AA\\:BB\\:CC\\:DD\\:EE\\:02:MissingSpace:50:100:5500MHz\n",
+            "AA\\:BB\\:CC\\:DD\\:EE\\:03:TrailingGarbage:50:100:5500 MHz extra\n",
+        );
+        let networks = parse_nmcli_output(output);
+        assert_eq!(networks.len(), 3);
+        assert!(networks.iter().all(|network| network.frequency.is_none()));
+
+        // Preserve the parser's previous bare-integer contract for callers
+        // that supply synthetic or older nmcli output.
+        assert_eq!(parse_nmcli_frequency("5500"), Some(5500));
     }
 
     /// task-0226: nmcli escapes `\` as `\\`. A field ending in a literal

@@ -61,6 +61,10 @@ EOF
     if (( $# == 5 )) \
       && [[ "$1" == "device" && "$2" == "wifi" && "$3" == "rescan" \
             && "$4" == "ifname" && "$5" == "vmwifi0" ]]; then
+      [[ "''${LC_ALL-}" == "C" ]] || {
+        echo "nmcli mock requires LC_ALL=C" >&2
+        exit 65
+      }
       [[ "$mode" == "nmcli" ]] || exit 1
       exit 0
     fi
@@ -69,13 +73,17 @@ EOF
             && "$3" == "BSSID,SSID,SIGNAL,CHAN,FREQ" \
             && "$4" == "device" && "$5" == "wifi" && "$6" == "list" \
             && "$7" == "ifname" && "$8" == "vmwifi0" ]]; then
+      [[ "''${LC_ALL-}" == "C" ]] || {
+        echo "nmcli mock requires LC_ALL=C" >&2
+        exit 65
+      }
       [[ "$mode" == "nmcli" ]] || {
         echo "VM test forcing nmcli failure for iw fallback" >&2
         exit 1
       }
       ${realNmcliProbe}/bin/nmcli-real --terse general status >/dev/null
       printf '%s\n' ok > /var/lib/whereami/nmcli-dbus-probe-ok
-      printf '%s\n' '02\:00\:00\:00\:21\:10:VM-nmcli:80:6:2437'
+      printf '%s\n' '02\:00\:00\:00\:21\:10:VM-nmcli:80:6:2437 MHz'
       exit 0
     fi
 
