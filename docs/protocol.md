@@ -435,19 +435,21 @@ current daemon; clients should branch on `ok`, not parse error prose.
 
 ## Official CLI `--json` behavior
 
-The client transport removes the framing newline and trims surrounding
-whitespace from the daemon response. For any syntactically valid JSON body that
-remains, `whereami --json …` writes that body byte-for-byte and adds one output
-newline. It does not deserialize and re-serialize the command-specific response,
-so unknown fields and the distinction between omitted fields and `null` survive.
-The exit status is 0 if and only if the top-level `ok` field is the JSON boolean
-`true`; every other value, a missing `ok`, or `ok: false` exits 1.
+For daemon-backed commands, the client transport removes the framing newline
+and trims surrounding whitespace from the daemon response. For any
+syntactically valid JSON body that remains, `whereami --json …` writes that body
+byte-for-byte and adds one output newline. It does not deserialize and
+re-serialize the command-specific response, so unknown fields and the
+distinction between omitted fields and `null` survive. The exit status is 0 if
+and only if the top-level `ok` field is the JSON boolean `true`; every other
+value, a missing `ok`, or `ok: false` exits 1.
 
-This deliberately creates an asymmetry with human output. JSON mode checks only
-that the body is valid JSON and that `ok` is boolean `true`; it does not validate
-`v` or the command-specific schema. An otherwise schema-invalid response with
-`ok: true` can therefore pass through and exit 0. Human mode uses the typed
-response for that command and can reject the same line during deserialization.
+This deliberately creates an asymmetry with human output. Daemon-backed JSON
+mode checks only that the body is valid JSON and that `ok` is boolean `true`; it
+does not validate `v` or the command-specific schema. An otherwise
+schema-invalid response with `ok: true` can therefore pass through and exit 0.
+Human mode uses the typed response for that command and can reject the same line
+during deserialization.
 
 If no daemon line is available because transport failed, or if the daemon line
 is not valid JSON, the CLI emits its own valid JSON error object and exits 1:
@@ -456,20 +458,37 @@ is not valid JSON, the CLI emits its own valid JSON error object and exits 1:
 {"error":"description","ok":false}
 ```
 
-This CLI-only envelope intentionally has no protocol `v` field and is not a
-daemon response. JSON object key order is not a contract. Clap parse errors
-(such as an unknown flag) occur before target resolution: even under `--json`,
-they write to stderr, leave stdout empty, and exit 1. The history `--from`/`--to`
-pair check occurs after target resolution. With a resolved target it likewise
-writes to stderr with empty stdout and exits 1, but if no target can be resolved,
-the earlier target-resolution failure instead produces the synthesized JSON
-envelope on stdout and exits 1. This precedence is tracked for a future decision
-in TASK-0228.
+This CLI-only error envelope intentionally has no protocol `v` field and is not
+a daemon response.
 
-The 0/1 rules above apply when I/O completes. On Unix, an early-closed stdout
-pipe (or a daemon connection that closes during a request write) can instead
-terminate the CLI via `SIGPIPE`; shells conventionally report status **141**
-(`128 + SIGPIPE(13)`).
+The offline `--version` / `-V` flag is a separate exception to daemon
+passthrough. It reports the version embedded in the client executable and never
+resolves or contacts a daemon. With `--json`, for example
+`whereami --json --version`, it emits a locally synthesized success object and
+exits 0:
+
+```json
+{"git_rev":"<embedded revision>","ok":true,"version":"<client package version>"}
+```
+
+This object is also not a daemon response and intentionally has no protocol `v`
+field. The similarly named `whereami --json version` subcommand remains
+daemon-backed and follows the passthrough/error rules above. JSON object key
+order is not contractual for either CLI-synthesized shape.
+
+Clap parse errors (such as an unknown flag) occur before target resolution:
+even under `--json`, they write to stderr, leave stdout empty, and exit 1. The
+history `--from`/`--to` pair check occurs after target resolution. With a
+resolved target it likewise writes to stderr with empty stdout and exits 1, but
+if no target can be resolved, the earlier target-resolution failure instead
+produces the synthesized JSON error envelope on stdout and exits 1. This
+precedence is tracked for a future decision in TASK-0228.
+
+The exit-status rules above assume the stdout write completes and, for
+daemon-backed commands, that daemon I/O completes. On Unix, an early-closed
+stdout pipe (or a daemon connection that closes during a request write) can
+instead terminate the CLI via `SIGPIPE`; shells conventionally report status
+**141** (`128 + SIGPIPE(13)`).
 
 ## Minimal client examples
 

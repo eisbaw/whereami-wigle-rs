@@ -13,8 +13,9 @@
 //! - `whereami scan --scan-time=no` still works (the value-taking
 //!   `--scan-time <yes|no>` flag lives on the scan subcommand).
 //! - Single-letter aliases preserved (l/s/st/d/h/v).
-//! - `--version` / `-V` print the same cli+daemon banner the prior
-//!   `version` subcommand emitted; clap's own version flag is suppressed.
+//! - `--version` / `-V` print the embedded CLI version locally, without
+//!   resolving or contacting a daemon. The `version` subcommand continues
+//!   to query the daemon and report both versions.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -30,16 +31,15 @@ use whereami_client::{
 /// (default `$XDG_RUNTIME_DIR/whereamid.sock`, else `/run/whereami/whereamid.sock`).
 /// Override with `WHEREAMI_SOCKET=<path>`; point at an old TCP daemon with
 /// `WHEREAMI_ADDR=<host:port>`. Output is human-readable by default; pass
-/// `--json` for the raw daemon response on stdout.
+/// `--json` for JSON output; daemon responses pass through unchanged.
 #[derive(Parser, Debug)]
 #[command(
     name = "whereami",
     bin_name = "whereami",
     about = "Wi-Fi geolocation CLI (talks to whereamid)",
     long_about = None,
-    // We provide our own --version that also queries the daemon, so
-    // disable clap's auto-generated one. The `version` subcommand and
-    // top-level --version flag both route to handle_version().
+    // We provide our own --version so it can include the embedded Git
+    // revision and support the CLI's global --json output mode.
     disable_version_flag = true,
     arg_required_else_help = false,
     // task-0199: document the Unix-filter pipe behavior in `whereami --help`.
@@ -48,7 +48,7 @@ use whereami_client::{
                   is terminated by SIGPIPE (exit status 141) rather than printing a panic.",
 )]
 struct Cli {
-    /// Print the raw JSON daemon response instead of the human renderer.
+    /// Print JSON instead of human-readable output; daemon responses stay raw.
     #[arg(long, global = true)]
     json: bool,
 
@@ -62,9 +62,7 @@ struct Cli {
     )]
     timeout_secs: u64,
 
-    /// Print CLI + daemon version and exit. Equivalent to the `version`
-    /// subcommand. Provided as a flag because `whereami --version` is
-    /// a near-universal convention.
+    /// Print this CLI's version locally, without contacting the daemon.
     #[arg(long = "version", short = 'V', global = true)]
     version_flag: bool,
 
@@ -123,7 +121,7 @@ enum Command {
         yes: bool,
     },
 
-    /// Print CLI and daemon versions.
+    /// Contact the daemon and print both CLI and daemon versions.
     #[command(alias = "v")]
     Version,
 }
@@ -159,22 +157,24 @@ fn dispatch<T: DaemonResponse>(result: Result<T>, render: impl FnOnce(&T)) {
     }
 }
 
-/// Build a CLI-synthesized `--json` error line. Used ONLY when there is
-/// no daemon line to pass through (daemon unreachable, or it returned an
-/// unusable/non-JSON payload). Serialized via serde_json so the message is
-/// always correctly escaped and stdout stays valid JSON (task-0183 AC #3).
+/// Build a CLI-synthesized error for a daemon-backed `--json` command. Used
+/// when there is no daemon line to pass through (daemon unreachable, or it
+/// returned an unusable/non-JSON payload). Serialized via serde_json so the
+/// message is always correctly escaped and stdout stays valid JSON (task-0183
+/// AC #3).
 ///
 /// NOTE: this object is fabricated by the CLI, not received from the
-/// daemon — it is the one case where `--json` output is not a verbatim
-/// daemon line. protocol.md documents this transport-error shape (see
-/// TASK-0213).
+/// daemon. The separate offline `--json --version` flag also fabricates a
+/// local object, but it is a successful client-version result rather than an
+/// error. protocol.md documents both CLI-owned shapes (see TASK-0213 and
+/// TASK-0236).
 fn synth_error(msg: &str) -> String {
     serde_json::json!({ "ok": false, "error": msg }).to_string()
 }
 
-/// Pure core of the `--json` path (task-0183): map the raw-line result to
-/// the exact stdout line and process exit code. No I/O, so it is directly
-/// unit-testable.
+/// Pure core of the daemon-backed `--json` path (task-0183): map the raw-line
+/// result to the exact stdout line and process exit code. No I/O, so it is
+/// directly unit-testable.
 ///
 /// - Valid JSON line: passed through BYTE-IDENTICALLY. Exit 0 iff its `ok`
 ///   field is boolean true, else exit 1. We parse ONLY `ok` and never
@@ -201,7 +201,7 @@ fn json_output(raw: Result<String>) -> (String, i32) {
 
 /// Emit the `--json` result and exit. Never returns.
 ///
-/// Callers must pair this with the human path in an
+/// Daemon-backed callers must pair this with the human path in an
 /// `if json { emit_json(..) } else { dispatch(..) }` so the two modes are
 /// mutually exclusive by control flow, not merely by this `-> !`
 /// signature — otherwise a future non-diverging refactor would silently
@@ -223,9 +223,9 @@ fn emit_json(raw: Result<String>) -> ! {
 /// emoji, non-Latin scripts) passes through unchanged so legitimate SSIDs
 /// still render readably (AC #3).
 ///
-/// Applied ONLY in the human renderer. The `--json` path is a byte-
-/// identical daemon passthrough (task-0183) and must stay untouched —
-/// that IS task-0198 AC #2.
+/// Applied ONLY in the human renderer. Daemon lines on the daemon-backed
+/// `--json` path pass through byte-identically (task-0183) and must stay
+/// untouched — that IS task-0198 AC #2.
 fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -386,6 +386,15 @@ fn main() {
             process::exit(code);
         }
     };
+
+    // The conventional version flags describe this executable and must work
+    // when the daemon is absent or its environment is misconfigured. Keep
+    // this before daemon target resolution and timeout configuration.
+    if cli.version_flag {
+        print_local_version(cli.json);
+        return;
+    }
+
     let json = cli.json;
     let timeout_secs = cli.timeout_secs;
     // Resolve the daemon target (unix socket by default; TCP via WHEREAMI_ADDR).
@@ -406,12 +415,6 @@ fn main() {
         }
     };
 
-    // --version short-circuits all other subcommands. We render the same
-    // banner the `version` subcommand produces.
-    if cli.version_flag {
-        return run_version(&client, json);
-    }
-
     // No subcommand -> default to locate (backwards compatible with the
     // pre-clap CLI that did `cmd = args.get(1).unwrap_or("locate")`).
     let command = cli.command.unwrap_or(Command::Locate);
@@ -424,7 +427,7 @@ fn main() {
         Command::History { range, from, to } => run_history(&client, json, range, from, to),
         Command::Wipe { yes: true } => run_wipe(&client, json),
         Command::Wipe { yes: false } => unreachable!("clap requires --yes"),
-        Command::Version => run_version(&client, json),
+        Command::Version => run_daemon_version(&client, json),
     }
 }
 
@@ -571,7 +574,27 @@ fn run_wipe(client: &WhereAmIClient, json: bool) {
     }
 }
 
-fn run_version(client: &WhereAmIClient, json: bool) {
+/// Print the version embedded in this executable without resolving or
+/// contacting a daemon. The JSON object is synthesized locally and serialized
+/// by serde_json so future revision strings cannot corrupt the output shape.
+fn print_local_version(json: bool) {
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let cli_rev = env!("GIT_REV");
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "version": cli_version,
+                "git_rev": cli_rev,
+            })
+        );
+    } else {
+        println!("cli:    {cli_version} ({cli_rev})");
+    }
+}
+
+fn run_daemon_version(client: &WhereAmIClient, json: bool) {
     // --json version must never print the human `cli: ...` banner to
     // stdout; it goes through the same raw passthrough as every other
     // command, so stdout stays valid JSON even with the daemon down
@@ -796,6 +819,19 @@ mod tests {
         assert!(cli.version_flag);
         let cli = Cli::try_parse_from(["whereami", "-V"]).unwrap();
         assert!(cli.version_flag);
+    }
+
+    #[test]
+    fn help_distinguishes_local_version_flag_from_daemon_subcommand() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            help.contains("Print this CLI's version locally, without contacting the daemon"),
+            "{help}"
+        );
+        assert!(
+            help.contains("Contact the daemon and print both CLI and daemon versions"),
+            "{help}"
+        );
     }
 
     #[test]
