@@ -3,6 +3,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
+use std::fs::File;
+use std::io::{ErrorKind, Read};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 /// whereamid: Wi-Fi geolocation daemon
@@ -40,7 +43,7 @@ pub struct Args {
     #[arg(long, default_value = "wlan0")]
     pub interface: String,
 
-    /// Path to TOML config file (API secrets)
+    /// Path to TOML WiGLE API credentials file; keep owner-only (0600)
     #[arg(long, default_value = "~/.config/whereami/config.toml")]
     pub config: String,
 
@@ -251,14 +254,51 @@ fn expand_tilde(path: &str) -> PathBuf {
 /// Load the TOML config file. Returns default if file does not exist.
 pub fn load_config_file(path: &str) -> Result<ConfigFile> {
     let expanded = expand_tilde(path);
-    if !expanded.exists() {
-        tracing::warn!(
-            "config file not found at {}, using defaults",
-            expanded.display()
-        );
-        return Ok(ConfigFile::default());
+    // Open once, then inspect and read that exact descriptor. A separate
+    // exists()/metadata()/read_to_string sequence would let a path be swapped
+    // between the permission check and the read.
+    let mut file = match File::open(&expanded) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            tracing::warn!(
+                "config file not found at {}, using defaults",
+                expanded.display()
+            );
+            return Ok(ConfigFile::default());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("opening config file {}", expanded.display()));
+        }
+    };
+
+    match file.metadata() {
+        Ok(metadata) => {
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    "WiGLE credentials file {:?} has permissions {:04o}; another local user may \
+                     read or modify the WiGLE API credentials. Restrict it to owner-only mode \
+                     0600.",
+                    expanded,
+                    mode
+                );
+            }
+        }
+        Err(error) => {
+            // Permission inspection is advisory: never make an otherwise
+            // readable credentials file unusable because metadata failed.
+            tracing::warn!(
+                "cannot verify permissions for WiGLE credentials file {:?}: {error}; another local \
+                 user may be able to read or modify the WiGLE API credentials. Restrict it to \
+                 owner-only mode 0600.",
+                expanded
+            );
+        }
     }
-    let contents = std::fs::read_to_string(&expanded)
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
         .with_context(|| format!("reading config file {}", expanded.display()))?;
     let config: ConfigFile = toml::from_str(&contents)
         .with_context(|| format!("parsing config file {}", expanded.display()))?;
@@ -269,11 +309,256 @@ pub fn load_config_file(path: &str) -> Result<ConfigFile> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::sync::{Arc, Mutex};
+    use tracing::{
+        field::{Field, Visit},
+        span, subscriber, Event, Metadata, Subscriber,
+    };
+
+    const TEST_API_KEY: &str = "unit-secret-that-must-never-be-logged";
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "whereamid-config-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create config test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    struct MessageVisitor(String);
+
+    impl Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.0 = value.to_owned();
+            }
+        }
+    }
+
+    impl Subscriber for CapturedEvents {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .expect("capture lock poisoned")
+                .push((*event.metadata().level(), visitor.0));
+        }
+
+        fn enter(&self, _span: &span::Id) {}
+        fn exit(&self, _span: &span::Id) {}
+    }
+
+    fn write_config(path: &std::path::Path, mode: u32) {
+        std::fs::write(
+            path,
+            format!("[wigle]\napi_user = \"unit-user\"\napi_key = \"{TEST_API_KEY}\"\n"),
+        )
+        .expect("write config test file");
+        let mut permissions = std::fs::metadata(path)
+            .expect("stat config test file")
+            .permissions();
+        permissions.set_mode(mode);
+        std::fs::set_permissions(path, permissions).expect("set config test file permissions");
+    }
+
+    fn load_with_captured_events(
+        path: &std::path::Path,
+    ) -> (ConfigFile, Vec<(tracing::Level, String)>) {
+        let captured = CapturedEvents::default();
+        let events = captured.clone();
+        let config = subscriber::with_default(captured, || {
+            load_config_file(path.to_str().expect("UTF-8 config test path"))
+        })
+        .expect("load config test file");
+        let events = events.0.lock().expect("capture lock poisoned").clone();
+        (config, events)
+    }
+
+    fn rendered_events(events: &[(tracing::Level, String)]) -> String {
+        events
+            .iter()
+            .map(|(level, message)| format!("{level}: {message}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     fn parse(extra: &[&str]) -> Args {
         let mut argv = vec!["whereamid"];
         argv.extend_from_slice(extra);
         Args::parse_from(argv)
+    }
+
+    #[test]
+    fn group_or_world_access_emits_warning_without_leaking_credentials() {
+        let dir = TestDir::new("insecure-modes");
+
+        for mode in [0o640, 0o604] {
+            let path = dir.path().join(format!("config-{mode:04o}.toml"));
+            write_config(&path, mode);
+
+            let (config, events) = load_with_captured_events(&path);
+            assert_eq!(config.wigle.api_key, TEST_API_KEY);
+            let output = rendered_events(&events);
+            let expected_mode = format!("{mode:04o}");
+            assert!(
+                events.iter().any(|(level, message)| {
+                    *level == tracing::Level::WARN
+                        && message.contains("WiGLE credentials file")
+                        && message.contains(&path.display().to_string())
+                        && message.contains(&expected_mode)
+                        && message.contains("another local user")
+                        && message.contains("read or modify")
+                        && message.contains("0600")
+                }),
+                "mode {expected_mode} must emit a clear permission warning; events:\n{output}"
+            );
+            assert!(
+                !output.contains(TEST_API_KEY),
+                "permission warning leaked the API key; events:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_warning_escapes_control_characters_in_config_path() {
+        let dir = TestDir::new("control-path");
+        let path = dir.path().join("config-\n-\u{1b}.toml");
+        write_config(&path, 0o644);
+
+        let (config, events) = load_with_captured_events(&path);
+        assert_eq!(config.wigle.api_key, TEST_API_KEY);
+        let output = rendered_events(&events);
+        let message = events
+            .iter()
+            .find_map(|(level, message)| {
+                (*level == tracing::Level::WARN && message.contains("WiGLE credentials file"))
+                    .then_some(message.as_str())
+            })
+            .unwrap_or_else(|| panic!("missing permission warning; events:\n{output}"));
+        let escaped_path = format!("{path:?}");
+
+        assert!(
+            message.contains(&escaped_path),
+            "warning must preserve the configured path in escaped Debug form {escaped_path}; \
+             events:\n{output}"
+        );
+        assert!(
+            message.contains("\\n") && (message.contains("\\u{1b}") || message.contains("\\x1b")),
+            "warning must visibly escape newline and ESC bytes; events:\n{output}"
+        );
+        assert!(
+            !message.contains('\n') && !message.contains('\u{1b}'),
+            "warning must not contain literal newline or ESC bytes; events:\n{output}"
+        );
+        assert!(
+            message.contains("0644")
+                && message.contains("another local user")
+                && message.contains("read or modify")
+                && message.contains("owner-only mode 0600"),
+            "escaped-path warning must retain mode and risk guidance; events:\n{output}"
+        );
+        assert!(
+            !message.contains(TEST_API_KEY),
+            "escaped-path warning leaked the API key; events:\n{output}"
+        );
+    }
+
+    #[test]
+    fn owner_only_modes_do_not_emit_permission_warning() {
+        let dir = TestDir::new("owner-only-modes");
+
+        for mode in [0o600, 0o400] {
+            let path = dir.path().join(format!("config-{mode:04o}.toml"));
+            write_config(&path, mode);
+
+            let (config, events) = load_with_captured_events(&path);
+            assert_eq!(config.wigle.api_key, TEST_API_KEY);
+            let output = rendered_events(&events);
+            assert!(
+                !events.iter().any(|(level, message)| {
+                    *level == tracing::Level::WARN
+                        && (message.contains("WiGLE credentials file")
+                            || message.contains("cannot verify permissions"))
+                }),
+                "owner-only mode {mode:04o} must not emit a permission warning; events:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn symlink_permission_check_uses_opened_target_mode() {
+        let dir = TestDir::new("symlink-target-mode");
+        let target = dir.path().join("target.toml");
+        let link = dir.path().join("config.toml");
+        write_config(&target, 0o600);
+        std::os::unix::fs::symlink(&target, &link).expect("create config symlink");
+
+        let (_, safe_events) = load_with_captured_events(&link);
+        let safe_output = rendered_events(&safe_events);
+        assert!(
+            !safe_events.iter().any(|(level, message)| {
+                *level == tracing::Level::WARN && message.contains("WiGLE credentials file")
+            }),
+            "symlink metadata must use its 0600 target, not the symlink's mode; events:\n{safe_output}"
+        );
+
+        let mut permissions = std::fs::metadata(&target)
+            .expect("stat symlink target")
+            .permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&target, permissions).expect("make symlink target insecure");
+
+        let (_, insecure_events) = load_with_captured_events(&link);
+        let insecure_output = rendered_events(&insecure_events);
+        assert!(
+            insecure_events.iter().any(|(level, message)| {
+                *level == tracing::Level::WARN
+                    && message.contains(&link.display().to_string())
+                    && message.contains("0644")
+            }),
+            "symlink metadata must report its opened 0644 target and the configured path; \
+             events:\n{insecure_output}"
+        );
     }
 
     #[test]

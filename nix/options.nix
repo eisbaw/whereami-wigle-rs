@@ -82,6 +82,8 @@
     default = credentialsFileDefault;
     description = ''
       Path to a TOML file containing WiGLE credentials.
+      Keep this source file owner-only (mode 0600, or 0400 when immutable),
+      because another local user may otherwise read or modify the credentials.
       Expected format:
         [wigle]
         api_user = "AID..."

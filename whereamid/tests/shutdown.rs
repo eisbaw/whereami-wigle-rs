@@ -6,14 +6,15 @@
 //! on this machine. Each test also passes an explicit `--socket` under its own
 //! throwaway tempdir, so the daemon never touches the DEFAULT unix-socket path
 //! ($XDG_RUNTIME_DIR/whereamid.sock or /run/whereami/...) and parallel tests
-//! cannot collide. `--config` points at a nonexistent file so WiGLE stays
-//! unconfigured (zero quota spend / no network), `--db` is a throwaway tempdir,
-//! and `--interface` is bogus so no real Wi-Fi scan runs. No test ever sends
-//! the daemon a `resolve`.
+//! cannot collide. `--config` points at either a nonexistent file or a file
+//! with empty WiGLE values, so WiGLE stays unconfigured (zero quota spend / no
+//! network), `--db` is a throwaway tempdir, and `--interface` is bogus so no
+//! real Wi-Fi scan runs. No test ever sends the daemon a `resolve`.
 #![cfg(unix)]
 
 use std::io::Read;
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -40,12 +41,12 @@ fn make_tempdir(tag: &str) -> PathBuf {
 }
 
 /// Spawn the daemon with an explicit unix `--socket`, an optional TCP `--bind`,
-/// and hermetic flags (throwaway DB, no config, bogus interface). Both stdout
-/// and stderr are captured to files: the tracing subscriber writes lifecycle
-/// logs to STDOUT, while panics and a `main`-returned error go to STDERR, so a
-/// test may need either. Passing an explicit `--socket` keeps the daemon off
-/// the default socket path (task-0196 hermeticity).
-fn spawn_daemon(bind: Option<&str>, socket: &Path, dir: &Path) -> Child {
+/// and hermetic flags (throwaway DB, explicit config, bogus interface). Both
+/// stdout and stderr are captured to files: the tracing subscriber writes
+/// lifecycle logs to STDOUT, while panics and a `main`-returned error go to
+/// STDERR, so a test may need either. Passing an explicit `--socket` keeps the
+/// daemon off the default socket path (task-0196 hermeticity).
+fn spawn_daemon(bind: Option<&str>, socket: &Path, config: &Path, dir: &Path) -> Child {
     let out = std::fs::File::create(dir.join("stdout.log")).expect("create stdout.log");
     let err = std::fs::File::create(dir.join("stderr.log")).expect("create stderr.log");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_whereamid"));
@@ -55,9 +56,8 @@ fn spawn_daemon(bind: Option<&str>, socket: &Path, dir: &Path) -> Child {
     }
     cmd.arg("--db")
         .arg(dir.join("aps.sqlite"))
-        // Nonexistent config -> defaults -> WiGLE unconfigured (no network).
         .arg("--config")
-        .arg(dir.join("no-such-config.toml"))
+        .arg(config)
         // Bogus interface: wifi_scan fails fast, never touches real hardware.
         .arg("--interface")
         .arg("whereami-nonexistent0")
@@ -158,6 +158,129 @@ fn wait_until_output_contains(child: &mut Child, dir: &Path, needle: &str, budge
     }
 }
 
+/// RAII cleanup for assertions/setup failures in tests that start a daemon.
+/// The explicit happy-path cleanup still runs before assertions; this guard is
+/// the panic/unwind backstop that prevents a failed readiness check from
+/// leaking a daemon into later tests.
+struct ChildCleanup(Child);
+
+impl Drop for ChildCleanup {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+struct DirCleanup(PathBuf);
+
+impl Drop for DirCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct ConfigPermissionRun {
+    config_path: String,
+    output: String,
+    signal_rc: i32,
+    outcome: Option<(Duration, ExitStatus)>,
+}
+
+/// Start the real daemon with a config at exactly `mode`, wait for its unix
+/// socket, then shut it down. All process and filesystem cleanup happens here,
+/// before the caller performs assertions on the captured result.
+fn run_config_permission_case(mode: u32) -> ConfigPermissionRun {
+    let dir = make_tempdir(&format!("config-mode-{mode:04o}"));
+    let dir_cleanup = DirCleanup(dir.clone());
+    let config = dir.join("config.toml");
+    std::fs::write(&config, "[wigle]\napi_user = \"\"\napi_key = \"\"\n")
+        .expect("write empty WiGLE config");
+    let mut permissions = std::fs::metadata(&config)
+        .expect("stat empty WiGLE config")
+        .permissions();
+    permissions.set_mode(mode);
+    std::fs::set_permissions(&config, permissions).expect("set WiGLE config mode");
+
+    let socket = dir.join("whereamid.sock");
+    let mut child = ChildCleanup(spawn_daemon(None, &socket, &config, &dir));
+    wait_until_socket_ready(&mut child.0, &socket, &dir, Duration::from_secs(10));
+
+    let signal_rc = unsafe { kill(child.0.id() as i32, SIGTERM) };
+    let outcome = if signal_rc == 0 {
+        wait_for_exit(&mut child.0, Duration::from_secs(6))
+    } else {
+        None
+    };
+    let output = read_output(&dir);
+    let config_path = config.display().to_string();
+
+    // The guards are unwind backstops; explicitly complete cleanup before any
+    // assertion in the caller so even a failed assertion cannot leak state.
+    drop(child);
+    drop(dir_cleanup);
+
+    ConfigPermissionRun {
+        config_path,
+        output,
+        signal_rc,
+        outcome,
+    }
+}
+
+/// task-0200: the real startup path warns for a group/world-accessible WiGLE
+/// credentials file and remains silent for owner-only permissions. Unit tests
+/// cover additional modes and the descriptor/symlink semantics; this test
+/// guards tracing initialization, CLI path plumbing, and startup ordering.
+#[test]
+fn config_permission_warning_is_visible_at_real_daemon_startup() {
+    for (mode, should_warn) in [(0o644, true), (0o600, false)] {
+        let run = run_config_permission_case(mode);
+
+        assert_eq!(
+            run.signal_rc, 0,
+            "failed to send SIGTERM for mode {mode:04o}; output:\n{}",
+            run.output
+        );
+        let (_elapsed, status) = run.outcome.expect(
+            "daemon must shut down after permission-warning startup case, not hang or exit early",
+        );
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "clean shutdown expected for mode {mode:04o}, got {status:?}; output:\n{}",
+            run.output
+        );
+        assert!(
+            !run.output.contains("panicked"),
+            "daemon panicked for mode {mode:04o}; output:\n{}",
+            run.output
+        );
+
+        if should_warn {
+            assert!(
+                run.output.contains("WARN")
+                    && run.output.contains("WiGLE credentials file")
+                    && run.output.contains(&run.config_path)
+                    && run.output.contains("0644")
+                    && run.output.contains("another local user")
+                    && run.output.contains("read or modify")
+                    && run.output.contains("0600"),
+                "0644 startup must emit a clear credential-permission warning; output:\n{}",
+                run.output
+            );
+        } else {
+            assert!(
+                !run.output.contains("WiGLE credentials file")
+                    && !run.output.contains("cannot verify permissions"),
+                "0600 startup must not emit a credential-permission warning; output:\n{}",
+                run.output
+            );
+        }
+    }
+}
+
 /// task-0233 (amending task-0195/0196): an explicitly-requested TCP `--bind`
 /// whose port is already taken must NOT take the daemon down. `run_server`'s
 /// `TcpListener::bind` returns EADDRINUSE, and the daemon must degrade to
@@ -182,7 +305,12 @@ fn tcp_bind_failure_degrades_to_unix_only() {
     );
 
     let sock = dir.join("whereamid.sock");
-    let mut child = spawn_daemon(Some(&addr.to_string()), &sock, &dir);
+    let mut child = spawn_daemon(
+        Some(&addr.to_string()),
+        &sock,
+        &dir.join("no-such-config.toml"),
+        &dir,
+    );
 
     // The daemon reaches its accept loop despite the TCP failure. "unix socket
     // ready" is logged AFTER the TCP bind attempt (run_server), so observing it
@@ -252,7 +380,7 @@ fn sigterm_exits_within_drain_budget() {
     let addr = format!("127.0.0.1:{port}");
 
     let sock = dir.join("whereamid.sock");
-    let mut child = spawn_daemon(Some(&addr), &sock, &dir);
+    let mut child = spawn_daemon(Some(&addr), &sock, &dir.join("no-such-config.toml"), &dir);
 
     // Readiness handshake: wait for the daemon to bind its control socket rather
     // than sleeping a fixed interval and hoping startup finished. Since the
@@ -314,7 +442,7 @@ fn live_socket_refused_nonzero_exit() {
 
     // No --bind: the unix socket is the mandatory transport, and its failure
     // must abort startup by itself.
-    let mut child = spawn_daemon(None, &sock, &dir);
+    let mut child = spawn_daemon(None, &sock, &dir.join("no-such-config.toml"), &dir);
     let outcome = wait_for_exit(&mut child, Duration::from_secs(15));
     let stderr = read_stderr(&dir);
 

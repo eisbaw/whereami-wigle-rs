@@ -14,7 +14,7 @@ All operational parameters are CLI args with sensible defaults. Only API credent
 ## Rationale
 
 - CLI args are visible in `ps`, overridable in systemd unit files, and self-documenting via `--help`. No guessing what config file format to use.
-- Secrets in a separate TOML file can have restricted file permissions (600). They don't change between deployments — only the operational params do.
+- Secrets in a separate TOML file must be owner-only (0600, or stricter such as 0400); the daemon warns when group or world permission bits are set. They don't change between deployments — only the operational params do.
 - No single config file mixing "how often to scan" with "WiGLE API key." Different change cadences, different access patterns.
 - Defaults are conservative and work out of the box. Most users never need to touch them.
 

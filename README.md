@@ -58,6 +58,17 @@ api_user = "AID..."   # optional; daemon runs without WiGLE creds
 api_key  = "..."
 ```
 
+Keep this file owner-only because another local user who can read or modify it
+can steal or replace the WiGLE API credentials:
+
+```bash
+chmod 600 ~/.config/whereami/config.toml
+```
+
+At startup, the daemon warns when any group or world permission bit is set. It
+does not print credential values, change the mode, or reject the file; fix the
+permissions explicitly. Read-only owner access (`0400`) is also safe.
+
 Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
 
 ```
