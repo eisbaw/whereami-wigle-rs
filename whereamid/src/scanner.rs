@@ -463,21 +463,59 @@ BSS 11:22:33:44:55:66(on wlan0)
     }
 
     #[test]
-    fn test_freq_to_channel() {
-        // 2.4 GHz
-        assert_eq!(freq_to_channel(2437), Some(6));
-        assert_eq!(freq_to_channel(2484), Some(14));
-        // 5 GHz
-        assert_eq!(freq_to_channel(5180), Some(36));
-        assert_eq!(freq_to_channel(5825), Some(165));
-        // 6 GHz / Wi-Fi 6E
-        assert_eq!(freq_to_channel(5955), Some(1)); // first 6 GHz channel
-        assert_eq!(freq_to_channel(6105), Some(31)); // mid-range example
-        assert_eq!(freq_to_channel(7115), Some(233)); // last 6 GHz channel
-                                                      // Gaps that should remain None
-        assert_eq!(freq_to_channel(5905), None); // UNII-4 gap
-        assert_eq!(freq_to_channel(7120), None); // above 6 GHz
-        assert_eq!(freq_to_channel(2400), None); // below 2.4 GHz
+    fn freq_to_channel_band_boundaries() {
+        let cases = [
+            // 2.4 GHz: frequencies are discrete rather than a continuous range.
+            (2407, None, "below 2.4 GHz"),
+            (2411, None, "immediately below 2.4 GHz"),
+            (2412, Some(1), "first 2.4 GHz channel"),
+            (2437, Some(6), "interior 2.4 GHz channel"),
+            (2484, Some(14), "last 2.4 GHz channel"),
+            (2485, None, "immediately above 2.4 GHz"),
+            (2489, None, "above 2.4 GHz"),
+            // Pin the first two 5 GHz channels so moving the lower guard from
+            // 5180 to 5185 cannot slip through as an off-by-one regression.
+            (5175, None, "below 5 GHz"),
+            (5179, None, "immediately below 5 GHz"),
+            (5180, Some(36), "first 5 GHz channel"),
+            (5185, Some(37), "second 5 GHz channel"),
+            (5825, Some(165), "interior 5 GHz channel"),
+            (5885, Some(177), "last 5 GHz channel"),
+            (5886, None, "immediately above 5 GHz"),
+            (5890, None, "above 5 GHz"),
+            (5905, None, "UNII-4 gap"),
+            // 6 GHz / Wi-Fi 6E.
+            (5950, None, "below 6 GHz"),
+            (5954, None, "immediately below 6 GHz"),
+            (5955, Some(1), "first 6 GHz channel"),
+            (6105, Some(31), "interior 6 GHz channel"),
+            (7115, Some(233), "last 6 GHz channel"),
+            (7116, None, "immediately above 6 GHz"),
+            (7120, None, "above 6 GHz"),
+        ];
+
+        for (frequency, expected, description) in cases {
+            assert_eq!(
+                freq_to_channel(frequency),
+                expected,
+                "unexpected mapping at {description} ({frequency} MHz)"
+            );
+        }
+    }
+
+    #[test]
+    fn freq_to_channel_outputs_are_valid_channels() {
+        // Frequencies are parsed as MHz. Exhausting u16 covers the complete
+        // practical non-negative domain and every branch that can return Some,
+        // while keeping this regression property deterministic and fast.
+        for frequency in 0..=u16::MAX {
+            if let Some(channel) = freq_to_channel(i32::from(frequency)) {
+                assert!(
+                    (1..=233).contains(&channel),
+                    "{frequency} MHz mapped to invalid channel {channel}"
+                );
+            }
+        }
     }
 }
 
