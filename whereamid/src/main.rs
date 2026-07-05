@@ -14,6 +14,7 @@ mod history;
 mod http;
 mod nominatim;
 mod pending;
+mod privacy;
 mod provider;
 mod resolver;
 mod scanner;
@@ -163,6 +164,7 @@ async fn main() -> Result<()> {
         #[cfg(test)]
         test_db: std::sync::Mutex::new(Database::open_memory().unwrap()),
         debouncer: tokio::sync::Mutex::new(debouncer),
+        privacy: privacy::PrivacyCoordinator::new(),
         apple: apple::AppleClient::with_timeout(http_timeout),
         nominatim: nominatim::NominatimClient::with_timeout(nominatim_timeout),
         geocode: server::geocode::GeocodeScheduler::new(shutdown.clone()),
@@ -172,12 +174,14 @@ async fn main() -> Result<()> {
         args: args.clone(),
         wigle: wigle_client,
         last_fix: tokio::sync::Mutex::new(initial_last_fix),
-        inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
         db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
         history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+        wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         shutdown,
         tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+        privacy_wipes: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(orphans_last_shutdown),
     });
 
@@ -205,32 +209,12 @@ async fn main() -> Result<()> {
         server::geocode::run_worker(geocode_state).await;
     });
 
-    // History-prune task: drop fixes older than retention_days every 24h.
-    // The first sweep runs after one full interval so the daemon's startup
-    // is not slowed by a potentially large DELETE.
-    let history_state = Arc::clone(&state);
-    let history_handle = tokio::spawn(async move {
-        let interval = Duration::from_secs(24 * 60 * 60);
-        loop {
-            // Level-triggered shutdown (task-0190): `biased` checks
-            // cancellation first, so a cancel that lands during the interval
-            // wakes the loop immediately instead of waiting out the full 24h.
-            tokio::select! {
-                biased;
-                _ = history_state.shutdown.cancelled() => break,
-                _ = sleep(interval) => {}
-            }
-            let retention = history_state.args.history_retention_days;
-            let pruned = history_state.db.prune_fixes(retention).await;
-            match pruned {
-                Ok(0) => {}
-                Ok(n) => info!("history prune: removed {n} fix rows older than {retention}d"),
-                Err(e) => {
-                    tracing::warn!("history prune failed: {e}");
-                    history_state.record_db_failure();
-                }
-            }
-        }
+    // Privacy retention runs once immediately, then every 24 hours. Fixes and
+    // APs are pruned in alternating bounded transactions so neither table can
+    // monopolise the writer actor.
+    let retention_state = Arc::clone(&state);
+    let retention_handle = tokio::spawn(async move {
+        run_retention_loop(retention_state, Duration::from_secs(24 * 60 * 60)).await;
     });
 
     let server_state = Arc::clone(&state);
@@ -283,14 +267,32 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let named = vec![scan_handle, pending_handle, geocode_handle, history_handle];
+    let named = vec![
+        scan_handle,
+        pending_handle,
+        geocode_handle,
+        retention_handle,
+    ];
 
     // Take the tracked-spawn JoinSet out of shared state so we can drive it to
     // completion here (a std::sync::Mutex guard cannot be held across await).
     let tracked = std::mem::take(&mut *state.tasks.lock().unwrap_or_else(|e| e.into_inner()));
 
     // task-0190/0102: wait up to the budget, then force-abort survivors.
-    let aborted = run_shutdown_drain(Duration::from_secs(5), named, server_to_drain, tracked).await;
+    let mut aborted =
+        run_shutdown_drain(Duration::from_secs(5), named, server_to_drain, tracked).await;
+
+    // Wipes have their own single-flight task set so an accepted handler can
+    // disappear without cancelling the worker. Their DB command owns the
+    // clear+epoch continuation durably, so force-aborting an async waiter after
+    // this additional bounded drain cannot create a committed/uncleared split.
+    let privacy_wipes = std::mem::take(
+        &mut *state
+            .privacy_wipes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+    );
+    aborted += run_privacy_wipe_shutdown_drain(Duration::from_secs(5), privacy_wipes).await;
     if aborted > 0 {
         // Journal observability, independent of the stats persist below.
         info!("shutdown drain force-aborted {aborted} orphaned tasks");
@@ -337,8 +339,8 @@ async fn main() -> Result<()> {
         Some(_) => error!("whereamid stopped after unexpected server task failure"),
         None => info!("whereamid stopped"),
     }
-    // Every task/handler and the final metadata command is drained before the
-    // actor owner stops its FIFO threads.
+    // Every task/handler, privacy wipe, and final metadata command is drained
+    // before the actor owner stops its FIFO threads.
     drop(state);
     db_runtime
         .shutdown()
@@ -640,6 +642,153 @@ async fn run_shutdown_drain(
     aborted
 }
 
+/// Bound the async wipe-worker wait separately from ordinary background work.
+/// Once a wipe has enqueued its durable writer command, the actor itself owns
+/// DB commit -> managed clear -> epoch advance, so aborting only this waiter is
+/// safe; database shutdown later drains the FIFO command before stopping.
+async fn run_privacy_wipe_shutdown_drain(
+    budget: Duration,
+    mut wipes: tokio::task::JoinSet<()>,
+) -> u64 {
+    let graceful = async {
+        while let Some(result) = wipes.join_next().await {
+            if let Err(error) = result {
+                tracing::error!("privacy wipe worker failed during shutdown: {error}");
+            }
+        }
+    };
+    if tokio::time::timeout(budget, graceful).await.is_ok() {
+        return 0;
+    }
+
+    while let Some(result) = wipes.try_join_next() {
+        if let Err(error) = result {
+            tracing::error!("privacy wipe worker failed during shutdown: {error}");
+        }
+    }
+    let aborted = wipes.len() as u64;
+    wipes.abort_all();
+    while wipes.join_next().await.is_some() {}
+    aborted
+}
+
+/// Run immediate and periodic retention sweeps until shutdown. The interval is
+/// injected so paused-clock tests can prove cadence without a 24-hour wait.
+async fn run_retention_loop(state: Arc<DaemonState>, interval: Duration) {
+    run_retention_loop_with_hook(state, interval, || {}).await;
+}
+
+/// The completion hook gives cadence tests an exact boundary without timing
+/// sleeps or racing SQLite's shared-cache test connections.
+async fn run_retention_loop_with_hook<F>(
+    state: Arc<DaemonState>,
+    interval: Duration,
+    mut sweep_finished: F,
+) where
+    F: FnMut(),
+{
+    loop {
+        if state.shutdown.is_cancelled() {
+            break;
+        }
+        run_retention_sweep_once(&state).await;
+        sweep_finished();
+        tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => break,
+            _ = sleep(interval) => {}
+        }
+    }
+}
+
+/// Prune history and AP cache rows in alternating 1,000-row writer turns.
+/// Cutoffs are fixed once per sweep; failures are independent so one table
+/// cannot suppress the other's privacy policy.
+async fn run_retention_sweep_once(state: &Arc<DaemonState>) {
+    let mut fixes_cutoff = match db::retention_cutoff(state.args.history_retention_days) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!("history retention cutoff failed: {error}");
+            state.record_db_failure();
+            None
+        }
+    };
+    let mut aps_cutoff = match db::retention_cutoff(state.args.aps_retention_days) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!("AP retention cutoff failed: {error}");
+            state.record_db_failure();
+            None
+        }
+    };
+    let mut fixes_total = 0usize;
+    let mut aps_total = 0usize;
+    let ticket = state.privacy.ticket();
+
+    while fixes_cutoff.is_some() || aps_cutoff.is_some() {
+        if state.shutdown.is_cancelled() {
+            return;
+        }
+
+        if let Some(cutoff) = fixes_cutoff.clone() {
+            let Some(_privacy) = state.privacy.read(ticket).await else {
+                return;
+            };
+            match state.db.prune_fixes_before_chunk(cutoff).await {
+                Ok(deleted) => {
+                    fixes_total += deleted;
+                    if deleted < db::RETENTION_CHUNK_SIZE {
+                        fixes_cutoff = None;
+                    }
+                }
+                Err(error) => {
+                    warn!("history prune failed: {error}");
+                    state.record_db_failure();
+                    fixes_cutoff = None;
+                }
+            }
+        }
+
+        if state.shutdown.is_cancelled() {
+            return;
+        }
+
+        if let Some(cutoff) = aps_cutoff.clone() {
+            let Some(_privacy) = state.privacy.read(ticket).await else {
+                return;
+            };
+            match state.db.prune_aps_before_chunk(cutoff).await {
+                Ok(deleted) => {
+                    aps_total += deleted;
+                    if deleted < db::RETENTION_CHUNK_SIZE {
+                        aps_cutoff = None;
+                    }
+                }
+                Err(error) => {
+                    warn!("AP cache prune failed: {error}");
+                    state.record_db_failure();
+                    aps_cutoff = None;
+                }
+            }
+        }
+
+        tokio::task::yield_now().await;
+    }
+
+    if fixes_total > 0 {
+        info!(
+            "history prune: removed {fixes_total} fix rows older than {}d",
+            state.args.history_retention_days
+        );
+    }
+    if aps_total > 0 {
+        info!(
+            "AP cache prune: removed {aps_total} rows older than {}d",
+            state.args.aps_retention_days
+        );
+    }
+}
+
 /// Background scan loop with fast/slow phase.
 async fn run_scan_loop(state: Arc<DaemonState>) {
     let start = Instant::now();
@@ -653,6 +802,7 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
     );
 
     loop {
+        let privacy_ticket = state.privacy.ticket();
         let interval = if start.elapsed() < fast_duration {
             fast_interval
         } else {
@@ -673,6 +823,9 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
             Ok(networks) => {
                 let count = networks.len();
                 let sample = scanner::scan_to_sample(&networks);
+                let Some(_privacy) = state.privacy.read(privacy_ticket).await else {
+                    continue;
+                };
                 let mut debouncer = state.debouncer.lock().await;
                 debouncer.push_scan(sample);
                 let stable = debouncer.stable_bssids();
@@ -694,7 +847,8 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
                     let resolve_state = Arc::clone(&state);
                     let stable_vec: Vec<String> = stable.into_iter().collect();
                     state.spawn_tracked(async move {
-                        resolver::resolve_background(&stable_vec, &resolve_state).await;
+                        resolver::resolve_background(&stable_vec, &resolve_state, privacy_ticket)
+                            .await;
                     });
                 }
             }
@@ -709,6 +863,88 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
             _ = state.shutdown.cancelled() => break,
             _ = sleep(interval) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::db::{ApInfo, Source};
+
+    fn seed_expired_rows(state: &Arc<DaemonState>, suffix: &str) {
+        let db = crate::server::lock_db(state);
+        let ap = ApInfo {
+            bssid: format!("expired-{suffix}"),
+            ssid: Some("private-ssid".to_string()),
+            lat: 55.0,
+            lon: 12.0,
+            encryption: None,
+            channel: None,
+            frequency: None,
+            city: None,
+            country: None,
+            source: Source::Manual,
+        };
+        db.upsert_ap(&ap).unwrap();
+        db.execute_batch_for_test("UPDATE aps SET last_seen = '2000-01-01T00:00:00+00:00';")
+            .unwrap();
+        db.insert_fix("2000-01-01T00:00:00+00:00", 55.0, 12.0, 5.0, 1)
+            .unwrap();
+    }
+
+    fn privacy_row_counts(state: &Arc<DaemonState>) -> (i64, usize) {
+        let db = crate::server::lock_db(state);
+        (
+            db.cached_ap_count().unwrap(),
+            db.get_fixes_in_range("0000", "9999").unwrap().len(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retention_loop_sweeps_immediately_then_on_interval_and_stops() {
+        let state = crate::server::test_state();
+        seed_expired_rows(&state, "first");
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_retention_loop_with_hook(loop_state, Duration::from_secs(60), move || {
+                completed_tx.send(()).unwrap();
+            })
+            .await
+        });
+        completed_rx.recv().await.unwrap();
+        assert_eq!(privacy_row_counts(&state), (0, 0));
+
+        seed_expired_rows(&state, "second");
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert_eq!(privacy_row_counts(&state), (1, 1));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        completed_rx.recv().await.unwrap();
+        assert_eq!(privacy_row_counts(&state), (0, 0));
+
+        state.shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_retention_table_failure_does_not_suppress_the_other() {
+        let state = crate::server::test_state();
+        seed_expired_rows(&state, "independent");
+        crate::server::lock_db(&state)
+            .execute_batch_for_test(
+                "CREATE TRIGGER reject_retention_fix BEFORE DELETE ON fixes
+                 BEGIN SELECT RAISE(ABORT, 'retention fix failure'); END;",
+            )
+            .unwrap();
+
+        run_retention_sweep_once(&state).await;
+        assert_eq!(privacy_row_counts(&state), (0, 1));
+        assert_eq!(
+            state
+                .db_write_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 }
 

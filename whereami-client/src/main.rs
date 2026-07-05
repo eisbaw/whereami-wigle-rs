@@ -20,7 +20,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::process;
 use whereami_client::{
-    DaemonResponse, LocateResponse, ScanResponse, StatsResponse, WhereAmIClient,
+    DaemonResponse, LocateResponse, ScanResponse, StatsResponse, WhereAmIClient, WipeConfirmation,
+    WipeResponse,
 };
 
 /// `whereami` — Wi-Fi geolocation CLI.
@@ -103,6 +104,13 @@ enum Command {
         /// RFC3339 inclusive end. Requires --from.
         #[arg(long, conflicts_with = "range")]
         to: Option<String>,
+    },
+
+    /// Delete all stored location, history, and observed Wi-Fi data.
+    Wipe {
+        /// Required non-interactive confirmation of the destructive operation.
+        #[arg(long, required = true)]
+        yes: bool,
     },
 
     /// Print CLI and daemon versions.
@@ -300,6 +308,18 @@ fn render_stats(resp: &StatsResponse) -> String {
     )
 }
 
+fn render_wipe(resp: &WipeResponse) -> String {
+    format!(
+        "deleted: aps={} pending={} not_found={} fixes={} last_fix={}\n\
+         collection remains enabled; new observations may repopulate the database\n",
+        resp.aps_deleted,
+        resp.pending_deleted,
+        resp.not_found_deleted,
+        resp.fixes_deleted,
+        resp.last_fix_deleted,
+    )
+}
+
 fn main() {
     // Restore the default SIGPIPE disposition (task-0199). The Rust runtime
     // installs SIG_IGN for SIGPIPE before main(), which turns a closed
@@ -377,6 +397,8 @@ fn main() {
         Command::Stats => run_stats(&client, json),
         Command::Debug => run_debug(&client, json),
         Command::History { range, from, to } => run_history(&client, json, range, from, to),
+        Command::Wipe { yes: true } => run_wipe(&client, json),
+        Command::Wipe { yes: false } => unreachable!("clap requires --yes"),
         Command::Version => run_version(&client, json),
     }
 }
@@ -514,6 +536,16 @@ fn run_history(
     }
 }
 
+fn run_wipe(client: &WhereAmIClient, json: bool) {
+    if json {
+        emit_json(client.wipe_raw(WipeConfirmation::Confirmed));
+    } else {
+        dispatch(client.wipe(WipeConfirmation::Confirmed), |resp| {
+            print!("{}", render_wipe(resp));
+        });
+    }
+}
+
 fn run_version(client: &WhereAmIClient, json: bool) {
     // --json version must never print the human `cli: ...` banner to
     // stdout; it goes through the same raw passthrough as every other
@@ -647,6 +679,36 @@ mod tests {
             "2026-01-01T00:00:00Z",
         ]);
         assert!(res.is_err(), "range + --from must conflict");
+    }
+
+    #[test]
+    fn wipe_requires_explicit_yes_and_parses_under_json() {
+        assert!(
+            Cli::try_parse_from(["whereami", "wipe"]).is_err(),
+            "bare wipe must fail before target resolution"
+        );
+        let cli = Cli::try_parse_from(["whereami", "--json", "wipe", "--yes"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(cli.command, Some(Command::Wipe { yes: true })));
+    }
+
+    #[test]
+    fn wipe_renderer_prints_exact_counts_and_repopulation_notice() {
+        let output = render_wipe(&WipeResponse {
+            ok: true,
+            v: 1,
+            aps_deleted: 5,
+            pending_deleted: 4,
+            not_found_deleted: 3,
+            fixes_deleted: 2,
+            last_fix_deleted: 1,
+            error: None,
+        });
+        assert_eq!(
+            output,
+            "deleted: aps=5 pending=4 not_found=3 fixes=2 last_fix=1\n\
+             collection remains enabled; new observations may repopulate the database\n"
+        );
     }
 
     #[test]

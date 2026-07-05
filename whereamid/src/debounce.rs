@@ -53,6 +53,12 @@ impl Debouncer {
         });
     }
 
+    /// Forget every observed network and timestamp. Used by the confirmed
+    /// privacy wipe while it owns the daemon-wide exclusive publication gate.
+    pub fn clear(&mut self) {
+        self.ring.clear();
+    }
+
     /// Check if a specific BSSID is stable (appears in >= threshold samples).
     #[allow(dead_code)]
     pub fn is_stable(&self, bssid: &str) -> bool {
@@ -182,6 +188,20 @@ mod tests {
         d.push_scan(HashMap::new());
         d.push_scan(HashMap::new());
         assert!(!d.is_stable(bssid));
+    }
+
+    #[test]
+    fn clear_forgets_every_sample() {
+        let mut d = Debouncer::new(3, 1);
+        let mut sample = HashMap::new();
+        sample.insert("AA:BB:CC:DD:EE:FF".to_string(), entry(-65));
+        d.push_scan(sample);
+        assert_eq!(d.sample_count(), 1);
+
+        d.clear();
+        assert_eq!(d.sample_count(), 0);
+        assert!(d.latest_scan().is_none());
+        assert!(d.stable_bssids().is_empty());
     }
 
     #[test]

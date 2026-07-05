@@ -121,8 +121,21 @@ pub struct Args {
     /// Days to retain rows in the location-history `fixes` table. Older rows
     /// are pruned periodically. 0 disables retention (no pruning); fixes are
     /// kept indefinitely.
-    #[arg(long, default_value_t = 30)]
+    #[arg(
+        long,
+        default_value_t = 30,
+        value_parser = clap::value_parser!(i64).range(0..=crate::db::MAX_RETENTION_DAYS)
+    )]
     pub history_retention_days: i64,
+
+    /// Days to retain resolved access points after their last observation.
+    /// 0 disables retention (cached AP rows are kept indefinitely).
+    #[arg(
+        long,
+        default_value_t = 30,
+        value_parser = clap::value_parser!(i64).range(0..=crate::db::MAX_RETENTION_DAYS)
+    )]
+    pub aps_retention_days: i64,
 
     /// Maximum distance (meters) between consecutive fixes for them to be
     /// grouped into the same stay-point segment.
@@ -218,8 +231,17 @@ impl Args {
         if self.nominatim_timeout_secs == 0 {
             anyhow::bail!("--nominatim-timeout-secs must be > 0");
         }
-        if self.history_retention_days < 0 {
-            anyhow::bail!("--history-retention-days must be >= 0 (0 disables retention)");
+        if !(0..=crate::db::MAX_RETENTION_DAYS).contains(&self.history_retention_days) {
+            anyhow::bail!(
+                "--history-retention-days must be in 0..={} (0 disables retention)",
+                crate::db::MAX_RETENTION_DAYS
+            );
+        }
+        if !(0..=crate::db::MAX_RETENTION_DAYS).contains(&self.aps_retention_days) {
+            anyhow::bail!(
+                "--aps-retention-days must be in 0..={} (0 disables retention)",
+                crate::db::MAX_RETENTION_DAYS
+            );
         }
         if self.history_segment_distance_m == 0 {
             anyhow::bail!("--history-segment-distance-m must be > 0");
@@ -585,7 +607,27 @@ mod tests {
 
     #[test]
     fn defaults_validate_clean() {
-        parse(&[]).validate().expect("default Args must validate");
+        let args = parse(&[]);
+        args.validate().expect("default Args must validate");
+        assert_eq!(args.history_retention_days, 30);
+        assert_eq!(args.aps_retention_days, 30);
+    }
+
+    #[test]
+    fn retention_zero_is_accepted_and_out_of_range_is_rejected_by_clap() {
+        parse(&["--history-retention-days", "0", "--aps-retention-days", "0"])
+            .validate()
+            .expect("zero explicitly disables retention");
+
+        for flag in ["--history-retention-days", "--aps-retention-days"] {
+            assert!(Args::try_parse_from(["whereamid", flag, "-1"]).is_err());
+            assert!(Args::try_parse_from([
+                "whereamid",
+                flag,
+                &(crate::db::MAX_RETENTION_DAYS + 1).to_string(),
+            ])
+            .is_err());
+        }
     }
 
     #[test]

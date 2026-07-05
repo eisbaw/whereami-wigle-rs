@@ -2,8 +2,8 @@
 
 Wi-Fi geolocation daemon for Linux. Scans nearby access points, resolves their
 positions via Apple WPS (free, no auth) with WiGLE as a secondary backend,
-caches results in SQLite, and answers "where am I?" over a localhost TCP
-socket.
+caches results in SQLite, and answers "where am I?" over an access-controlled
+Unix socket.
 
 ```
 $ whereami locate
@@ -43,6 +43,7 @@ whereami debug               # per-BSSID debounce + DB classification
 whereami history 24h         # stay-point segments over the last 24 hours
 whereami history 7d          # last 7 days; supports s/m/h/d/w
 whereami history --from 2026-05-01T00:00:00+00:00 --to 2026-05-08T00:00:00+00:00
+whereami wipe --yes          # delete stored location and observed Wi-Fi data
 whereami version             # CLI + daemon versions
 whereami --json locate       # raw JSON output (any subcommand)
 whereami help
@@ -94,6 +95,7 @@ Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
 --http-timeout-secs <N>             Apple/WiGLE total timeout [15]
 --nominatim-timeout-secs <N>        Nominatim total timeout [30]
 --history-retention-days <N>        Prune fixes older than N days [30]
+--aps-retention-days <N>            Prune APs not seen for N days [30]
 --history-segment-distance-m <M>    Stay-point clustering threshold [100]
 --history-segment-min-duration-secs Min stay-point duration [300]
 ```
@@ -138,6 +140,55 @@ opportunistically.
 
 After a daemon restart, the most recent fix is rehydrated from disk — `whereami
 locate` answers immediately while the next scan-and-resolve cycle runs.
+
+## Privacy, retention, and wiping
+
+By default, the daemon removes location-history fixes older than 30 days and
+resolved AP rows that have not been observed for 30 days. It runs one sweep at
+startup and then daily, alternating bounded 1,000-row transactions between the
+two tables. Configure the windows with `--history-retention-days` and
+`--aps-retention-days`, or the Nix options `historyRetentionDays` and
+`apsRetentionDays`. A value of `0` keeps that table indefinitely.
+
+To delete the daemon's current logical location data immediately:
+
+```bash
+whereami wipe --yes
+```
+
+The command uses the filesystem-permission-gated Unix control socket and is
+always refused over unauthenticated TCP, including loopback TCP. It atomically
+deletes resolved APs, pending APs, negative-cache entries, fix history, the
+persisted last-known fix, and the fix-ID sequence. It also clears the daemon's
+managed in-memory scan/debounce, last-fix, address-cache, geocode-queue, and
+in-flight lookup state. The success response reports exact per-table counts.
+Schema state and operational metadata such as API quota and shutdown counters
+are intentionally retained. Daemon configuration and WiGLE credentials live
+outside these tables and are untouched.
+
+Socket access is the authorization boundary. Every user authorized by the
+socket's filesystem permissions (including every NixOS `allowedUsers` member)
+can run the destructive wipe; there is no read-only or per-command role. The
+`--yes` confirmation prevents accidental invocation but grants no additional
+authority.
+
+A wipe does not disable collection. Its exclusive boundary ends when the
+server's response-write attempt terminates, whether by success, write failure,
+timeout, or disconnect; later scans and queries may then repopulate the
+database. If no complete response arrives, completion is unknown: verify the
+state or retry the idempotent wipe. Stop or disable the daemon as well if
+collection must remain off. This is logical live-state deletion, not forensic
+erasure: SQLite free pages or WAL remnants, allocator/process-memory remnants
+outside the managed structures above, filesystem snapshots, backups, storage
+media, logs, and provider traffic already sent are outside its scope. Use
+encrypted storage and separately manage snapshots/backups when those threats
+matter.
+
+An internal invariant panic after the database commit is fail-stop: the daemon
+keeps the publication boundary held and exits nonzero before it can resume
+serving partially cleared state. A systemd service can restart against the
+already-wiped database; clients should treat the interrupted response as
+unknown and verify or retry.
 
 ## Development
 

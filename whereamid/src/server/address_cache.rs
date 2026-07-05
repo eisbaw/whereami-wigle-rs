@@ -104,6 +104,13 @@ impl AddressCache {
             }
         }
     }
+
+    /// Remove all rounded positions and addresses without changing the
+    /// configured TTL. The privacy wipe calls this under its exclusive gate.
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +208,16 @@ mod tests {
             cache.order.len() <= ADDRESS_CACHE_CAP,
             "order must respect capacity"
         );
+    }
+
+    #[test]
+    fn clear_removes_map_and_eviction_order() {
+        let mut cache = AddressCache::new();
+        cache.insert(55.6684, 12.5541, "Copenhagen".to_string());
+        cache.clear();
+        assert!(cache.map.is_empty());
+        assert!(cache.order.is_empty());
+        assert!(cache.get(55.6684, 12.5541).is_none());
     }
 
     /// TTL: an entry whose inserted_at is older than ttl_days reads back

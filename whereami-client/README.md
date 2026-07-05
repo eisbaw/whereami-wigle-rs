@@ -15,7 +15,7 @@ The crate ships two artefacts:
 ## Library usage
 
 ```rust
-use whereami_client::WhereAmIClient;
+use whereami_client::{WhereAmIClient, WipeConfirmation};
 
 // Resolve the daemon from the environment: WHEREAMI_SOCKET / WHEREAMI_ADDR /
 // the default unix-socket paths ($XDG_RUNTIME_DIR/whereamid.sock, then
@@ -36,6 +36,12 @@ for seg in &h.segments {
 let via_socket = WhereAmIClient::unix("/run/whereami/whereamid.sock");
 let via_tcp = WhereAmIClient::tcp("10.0.0.5:4747"); // opt-in, unauthenticated
 let stats = via_socket.stats()?;
+
+// Destructive operations require an explicit confirmation marker at the call
+// site. This prevents accidents but is not authorization: every user allowed
+// to connect to the Unix socket can wipe. The daemon never accepts wipe on TCP.
+let deleted = via_socket.wipe(WipeConfirmation::Confirmed)?;
+println!("deleted {} AP rows", deleted.aps_deleted);
 ```
 
 `StatsResponse::orphan_tasks_aborted` is the number of tasks force-aborted at
@@ -65,6 +71,7 @@ whereami stats                           # cache + observability counters
 whereami debug                           # daemon debug snapshot
 whereami history 7d                      # stay-point segments
 whereami history --from 2026-05-01T00:00:00+00:00 --to 2026-05-08T00:00:00+00:00
+whereami wipe --yes                      # delete stored location/AP data
 whereami version                         # CLI + daemon versions
 whereami --json locate                   # raw JSON output for any subcommand
 whereami help
@@ -75,6 +82,16 @@ The CLI reaches the daemon over its unix control socket by default
 Override with `WHEREAMI_SOCKET=<path>`, or point at an old TCP daemon with
 `WHEREAMI_ADDR=<host:port>` (e.g. `127.0.0.1:4747`). See
 [docs/protocol.md](../docs/protocol.md) for the access-control model.
+
+`wipe --yes` deletes persisted AP, pending, negative-cache, fix-history, and
+last-fix rows and clears the daemon's managed in-memory location state. It does
+not disable collection. Its exclusive boundary ends when the response-write
+attempt terminates by success, failure, timeout, or disconnect, after which new
+observations can repopulate the database. A missing complete response leaves
+the result unknown; verify or retry, since wipe is idempotent. It is logical
+deletion rather than forensic erasure of SQLite/WAL remnants,
+allocator/process-memory remnants outside managed caches, snapshots, backups,
+logs, or storage media.
 
 ## Wire protocol
 

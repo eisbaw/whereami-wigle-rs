@@ -19,20 +19,27 @@ use crate::server::DaemonState;
 struct InflightGuard<'a> {
     state: &'a Arc<DaemonState>,
     bssid: String,
+    ticket: crate::privacy::PrivacyTicket,
 }
 
 impl<'a> InflightGuard<'a> {
     /// Try to claim `bssid`. Returns `Some(guard)` if no other task holds it,
     /// `None` if another task already claimed it.
-    fn try_claim(state: &'a Arc<DaemonState>, bssid: &str) -> Option<Self> {
+    fn try_claim(
+        state: &'a Arc<DaemonState>,
+        bssid: &str,
+        ticket: crate::privacy::PrivacyTicket,
+    ) -> Option<Self> {
         let mut guard = state.inflight.lock().unwrap_or_else(|e| {
             warn!("inflight mutex was poisoned — recovering");
             e.into_inner()
         });
-        if guard.insert(bssid.to_string()) {
+        if !guard.contains_key(bssid) {
+            guard.insert(bssid.to_string(), ticket);
             Some(InflightGuard {
                 state,
                 bssid: bssid.to_string(),
+                ticket,
             })
         } else {
             None
@@ -49,7 +56,9 @@ impl<'a> Drop for InflightGuard<'a> {
                 e.into_inner()
             }
         };
-        guard.remove(&self.bssid);
+        if guard.get(&self.bssid) == Some(&self.ticket) {
+            guard.remove(&self.bssid);
+        }
     }
 }
 
@@ -152,7 +161,14 @@ pub struct ChainPolicy {
 
 /// Cache-only lookup: returns positions from the aps table, no API calls.
 /// Used by `locate` to give instant responses.
-pub async fn lookup_cached(bssids: &[String], state: &Arc<DaemonState>) -> Vec<ApInfo> {
+pub async fn lookup_cached(
+    bssids: &[String],
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+) -> Vec<ApInfo> {
+    let Some(_privacy) = state.privacy.read(ticket).await else {
+        return Vec::new();
+    };
     match state.db.lookup_cached_touch(bssids.to_vec()).await {
         Ok(result) => result,
         Err(error) => {
@@ -175,6 +191,7 @@ pub async fn resolve_chain(
     state: &Arc<DaemonState>,
     providers: &[Provider],
     policy: &ChainPolicy,
+    ticket: crate::privacy::PrivacyTicket,
 ) -> ResolveResult {
     let mut positioned: Vec<ApInfo> = Vec::new();
     let mut fetched_bssids: HashSet<String> = HashSet::new();
@@ -221,12 +238,15 @@ pub async fn resolve_chain(
     for bssid in bssids {
         // Short-circuit: already in aps cache.
         if policy.skip_cached {
-            let cache_hit = match state.db.lookup_cached_touch(vec![bssid.clone()]).await {
-                Ok(mut hits) => hits.pop(),
-                Err(e) => {
-                    warn!("db error looking up {bssid}: {e}");
-                    None
-                }
+            let cache_hit = match state.privacy.read(ticket).await {
+                Some(_privacy) => match state.db.lookup_cached_touch(vec![bssid.clone()]).await {
+                    Ok(mut hits) => hits.pop(),
+                    Err(e) => {
+                        warn!("db error looking up {bssid}: {e}");
+                        None
+                    }
+                },
+                None => None,
             };
             if let Some(ap) = cache_hit {
                 debug!("cache hit for {bssid}");
@@ -259,12 +279,18 @@ pub async fn resolve_chain(
         // If another task already owns it, we defer entirely — that task
         // will write to the cache / pending / not_found tables, and a later
         // pass will see the result via the cache.
-        let _inflight_guard = match InflightGuard::try_claim(state, bssid) {
-            Some(g) => g,
-            None => {
-                debug!("{bssid} already in-flight, deferring to other task");
+        let _inflight_guard = {
+            let Some(_privacy) = state.privacy.read(ticket).await else {
                 deferred_to_other.insert(bssid.clone());
                 continue;
+            };
+            match InflightGuard::try_claim(state, bssid, ticket) {
+                Some(g) => g,
+                None => {
+                    debug!("{bssid} already in-flight, deferring to other task");
+                    deferred_to_other.insert(bssid.clone());
+                    continue;
+                }
             }
         };
 
@@ -299,13 +325,15 @@ pub async fn resolve_chain(
                         ap.lon
                     );
                     if policy.write_through {
-                        if let Err(e) = state
-                            .db
-                            .cache_resolved_ap(ap.clone(), policy.delete_pending_on_success)
-                            .await
-                        {
-                            warn!("failed to cache AP {} and update pending: {e}", ap.bssid);
-                            state.record_db_failure();
+                        if let Some(_privacy) = state.privacy.read(ticket).await {
+                            if let Err(e) = state
+                                .db
+                                .cache_resolved_ap(ap.clone(), policy.delete_pending_on_success)
+                                .await
+                            {
+                                warn!("failed to cache AP {} and update pending: {e}", ap.bssid);
+                                state.record_db_failure();
+                            }
                         }
                     }
                     fetched_bssids.insert(bssid.clone());
@@ -371,9 +399,11 @@ pub async fn resolve_chain(
 
     // Apply deferred pending inserts.
     if !to_pend_at_end.is_empty() {
-        if let Err(e) = state.db.insert_pending_many(to_pend_at_end.clone()).await {
-            warn!("failed to insert deferred pending BSSIDs: {e}");
-            state.record_db_failure();
+        if let Some(_privacy) = state.privacy.read(ticket).await {
+            if let Err(e) = state.db.insert_pending_many(to_pend_at_end.clone()).await {
+                warn!("failed to insert deferred pending BSSIDs: {e}");
+                state.record_db_failure();
+            }
         }
     }
 
@@ -421,13 +451,15 @@ pub async fn resolve_chain(
         // Definitive absence for this call.
         result_not_found.insert(bssid.clone());
         if persist {
-            if let Err(e) = state
-                .db
-                .record_not_found(bssid.clone(), policy.delete_pending_on_not_found)
-                .await
-            {
-                warn!("failed to insert not_found {bssid}: {e}");
-                state.record_db_failure();
+            if let Some(_privacy) = state.privacy.read(ticket).await {
+                if let Err(e) = state
+                    .db
+                    .record_not_found(bssid.clone(), policy.delete_pending_on_not_found)
+                    .await
+                {
+                    warn!("failed to insert not_found {bssid}: {e}");
+                    state.record_db_failure();
+                }
             }
             // task-0052: collapse drain_cleanup_after_chain — when the chain
             // marks not_found, also remove the pending row so the drain loop
@@ -479,13 +511,28 @@ fn readonly_policy() -> ChainPolicy {
 /// `touch_ap` (shared cache-lookup bookkeeping; the stored position, pending
 /// queue, and not_found table are all untouched). Cascade is WiGLE-only,
 /// matching prior behaviour.
-pub async fn resolve_readonly(bssids: &[String], state: &Arc<DaemonState>) -> ResolveResult {
-    resolve_chain(bssids, state, &[Provider::Wigle], &readonly_policy()).await
+pub async fn resolve_readonly(
+    bssids: &[String],
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+) -> ResolveResult {
+    resolve_chain(
+        bssids,
+        state,
+        &[Provider::Wigle],
+        &readonly_policy(),
+        ticket,
+    )
+    .await
 }
 
 /// Background resolution: resolve uncached stable BSSIDs proactively.
 /// Apple first (free), then WiGLE for remaining. Writes to aps cache.
-pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
+pub async fn resolve_background(
+    bssids: &[String],
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+) {
     let policy = ChainPolicy {
         skip_cached: true,
         skip_not_found: true,
@@ -499,7 +546,14 @@ pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
         on_network_error: NetErrorAction::QueuePending,
         on_hard_stop: HardStopAction::QueuePendingAndStop,
     };
-    let _ = resolve_chain(bssids, state, &[Provider::Apple, Provider::Wigle], &policy).await;
+    let _ = resolve_chain(
+        bssids,
+        state,
+        &[Provider::Apple, Provider::Wigle],
+        &policy,
+        ticket,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -523,6 +577,7 @@ mod tests {
             _db_runtime: Some(db_runtime),
             test_db: std::sync::Mutex::new(test_db),
             debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(10, 5)),
+            privacy: crate::privacy::PrivacyCoordinator::new(),
             connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
             args,
             wigle: crate::wigle::WigleClient::new("", ""),
@@ -530,12 +585,14 @@ mod tests {
             nominatim: crate::nominatim::NominatimClient::new(),
             geocode: crate::server::geocode::GeocodeScheduler::new(shutdown.clone()),
             last_fix: tokio::sync::Mutex::new(None),
-            inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
             db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             shutdown,
             tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            privacy_wipes: std::sync::Mutex::new(tokio::task::JoinSet::new()),
             orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -585,6 +642,7 @@ mod tests {
             &state,
             &providers,
             &permissive_policy(),
+            state.privacy.ticket(),
         )
         .await;
 
@@ -618,6 +676,7 @@ mod tests {
             &state,
             &providers,
             &permissive_policy(),
+            state.privacy.ticket(),
         )
         .await;
         assert_eq!(result.positioned.len(), 1);
@@ -648,6 +707,7 @@ mod tests {
             &state,
             &providers,
             &permissive_policy(),
+            state.privacy.ticket(),
         )
         .await;
 
@@ -686,6 +746,7 @@ mod tests {
             &state,
             &providers,
             &permissive_policy(),
+            state.privacy.ticket(),
         )
         .await;
 
@@ -714,7 +775,11 @@ mod tests {
         // task owning it. This is the simplest deterministic test of the
         // dedup short-circuit (real concurrency is exercised elsewhere via
         // the inflight lock contention paths, but those are racy to assert).
-        state.inflight.lock().unwrap().insert(target.clone());
+        state
+            .inflight
+            .lock()
+            .unwrap()
+            .insert(target.clone(), state.privacy.ticket());
 
         let mock = std::sync::Arc::new(MockProvider::new("blocked", |_| {
             unreachable!("provider must not be called when BSSID is already inflight")
@@ -726,6 +791,7 @@ mod tests {
             &state,
             &providers,
             &permissive_policy(),
+            state.privacy.ticket(),
         )
         .await;
 
@@ -760,6 +826,125 @@ mod tests {
         let _ = (started, release);
     }
 
+    #[tokio::test]
+    async fn pre_wipe_inflight_guard_cannot_remove_post_wipe_same_bssid_claim() {
+        let state = test_state();
+        let bssid = "aa:bb:cc:dd:ee:ab";
+        let old_ticket = state.privacy.ticket();
+        let old_claim = {
+            let _privacy = state.privacy.read(old_ticket).await.unwrap();
+            InflightGuard::try_claim(&state, bssid, old_ticket).unwrap()
+        };
+
+        let mut wipe = state.privacy.begin_wipe().await;
+        wipe.advance_epoch();
+        state.inflight.lock().unwrap().clear();
+        drop(wipe);
+
+        let new_ticket = state.privacy.ticket();
+        let new_claim = {
+            let _privacy = state.privacy.read(new_ticket).await.unwrap();
+            InflightGuard::try_claim(&state, bssid, new_ticket).unwrap()
+        };
+        drop(old_claim);
+        assert_eq!(
+            state.inflight.lock().unwrap().get(bssid),
+            Some(&new_ticket),
+            "old guard Drop must not erase the post-wipe claim"
+        );
+        drop(new_claim);
+        assert!(!state.inflight.lock().unwrap().contains_key(bssid));
+    }
+
+    #[tokio::test]
+    async fn stale_resolver_ticket_cannot_repopulate_but_fresh_work_can_resume() {
+        let state = test_state();
+        let stale = state.privacy.ticket();
+        let mut wipe = state.privacy.begin_wipe().await;
+        wipe.advance_epoch();
+        drop(wipe);
+
+        let target = "aa:bb:cc:dd:ee:ac".to_string();
+        let result_bssid = target.clone();
+        let provider = std::sync::Arc::new(MockProvider::new("post-wipe", move |_| {
+            ProviderOutcome::Found(mk_ap(&result_bssid, 1.0, 2.0, Source::Apple))
+        }));
+        let result = resolve_chain(
+            std::slice::from_ref(&target),
+            &state,
+            &[Provider::Mock(std::sync::Arc::clone(&provider))],
+            &permissive_policy(),
+            stale,
+        )
+        .await;
+        assert_eq!(provider.call_count(), 0);
+        assert!(result.positioned.is_empty());
+        assert_eq!(crate::server::lock_db(&state).cached_ap_count().unwrap(), 0);
+
+        let fresh = state.privacy.ticket();
+        let result = resolve_chain(
+            std::slice::from_ref(&target),
+            &state,
+            &[Provider::Mock(std::sync::Arc::clone(&provider))],
+            &permissive_policy(),
+            fresh,
+        )
+        .await;
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(result.positioned.len(), 1);
+        assert_eq!(crate::server::lock_db(&state).cached_ap_count().unwrap(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_result_crossing_wipe_cannot_repopulate_cache() {
+        let state = test_state();
+        let ticket = state.privacy.ticket();
+        let target = "aa:bb:cc:dd:ee:ad".to_string();
+        let result_bssid = target.clone();
+        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let provider_entered = std::sync::Arc::clone(&entered);
+        let provider_release = std::sync::Arc::clone(&release);
+        let provider = std::sync::Arc::new(MockProvider::new("blocked", move |_| {
+            provider_entered.wait();
+            provider_release.wait();
+            ProviderOutcome::Found(mk_ap(&result_bssid, 1.0, 2.0, Source::Apple))
+        }));
+
+        let resolve_state = Arc::clone(&state);
+        let resolve_provider = std::sync::Arc::clone(&provider);
+        let resolve_target = target.clone();
+        let resolving = tokio::spawn(async move {
+            resolve_chain(
+                &[resolve_target],
+                &resolve_state,
+                &[Provider::Mock(resolve_provider)],
+                &permissive_policy(),
+                ticket,
+            )
+            .await
+        });
+        entered.wait();
+
+        // The provider is already on the wire but owns no publication lease.
+        // A successful wipe can therefore invalidate it, and the eventual
+        // result must fail the cache-write gate.
+        let mut wipe = state.privacy.begin_wipe().await;
+        wipe.advance_epoch();
+        state.inflight.lock().unwrap().clear();
+        drop(wipe);
+        release.wait();
+
+        let result = resolving.await.unwrap();
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(result.positioned.len(), 1, "local stale result may unwind");
+        assert_eq!(
+            crate::server::lock_db(&state).cached_ap_count().unwrap(),
+            0,
+            "provider result that crossed the wipe must not publish"
+        );
+    }
+
     /// task-0194: ResolveResult.not_found holds ONLY authoritative absences.
     /// A definitive miss (provider NotFound, nothing transient) is included; a
     /// merely-Skipped BSSID (no provider consulted) is not.
@@ -783,6 +968,7 @@ mod tests {
             &state,
             &providers,
             &permissive_policy(),
+            state.privacy.ticket(),
         )
         .await;
 
@@ -824,6 +1010,7 @@ mod tests {
             &state,
             &providers,
             &readonly_policy(),
+            state.privacy.ticket(),
         )
         .await;
 
@@ -853,7 +1040,12 @@ mod tests {
         let cached = mk_ap(&target, 55.5, 12.5, Source::Apple);
         crate::server::lock_db(&state).upsert_ap(&cached).unwrap();
 
-        let result = resolve_readonly(std::slice::from_ref(&target), &state).await;
+        let result = resolve_readonly(
+            std::slice::from_ref(&target),
+            &state,
+            state.privacy.ticket(),
+        )
+        .await;
 
         assert_eq!(result.positioned.len(), 1, "cached BSSID must be returned");
         assert!((result.positioned[0].lat - 55.5).abs() < 1e-9);

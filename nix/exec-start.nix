@@ -48,6 +48,7 @@ lib.concatStringsSep " " ([
   "--http-timeout-secs" (toString cfg.httpTimeoutSecs)
   "--nominatim-timeout-secs" (toString cfg.nominatimTimeoutSecs)
   "--history-retention-days" (toString cfg.historyRetentionDays)
+  "--aps-retention-days" (toString cfg.apsRetentionDays)
   "--history-segment-distance-m" (toString cfg.historySegmentDistanceM)
   "--history-segment-min-duration-secs" (toString cfg.historySegmentMinDurationSecs)
 ] ++ lib.optional (socketArg != "") socketArg

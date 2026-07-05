@@ -35,6 +35,15 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024; // 64 KiB max request size
 /// so an unbounded count would let one hostile request starve the rest
 /// of the daemon. task-0053.
 const MAX_RESOLVE_BSSIDS: usize = 256;
+const WIPE_CONFIRMATION: &str = "delete-all-location-data";
+const WIPE_CONFIRMATION_ERROR: &str = "wipe: confirmation must equal 'delete-all-location-data'";
+const WIPE_TCP_ERROR: &str =
+    "wipe: unavailable over unauthenticated TCP; use the Unix control socket";
+const WIPE_BUSY_ERROR: &str = "wipe: busy; retry later";
+const WIPE_RESULT_UNKNOWN_ERROR: &str = "wipe: result unavailable; verify and retry";
+const STALE_AFTER_WIPE_ERROR: &str = "request invalidated by data wipe; retry";
+#[cfg(test)]
+const WIPE_GUARD_DROP_MARKER_ENV: &str = "WHEREAMID_WIPE_GUARD_DROP_MARKER";
 
 // task-0056: AddressCache extracted to server/address_cache.rs. Public
 // re-export so existing call sites (`crate::server::AddressCache`) keep
@@ -121,6 +130,9 @@ pub struct DaemonState {
     #[cfg(test)]
     pub test_db: std::sync::Mutex<crate::db::Database>,
     pub debouncer: tokio::sync::Mutex<Debouncer>,
+    /// Linearization boundary shared by every privacy-bearing publisher and
+    /// the destructive wipe command.
+    pub(crate) privacy: crate::privacy::PrivacyCoordinator,
     pub args: Args,
     pub wigle: WigleClient,
     pub apple: AppleClient,
@@ -135,7 +147,8 @@ pub struct DaemonState {
     /// fire at once otherwise). std::sync::Mutex is fine: we only ever hold
     /// it for an insert or a remove, never across await points, and that
     /// makes Drop-based cleanup viable for future RAII guards.
-    pub inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    pub inflight:
+        std::sync::Mutex<std::collections::HashMap<String, crate::privacy::PrivacyTicket>>,
     /// Reverse-geocoded street addresses keyed by rounded (lat, lon).
     /// Populated lazily in the background after a `locate` returns; the
     /// next call at the same rounded position gets the address for free
@@ -150,6 +163,10 @@ pub struct DaemonState {
     pub connection_slots: Arc<tokio::sync::Semaphore>,
     /// Single-flight admission for the O(N) history query/segmentation path.
     pub history_slot: Arc<tokio::sync::Semaphore>,
+    /// Single-flight admission for destructive wipes. The accepted permit is
+    /// shared by the handler response, worker, and durable DB continuation; an
+    /// overlapping wipe cannot start until every surviving owner has finished.
+    pub(crate) wipe_slot: Arc<tokio::sync::Semaphore>,
     /// Level-triggered cooperative shutdown signal (task-0190).
     ///
     /// Replaces the previous `tokio::sync::Notify`, whose `notify_waiters()`
@@ -168,6 +185,11 @@ pub struct DaemonState {
     /// the `JoinSet` because it is not `Sync` for concurrent spawn; the guard
     /// is only ever held to spawn/reap/take, never across an await.
     pub tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// Accepted wipes are isolated from connection handlers in this
+    /// single-flight task set. Main gives the set a bounded drain; the durable
+    /// DB actor command owns post-commit memory clear + epoch invalidation, so
+    /// aborting an async waiter cannot split those phases.
+    pub(crate) privacy_wipes: std::sync::Mutex<tokio::task::JoinSet<()>>,
     /// Count of tracked tasks force-aborted at shutdown because they did not
     /// finish within the drain budget (task-0102). Surfaced via stats.
     pub orphan_tasks_aborted: std::sync::atomic::AtomicU64,
@@ -243,6 +265,7 @@ impl TryFrom<crate::db::LastFixRow> for LastFix {
 /// stale-backfill race where a newer in-memory fix can be overwritten on disk.
 async fn backfill_last_fix_address_with<P, F>(
     state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
     lat: f64,
     lon: f64,
     display: &str,
@@ -252,6 +275,9 @@ where
     P: FnOnce(DbHandle, crate::db::LastFixRow) -> F + Send,
     F: std::future::Future<Output = Result<()>> + Send,
 {
+    let Some(_privacy) = state.privacy.read(ticket).await else {
+        return Ok(false);
+    };
     let mut last = state.last_fix.lock().await;
     let Some(fix) = last.as_mut() else {
         return Ok(false);
@@ -281,7 +307,14 @@ where
 /// stores (plus history) under the same `last_fix -> durable writer` ordering
 /// used by address backfill. This is the handle_locate-side operation raced by the
 /// task-0046 regression.
-async fn persist_last_fix_and_history(state: &Arc<DaemonState>, new_fix: LastFix) {
+async fn persist_last_fix_and_history(
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+    new_fix: LastFix,
+) {
+    let Some(_privacy) = state.privacy.read(ticket).await else {
+        return;
+    };
     let row: crate::db::LastFixRow = (&new_fix).into();
     let mut last = state.last_fix.lock().await;
     *last = Some(new_fix);
@@ -305,8 +338,10 @@ async fn persist_last_fix_and_history(state: &Arc<DaemonState>, new_fix: LastFix
 /// remains held through DB persistence to preserve task-0046 ordering.
 async fn persist_locate_fix_and_schedule(
     state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
     mut new_fix: LastFix,
 ) -> Option<String> {
+    let _privacy = state.privacy.read(ticket).await?;
     let mut last = state.last_fix.lock().await;
     let (address, row) = {
         let cache = state.address_cache.lock().unwrap_or_else(|e| {
@@ -317,7 +352,9 @@ async fn persist_locate_fix_and_schedule(
         new_fix.address = address.clone();
         let row: crate::db::LastFixRow = (&new_fix).into();
         *last = Some(new_fix);
-        state.geocode.observe(row.lat, row.lon, address.is_none());
+        state
+            .geocode
+            .observe(row.lat, row.lon, address.is_none(), ticket);
         (address, row)
     };
 
@@ -411,6 +448,10 @@ enum Request {
         /// Absolute end (RFC3339).
         #[serde(default)]
         to: Option<String>,
+    },
+    Wipe {
+        #[serde(default)]
+        confirm: Option<String>,
     },
 }
 
@@ -536,6 +577,17 @@ struct StatsResponse {
     orphan_tasks_aborted: u64,
 }
 
+#[derive(Serialize)]
+struct WipeResponse {
+    ok: bool,
+    v: u32,
+    aps_deleted: usize,
+    pending_deleted: usize,
+    not_found_deleted: usize,
+    fixes_deleted: usize,
+    last_fix_deleted: usize,
+}
+
 fn error_json(msg: &str) -> String {
     serde_json::to_string(&ErrorResponse {
         ok: false,
@@ -554,17 +606,128 @@ fn ok_json<T: Serialize>(t: &T) -> String {
 
 /// A wire response plus any resource whose lifetime must extend through the
 /// socket write and shutdown. History uses this to keep its single-flight slot
-/// occupied until a slow client has received (or timed out on) the response.
+/// occupied until the response write terminates by success, failure, timeout,
+/// disconnect, or handler cancellation.
 struct CommandResponse {
     body: String,
     _history_lease: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    _wipe_admission: Option<Arc<WipeAdmission>>,
+    privacy: ResponsePrivacy,
+}
+
+struct WipeAdmission {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Actor-owned invariants that must survive unwinding until process fail-stop
+/// has begun. Keeping both in the guarded call prevents privacy publication or
+/// a second wipe from being admitted during fatal handling.
+struct DurableWipeGuard {
+    lease: crate::privacy::PrivacyWipeLease,
+    _admission: Arc<WipeAdmission>,
+    #[cfg(test)]
+    _drop_marker: WipeGuardDropMarker,
+}
+
+impl DurableWipeGuard {
+    fn new(lease: crate::privacy::PrivacyWipeLease, admission: Arc<WipeAdmission>) -> Self {
+        Self {
+            lease,
+            _admission: admission,
+            #[cfg(test)]
+            _drop_marker: WipeGuardDropMarker(
+                std::env::var_os(WIPE_GUARD_DROP_MARKER_ENV).map(std::path::PathBuf::from),
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+struct WipeGuardDropMarker(Option<std::path::PathBuf>);
+
+#[cfg(test)]
+impl Drop for WipeGuardDropMarker {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::write(path, b"dropped");
+        }
+    }
+}
+
+enum ResponsePrivacy {
+    None,
+    Pending(crate::privacy::PrivacyTicket),
+    Read {
+        _lease: crate::privacy::PrivacyReadLease,
+    },
+    Wipe {
+        _lease: crate::privacy::PrivacyWipeLease,
+    },
 }
 
 impl CommandResponse {
-    fn history(body: String, lease: Arc<tokio::sync::OwnedSemaphorePermit>) -> Self {
+    fn history(
+        body: String,
+        lease: Arc<tokio::sync::OwnedSemaphorePermit>,
+        ticket: crate::privacy::PrivacyTicket,
+    ) -> Self {
         Self {
             body,
             _history_lease: Some(lease),
+            _wipe_admission: None,
+            privacy: ResponsePrivacy::Pending(ticket),
+        }
+    }
+
+    fn privacy(body: String, ticket: crate::privacy::PrivacyTicket) -> Self {
+        Self {
+            body,
+            _history_lease: None,
+            _wipe_admission: None,
+            privacy: ResponsePrivacy::Pending(ticket),
+        }
+    }
+
+    fn wipe(
+        body: String,
+        lease: crate::privacy::PrivacyWipeLease,
+        admission: Arc<WipeAdmission>,
+    ) -> Self {
+        Self {
+            body,
+            _history_lease: None,
+            _wipe_admission: Some(admission),
+            privacy: ResponsePrivacy::Wipe { _lease: lease },
+        }
+    }
+
+    fn wipe_error(body: String, admission: Arc<WipeAdmission>) -> Self {
+        Self {
+            body,
+            _history_lease: None,
+            _wipe_admission: Some(admission),
+            privacy: ResponsePrivacy::None,
+        }
+    }
+
+    /// Acquire the response-side privacy boundary immediately before socket
+    /// output. A wipe that won while a handler was computing replaces the stale
+    /// body with a stable retry error. The resulting read/write lease remains in
+    /// this response until write+shutdown completes or times out.
+    async fn prepare_for_write(&mut self, state: &DaemonState) {
+        let pending = match std::mem::replace(&mut self.privacy, ResponsePrivacy::None) {
+            ResponsePrivacy::Pending(ticket) => Some(ticket),
+            held => {
+                self.privacy = held;
+                None
+            }
+        };
+        let Some(ticket) = pending else {
+            return;
+        };
+        match state.privacy.read(ticket).await {
+            Some(lease) => self.privacy = ResponsePrivacy::Read { _lease: lease },
+            None => self.body = error_json(STALE_AFTER_WIPE_ERROR),
         }
     }
 }
@@ -574,6 +737,8 @@ impl From<String> for CommandResponse {
         Self {
             body,
             _history_lease: None,
+            _wipe_admission: None,
+            privacy: ResponsePrivacy::None,
         }
     }
 }
@@ -862,6 +1027,12 @@ pub async fn run_server(state: Arc<DaemonState>, unix: UnixListener) -> Result<(
     .await
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportKind {
+    Unix,
+    Tcp,
+}
+
 /// Accept-loop core with injectable admission state for deterministic tests.
 /// A permit is acquired before polling either listener. Consequently excess
 /// connections remain in the kernel backlog and never become permit-waiting
@@ -912,14 +1083,14 @@ async fn run_server_inner(
                         ),
                         Err(e) => debug!("unix connection (peer_cred unavailable: {e})"),
                     }
-                    spawn_handler(stream, Arc::clone(&state), permit);
+                    spawn_handler(stream, Arc::clone(&state), permit, TransportKind::Unix);
                 }
                 Err(e) => error!("unix accept error: {e}"),
             },
             Accepted::Tcp(r) => match r {
                 Ok((stream, addr)) => {
                     debug!("tcp connection from {addr}");
-                    spawn_handler(stream, Arc::clone(&state), permit);
+                    spawn_handler(stream, Arc::clone(&state), permit, TransportKind::Tcp);
                 }
                 Err(e) => error!("tcp accept error: {e}"),
             },
@@ -935,6 +1106,7 @@ fn spawn_handler<S>(
     stream: S,
     state: Arc<DaemonState>,
     connection_permit: tokio::sync::OwnedSemaphorePermit,
+    transport: TransportKind,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -943,7 +1115,7 @@ fn spawn_handler<S>(
         // Own admission for the complete read/dispatch/write/shutdown lifetime.
         // Refusal or abort drops the future and therefore returns capacity.
         let _connection_permit = connection_permit;
-        if let Err(e) = handle_connection(stream, task_state).await {
+        if let Err(e) = handle_connection(stream, task_state, transport).await {
             warn!("connection error: {e}");
         }
     });
@@ -953,7 +1125,11 @@ fn spawn_handler<S>(
 /// socket and opt-in TCP share identical framing, limits and timeouts
 /// (task-0196). `tokio::io::split` works for any `AsyncRead + AsyncWrite`,
 /// unlike the type-specific `into_split`.
-async fn handle_connection<S>(stream: S, state: Arc<DaemonState>) -> Result<()>
+async fn handle_connection<S>(
+    stream: S,
+    state: Arc<DaemonState>,
+    transport: TransportKind,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -984,10 +1160,11 @@ where
         return Ok(());
     }
 
-    let response = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(req) => dispatch_command(&req, &state).await,
+    let mut response = match serde_json::from_str::<Request>(line.trim()) {
+        Ok(req) => dispatch_command_for_transport(&req, &state, transport).await,
         Err(e) => error_json(&format!("invalid request: {e}")).into(),
     };
+    response.prepare_for_write(&state).await;
 
     // Bound the write half of the connection. A slow-reading client
     // could otherwise keep the response buffered and pin a tokio task
@@ -1005,24 +1182,47 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 async fn dispatch_command(req: &Request, state: &Arc<DaemonState>) -> CommandResponse {
+    dispatch_command_for_transport(req, state, TransportKind::Unix).await
+}
+
+async fn dispatch_command_for_transport(
+    req: &Request,
+    state: &Arc<DaemonState>,
+    transport: TransportKind,
+) -> CommandResponse {
+    let ticket = state.privacy.ticket();
     match req {
-        Request::Locate => handle_locate(state).await.into(),
-        Request::Resolve { bssids } => handle_resolve(bssids, state).await.into(),
-        Request::Scan => handle_scan(state).await.into(),
-        Request::Stats => handle_stats(state).await.into(),
-        Request::Debug => handle_debug(state).await.into(),
+        Request::Locate => CommandResponse::privacy(handle_locate(state, ticket).await, ticket),
+        Request::Resolve { bssids } => {
+            CommandResponse::privacy(handle_resolve(bssids, state, ticket).await, ticket)
+        }
+        Request::Scan => CommandResponse::privacy(handle_scan(state).await, ticket),
+        Request::Stats => CommandResponse::privacy(handle_stats(state).await, ticket),
+        Request::Debug => CommandResponse::privacy(handle_debug(state).await, ticket),
         Request::Version => handle_version().into(),
         Request::History { range, from, to } => {
-            handle_history(range.as_deref(), from.as_deref(), to.as_deref(), state).await
+            handle_history(
+                range.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
+                state,
+                ticket,
+            )
+            .await
         }
+        Request::Wipe { confirm } => handle_wipe(confirm.as_deref(), state, transport).await,
     }
 }
 
-async fn handle_locate(state: &Arc<DaemonState>) -> String {
+async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::PrivacyTicket) -> String {
     use crate::resolver;
     use crate::trilaterate::{trilaterate, PositionedAp};
 
+    let Some(privacy) = state.privacy.read(ticket).await else {
+        return error_json(STALE_AFTER_WIPE_ERROR);
+    };
     let debouncer = state.debouncer.lock().await;
     let stable = debouncer.stable_bssids();
     let visible = debouncer.latest_scan().map(|s| s.len()).unwrap_or(0);
@@ -1061,6 +1261,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
     };
 
     drop(debouncer);
+    drop(privacy);
 
     // Try stable candidates first, fall back to raw visible APs
     let using_fallback = candidates.is_empty() && !fallback_candidates.is_empty();
@@ -1071,7 +1272,14 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
     };
 
     if active_candidates.is_empty() {
-        return return_last_fix_or_error(state, "no APs detected yet", visible, stable_count).await;
+        return return_last_fix_or_error(
+            state,
+            ticket,
+            "no APs detected yet",
+            visible,
+            stable_count,
+        )
+        .await;
     }
 
     let bssids: Vec<String> = active_candidates.iter().map(|(b, _)| b.clone()).collect();
@@ -1079,7 +1287,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
         active_candidates.iter().cloned().collect();
 
     // Cache-only lookup — never blocks on WiGLE. Instant response.
-    let cached_aps = resolver::lookup_cached(&bssids, state).await;
+    let cached_aps = resolver::lookup_cached(&bssids, state, ticket).await;
     let cached_count = cached_aps.len();
 
     if cached_aps.is_empty() {
@@ -1091,11 +1299,12 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
             let resolve_state = Arc::clone(state);
             let bssids_clone = bssids.clone();
             state.spawn_tracked(async move {
-                resolver::resolve_background(&bssids_clone, &resolve_state).await;
+                resolver::resolve_background(&bssids_clone, &resolve_state, ticket).await;
             });
         }
         return return_last_fix_or_error(
             state,
+            ticket,
             "no cached positions for visible APs (resolving in background)",
             visible,
             stable_count,
@@ -1159,9 +1368,9 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
             // observes the rounded cache cell; misses replace one bounded
             // scheduler slot and hits supersede stale rate-waiting work.
             let address = if state.args.address_approx {
-                persist_locate_fix_and_schedule(state, new_fix).await
+                persist_locate_fix_and_schedule(state, ticket, new_fix).await
             } else {
-                persist_last_fix_and_history(state, new_fix).await;
+                persist_last_fix_and_history(state, ticket, new_fix).await;
                 None
             };
 
@@ -1186,6 +1395,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
         Err(e) => {
             return_last_fix_or_error(
                 state,
+                ticket,
                 &format!("trilateration failed: {e}"),
                 visible,
                 stable_count,
@@ -1198,10 +1408,14 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
 /// Return last-known position if available, otherwise return error.
 async fn return_last_fix_or_error(
     state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
     error_msg: &str,
     visible: usize,
     stable: usize,
 ) -> String {
+    let Some(_privacy) = state.privacy.read(ticket).await else {
+        return error_json(STALE_AFTER_WIPE_ERROR);
+    };
     let last = state.last_fix.lock().await;
     if let Some(fix) = last.as_ref() {
         // Wall-clock age. Negative ages (clock skew) clamp to zero.
@@ -1228,7 +1442,11 @@ async fn return_last_fix_or_error(
     }
 }
 
-async fn handle_resolve(bssids: &[String], state: &Arc<DaemonState>) -> String {
+async fn handle_resolve(
+    bssids: &[String],
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+) -> String {
     use crate::resolver;
 
     if bssids.is_empty() {
@@ -1246,7 +1464,7 @@ async fn handle_resolve(bssids: &[String], state: &Arc<DaemonState>) -> String {
         .map(|b| crate::scanner::normalize_bssid(b))
         .collect();
 
-    let result = resolver::resolve_readonly(&normalized, state).await;
+    let result = resolver::resolve_readonly(&normalized, state, ticket).await;
 
     let results: Vec<ResolveResult> = normalized
         .iter()
@@ -1606,6 +1824,7 @@ async fn handle_history(
     from: Option<&str>,
     to: Option<&str>,
     state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
 ) -> CommandResponse {
     // Resolve range: either `range="7d"` shorthand OR explicit from/to RFC3339.
     // Mutually exclusive. If neither is provided, default to the last 7 days.
@@ -1657,7 +1876,11 @@ async fn handle_history(
     {
         Ok(v) => v,
         Err(e) => {
-            return CommandResponse::history(error_json(&format!("history: db error: {e}")), lease);
+            return CommandResponse::history(
+                error_json(&format!("history: db error: {e}")),
+                lease,
+                ticket,
+            );
         }
     };
 
@@ -1683,7 +1906,181 @@ async fn handle_history(
         }
     };
     cancellation.disarm();
-    CommandResponse::history(body, lease)
+    CommandResponse::history(body, lease, ticket)
+}
+
+async fn perform_privacy_wipe(
+    state: Arc<DaemonState>,
+    durable_admission: Arc<WipeAdmission>,
+) -> Result<(
+    crate::db::PrivacyWipeCounts,
+    crate::privacy::PrivacyWipeLease,
+)> {
+    perform_privacy_wipe_core(state, durable_admission, || {}, None).await
+}
+
+/// Shared production/test core. The hook is placed at the exact committed-DB,
+/// pre-clear boundary so the regression test can hold that real ordering open.
+#[cfg(test)]
+async fn perform_privacy_wipe_with_hook<H>(
+    state: Arc<DaemonState>,
+    durable_admission: Arc<WipeAdmission>,
+    after_db_commit: H,
+) -> Result<(
+    crate::db::PrivacyWipeCounts,
+    crate::privacy::PrivacyWipeLease,
+)>
+where
+    H: FnOnce() + Send + 'static,
+{
+    perform_privacy_wipe_core(state, durable_admission, after_db_commit, None).await
+}
+
+async fn perform_privacy_wipe_core<H>(
+    state: Arc<DaemonState>,
+    durable_admission: Arc<WipeAdmission>,
+    after_db_commit: H,
+    queued: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(
+    crate::db::PrivacyWipeCounts,
+    crate::privacy::PrivacyWipeLease,
+)>
+where
+    H: FnOnce() + Send + 'static,
+{
+    let lease = state.privacy.begin_wipe().await;
+    let durable_guard = DurableWipeGuard::new(lease, durable_admission);
+    let cleanup_state = Arc::clone(&state);
+    // The clear+epoch continuation is owned by the same durable, fail-stop
+    // actor command as the SQLite transaction. Cancelling either async waiter
+    // cannot strand a committed DB wipe with stale managed memory. A normal DB
+    // error skips the continuation and drops the exclusive lease unchanged; a
+    // panic after commit terminates the process instead of recovering the actor
+    // into a persisted/in-memory split.
+    let (counts, (), durable_guard) = state
+        .db
+        .wipe_privacy_data_then(
+            durable_guard,
+            move |guard| {
+                after_db_commit();
+
+                // Clear every managed store while the epoch is still old. ticket()
+                // is deliberately lock-free, so a ticket captured anywhere in the
+                // commit/clear interval must remain old and be rejected after the
+                // final epoch advance. Advancing first would let scan/debug capture
+                // the new epoch while still reading pre-clear BSSID/SSID state.
+                cleanup_state.debouncer.blocking_lock().clear();
+                *cleanup_state.last_fix.blocking_lock() = None;
+                cleanup_state
+                    .address_cache
+                    .lock()
+                    .unwrap_or_else(|error| {
+                        warn!("address cache mutex poisoned during wipe — recovering");
+                        error.into_inner()
+                    })
+                    .clear();
+                cleanup_state.geocode.clear_for_wipe();
+                cleanup_state
+                    .inflight
+                    .lock()
+                    .unwrap_or_else(|error| {
+                        warn!("inflight mutex poisoned during wipe — recovering");
+                        error.into_inner()
+                    })
+                    .clear();
+                guard.lease.advance_epoch();
+            },
+            queued,
+        )
+        .await?;
+
+    Ok((counts, durable_guard.lease))
+}
+
+/// Start an accepted wipe outside its connection handler. The set is
+/// single-flight by admission and gets its own bounded shutdown drain. Once
+/// enqueued, the durable DB actor command retains both admission and the
+/// clear+epoch continuation even if this async worker is aborted.
+fn spawn_privacy_wipe(
+    state: &Arc<DaemonState>,
+    admission: Arc<WipeAdmission>,
+    queued: Option<tokio::sync::oneshot::Sender<()>>,
+) -> tokio::sync::oneshot::Receiver<
+    Result<(
+        crate::db::PrivacyWipeCounts,
+        crate::privacy::PrivacyWipeLease,
+    )>,
+> {
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let worker_state = Arc::clone(state);
+    let mut wipes = state
+        .privacy_wipes
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    while wipes.try_join_next().is_some() {}
+    wipes.spawn(async move {
+        let result = if queued.is_some() {
+            perform_privacy_wipe_core(worker_state, admission, || {}, queued).await
+        } else {
+            perform_privacy_wipe(worker_state, admission).await
+        };
+        let _ = result_tx.send(result);
+    });
+    result_rx
+}
+
+async fn handle_wipe(
+    confirmation: Option<&str>,
+    state: &Arc<DaemonState>,
+    transport: TransportKind,
+) -> CommandResponse {
+    handle_wipe_observing_enqueue(confirmation, state, transport, None).await
+}
+
+/// The optional signal fires only after the durable writer command owns the
+/// wipe continuation. Production passes `None`; cancellation tests use the
+/// signal instead of scheduler yields to prove they abort after enqueue.
+async fn handle_wipe_observing_enqueue(
+    confirmation: Option<&str>,
+    state: &Arc<DaemonState>,
+    transport: TransportKind,
+    queued: Option<tokio::sync::oneshot::Sender<()>>,
+) -> CommandResponse {
+    if transport != TransportKind::Unix {
+        return error_json(WIPE_TCP_ERROR).into();
+    }
+    if confirmation != Some(WIPE_CONFIRMATION) {
+        return error_json(WIPE_CONFIRMATION_ERROR).into();
+    }
+    let admission = match Arc::clone(&state.wipe_slot).try_acquire_owned() {
+        Ok(permit) => Arc::new(WipeAdmission { _permit: permit }),
+        Err(_) => return error_json(WIPE_BUSY_ERROR).into(),
+    };
+
+    // The dedicated worker owns the exclusive lease and complete
+    // DB->memory->epoch sequence. If this connection disappears (including a
+    // shutdown force-abort), the wipe still finishes instead of committing
+    // SQLite and leaving stale managed memory behind.
+    let result = spawn_privacy_wipe(state, Arc::clone(&admission), queued);
+    match result.await {
+        Ok(Ok((counts, lease))) => CommandResponse::wipe(
+            ok_json(&WipeResponse {
+                ok: true,
+                v: 1,
+                aps_deleted: counts.aps_deleted,
+                pending_deleted: counts.pending_deleted,
+                not_found_deleted: counts.not_found_deleted,
+                fixes_deleted: counts.fixes_deleted,
+                last_fix_deleted: counts.last_fix_deleted,
+            }),
+            lease,
+            admission,
+        ),
+        Ok(Err(error)) => {
+            CommandResponse::wipe_error(error_json(&format!("wipe: db error: {error}")), admission)
+        }
+        Err(_) => CommandResponse::wipe_error(error_json(WIPE_RESULT_UNKNOWN_ERROR), admission),
+    }
 }
 
 async fn handle_stats(state: &Arc<DaemonState>) -> String {
@@ -1728,10 +2125,20 @@ pub(crate) fn test_state() -> std::sync::Arc<DaemonState> {
 pub(crate) fn test_state_with_nominatim(
     nominatim: crate::nominatim::NominatimClient,
 ) -> std::sync::Arc<DaemonState> {
+    let (db_runtime, db, test_db) = crate::db::DbRuntime::open_test().unwrap();
+    test_state_with_db(db_runtime, db, test_db, nominatim)
+}
+
+#[cfg(test)]
+fn test_state_with_db(
+    db_runtime: crate::db::DbRuntime,
+    db: crate::db::DbHandle,
+    test_db: crate::db::Database,
+    nominatim: crate::nominatim::NominatimClient,
+) -> std::sync::Arc<DaemonState> {
     use clap::Parser;
     let args = crate::config::Args::parse_from(["whereamid"]);
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let (db_runtime, db, test_db) = crate::db::DbRuntime::open_test().unwrap();
     std::sync::Arc::new(DaemonState {
         db,
         _db_runtime: Some(db_runtime),
@@ -1740,18 +2147,21 @@ pub(crate) fn test_state_with_nominatim(
             args.debounce_window,
             args.debounce_threshold,
         )),
+        privacy: crate::privacy::PrivacyCoordinator::new(),
         wigle: crate::wigle::WigleClient::new("", ""),
         apple: crate::apple::AppleClient::new(),
         nominatim,
         geocode: geocode::GeocodeScheduler::new(shutdown.clone()),
         last_fix: tokio::sync::Mutex::new(None),
-        inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
         address_cache: std::sync::Mutex::new(AddressCache::new()),
         db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
         history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+        wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         shutdown,
         tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+        privacy_wipes: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
         args,
     })
@@ -1816,6 +2226,7 @@ mod last_fix_concurrency_tests {
         let backfill = tokio::spawn(async move {
             backfill_last_fix_address_with(
                 &backfill_state,
+                backfill_state.privacy.ticket(),
                 OLD_LAT,
                 OLD_LON,
                 "old address",
@@ -1846,7 +2257,12 @@ mod last_fix_concurrency_tests {
             sources: 7,
         };
         let replacement = tokio::spawn(async move {
-            persist_last_fix_and_history(&replacement_state, new_fix).await;
+            persist_last_fix_and_history(
+                &replacement_state,
+                replacement_state.privacy.ticket(),
+                new_fix,
+            )
+            .await;
         });
 
         // Cleanup precedes every assertion: a failing discriminator must not
@@ -2012,6 +2428,31 @@ mod dispatch_tests {
     use super::test_state;
     use super::*;
 
+    const WIPE_FAIL_STOP_CHILD_ENV: &str = "WHEREAMID_WIPE_FAIL_STOP_TEST_CHILD";
+    const WIPE_FAIL_STOP_DB_ENV: &str = "WHEREAMID_WIPE_FAIL_STOP_TEST_DB";
+    const WIPE_FAIL_STOP_RESUMED_ENV: &str = "WHEREAMID_WIPE_FAIL_STOP_TEST_RESUMED";
+    const WIPE_FAIL_STOP_READER_WAITING_ENV: &str = "WHEREAMID_WIPE_FAIL_STOP_READER_WAITING";
+    const WIPE_FAIL_STOP_READER_ACQUIRED_ENV: &str = "WHEREAMID_WIPE_FAIL_STOP_READER_ACQUIRED";
+    const WIPE_FAIL_STOP_CHILD_TEST: &str =
+        "server::dispatch_tests::wipe_post_commit_panic_fail_stop_child";
+
+    fn wait_for_child_marker(
+        child: &mut std::process::Child,
+        path: &std::path::Path,
+        budget: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if path.exists() {
+                return true;
+            }
+            if child.try_wait().unwrap().is_some() || std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     fn first_resolve_result(resp: &str) -> serde_json::Value {
         let v: serde_json::Value =
             serde_json::from_str(resp).expect("dispatch must return valid JSON");
@@ -2050,6 +2491,678 @@ mod dispatch_tests {
             source: crate::db::Source::Manual,
         };
         lock_db(state).upsert_ap(&ap).unwrap();
+    }
+
+    async fn seed_wipe_state(state: &Arc<DaemonState>) {
+        cache_ap(state, "aa:bb:cc:dd:ee:01", 55.0, 12.0);
+        {
+            let db = lock_db(state);
+            db.insert_pending("pending", Some("private-ssid"), None, None, Some(-40))
+                .unwrap();
+            db.insert_not_found("not-found").unwrap();
+            db.insert_fix("2026-01-01T00:00:00+00:00", 55.0, 12.0, 5.0, 1)
+                .unwrap();
+            db.set_last_fix(&crate::db::LastFixRow {
+                lat: 55.0,
+                lon: 12.0,
+                accuracy_m: 5.0,
+                address: Some("private address".to_string()),
+                at_rfc3339: "2026-01-01T00:00:00+00:00".to_string(),
+                sources: 1,
+            })
+            .unwrap();
+        }
+        let mut sample = std::collections::HashMap::new();
+        sample.insert(
+            "aa:bb:cc:dd:ee:01".to_string(),
+            crate::debounce::ScanEntry {
+                signal_dbm: -40,
+                ssid: Some("private-ssid".to_string()),
+                channel: Some(6),
+            },
+        );
+        state.debouncer.lock().await.push_scan(sample);
+        *state.last_fix.lock().await = Some(LastFix {
+            lat: 55.0,
+            lon: 12.0,
+            accuracy_m: 5.0,
+            address: Some("private address".to_string()),
+            at: chrono::Utc::now(),
+            sources: 1,
+        });
+        state
+            .address_cache
+            .lock()
+            .unwrap()
+            .insert(55.0, 12.0, "private address".to_string());
+        state
+            .geocode
+            .observe(55.0, 12.0, true, state.privacy.ticket());
+        state
+            .inflight
+            .lock()
+            .unwrap()
+            .insert("aa:bb:cc:dd:ee:01".to_string(), state.privacy.ticket());
+    }
+
+    /// Subprocess-only half of the fail-stop regression below. With the old
+    /// generic actor panic policy this continued after `perform_privacy_wipe`
+    /// returned an error, observed a reusable actor plus stale memory, and
+    /// wrote the resumed marker. The fail-stop command must terminate the
+    /// entire process from the actor thread before any of that can execute.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wipe_post_commit_panic_fail_stop_child() {
+        if std::env::var_os(WIPE_FAIL_STOP_CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        let db_path = std::path::PathBuf::from(
+            std::env::var_os(WIPE_FAIL_STOP_DB_ENV).expect("child DB path"),
+        );
+        let resumed_path = std::path::PathBuf::from(
+            std::env::var_os(WIPE_FAIL_STOP_RESUMED_ENV).expect("child resumed marker path"),
+        );
+        let reader_waiting_path = std::path::PathBuf::from(
+            std::env::var_os(WIPE_FAIL_STOP_READER_WAITING_ENV)
+                .expect("child reader-waiting marker path"),
+        );
+        let reader_acquired_path = std::path::PathBuf::from(
+            std::env::var_os(WIPE_FAIL_STOP_READER_ACQUIRED_ENV)
+                .expect("child reader-acquired marker path"),
+        );
+        let (db_runtime, db) = crate::db::DbRuntime::open(&db_path).await.unwrap();
+        let state = test_state_with_db(
+            db_runtime,
+            db,
+            crate::db::Database::open_memory().unwrap(),
+            crate::nominatim::NominatimClient::new(),
+        );
+        *state.last_fix.lock().await = Some(LastFix {
+            lat: 55.0,
+            lon: 12.0,
+            accuracy_m: 5.0,
+            address: Some("stale private address".to_string()),
+            at: chrono::Utc::now(),
+            sources: 1,
+        });
+        let admission = Arc::new(WipeAdmission {
+            _permit: Arc::clone(&state.wipe_slot).try_acquire_owned().unwrap(),
+        });
+
+        let old_ticket = state.privacy.ticket();
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let wipe_state = Arc::clone(&state);
+        let wipe = tokio::spawn(async move {
+            perform_privacy_wipe_core(
+                wipe_state,
+                admission,
+                || panic!("injected panic after privacy wipe commit"),
+                Some(queued_tx),
+            )
+            .await
+        });
+        queued_rx
+            .await
+            .expect("fail-stop wipe must enqueue its guarded command");
+
+        let reader_state = Arc::clone(&state);
+        let reader = tokio::spawn(async move {
+            let lease = reader_state
+                .privacy
+                .read_observing_wait(old_ticket, || {
+                    let _ = std::fs::write(reader_waiting_path, b"waiting");
+                })
+                .await;
+            let _ = std::fs::write(
+                reader_acquired_path,
+                if lease.is_some() { "current" } else { "stale" },
+            );
+        });
+
+        let wipe = wipe.await;
+        let reader = reader.await;
+
+        // Reaching this code is the defect: the actor recovered from an
+        // irrecoverable post-COMMIT panic and the process could keep serving.
+        let actor_reusable = state.db.stats().await.is_ok();
+        let stale_memory = state.last_fix.lock().await.is_some();
+        std::fs::write(
+            resumed_path,
+            format!(
+                "wipe_join_error={} reader_join_error={} actor_reusable={actor_reusable} \
+                 stale_memory={stale_memory}",
+                wipe.is_err(),
+                reader.is_err()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn post_commit_wipe_panic_terminates_process_after_durable_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "whereamid-wipe-fail-stop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("whereami.db");
+        let resumed_path = dir.join("process-resumed-serving");
+        let fatal_entered_path = dir.join("fatal-entered");
+        let fatal_release_path = dir.join("fatal-release");
+        let reader_waiting_path = dir.join("reader-waiting");
+        let reader_acquired_path = dir.join("reader-acquired");
+        let guard_dropped_path = dir.join("wipe-guard-dropped");
+        {
+            let db = crate::db::Database::open(&db_path).unwrap();
+            db.upsert_ap(&crate::db::ApInfo {
+                bssid: "aa:bb:cc:dd:ee:ff".to_string(),
+                ssid: Some("private-ssid".to_string()),
+                lat: 55.0,
+                lon: 12.0,
+                encryption: None,
+                channel: None,
+                frequency: None,
+                city: None,
+                country: None,
+                source: crate::db::Source::Manual,
+            })
+            .unwrap();
+            db.insert_pending("pending", Some("private-ssid"), None, None, Some(-40))
+                .unwrap();
+            db.insert_not_found("not-found").unwrap();
+            db.insert_fix("2026-01-01T00:00:00+00:00", 55.0, 12.0, 5.0, 1)
+                .unwrap();
+            db.set_last_fix(&crate::db::LastFixRow {
+                lat: 55.0,
+                lon: 12.0,
+                accuracy_m: 5.0,
+                address: Some("private address".to_string()),
+                at_rfc3339: "2026-01-01T00:00:00+00:00".to_string(),
+                sources: 1,
+            })
+            .unwrap();
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(WIPE_FAIL_STOP_CHILD_TEST)
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(WIPE_FAIL_STOP_CHILD_ENV, "1")
+            .env(WIPE_FAIL_STOP_DB_ENV, &db_path)
+            .env(WIPE_FAIL_STOP_RESUMED_ENV, &resumed_path)
+            .env(WIPE_FAIL_STOP_READER_WAITING_ENV, &reader_waiting_path)
+            .env(WIPE_FAIL_STOP_READER_ACQUIRED_ENV, &reader_acquired_path)
+            .env(WIPE_GUARD_DROP_MARKER_ENV, &guard_dropped_path)
+            .env(crate::db::FAIL_STOP_TEST_ENTERED_ENV, &fatal_entered_path)
+            .env(crate::db::FAIL_STOP_TEST_RELEASE_ENV, &fatal_release_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let fatal_entered = wait_for_child_marker(
+            &mut child,
+            &fatal_entered_path,
+            std::time::Duration::from_secs(10),
+        );
+        let reader_waiting = wait_for_child_marker(
+            &mut child,
+            &reader_waiting_path,
+            std::time::Duration::from_secs(10),
+        );
+        let reader_acquired_while_paused = reader_acquired_path.exists();
+        let guard_dropped_while_paused = guard_dropped_path.exists();
+        let resumed_while_paused = resumed_path.exists();
+
+        // Release the fatal path even when a preceding marker was missing, so
+        // the parent always has a bounded path to collect/kill the subprocess.
+        std::fs::write(&fatal_release_path, b"release").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                break true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let status = output.status;
+        let resumed = resumed_path.exists();
+        let reader_acquired = reader_acquired_path.exists();
+        let guard_dropped = guard_dropped_path.exists();
+
+        // Reopen after the abrupt process exit. Seeing every table empty proves
+        // the injected panic ran after SQLite COMMIT, not before it.
+        let persisted_empty = {
+            let db = crate::db::Database::open(&db_path).unwrap();
+            db.cached_ap_count().unwrap() == 0
+                && db.pending_ap_count().unwrap() == 0
+                && db.not_found_ap_count().unwrap() == 0
+                && db.get_fixes_in_range("0000", "9999").unwrap().is_empty()
+                && db.get_last_fix().unwrap().is_none()
+        };
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            fatal_entered,
+            "child never reached the deterministically paused fatal path; stderr:\n{stderr}"
+        );
+        assert!(
+            reader_waiting,
+            "privacy reader never reported Poll::Pending behind the wipe guard; stderr:\n{stderr}"
+        );
+        assert!(
+            !reader_acquired_while_paused,
+            "privacy reader acquired while fatal handling was paused"
+        );
+        assert!(
+            !guard_dropped_while_paused,
+            "privacy guard dropped before fail-stop termination"
+        );
+        assert!(
+            !resumed_while_paused,
+            "child resumed serving while fatal handling was paused"
+        );
+        assert!(!timed_out, "fail-stop child did not terminate within 10s");
+        assert_eq!(
+            status.code(),
+            Some(70),
+            "post-commit panic must exit via the fail-stop policy; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("privacy wipe committed-state continuation")
+                && stderr.contains("exiting 70"),
+            "fatal diagnostic must identify the fail-stop operation; stderr:\n{stderr}"
+        );
+        assert!(
+            !resumed,
+            "child resumed after irrecoverable post-commit panic"
+        );
+        assert!(
+            !reader_acquired,
+            "privacy reader acquired before fail-stop process exit"
+        );
+        assert!(
+            !guard_dropped,
+            "privacy guard destructor ran before fail-stop process exit"
+        );
+        assert!(persisted_empty, "wipe must commit before fail-stop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_to_clear_tickets_cannot_publish_stale_scan_or_debug_bodies() {
+        let state = test_state();
+        seed_wipe_state(&state).await;
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let admission = Arc::new(WipeAdmission {
+            _permit: Arc::clone(&state.wipe_slot).try_acquire_owned().unwrap(),
+        });
+        let wipe_state = Arc::clone(&state);
+        let wipe = tokio::spawn(async move {
+            perform_privacy_wipe_with_hook(wipe_state, admission, move || {
+                let _ = committed_tx.send(());
+                let _ = release_rx.recv();
+            })
+            .await
+        });
+        committed_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        // The DB is committed, but the production wipe core is deliberately
+        // stalled before memory clear and epoch advance. Both handlers capture
+        // the lock-free current ticket and can still build a pre-clear body.
+        let mut scan = dispatch_command(&Request::Scan, &state).await;
+        let mut debug = dispatch_command(&Request::Debug, &state).await;
+        assert!(scan.body.contains("aa:bb:cc:dd:ee:01"));
+        assert!(scan.body.contains("private-ssid"));
+        assert!(debug.body.contains("aa:bb:cc:dd:ee:01"));
+
+        release_tx.send(()).unwrap();
+        let (_counts, lease) = wipe.await.unwrap().unwrap();
+        drop(lease);
+        scan.prepare_for_write(&state).await;
+        debug.prepare_for_write(&state).await;
+
+        let stale = error_json(STALE_AFTER_WIPE_ERROR);
+        assert_eq!(scan.body, stale);
+        assert_eq!(debug.body, stale);
+        for body in [&scan.body, &debug.body] {
+            assert!(!body.contains("aa:bb:cc:dd:ee:01"));
+            assert!(!body.contains("private-ssid"));
+        }
+        assert_eq!(state.debouncer.lock().await.sample_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_wipe_is_busy_while_first_db_is_blocked_and_response_is_held() {
+        let state = test_state();
+        seed_wipe_state(&state).await;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker_db = state.db.clone();
+        let blocker =
+            tokio::spawn(async move { blocker_db.hold_writer_until(entered_tx, release_rx).await });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let first_state = Arc::clone(&state);
+        let first = tokio::spawn(async move {
+            dispatch_command(
+                &Request::Wipe {
+                    confirm: Some(WIPE_CONFIRMATION.to_string()),
+                },
+                &first_state,
+            )
+            .await
+        });
+        while state.wipe_slot.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let second = tokio::time::timeout(
+            Duration::from_millis(100),
+            dispatch_command(
+                &Request::Wipe {
+                    confirm: Some(WIPE_CONFIRMATION.to_string()),
+                },
+                &state,
+            ),
+        )
+        .await
+        .expect("overlapping wipe must be rejected promptly");
+        assert_eq!(second.body, error_json(WIPE_BUSY_ERROR));
+
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        let first = first.await.unwrap();
+        assert!(first.body.contains(r#""ok":true"#));
+        assert_eq!(
+            state.wipe_slot.available_permits(),
+            0,
+            "accepted response must retain admission after worker completion"
+        );
+        let while_response_held = dispatch_command(
+            &Request::Wipe {
+                confirm: Some(WIPE_CONFIRMATION.to_string()),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(while_response_held.body, error_json(WIPE_BUSY_ERROR));
+        drop(first);
+        assert_eq!(state.wipe_slot.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_db_wipe_has_bounded_shutdown_wait_and_durable_cleanup() {
+        let state = test_state();
+        seed_wipe_state(&state).await;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker_db = state.db.clone();
+        let blocker =
+            tokio::spawn(async move { blocker_db.hold_writer_until(entered_tx, release_rx).await });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let first_state = Arc::clone(&state);
+        let first = tokio::spawn(async move {
+            handle_wipe_observing_enqueue(
+                Some(WIPE_CONFIRMATION),
+                &first_state,
+                TransportKind::Unix,
+                Some(queued_tx),
+            )
+            .await
+        });
+        queued_rx
+            .await
+            .expect("wipe command must be durably enqueued behind the blocker");
+        assert_eq!(state.wipe_slot.available_permits(), 0);
+        let wipes = {
+            let mut guard = state
+                .privacy_wipes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        let started = std::time::Instant::now();
+        let aborted =
+            crate::run_privacy_wipe_shutdown_drain(Duration::from_millis(50), wipes).await;
+        assert_eq!(aborted, 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "blocked wipe exceeded its bounded async shutdown drain"
+        );
+        assert_eq!(
+            state.wipe_slot.available_permits(),
+            0,
+            "actor-owned admission must survive worker force-abort"
+        );
+
+        let unavailable_response = first.await.unwrap();
+        assert_eq!(
+            unavailable_response.body,
+            error_json(WIPE_RESULT_UNKNOWN_ERROR)
+        );
+        assert_eq!(
+            state.wipe_slot.available_permits(),
+            0,
+            "unknown-result response must retain admission through its write lifetime"
+        );
+
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        state.db.writer_barrier().await.unwrap();
+        assert_eq!(
+            state.wipe_slot.available_permits(),
+            0,
+            "response still owns admission after durable cleanup completes"
+        );
+        drop(unavailable_response);
+        assert_eq!(state.wipe_slot.available_permits(), 1);
+        assert_eq!(lock_db(&state).cached_ap_count().unwrap(), 0);
+        assert!(state.last_fix.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn wipe_confirmation_is_mandatory_and_success_clears_disk_and_memory() {
+        let state = test_state();
+        seed_wipe_state(&state).await;
+
+        for confirm in [None, Some("wrong".to_string())] {
+            let response = dispatch_command(&Request::Wipe { confirm }, &state).await;
+            assert_eq!(response.body, error_json(WIPE_CONFIRMATION_ERROR));
+            assert_eq!(lock_db(&state).cached_ap_count().unwrap(), 1);
+        }
+
+        let response = dispatch_command(
+            &Request::Wipe {
+                confirm: Some(WIPE_CONFIRMATION.to_string()),
+            },
+            &state,
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(json["ok"], true);
+        for (field, expected) in [
+            ("aps_deleted", 1),
+            ("pending_deleted", 1),
+            ("not_found_deleted", 1),
+            ("fixes_deleted", 1),
+            ("last_fix_deleted", 1),
+        ] {
+            assert_eq!(json[field], expected, "wrong count for {field}");
+        }
+        assert_eq!(state.wipe_slot.available_permits(), 0);
+        drop(response);
+        assert_eq!(state.wipe_slot.available_permits(), 1);
+
+        {
+            let db = lock_db(&state);
+            assert_eq!(db.cached_ap_count().unwrap(), 0);
+            assert_eq!(db.pending_ap_count().unwrap(), 0);
+            assert_eq!(db.not_found_ap_count().unwrap(), 0);
+            assert!(db.get_fixes_in_range("0000", "9999").unwrap().is_empty());
+            assert!(db.get_last_fix().unwrap().is_none());
+        }
+        assert_eq!(state.debouncer.lock().await.sample_count(), 0);
+        assert!(state.last_fix.lock().await.is_none());
+        assert!(state
+            .address_cache
+            .lock()
+            .unwrap()
+            .get(55.0, 12.0)
+            .is_none());
+        assert_eq!(state.geocode.snapshot().active, 0);
+        assert_eq!(state.geocode.snapshot().pending, 0);
+        assert!(state.inflight.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wipe_db_failure_rolls_back_and_leaves_managed_memory_unchanged() {
+        let state = test_state();
+        seed_wipe_state(&state).await;
+        lock_db(&state)
+            .execute_batch_for_test(
+                "CREATE TRIGGER reject_server_wipe BEFORE DELETE ON fixes
+                 BEGIN SELECT RAISE(ABORT, 'server wipe failure'); END;",
+            )
+            .unwrap();
+
+        let response = dispatch_command(
+            &Request::Wipe {
+                confirm: Some(WIPE_CONFIRMATION.to_string()),
+            },
+            &state,
+        )
+        .await;
+        assert!(response.body.contains("server wipe failure"));
+        assert_eq!(state.wipe_slot.available_permits(), 0);
+        let overlapping = dispatch_command(
+            &Request::Wipe {
+                confirm: Some(WIPE_CONFIRMATION.to_string()),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(overlapping.body, error_json(WIPE_BUSY_ERROR));
+        drop(response);
+        assert_eq!(state.wipe_slot.available_permits(), 1);
+        state
+            .db
+            .writer_barrier()
+            .await
+            .expect("normal wipe Result error must leave writer actor reusable");
+        assert_eq!(lock_db(&state).cached_ap_count().unwrap(), 1);
+        assert_eq!(state.debouncer.lock().await.sample_count(), 1);
+        assert!(state.last_fix.lock().await.is_some());
+        assert!(state
+            .address_cache
+            .lock()
+            .unwrap()
+            .get(55.0, 12.0)
+            .is_some());
+        assert_eq!(state.geocode.snapshot().pending, 1);
+        assert_eq!(state.inflight.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wipe_db_busy_leaves_persisted_and_managed_memory_unchanged() {
+        let state = test_state();
+        seed_wipe_state(&state).await;
+        // The legacy test connection is independent from the writer actor.
+        // Keeping an IMMEDIATE transaction open makes the wipe hit SQLite's
+        // real busy/locked path rather than an injected SQL error.
+        lock_db(&state)
+            .execute_batch_for_test(
+                "BEGIN IMMEDIATE;
+                 INSERT INTO metadata (key, value) VALUES ('wipe-busy', 'held')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            )
+            .unwrap();
+
+        let response = dispatch_command(
+            &Request::Wipe {
+                confirm: Some(WIPE_CONFIRMATION.to_string()),
+            },
+            &state,
+        )
+        .await;
+        assert!(response.body.contains("wipe: db error:"));
+        assert!(
+            response.body.contains("locked") || response.body.contains("busy"),
+            "expected SQLite busy/locked root cause, got {}",
+            response.body
+        );
+
+        {
+            let db = lock_db(&state);
+            assert_eq!(db.cached_ap_count().unwrap(), 1);
+            assert_eq!(db.pending_ap_count().unwrap(), 1);
+            assert_eq!(db.not_found_ap_count().unwrap(), 1);
+            assert_eq!(db.get_fixes_in_range("0000", "9999").unwrap().len(), 1);
+            assert!(db.get_last_fix().unwrap().is_some());
+            db.execute_batch_for_test("ROLLBACK").unwrap();
+        }
+        assert_eq!(state.debouncer.lock().await.sample_count(), 1);
+        assert!(state.last_fix.lock().await.is_some());
+        assert!(state
+            .address_cache
+            .lock()
+            .unwrap()
+            .get(55.0, 12.0)
+            .is_some());
+        assert_eq!(state.geocode.snapshot().pending, 1);
+        assert_eq!(state.inflight.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_wipe_locate_publication_cannot_restore_last_fix() {
+        let state = test_state();
+        let stale_ticket = state.privacy.ticket();
+        let response = dispatch_command(
+            &Request::Wipe {
+                confirm: Some(WIPE_CONFIRMATION.to_string()),
+            },
+            &state,
+        )
+        .await;
+        drop(response);
+
+        persist_last_fix_and_history(
+            &state,
+            stale_ticket,
+            LastFix {
+                lat: 55.0,
+                lon: 12.0,
+                accuracy_m: 5.0,
+                address: None,
+                at: chrono::Utc::now(),
+                sources: 1,
+            },
+        )
+        .await;
+        assert!(state.last_fix.lock().await.is_none());
+        assert!(lock_db(&state).get_last_fix().unwrap().is_none());
+        assert!(lock_db(&state)
+            .get_fixes_in_range("0000", "9999")
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -2280,7 +3393,9 @@ mod dispatch_tests {
         // its CommandResponse still owns history admission.
         let (client, server) = tokio::io::duplex(1);
         let handler_state = Arc::clone(&state);
-        let handler = tokio::spawn(async move { handle_connection(server, handler_state).await });
+        let handler = tokio::spawn(async move {
+            handle_connection(server, handler_state, TransportKind::Unix).await
+        });
         let (mut client_read, mut client_write) = tokio::io::split(client);
         client_write
             .write_all(b"{\"cmd\":\"history\",\"range\":\"1h\"}\n")
@@ -2640,7 +3755,11 @@ mod dispatch_tests {
         let state = test_state();
         let bssid = "AA:BB:CC:DD:EE:02".to_string();
         // Simulate a concurrent task already resolving this BSSID.
-        state.inflight.lock().unwrap().insert(bssid.clone());
+        state
+            .inflight
+            .lock()
+            .unwrap()
+            .insert(bssid.clone(), state.privacy.ticket());
 
         let req = Request::Resolve {
             bssids: vec![bssid],
@@ -2835,6 +3954,56 @@ mod dispatch_tests {
 }
 
 #[cfg(test)]
+mod privacy_response_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wipe_wins_before_response_write_and_replaces_stale_body() {
+        let state = test_state();
+        let ticket = state.privacy.ticket();
+        let response = CommandResponse::privacy("pre-wipe private body".to_string(), ticket);
+        let mut wipe = state.privacy.begin_wipe().await;
+        wipe.advance_epoch();
+
+        let prepare_state = Arc::clone(&state);
+        let prepare = tokio::spawn(async move {
+            let mut response = response;
+            response.prepare_for_write(&prepare_state).await;
+            response
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !prepare.is_finished(),
+            "stale response must wait behind the wipe response boundary"
+        );
+        drop(wipe);
+        let response = prepare.await.unwrap();
+        assert_eq!(response.body, error_json(STALE_AFTER_WIPE_ERROR));
+    }
+
+    #[tokio::test]
+    async fn wipe_response_holds_exclusive_gate_until_response_drop() {
+        let state = test_state();
+        let mut lease = state.privacy.begin_wipe().await;
+        let current = lease.advance_epoch();
+        let admission = Arc::new(WipeAdmission {
+            _permit: Arc::clone(&state.wipe_slot).try_acquire_owned().unwrap(),
+        });
+        let response = CommandResponse::wipe("wipe success".to_string(), lease, admission);
+
+        let read_state = Arc::clone(&state);
+        let read = tokio::spawn(async move { read_state.privacy.read(current).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !read.is_finished(),
+            "post-wipe publication must wait until the wipe response lifetime ends"
+        );
+        drop(response);
+        assert!(read.await.unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
 mod transport_tests {
     //! task-0196: unix-socket transport setup — self-bind + 0600, stale-socket
     //! recovery, non-socket refusal, socket-activation env parsing, and a full
@@ -2869,8 +4038,16 @@ mod transport_tests {
     /// Exercise the real one-shot connection handler without binding a host
     /// socket. The returned string includes the protocol framing newline.
     async fn duplex_round_trip(request: &str) -> String {
+        duplex_round_trip_with_state(request, test_state(), TransportKind::Unix).await
+    }
+
+    async fn duplex_round_trip_with_state(
+        request: &str,
+        state: Arc<DaemonState>,
+        transport: TransportKind,
+    ) -> String {
         let (client, server) = tokio::io::duplex(4096);
-        let handler = tokio::spawn(handle_connection(server, test_state()));
+        let handler = tokio::spawn(handle_connection(server, state, transport));
         let (mut reader, mut writer) = tokio::io::split(client);
         writer.write_all(request.as_bytes()).await.unwrap();
         writer.write_all(b"\n").await.unwrap();
@@ -2887,7 +4064,7 @@ mod transport_tests {
         let unknown = duplex_round_trip(r#"{"cmd":"bogus"}"#).await;
         assert_eq!(
             unknown,
-            "{\"ok\":false,\"v\":1,\"error\":\"invalid request: unknown variant `bogus`, expected one of `locate`, `resolve`, `scan`, `stats`, `debug`, `version`, `history` at line 1 column 14\"}\n"
+            "{\"ok\":false,\"v\":1,\"error\":\"invalid request: unknown variant `bogus`, expected one of `locate`, `resolve`, `scan`, `stats`, `debug`, `version`, `history`, `wipe` at line 1 column 14\"}\n"
         );
 
         let missing = duplex_round_trip(r#"{"range":"7d"}"#).await;
@@ -2895,6 +4072,239 @@ mod transport_tests {
             missing,
             "{\"ok\":false,\"v\":1,\"error\":\"invalid request: missing field `cmd` at line 1 column 14\"}\n"
         );
+    }
+
+    #[tokio::test]
+    async fn confirmed_wipe_succeeds_on_unix_wire_and_is_rejected_on_tcp_wire() {
+        let unix_state = test_state();
+        let ap = crate::db::ApInfo {
+            bssid: "aa:bb:cc:dd:ee:01".to_string(),
+            ssid: Some("private".to_string()),
+            lat: 55.0,
+            lon: 12.0,
+            encryption: None,
+            channel: None,
+            frequency: None,
+            city: None,
+            country: None,
+            source: crate::db::Source::Manual,
+        };
+        lock_db(&unix_state).upsert_ap(&ap).unwrap();
+        let unix = duplex_round_trip_with_state(
+            r#"{"cmd":"wipe","confirm":"delete-all-location-data"}"#,
+            Arc::clone(&unix_state),
+            TransportKind::Unix,
+        )
+        .await;
+        let unix_json: serde_json::Value = serde_json::from_str(unix.trim()).unwrap();
+        assert_eq!(unix_json["ok"], true);
+        assert_eq!(unix_json["aps_deleted"], 1);
+        assert_eq!(lock_db(&unix_state).cached_ap_count().unwrap(), 0);
+
+        let tcp_state = test_state();
+        lock_db(&tcp_state).upsert_ap(&ap).unwrap();
+        let tcp = duplex_round_trip_with_state(
+            r#"{"cmd":"wipe","confirm":"delete-all-location-data"}"#,
+            Arc::clone(&tcp_state),
+            TransportKind::Tcp,
+        )
+        .await;
+        assert_eq!(tcp.trim(), error_json(WIPE_TCP_ERROR));
+        assert_eq!(
+            lock_db(&tcp_state).cached_ap_count().unwrap(),
+            1,
+            "TCP refusal must have no side effects"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_wipe_finishes_after_client_disconnects() {
+        let state = test_state();
+        let ap = crate::db::ApInfo {
+            bssid: "aa:bb:cc:dd:ee:02".to_string(),
+            ssid: Some("private".to_string()),
+            lat: 55.0,
+            lon: 12.0,
+            encryption: None,
+            channel: None,
+            frequency: None,
+            city: None,
+            country: None,
+            source: crate::db::Source::Manual,
+        };
+        lock_db(&state).upsert_ap(&ap).unwrap();
+        *state.last_fix.lock().await = Some(LastFix {
+            lat: 55.0,
+            lon: 12.0,
+            accuracy_m: 5.0,
+            address: Some("private".to_string()),
+            at: chrono::Utc::now(),
+            sources: 1,
+        });
+
+        let (mut client, server) = tokio::io::duplex(256);
+        let handler_state = Arc::clone(&state);
+        let handler = tokio::spawn(async move {
+            handle_connection(server, handler_state, TransportKind::Unix).await
+        });
+        client
+            .write_all(b"{\"cmd\":\"wipe\",\"confirm\":\"delete-all-location-data\"}\n")
+            .await
+            .unwrap();
+        drop(client);
+        handler.await.unwrap().unwrap();
+
+        assert_eq!(lock_db(&state).cached_ap_count().unwrap(), 0);
+        assert!(state.last_fix.lock().await.is_none());
+        assert_eq!(state.wipe_slot.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_wipe_survives_force_aborted_connection_handler() {
+        let state = test_state();
+        let ap = crate::db::ApInfo {
+            bssid: "aa:bb:cc:dd:ee:03".to_string(),
+            ssid: Some("private".to_string()),
+            lat: 55.0,
+            lon: 12.0,
+            encryption: None,
+            channel: None,
+            frequency: None,
+            city: None,
+            country: None,
+            source: crate::db::Source::Manual,
+        };
+        lock_db(&state).upsert_ap(&ap).unwrap();
+        *state.last_fix.lock().await = Some(LastFix {
+            lat: 55.0,
+            lon: 12.0,
+            accuracy_m: 5.0,
+            address: Some("private".to_string()),
+            at: chrono::Utc::now(),
+            sources: 1,
+        });
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker_db = state.db.clone();
+        let blocker =
+            tokio::spawn(async move { blocker_db.hold_writer_until(entered_tx, release_rx).await });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let (mut client, server) = tokio::io::duplex(256);
+        let handler_state = Arc::clone(&state);
+        let handler = tokio::spawn(async move {
+            handle_connection(server, handler_state, TransportKind::Unix).await
+        });
+        client
+            .write_all(b"{\"cmd\":\"wipe\",\"confirm\":\"delete-all-location-data\"}\n")
+            .await
+            .unwrap();
+        loop {
+            if state
+                .privacy_wipes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len()
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled());
+        drop(client);
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+
+        let mut wipes = {
+            let mut guard = state
+                .privacy_wipes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        while let Some(result) = wipes.join_next().await {
+            result.unwrap();
+        }
+
+        assert_eq!(lock_db(&state).cached_ap_count().unwrap(), 0);
+        assert!(state.last_fix.lock().await.is_none());
+        assert_eq!(state.wipe_slot.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn wipe_holds_exclusive_gate_through_stalled_socket_write() {
+        let state = test_state();
+        let before = state.privacy.ticket();
+        *state.last_fix.lock().await = Some(LastFix {
+            lat: 55.0,
+            lon: 12.0,
+            accuracy_m: 5.0,
+            address: Some("private".to_string()),
+            at: chrono::Utc::now(),
+            sources: 1,
+        });
+
+        // One byte of capacity makes the success response block until this
+        // test starts reading it. That exposes the actual socket-write
+        // lifetime rather than merely inspecting CommandResponse ownership.
+        let (client, server) = tokio::io::duplex(1);
+        let handler_state = Arc::clone(&state);
+        let handler = tokio::spawn(async move {
+            handle_connection(server, handler_state, TransportKind::Unix).await
+        });
+        let (client_read, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(b"{\"cmd\":\"wipe\",\"confirm\":\"delete-all-location-data\"}\n")
+            .await
+            .unwrap();
+
+        // Wait for the production DB -> managed-memory clear -> final epoch
+        // advance sequence. The worker then retains the write lease or has
+        // transferred it to the response stalled on the one-byte socket.
+        while state.privacy.ticket() == before {
+            tokio::task::yield_now().await;
+        }
+        assert!(state.last_fix.lock().await.is_none());
+        let current = state.privacy.ticket();
+        let read_state = Arc::clone(&state);
+        let publication = tokio::spawn(async move { read_state.privacy.read(current).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !publication.is_finished(),
+            "post-wipe publication escaped before the response-write attempt ended"
+        );
+        let overlapping = tokio::time::timeout(
+            Duration::from_millis(100),
+            dispatch_command(
+                &Request::Wipe {
+                    confirm: Some(WIPE_CONFIRMATION.to_string()),
+                },
+                &state,
+            ),
+        )
+        .await
+        .expect("stalled success write must reject an overlapping wipe promptly");
+        assert_eq!(overlapping.body, error_json(WIPE_BUSY_ERROR));
+        assert_eq!(state.wipe_slot.available_permits(), 0);
+
+        let mut line = String::new();
+        BufReader::new(client_read)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(line.trim()).unwrap()["ok"],
+            true
+        );
+        handler.await.unwrap().unwrap();
+        assert!(publication.await.unwrap().is_some());
+        assert_eq!(state.wipe_slot.available_permits(), 1);
     }
 
     #[test]
@@ -3116,7 +4526,9 @@ mod transport_tests {
         let state = test_state();
         let server = tokio::spawn(async move {
             let (stream, _peer) = listener.accept().await.unwrap();
-            handle_connection(stream, state).await.unwrap();
+            handle_connection(stream, state, TransportKind::Tcp)
+                .await
+                .unwrap();
         });
 
         let line = tokio::task::spawn_blocking(move || {

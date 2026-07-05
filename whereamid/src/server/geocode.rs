@@ -9,7 +9,7 @@
 use super::lock_db;
 use super::{address_cache_key, backfill_last_fix_address_with, DaemonState};
 use crate::nominatim::REQUEST_INTERVAL;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant};
@@ -30,12 +30,19 @@ struct Candidate {
     lon: f64,
     enqueued_at: Instant,
     generation: u64,
+    privacy_ticket: crate::privacy::PrivacyTicket,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActiveToken {
+    generation: u64,
+    privacy_ticket: crate::privacy::PrivacyTicket,
 }
 
 #[derive(Default)]
 struct SchedulerState {
     pending: Option<Candidate>,
-    active: HashSet<GridKey>,
+    active: HashMap<GridKey, ActiveToken>,
     latest_key: Option<GridKey>,
     latest_needs_lookup: bool,
     generation: u64,
@@ -65,7 +72,13 @@ impl GeocodeScheduler {
     /// cache -> scheduler ordering makes the hit/miss observation atomic with
     /// worker insertion, and the worker uses the same ordering. The scheduler
     /// never acquires the cache itself and never holds its mutex across await.
-    pub(super) fn observe(&self, lat: f64, lon: f64, needs_lookup: bool) -> bool {
+    pub(super) fn observe(
+        &self,
+        lat: f64,
+        lon: f64,
+        needs_lookup: bool,
+        privacy_ticket: crate::privacy::PrivacyTicket,
+    ) -> bool {
         if self.shutdown.is_cancelled() {
             return false;
         }
@@ -107,7 +120,9 @@ impl GeocodeScheduler {
             pending.enqueued_at = Instant::now();
             return false;
         }
-        if state.active.contains(&key) && state.latest_key == Some(key) && state.latest_needs_lookup
+        if state.active.contains_key(&key)
+            && state.latest_key == Some(key)
+            && state.latest_needs_lookup
         {
             return false;
         }
@@ -121,6 +136,7 @@ impl GeocodeScheduler {
             lon,
             enqueued_at: Instant::now(),
             generation,
+            privacy_ticket,
         });
         self.changed.send_replace(generation);
         drop(state);
@@ -154,12 +170,18 @@ impl GeocodeScheduler {
 
     fn claim(&self, candidate: Candidate) -> Option<ActiveClaim<'_>> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.active.is_empty() || !state.active.insert(candidate.key) {
+        if !state.active.is_empty() || state.active.contains_key(&candidate.key) {
             return None;
         }
+        let token = ActiveToken {
+            generation: candidate.generation,
+            privacy_ticket: candidate.privacy_ticket,
+        };
+        state.active.insert(candidate.key, token);
         Some(ActiveClaim {
             scheduler: self,
             key: candidate.key,
+            token,
         })
     }
 
@@ -199,8 +221,21 @@ impl GeocodeScheduler {
         drop(state);
     }
 
+    /// Invalidate queued/active coordinates and wake the worker. The active
+    /// claim is tokenized, so its eventual Drop cannot remove a same-key claim
+    /// created after the wipe.
+    pub(super) fn clear_for_wipe(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending = None;
+        state.active.clear();
+        state.latest_key = None;
+        state.latest_needs_lookup = false;
+        let generation = bump_generation(&mut state);
+        self.changed.send_replace(generation);
+    }
+
     #[cfg(test)]
-    fn snapshot(&self) -> SchedulerSnapshot {
+    pub(super) fn snapshot(&self) -> SchedulerSnapshot {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         SchedulerSnapshot {
             worker_running: usize::from(state.worker_running),
@@ -218,16 +253,19 @@ fn bump_generation(state: &mut SchedulerState) -> u64 {
 struct ActiveClaim<'a> {
     scheduler: &'a GeocodeScheduler,
     key: GridKey,
+    token: ActiveToken,
 }
 
 impl Drop for ActiveClaim<'_> {
     fn drop(&mut self) {
-        self.scheduler
+        let mut state = self
+            .scheduler
             .state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .active
-            .remove(&self.key);
+            .unwrap_or_else(|e| e.into_inner());
+        if state.active.get(&self.key) == Some(&self.token) {
+            state.active.remove(&self.key);
+        }
     }
 }
 
@@ -340,6 +378,9 @@ pub(crate) async fn run_worker(state: Arc<DaemonState>) {
         // freshness check and cache insertion are therefore one linearized
         // operation relative to every newer hit/miss observation.
         let inserted = {
+            let Some(_privacy) = state.privacy.read(candidate.privacy_ticket).await else {
+                continue;
+            };
             let mut cache = state.address_cache.lock().unwrap_or_else(|e| {
                 warn!("address cache mutex poisoned on insert — recovering");
                 e.into_inner()
@@ -359,6 +400,7 @@ pub(crate) async fn run_worker(state: Arc<DaemonState>) {
         // the reviewed last_fix -> durable writer FIFO order from task-0046.
         if let Err(error) = backfill_last_fix_address_with(
             &state,
+            candidate.privacy_ticket,
             candidate.lat,
             candidate.lon,
             &address.display,
@@ -374,10 +416,10 @@ pub(crate) async fn run_worker(state: Arc<DaemonState>) {
 
 #[cfg(test)]
 #[derive(Debug)]
-struct SchedulerSnapshot {
-    worker_running: usize,
-    active: usize,
-    pending: usize,
+pub(super) struct SchedulerSnapshot {
+    pub(super) worker_running: usize,
+    pub(super) active: usize,
+    pub(super) pending: usize,
 }
 
 #[cfg(test)]
@@ -444,7 +486,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let cached = cache.get(lat, lon);
-        state.geocode.observe(lat, lon, cached.is_none());
+        state
+            .geocode
+            .observe(lat, lon, cached.is_none(), state.privacy.ticket());
         cached
     }
 
@@ -484,6 +528,7 @@ mod tests {
         // of a pending slot before the worker starts.
         persist_locate_fix_and_schedule(
             &state,
+            state.privacy.ticket(),
             LastFix {
                 lat: LAT,
                 lon: LON,
@@ -507,6 +552,7 @@ mod tests {
                 let jitter = if i % 2 == 0 { 0.000_003 } else { -0.000_003 };
                 persist_locate_fix_and_schedule(
                     &state,
+                    state.privacy.ticket(),
                     LastFix {
                         lat: LAT + jitter,
                         lon: LON + jitter,
@@ -776,6 +822,7 @@ mod tests {
         }
         let returned = persist_locate_fix_and_schedule(
             &state,
+            state.privacy.ticket(),
             LastFix {
                 lat: NEW_LAT,
                 lon: NEW_LON,
@@ -1001,7 +1048,9 @@ mod tests {
         });
         let before = test_state_with_nominatim(before_client);
         before.shutdown.cancel();
-        let accepted_before = before.geocode.observe(55.0, 12.0, true);
+        let accepted_before = before
+            .geocode
+            .observe(55.0, 12.0, true, before.privacy.ticket());
         let before_worker = tokio::spawn(run_worker(Arc::clone(&before)));
         let before_stopped = worker_finished(before_worker).await;
 
@@ -1029,7 +1078,9 @@ mod tests {
         observe(&during, 56.0, 13.0);
         during.shutdown.cancel();
         let during_stopped = worker_finished(during_worker).await;
-        let accepted_after = during.geocode.observe(57.0, 14.0, true);
+        let accepted_after = during
+            .geocode
+            .observe(57.0, 14.0, true, during.privacy.ticket());
         let clean = during.geocode.snapshot();
 
         assert!(!accepted_before);
@@ -1042,6 +1093,33 @@ mod tests {
         assert_eq!(clean.active, 0);
         assert_eq!(clean.pending, 0);
         assert_eq!(clean.worker_running, 0);
+    }
+
+    #[tokio::test]
+    async fn pre_wipe_active_drop_cannot_remove_post_wipe_same_cell_claim() {
+        let state = test_state_with_nominatim(NominatimClient::new());
+        let old_ticket = state.privacy.ticket();
+        assert!(state.geocode.observe(55.0, 12.0, true, old_ticket));
+        let old_candidate = state.geocode.take_pending().unwrap();
+        let old_claim = state.geocode.claim(old_candidate).unwrap();
+
+        let mut wipe = state.privacy.begin_wipe().await;
+        wipe.advance_epoch();
+        state.geocode.clear_for_wipe();
+        drop(wipe);
+
+        let new_ticket = state.privacy.ticket();
+        assert!(state.geocode.observe(55.0, 12.0, true, new_ticket));
+        let new_candidate = state.geocode.take_pending().unwrap();
+        let new_claim = state.geocode.claim(new_candidate).unwrap();
+        drop(old_claim);
+        assert_eq!(
+            state.geocode.snapshot().active,
+            1,
+            "old claim Drop must retain the post-wipe same-cell claim"
+        );
+        drop(new_claim);
+        assert_eq!(state.geocode.snapshot().active, 0);
     }
 
     /// A panic inside the selected transport future unwinds through both RAII

@@ -60,6 +60,10 @@ UID. `LISTEN_FDS > 1` is a startup error.
   the permitted users in `services.whereami.allowedUsers`, which populates the
   `whereami` group. Non-members get `EACCES`/connection-refused on connect.
 
+Every user who can connect receives the same full command set, including the
+destructive `wipe` command. There is no read-only or per-command role; the wipe
+confirmation literal prevents accidents but is not an authorization layer.
+
 The daemon logs the connecting peer's `SO_PEERCRED` (uid/gid/pid) at debug level
 for auditability but does **not** enforce same-UID in-process — that would break
 the system-service group model, where systemd hands a group-readable socket to a
@@ -100,6 +104,7 @@ Per-command fields are documented below; unknown fields are silently ignored
 {"cmd": "locate"}
 {"cmd": "resolve", "bssids": ["AA:BB:CC:DD:EE:FF"]}
 {"cmd": "history", "range": "7d"}
+{"cmd": "wipe", "confirm": "delete-all-location-data"}
 ```
 
 ## Response format
@@ -292,6 +297,58 @@ Segmentation and JSON serialization run off the async executor and are bounded
 to O(N) work, but one admitted request still allocates its O(N) database result
 and response. The concurrency cap is not an absolute history-row or memory cap.
 
+### `wipe` — delete logical location and observed-network state
+
+`wipe` is destructive and is accepted only over the filesystem-permission-gated
+Unix socket. The daemon refuses it over the unauthenticated TCP transport,
+including loopback. The confirmation string is literal and mandatory, but it
+is an accident guard rather than separate authorization:
+
+```json
+→ {"cmd":"wipe","confirm":"delete-all-location-data"}
+← {
+    "ok": true, "v": 1,
+    "aps_deleted": 8,
+    "pending_deleted": 2,
+    "not_found_deleted": 3,
+    "fixes_deleted": 144,
+    "last_fix_deleted": 1
+}
+```
+
+One SQLite `IMMEDIATE` transaction deletes `aps`, `pending`, `not_found`,
+`fixes`, `last_fix`, and the `fixes` row in `sqlite_sequence`. Each response
+count is the number of rows deleted from its named table; a repeated wipe is
+successful with zero counts. `schema_version` and operational `metadata`
+(including quota and shutdown observability) are retained. Configuration and
+credentials are outside these tables and are untouched. A database error rolls
+back the transaction and leaves managed in-memory state unchanged.
+
+After commit, the daemon clears managed in-memory scan/debounce, last-fix,
+address-cache, geocode-queue, and in-flight lookup state while exclusive, then
+advances the publication epoch last. The boundary remains exclusive until the
+response-write attempt terminates by successful write, write failure, timeout,
+or disconnect. No post-wipe publication can precede that termination, and an
+older response that lost the race becomes
+`request invalidated by data wipe; retry`.
+
+Wipe is single-flight across that entire boundary. An overlapping request gets
+`wipe: busy; retry later` rather than queuing another O(N) deletion. A client
+disconnect does not cancel an accepted wipe, but a missing complete response
+leaves its result unknown; verify the state or retry idempotently. Collection
+remains enabled and may repopulate the database after the response attempt
+terminates. Wipe is logical live-state deletion, not forensic erasure of SQLite
+free pages/WAL remnants, allocator/process-memory remnants outside the managed
+structures named above, snapshots, backups, storage media, logs, or provider
+traffic already sent.
+
+An internal invariant panic after SQLite commit is not recoverable in-process:
+the daemon retains the exclusive publication boundary through fatal handling,
+logs the failure, and exits nonzero before it can resume serving a
+persisted/in-memory split. Under systemd it can then restart against the
+already-wiped database. To the client this is an interrupted, unknown result,
+so the same verify-or-retry rule applies.
+
 ## Error response shape
 
 ```json
@@ -306,7 +363,7 @@ Common errors:
   its framing newline):
 
   ```json
-  {"ok":false,"v":1,"error":"invalid request: unknown variant `bogus`, expected one of `locate`, `resolve`, `scan`, `stats`, `debug`, `version`, `history` at line 1 column 14"}
+  {"ok":false,"v":1,"error":"invalid request: unknown variant `bogus`, expected one of `locate`, `resolve`, `scan`, `stats`, `debug`, `version`, `history`, `wipe` at line 1 column 14"}
   ```
 
   For `{"range":"7d"}` (no `cmd`), it emits:
@@ -335,6 +392,15 @@ Common errors:
 - `history: cancelled` — shutdown cancelled admitted history work
 - `history: processing failed` — the blocking history worker failed
 - `history: db error: <detail>` — the history database query failed
+- `wipe: confirmation must equal 'delete-all-location-data'`
+- `wipe: unavailable over unauthenticated TCP; use the Unix control socket`
+- `wipe: busy; retry later` — another wipe remains admitted through its
+  response-write attempt
+- `wipe: result unavailable; verify and retry` — completion could not be
+  reported; its result is unknown and an idempotent retry is safe
+- `wipe: db error: <detail>` — deletion failed; no managed memory was cleared
+- `request invalidated by data wipe; retry` — a privacy-bearing request began
+  before a concurrent successful wipe and lost the response-publication race
 
 The six constant history strings (mutual exclusion, ordering, missing pair,
 busy, cancelled, and processing failed) are exact. The four dynamic forms are
@@ -405,6 +471,7 @@ terminate the CLI via `SIGPIPE`; shells conventionally report status **141**
 whereami locate                # parsed response, friendly output
 whereami --json locate         # raw JSON
 whereami history 24h
+whereami wipe --yes            # Unix socket only; destructive confirmation
 ```
 
 ### Bash + `nc` / `socat` (unix socket)

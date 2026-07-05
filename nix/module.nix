@@ -27,9 +27,9 @@ in {
     # bad combination fails `nixos-rebuild` rather than crash-looping the daemon.
     assertions = import ./assertions.nix { inherit lib cfg; };
 
-    # The `whereami` group owns the 0660 control socket; its members are the
-    # users allowed to query the daemon (task-0196 / ADR-003). Empty by default,
-    # so only root can connect until the owner opts users in via allowedUsers.
+    # The `whereami` group owns the 0660 control socket; every member receives
+    # the full command set, including destructive wipe (task-0196 / ADR-003).
+    # Empty by default, so only root connects until allowedUsers opts users in.
     users.groups.whereami.members = cfg.allowedUsers;
 
     # Socket activation is what makes the DynamicUser daemon reachable by the

@@ -151,6 +151,7 @@ pkgs.testers.runNixOSTest {
         # task-0206: pin one of the six newly-exposed flags end-to-end (option ->
         # exec-start.nix -> unit ExecStart), asserted below via `systemctl cat`.
         historyRetentionDays = 7;
+        apsRetentionDays = 11;
         # task-0205: a 0600 root:root secrets file the DynamicUser must reach only
         # via LoadCredential (the module wires --config to $CREDENTIALS_DIRECTORY).
         credentialsFile = "/etc/whereami/secrets.toml";
@@ -172,7 +173,7 @@ pkgs.testers.runNixOSTest {
       };
       # Put the `whereami` client on PATH so the socket-access assertions use
       # the real client path-resolution, not a hand-rolled socket poke.
-      environment.systemPackages = [ config.services.whereami.package ];
+      environment.systemPackages = [ config.services.whereami.package pkgs.sqlite ];
       users.users.alice = { isNormalUser = true; };
       users.users.mallory = { isNormalUser = true; };
 
@@ -233,6 +234,7 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import json
+    import shlex
 
     hardening_properties = [
         "PrivateDevices",
@@ -503,6 +505,9 @@ pkgs.testers.runNixOSTest {
         machine.succeed(
             "systemctl cat whereamid.service | grep -F -- '--history-retention-days 7'"
         )
+        machine.succeed(
+            "systemctl cat whereamid.service | grep -F -- '--aps-retention-days 11'"
+        )
 
     with subtest("task-0205: WiGLE secrets load via LoadCredential without widening the source"):
         # AC#1/#3: the 0600 root:root file reaches the DynamicUser through systemd
@@ -554,6 +559,110 @@ pkgs.testers.runNixOSTest {
             machine.wait_until_succeeds(f"test -f /var/lib/whereami/{sidecar}")
             m = machine.succeed(f"stat -L -c %a /var/lib/whereami/{sidecar}").strip()
             assert m == "600", f"{sidecar} mode is {m}, expected 600"
+
+    with subtest("task-0202: confirmed Unix wipe deletes live and persisted privacy state"):
+        db = "/var/lib/whereami/aps.sqlite"
+
+        def sqlite_value(sql):
+            return machine.succeed(
+                f"sqlite3 -batch -noheader {shlex.quote(db)} {shlex.quote(sql)}"
+            ).strip()
+
+        seed_sql = """
+          BEGIN IMMEDIATE;
+          INSERT INTO aps (
+            bssid, ssid, lat, lon, source, source_priority,
+            first_seen, last_seen, fetched_at
+          ) VALUES (
+            '02:00:00:00:20:20', 'wipe-private-ssid', 55.123456, 12.654321,
+            'manual', 10, '2999-01-01T00:00:00+00:00',
+            '2999-01-01T00:00:00+00:00', '2999-01-01T00:00:00+00:00'
+          );
+          INSERT INTO pending (
+            bssid, ssid, first_seen, last_seen, attempts
+          ) VALUES (
+            '02:00:00:00:20:21', 'wipe-pending-ssid',
+            '2999-01-01T00:00:00+00:00', '2999-01-01T00:00:00+00:00', 0
+          );
+          INSERT INTO not_found (
+            bssid, first_seen, last_seen, checked_at
+          ) VALUES (
+            '02:00:00:00:20:22', '2999-01-01T00:00:00+00:00',
+            '2999-01-01T00:00:00+00:00', '2999-01-01T00:00:00+00:00'
+          );
+          INSERT INTO fixes (
+            at_rfc3339, lat, lon, accuracy_m, n_sources
+          ) VALUES ('2999-01-01T00:00:00+00:00', 55.123456, 12.654321, 4.0, 1);
+          INSERT INTO last_fix (
+            id, lat, lon, accuracy_m, address, at_rfc3339, sources
+          ) VALUES (
+            1, 55.123456, 12.654321, 4.0, 'wipe-private-address',
+            '2999-01-01T00:00:00+00:00', 1
+          );
+          INSERT INTO metadata (key, value) VALUES ('wipe-vm-retained', 'yes');
+          COMMIT;
+        """
+        machine.succeed(
+            f"sqlite3 -cmd '.timeout 5000' -batch {shlex.quote(db)} {shlex.quote(seed_sql)}"
+        )
+        assert sqlite_value(
+            "SELECT (SELECT count(*) FROM aps) || ',' || "
+            "(SELECT count(*) FROM pending) || ',' || "
+            "(SELECT count(*) FROM not_found) || ',' || "
+            "(SELECT count(*) FROM fixes) || ',' || "
+            "(SELECT count(*) FROM last_fix);"
+        ) == "1,1,1,1,1"
+
+        # Restart forces last_fix through the production DB rehydration path;
+        # locate then proves the sensitive value is live in managed memory.
+        machine.succeed("systemctl restart whereamid.service")
+        machine.wait_for_unit("whereamid.service")
+        locate = machine.wait_until_succeeds(
+            "runuser -u alice -- env WHEREAMI_SOCKET=/run/whereami/whereamid.sock "
+            "whereami --json locate | grep -F '55.123456'",
+            timeout=30,
+        )
+        assert "55.123456" in locate
+
+        tcp_refusal = machine.fail(
+            "env WHEREAMI_ADDR=127.0.0.1:4747 whereami --json wipe --yes"
+        )
+        assert "unavailable over unauthenticated TCP" in tcp_refusal, tcp_refusal
+        assert sqlite_value("SELECT count(*) FROM aps;") == "1", \
+            "TCP refusal must not delete state"
+
+        wipe = json.loads(machine.succeed(
+            "runuser -u alice -- env WHEREAMI_SOCKET=/run/whereami/whereamid.sock "
+            "whereami --json wipe --yes"
+        ))
+        assert wipe == {
+            "ok": True,
+            "v": 1,
+            "aps_deleted": 1,
+            "pending_deleted": 1,
+            "not_found_deleted": 1,
+            "fixes_deleted": 1,
+            "last_fix_deleted": 1,
+        }, f"unexpected wipe response: {wipe!r}"
+        assert sqlite_value(
+            "SELECT (SELECT count(*) FROM aps) || ',' || "
+            "(SELECT count(*) FROM pending) || ',' || "
+            "(SELECT count(*) FROM not_found) || ',' || "
+            "(SELECT count(*) FROM fixes) || ',' || "
+            "(SELECT count(*) FROM last_fix) || ',' || "
+            "(SELECT count(*) FROM sqlite_sequence WHERE name = 'fixes');"
+        ) == "0,0,0,0,0,0"
+        assert sqlite_value(
+            "SELECT value FROM metadata WHERE key = 'wipe-vm-retained';"
+        ) == "yes", "wipe must retain operational metadata"
+        assert sqlite_value("SELECT version FROM schema_version WHERE id = 1;") == "5"
+
+        after = machine.fail(
+            "runuser -u alice -- env WHEREAMI_SOCKET=/run/whereami/whereamid.sock "
+            "whereami --json locate"
+        )
+        assert '"ok":false' in after.replace(" ", ""), after
+        assert "55.123456" not in after, "wiped in-memory last_fix leaked after wipe response"
 
     with subtest("task-0204: SIGKILL triggers auto-restart and the daemon answers again"):
         # AC#1/#2: hard-kill the running daemon and confirm Restart=on-failure

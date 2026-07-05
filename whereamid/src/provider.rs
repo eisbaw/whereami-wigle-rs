@@ -175,6 +175,7 @@ mod tests {
             _db_runtime: Some(db_runtime),
             test_db: std::sync::Mutex::new(test_db),
             debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(10, 5)),
+            privacy: crate::privacy::PrivacyCoordinator::new(),
             connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
             args,
             wigle: crate::wigle::WigleClient::new("", ""),
@@ -182,12 +183,14 @@ mod tests {
             nominatim: crate::nominatim::NominatimClient::new(),
             geocode: crate::server::geocode::GeocodeScheduler::new(shutdown.clone()),
             last_fix: tokio::sync::Mutex::new(None),
-            inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
             db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             shutdown,
             tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            privacy_wipes: std::sync::Mutex::new(tokio::task::JoinSet::new()),
             orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
         })
     }

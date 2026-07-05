@@ -134,6 +134,22 @@ struct SimpleRequest {
     cmd: &'static str,
 }
 
+const WIPE_CONFIRMATION_TOKEN: &str = "delete-all-location-data";
+
+/// Explicit confirmation marker required by the typed destructive wipe API.
+/// This prevents accidental call sites; Unix-socket permissions, not this
+/// value, provide server-side authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WipeConfirmation {
+    Confirmed,
+}
+
+#[derive(Serialize)]
+struct WipeRequest {
+    cmd: &'static str,
+    confirm: &'static str,
+}
+
 // --- Response types ---
 
 /// Response from the `locate` command.
@@ -418,6 +434,25 @@ pub struct StatsResponse {
     pub error: Option<String>,
 }
 
+/// Response from a confirmed privacy wipe.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct WipeResponse {
+    pub ok: bool,
+    pub v: u32,
+    #[serde(default)]
+    pub aps_deleted: usize,
+    #[serde(default)]
+    pub pending_deleted: usize,
+    #[serde(default)]
+    pub not_found_deleted: usize,
+    #[serde(default)]
+    pub fixes_deleted: usize,
+    #[serde(default)]
+    pub last_fix_deleted: usize,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 impl WhereAmIClient {
     /// Create a client for an explicit connect target.
     pub fn new(target: ConnectTarget) -> Self {
@@ -601,6 +636,23 @@ impl WhereAmIClient {
             to,
         })?)
     }
+
+    /// Delete the daemon's persisted and managed in-memory location/AP state.
+    /// The explicit enum makes destructive intent visible at every call site.
+    pub fn wipe(&self, confirmation: WipeConfirmation) -> Result<WipeResponse> {
+        Self::parse_response_line(&self.wipe_raw(confirmation)?)
+    }
+
+    /// Raw confirmed `wipe`; feeds the CLI's byte-preserving `--json` mode.
+    pub fn wipe_raw(&self, confirmation: WipeConfirmation) -> Result<String> {
+        let confirm = match confirmation {
+            WipeConfirmation::Confirmed => WIPE_CONFIRMATION_TOKEN,
+        };
+        self.raw_command(&serde_json::to_string(&WipeRequest {
+            cmd: "wipe",
+            confirm,
+        })?)
+    }
 }
 
 // task-0058: trait impls for every response so CLIs can dispatch
@@ -624,6 +676,44 @@ impl_daemon_response!(StatsResponse);
 impl_daemon_response!(DebugResponse);
 impl_daemon_response!(VersionResponse);
 impl_daemon_response!(HistoryResponse);
+impl_daemon_response!(WipeResponse);
+
+#[cfg(test)]
+mod wipe_wire_tests {
+    use super::*;
+
+    #[test]
+    fn confirmed_wipe_request_is_exact() {
+        let request = WipeRequest {
+            cmd: "wipe",
+            confirm: match WipeConfirmation::Confirmed {
+                WipeConfirmation::Confirmed => WIPE_CONFIRMATION_TOKEN,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"cmd":"wipe","confirm":"delete-all-location-data"}"#
+        );
+    }
+
+    #[test]
+    fn wipe_success_and_error_shapes_parse_typed() {
+        let success: WipeResponse = WhereAmIClient::parse_response_line(
+            r#"{"ok":true,"v":1,"aps_deleted":5,"pending_deleted":4,"not_found_deleted":3,"fixes_deleted":2,"last_fix_deleted":1}"#,
+        )
+        .unwrap();
+        assert!(success.ok);
+        assert_eq!(success.aps_deleted, 5);
+        assert_eq!(success.last_fix_deleted, 1);
+
+        let error: WipeResponse =
+            WhereAmIClient::parse_response_line(r#"{"ok":false,"v":1,"error":"wipe refused"}"#)
+                .unwrap();
+        assert!(!error.ok);
+        assert_eq!(error.error.as_deref(), Some("wipe refused"));
+        assert_eq!(error.fixes_deleted, 0);
+    }
+}
 
 #[cfg(test)]
 mod stats_wire_tests {

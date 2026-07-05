@@ -46,7 +46,12 @@ pub async fn run_pending_drain(state: Arc<DaemonState>) {
         tokio::select! {
             biased;
             _ = state.shutdown.cancelled() => break,
-            _ = drain_once(&state, max_attempts, &[Provider::Apple, Provider::Wigle]) => {}
+            _ = drain_once(
+                &state,
+                max_attempts,
+                &[Provider::Apple, Provider::Wigle],
+                state.privacy.ticket(),
+            ) => {}
         }
     }
 }
@@ -57,9 +62,17 @@ pub async fn run_pending_drain(state: Arc<DaemonState>) {
 /// pass with `Provider::Mock`s; production passes `[Apple, Wigle]`. The real
 /// Apple provider makes network calls and never returns `Skipped`, so the
 /// all-Skipped fairness/age-out cases below are reachable only under mocks.
-async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32, providers: &[Provider]) {
+async fn drain_once(
+    state: &Arc<DaemonState>,
+    max_attempts: i32,
+    providers: &[Provider],
+    ticket: crate::privacy::PrivacyTicket,
+) {
     // Clean up entries that exceeded max attempts
     {
+        let Some(_privacy) = state.privacy.read(ticket).await else {
+            return;
+        };
         match state.db.delete_expired_pending(max_attempts).await {
             Ok(deleted) if deleted > 0 => {
                 info!("deleted {deleted} pending entries exceeding {max_attempts} attempts");
@@ -74,6 +87,9 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32, providers: &[Pr
 
     // Re-check expired not_found entries (30 day TTL)
     {
+        let Some(_privacy) = state.privacy.read(ticket).await else {
+            return;
+        };
         match state
             .db
             .revive_expired_not_found(state.args.not_found_ttl_days, NOT_FOUND_REVIVAL_BATCH)
@@ -93,6 +109,9 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32, providers: &[Pr
 
     // Pick up to PENDING_DRAIN_BATCH pending MACs
     let pending = {
+        let Some(_privacy) = state.privacy.read(ticket).await else {
+            return;
+        };
         match state.db.get_pending(PENDING_DRAIN_BATCH).await {
             Ok(p) => p,
             Err(e) => {
@@ -133,7 +152,7 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32, providers: &[Pr
         on_network_error: NetErrorAction::Ignore,
         on_hard_stop: HardStopAction::Stop,
     };
-    let _ = resolve_chain(&bssids, state, providers, &policy).await;
+    let _ = resolve_chain(&bssids, state, providers, &policy, ticket).await;
 
     // task-0189: advance the attempts counter once per drain pass for every
     // BSSID we just tried. resolve_chain deletes rows it resolved or
@@ -150,9 +169,11 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32, providers: &[Pr
     // here and is bumped too. Harmless — that task's success/not_found deletes
     // the row well before attempts reaches the cap.
     {
-        if let Err(e) = state.db.increment_pending_attempts(bssids.clone()).await {
-            warn!("failed to increment pending attempts: {e}");
-            state.record_db_failure();
+        if let Some(_privacy) = state.privacy.read(ticket).await {
+            if let Err(e) = state.db.increment_pending_attempts(bssids.clone()).await {
+                warn!("failed to increment pending attempts: {e}");
+                state.record_db_failure();
+            }
         }
     }
 }
@@ -177,6 +198,7 @@ mod tests {
             _db_runtime: Some(db_runtime),
             test_db: std::sync::Mutex::new(test_db),
             debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(10, 5)),
+            privacy: crate::privacy::PrivacyCoordinator::new(),
             connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
             args,
             wigle: crate::wigle::WigleClient::new("", ""),
@@ -184,12 +206,14 @@ mod tests {
             nominatim: crate::nominatim::NominatimClient::new(),
             geocode: crate::server::geocode::GeocodeScheduler::new(shutdown.clone()),
             last_fix: tokio::sync::Mutex::new(None),
-            inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
             db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             shutdown,
             tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            privacy_wipes: std::sync::Mutex::new(tokio::task::JoinSet::new()),
             orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -236,6 +260,7 @@ mod tests {
             &state,
             &providers,
             &drain_policy(),
+            state.privacy.ticket(),
         )
         .await;
 
@@ -274,6 +299,7 @@ mod tests {
             &state,
             &providers,
             &drain_policy(),
+            state.privacy.ticket(),
         )
         .await;
 
@@ -312,6 +338,7 @@ mod tests {
             &state,
             &providers,
             &drain_policy(),
+            state.privacy.ticket(),
         )
         .await;
 
@@ -349,6 +376,7 @@ mod tests {
             &state,
             &providers,
             &drain_policy(),
+            state.privacy.ticket(),
         )
         .await;
 
@@ -390,7 +418,14 @@ mod tests {
             Provider::Mock(std::sync::Arc::clone(&wigle)),
         ];
         let bssids = [b1.clone(), b2.clone()];
-        let _ = resolve_chain(&bssids, &state, &providers, &drain_policy()).await;
+        let _ = resolve_chain(
+            &bssids,
+            &state,
+            &providers,
+            &drain_policy(),
+            state.privacy.ticket(),
+        )
+        .await;
 
         assert_eq!(
             wigle.call_count(),
@@ -434,6 +469,7 @@ mod tests {
             &state,
             &providers,
             &drain_policy(),
+            state.privacy.ticket(),
         )
         .await;
 
@@ -462,7 +498,7 @@ mod tests {
         let providers = [mock("skip", |_| ProviderOutcome::Skipped)];
         // attempts: 0 -> 1 -> 2, then delete_expired removes it at attempts>=2.
         for _ in 0..(max_attempts + 1) {
-            drain_once(&state, max_attempts, &providers).await;
+            drain_once(&state, max_attempts, &providers, state.privacy.ticket()).await;
         }
 
         assert!(
@@ -493,8 +529,8 @@ mod tests {
         let providers = [mock("skip", |_| ProviderOutcome::Skipped)];
         // High cap so nothing expires; we are testing rotation, not age-out.
         let max_attempts = 1000;
-        drain_once(&state, max_attempts, &providers).await;
-        drain_once(&state, max_attempts, &providers).await;
+        drain_once(&state, max_attempts, &providers, state.privacy.ticket()).await;
+        drain_once(&state, max_attempts, &providers, state.privacy.ticket()).await;
 
         let all = crate::server::lock_db(&state)
             .get_pending(total * 2)

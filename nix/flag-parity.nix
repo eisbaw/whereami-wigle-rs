@@ -49,6 +49,7 @@ let
     httpTimeoutSecs = 1;
     nominatimTimeoutSecs = 1;
     historyRetentionDays = 1;
+    apsRetentionDays = 1;
     historySegmentDistanceM = 1;
     historySegmentMinDurationSecs = 1;
   };

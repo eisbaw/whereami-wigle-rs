@@ -5,6 +5,24 @@ and the project follows semver.
 
 ## [Unreleased]
 
+### Added — privacy retention and wipe
+
+- `whereami wipe --yes` deletes AP, pending, negative-cache, fix-history, and
+  last-fix rows in one transaction, reports exact counts, resets the fix-ID
+  sequence, and clears managed in-memory location state. It is deliberately
+  Unix-socket-only; unauthenticated TCP is refused, while every socket-authorized
+  user can wipe (there is no read-only role). Wipes are single-flight with the
+  stable `wipe: busy; retry later` response. Collection may resume after the
+  response-write attempt terminates by success, failure, timeout, or disconnect;
+  an unknown result can be retried idempotently. The command is logical rather
+  than forensic erasure. A panic in the post-commit memory/epoch continuation
+  now retains the publication guard through a nonzero fail-stop exit instead of
+  recovering the actor into inconsistent persisted and in-memory state.
+- Resolved AP rows now have configurable retention via
+  `--aps-retention-days` / `services.whereami.apsRetentionDays` (default 30;
+  `0` keeps indefinitely). AP and fix retention run immediately at startup and
+  then daily in alternating 1,000-row transactions.
+
 ### Security / Changed — BREAKING: control channel is now a Unix domain socket
 
 The daemon's control channel moved from unauthenticated loopback TCP to a **Unix

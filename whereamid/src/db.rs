@@ -57,10 +57,75 @@ const PRUNE_FIXES_CHUNK_SQL: &str = "DELETE FROM fixes WHERE id IN (
          WHERE at_rfc3339 < ?1 ORDER BY at_rfc3339 LIMIT ?2
      )";
 
+const PRUNE_APS_CHUNK_SQL: &str = "DELETE FROM aps WHERE bssid IN (
+         SELECT bssid FROM aps INDEXED BY idx_aps_last_seen
+         WHERE last_seen < ?1 ORDER BY last_seen LIMIT ?2
+     )";
+
+/// Operational ceiling shared by daemon validation and the Nix module. It is
+/// intentionally generous (one thousand years) while keeping cutoff arithmetic
+/// representable and rejecting absurd values before startup side effects.
+pub const MAX_RETENTION_DAYS: i64 = 365_000;
+
+pub const RETENTION_CHUNK_SIZE: usize = 1_000;
+
 type DbJob = Box<dyn FnOnce(&mut Database) + Send + 'static>;
+
+const FAIL_STOP_EXIT_CODE: i32 = 70;
+
+#[cfg(test)]
+pub(crate) const FAIL_STOP_TEST_ENTERED_ENV: &str = "WHEREAMID_FAIL_STOP_TEST_ENTERED";
+#[cfg(test)]
+pub(crate) const FAIL_STOP_TEST_RELEASE_ENV: &str = "WHEREAMID_FAIL_STOP_TEST_RELEASE";
+
+fn fail_stop_after_actor_panic(actor: &'static str, operation: &'static str) -> ! {
+    #[cfg(test)]
+    if let (Some(entered), Some(release)) = (
+        std::env::var_os(FAIL_STOP_TEST_ENTERED_ENV),
+        std::env::var_os(FAIL_STOP_TEST_RELEASE_ENV),
+    ) {
+        // Exact subprocess-only fatal-path barrier. The guarded caller invokes
+        // fail-stop from its inner catch while its invariant guard is still a
+        // live local, so pausing here must keep privacy publication barred.
+        if std::fs::write(&entered, b"entered").is_ok() {
+            let release = std::path::PathBuf::from(release);
+            while !release.exists() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    // Diagnostics are best-effort, but a broken subscriber/stderr must never
+    // turn fail-stop back into actor-only failure. Catch any secondary panic,
+    // then terminate through the non-returning process primitive. The guarded
+    // call site still owns its publication barrier throughout this function,
+    // including if either diagnostic blocks.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tracing::error!(
+            actor,
+            operation,
+            exit_code = FAIL_STOP_EXIT_CODE,
+            "fatal database invariant transition panicked; terminating process"
+        );
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "fatal: database actor {actor} fail-stop operation \
+             {operation:?} panicked; exiting {FAIL_STOP_EXIT_CODE}"
+        );
+    }));
+    std::process::exit(FAIL_STOP_EXIT_CODE)
+}
 
 enum DbCommand {
     Run(DbJob),
+    /// This job owns an already-committed invariant transition whose unwind
+    /// cannot be repaired by dropping its result. A panic must terminate the
+    /// whole process before it can serve split persisted/in-memory state.
+    RunFailStop {
+        operation: &'static str,
+        job: DbJob,
+    },
     Stop(tokio::sync::oneshot::Sender<()>),
 }
 
@@ -199,6 +264,17 @@ impl DbActor {
                                     tracing::error!(actor = name, "database actor job panicked");
                                 }
                             }
+                            DbCommand::RunFailStop { operation, job } => {
+                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    job(&mut db)
+                                }))
+                                .is_err()
+                                {
+                                    // Process-wide termination is intentional: unwinding only this
+                                    // actor would let the daemon continue with irreconcilable state.
+                                    fail_stop_after_actor_panic(name, operation);
+                                }
+                            }
                             DbCommand::Stop(done) => {
                                 stop_done = Some(done);
                                 break;
@@ -332,6 +408,16 @@ pub struct DbStats {
     pub not_found_aps: i64,
     pub db_size_bytes: i64,
     pub api_calls_today: u32,
+}
+
+/// Exact row counts removed by one committed privacy wipe transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrivacyWipeCounts {
+    pub aps_deleted: usize,
+    pub pending_deleted: usize,
+    pub not_found_deleted: usize,
+    pub fixes_deleted: usize,
+    pub last_fix_deleted: usize,
 }
 
 impl DbRuntime {
@@ -534,15 +620,80 @@ impl DbHandle {
         R: Send + 'static,
         F: FnOnce(&mut Database) -> Result<R> + Send + 'static,
     {
+        Self::call_durable_queued(sender, operation, None).await
+    }
+
+    async fn call_durable_queued<R, F>(
+        sender: &mpsc::Sender<DbCommand>,
+        operation: F,
+        queued: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Database) -> Result<R> + Send + 'static,
+    {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         sender
             .send(DbCommand::Run(Box::new(move |db| {
                 let _ = result_tx.send(operation(db));
             })))
             .map_err(|_| anyhow::anyhow!("database actor is not running"))?;
+        if let Some(queued) = queued {
+            let _ = queued.send(());
+        }
         result_rx
             .await
             .map_err(|_| anyhow::anyhow!("database actor dropped durable request"))?
+    }
+
+    /// Durable command for a transition that becomes irrecoverable part-way
+    /// through its closure. `guard` remains a local outside the inner unwind
+    /// boundary, so fail-stop begins before the invariant guard can drop.
+    /// Normal `Result::Err` values release the guard and return to the caller;
+    /// only a panic invokes the process-wide fail-stop policy.
+    async fn call_durable_fail_stop_guarded_queued<R, G, F>(
+        sender: &mpsc::Sender<DbCommand>,
+        operation_name: &'static str,
+        guard: G,
+        operation: F,
+        queued: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<(R, G)>
+    where
+        R: Send + 'static,
+        G: Send + 'static,
+        F: FnOnce(&mut Database, &mut G) -> Result<R> + Send + 'static,
+    {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(DbCommand::RunFailStop {
+                operation: operation_name,
+                job: Box::new(move |db| {
+                    let mut guard = guard;
+                    let transition = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        operation(db, &mut guard)
+                    }));
+                    let result = match transition {
+                        Ok(Ok(value)) => Ok((value, guard)),
+                        Ok(Err(error)) => {
+                            // The transaction rolled back and managed state was
+                            // not touched. Release the actor-owned invariant
+                            // guard before publishing the error, so response
+                            // delivery cannot race its admission/lease drop.
+                            drop(guard);
+                            Err(error)
+                        }
+                        Err(_) => fail_stop_after_actor_panic("database writer", operation_name),
+                    };
+                    let _ = result_tx.send(result);
+                }),
+            })
+            .map_err(|_| anyhow::anyhow!("database actor is not running"))?;
+        if let Some(queued) = queued {
+            let _ = queued.send(());
+        }
+        result_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("database actor dropped fail-stop request"))?
     }
 
     async fn call_interruptible<R, F>(
@@ -1035,6 +1186,55 @@ impl DbHandle {
             .await
     }
 
+    /// Delete every persisted privacy-bearing row in one durable transaction.
+    /// Once enqueued, dropping the async waiter does not cancel the deletion.
+    #[allow(dead_code)]
+    pub async fn wipe_privacy_data(&self) -> Result<PrivacyWipeCounts> {
+        self.write_durable(Database::wipe_privacy_data).await
+    }
+
+    /// Run a synchronous continuation on the writer actor immediately after a
+    /// successful wipe commit. The caller's invariant `guard` remains outside
+    /// the continuation's inner unwind boundary and is returned on success.
+    /// Both remain owned by the durable actor command if the async waiter is
+    /// cancelled. On DB error the continuation is dropped without running and
+    /// the guard is released normally. A panic is process-fatal while the guard
+    /// is still held: after COMMIT, recovering only the actor could expose empty
+    /// persisted state alongside stale managed memory.
+    #[allow(dead_code)]
+    pub(crate) async fn wipe_privacy_data_then<R, G, F>(
+        &self,
+        guard: G,
+        after_commit: F,
+        queued: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<(PrivacyWipeCounts, R, G)>
+    where
+        R: Send + 'static,
+        G: Send + 'static,
+        F: FnOnce(&mut G) -> R + Send + 'static,
+    {
+        let ((counts, continuation), guard) = Self::call_durable_fail_stop_guarded_queued(
+            &self.writer,
+            "privacy wipe committed-state continuation",
+            guard,
+            move |db, guard| {
+                let counts = db.wipe_privacy_data()?;
+                Ok((counts, after_commit(guard)))
+            },
+            queued,
+        )
+        .await?;
+        Ok((counts, continuation, guard))
+    }
+
+    #[cfg(test)]
+    async fn wipe_privacy_data_queued(
+        &self,
+        queued: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<PrivacyWipeCounts> {
+        Self::call_durable_queued(&self.writer, Database::wipe_privacy_data, Some(queued)).await
+    }
+
     // `db.rs` is compiled into both the library and daemon targets. The
     // daemon uses the guarded variant; DB unit tests use this plain variant.
     #[allow(dead_code)]
@@ -1117,25 +1317,61 @@ impl DbHandle {
             .await
     }
 
+    #[allow(dead_code)]
     pub async fn prune_fixes(&self, retention_days: i64) -> Result<usize> {
-        if retention_days <= 0 {
+        let Some(cutoff) = retention_cutoff(retention_days)? else {
             return Ok(0);
-        }
-        let cutoff = (Utc::now() - chrono::TimeDelta::days(retention_days)).to_rfc3339();
+        };
         let mut total = 0;
         loop {
             let cutoff = cutoff.clone();
             let deleted = self
-                .write(move |db| db.prune_fixes_chunk(&cutoff, 1_000))
+                .write(move |db| db.prune_fixes_chunk(&cutoff, RETENTION_CHUNK_SIZE))
                 .await?;
             total += deleted;
-            if deleted < 1_000 {
+            if deleted < RETENTION_CHUNK_SIZE {
                 return Ok(total);
             }
             // Re-enqueue the next chunk at the tail so quota reservations and
             // shutdown metadata already waiting on the writer get a turn.
             tokio::task::yield_now().await;
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn prune_fixes_before_chunk(
+        &self,
+        cutoff: impl Into<String>,
+    ) -> Result<usize> {
+        let cutoff = cutoff.into();
+        self.write(move |db| db.prune_fixes_chunk(&cutoff, RETENTION_CHUNK_SIZE))
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn prune_aps(&self, retention_days: i64) -> Result<usize> {
+        let Some(cutoff) = retention_cutoff(retention_days)? else {
+            return Ok(0);
+        };
+        let mut total = 0;
+        loop {
+            let cutoff = cutoff.clone();
+            let deleted = self
+                .write(move |db| db.prune_aps_chunk(&cutoff, RETENTION_CHUNK_SIZE))
+                .await?;
+            total += deleted;
+            if deleted < RETENTION_CHUNK_SIZE {
+                return Ok(total);
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn prune_aps_before_chunk(&self, cutoff: impl Into<String>) -> Result<usize> {
+        let cutoff = cutoff.into();
+        self.write(move |db| db.prune_aps_chunk(&cutoff, RETENTION_CHUNK_SIZE))
+            .await
     }
 
     pub async fn debug_statuses(
@@ -1196,6 +1432,24 @@ fn parse_api_calls_value(raw: Option<String>) -> Result<u32> {
             anyhow::anyhow!("corrupt metadata.api_calls_today value: {s:?}")
         }),
     }
+}
+
+/// Compute one fixed UTC cutoff for a retention sweep. `0` disables pruning;
+/// negative or over-policy values fail safe instead of turning into a future
+/// cutoff or overflowing Chrono arithmetic.
+pub fn retention_cutoff(retention_days: i64) -> Result<Option<String>> {
+    if retention_days == 0 {
+        return Ok(None);
+    }
+    if !(1..=MAX_RETENTION_DAYS).contains(&retention_days) {
+        anyhow::bail!("retention days must be in 0..={MAX_RETENTION_DAYS}, got {retention_days}");
+    }
+    let delta = chrono::TimeDelta::try_days(retention_days)
+        .ok_or_else(|| anyhow::anyhow!("retention duration is not representable"))?;
+    let cutoff = Utc::now()
+        .checked_sub_signed(delta)
+        .ok_or_else(|| anyhow::anyhow!("retention cutoff is not representable"))?;
+    Ok(Some(cutoff.to_rfc3339()))
 }
 
 /// A historical fix row from the `fixes` table (task-0031). Each row records
@@ -1283,6 +1537,13 @@ fn tighten_file_to_0600(path: &Path) {
 }
 
 impl Database {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn execute_batch_for_test(&self, sql: &str) -> Result<()> {
+        self.conn.execute_batch(sql)?;
+        Ok(())
+    }
+
     /// Open or create the database at `path`. Sets WAL mode and creates schema if needed.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
@@ -2420,6 +2681,27 @@ impl Database {
         Ok(())
     }
 
+    /// Remove all persisted location and observed-network state atomically.
+    /// Schema and operational metadata (quota + shutdown observability) remain.
+    fn wipe_privacy_data(&mut self) -> Result<PrivacyWipeCounts> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let counts = PrivacyWipeCounts {
+            aps_deleted: tx.execute("DELETE FROM aps", [])?,
+            pending_deleted: tx.execute("DELETE FROM pending", [])?,
+            not_found_deleted: tx.execute("DELETE FROM not_found", [])?,
+            fixes_deleted: tx.execute("DELETE FROM fixes", [])?,
+            last_fix_deleted: tx.execute("DELETE FROM last_fix", [])?,
+        };
+        // AUTOINCREMENT stores the historical high-water mark separately from
+        // fixes. It carries no coordinates, but retaining the prior count would
+        // contradict "delete all history" and leaks how many fixes once existed.
+        tx.execute("DELETE FROM sqlite_sequence WHERE name = 'fixes'", [])?;
+        tx.commit()?;
+        Ok(counts)
+    }
+
     /// Read fix rows whose `at_rfc3339` falls within `[start_rfc3339, end_rfc3339]`,
     /// in ascending time order.
     pub fn get_fixes_in_range(
@@ -2456,17 +2738,14 @@ impl Database {
     /// forever" (matching the `--history-retention-days` help text), so it
     /// early-returns `Ok(0)` and deletes nothing. Without this guard the
     /// cutoff would equal `now` and every sweep would wipe the entire
-    /// history. Negative values are rejected at startup by `Args::validate`
-    /// (fail-fast in config.rs); the guard is `<= 0` rather than `== 0` so
-    /// that this `pub` DELETE fails *safe* (no-op) rather than *catastrophic*
-    /// (a negative would make the cutoff a future time and wipe everything)
-    /// even if some future caller bypasses `validate`.
+    /// history. Negative and over-policy values are rejected here as well as
+    /// at startup, so a future caller that bypasses `Args::validate` still
+    /// cannot turn them into a future cutoff and delete live history.
     #[cfg(test)]
     pub fn prune_fixes(&self, retention_days: i64) -> Result<usize> {
-        if retention_days <= 0 {
+        let Some(cutoff) = retention_cutoff(retention_days)? else {
             return Ok(0);
-        }
-        let cutoff = (Utc::now() - chrono::TimeDelta::days(retention_days)).to_rfc3339();
+        };
         let n = self
             .conn
             .execute("DELETE FROM fixes WHERE at_rfc3339 < ?1", params![cutoff])?;
@@ -2478,6 +2757,26 @@ impl Database {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let deleted = tx.execute(PRUNE_FIXES_CHUNK_SQL, params![cutoff, limit as i64])?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    #[cfg(test)]
+    pub fn prune_aps(&self, retention_days: i64) -> Result<usize> {
+        let Some(cutoff) = retention_cutoff(retention_days)? else {
+            return Ok(0);
+        };
+        let n = self
+            .conn
+            .execute("DELETE FROM aps WHERE last_seen < ?1", params![cutoff])?;
+        Ok(n)
+    }
+
+    fn prune_aps_chunk(&mut self, cutoff: &str, limit: usize) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(PRUNE_APS_CHUNK_SQL, params![cutoff, limit as i64])?;
         tx.commit()?;
         Ok(deleted)
     }
@@ -2622,6 +2921,225 @@ mod tests {
     }
 
     #[test]
+    fn aps_prune_chunk_selection_is_index_search_not_full_scan() {
+        let db = Database::open_memory().unwrap();
+        let explain = format!("EXPLAIN QUERY PLAN {PRUNE_APS_CHUNK_SQL}");
+        let mut stmt = db.conn.prepare(&explain).unwrap();
+        let details: Vec<String> = stmt
+            .query_map(params!["2020-01-01T00:00:00+00:00", 1_000_i64], |row| {
+                row.get(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("SEARCH aps") && detail.contains("idx_aps_last_seen")
+            }),
+            "expired AP selection must SEARCH idx_aps_last_seen: {details:?}"
+        );
+        assert!(
+            details.iter().all(|detail| !detail.contains("SCAN aps")),
+            "AP prune plan must never full-scan aps: {details:?}"
+        );
+    }
+
+    #[test]
+    fn aps_prune_strict_cutoff_and_chunk_counts() {
+        let mut db = Database::open_memory().unwrap();
+        let tx = db.conn.transaction().unwrap();
+        for index in 0..2_505 {
+            tx.execute(
+                "INSERT INTO aps (
+                    bssid, lat, lon, source, source_priority,
+                    first_seen, last_seen, fetched_at
+                 ) VALUES (?1, 1.0, 2.0, 'apple', 40, ?2, ?2, ?2)",
+                params![format!("old-{index:04}"), "2010-01-01T00:00:00+00:00"],
+            )
+            .unwrap();
+        }
+        for (bssid, seen) in [
+            ("at-cutoff", "2020-01-01T00:00:00+00:00"),
+            ("new", "2030-01-01T00:00:00+00:00"),
+        ] {
+            tx.execute(
+                "INSERT INTO aps (
+                    bssid, lat, lon, source, source_priority,
+                    first_seen, last_seen, fetched_at
+                 ) VALUES (?1, 1.0, 2.0, 'apple', 40, ?2, ?2, ?2)",
+                params![bssid, seen],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let cutoff = "2020-01-01T00:00:00+00:00";
+        assert_eq!(db.prune_aps_chunk(cutoff, 1_000).unwrap(), 1_000);
+        assert_eq!(db.prune_aps_chunk(cutoff, 1_000).unwrap(), 1_000);
+        assert_eq!(db.prune_aps_chunk(cutoff, 1_000).unwrap(), 505);
+        assert_eq!(db.prune_aps_chunk(cutoff, 1_000).unwrap(), 0);
+        let remaining: Vec<String> = db
+            .conn
+            .prepare("SELECT bssid FROM aps ORDER BY bssid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["at-cutoff", "new"]);
+    }
+
+    #[test]
+    fn retention_cutoff_zero_negative_and_huge_are_safe() {
+        assert_eq!(retention_cutoff(0).unwrap(), None);
+        assert!(retention_cutoff(-1).is_err());
+        assert!(retention_cutoff(MAX_RETENTION_DAYS + 1).is_err());
+
+        let db = Database::open_memory().unwrap();
+        let ap = sample_ap(1);
+        db.upsert_ap(&ap).unwrap();
+        db.conn
+            .execute("UPDATE aps SET last_seen = '1000-01-01T00:00:00+00:00'", [])
+            .unwrap();
+        assert_eq!(db.prune_aps(0).unwrap(), 0);
+        assert!(db.prune_aps(-1).is_err());
+        assert!(db.prune_aps(MAX_RETENTION_DAYS + 1).is_err());
+        assert_eq!(db.cached_ap_count().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn actor_fifo_touch_refreshes_ap_before_retention_prune() {
+        let (runtime, handle, legacy) = DbRuntime::open_test().unwrap();
+        let ap = sample_ap(2);
+        legacy.upsert_ap(&ap).unwrap();
+        legacy
+            .conn
+            .execute(
+                "UPDATE aps SET last_seen = '2000-01-01T00:00:00+00:00' WHERE bssid = ?1",
+                params![&ap.bssid],
+            )
+            .unwrap();
+
+        assert_eq!(
+            handle
+                .lookup_cached_touch(vec![ap.bssid.clone()])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(handle.prune_aps(30).await.unwrap(), 0);
+        assert_eq!(handle.stats().await.unwrap().cached_aps, 1);
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+    }
+
+    fn seed_every_privacy_table(db: &Database) {
+        db.upsert_ap(&sample_ap(1)).unwrap();
+        db.insert_pending("pending", Some("ssid"), Some(6), Some(2437), Some(-40))
+            .unwrap();
+        db.insert_not_found("not-found").unwrap();
+        db.insert_fix("2026-01-01T00:00:00+00:00", 1.0, 2.0, 3.0, 4)
+            .unwrap();
+        db.set_last_fix(&LastFixRow {
+            lat: 1.0,
+            lon: 2.0,
+            accuracy_m: 3.0,
+            address: Some("private address".to_string()),
+            at_rfc3339: "2026-01-01T00:00:00+00:00".to_string(),
+            sources: 4,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn privacy_wipe_is_atomic_counted_idempotent_and_reusable() {
+        let mut db = Database::open_memory().unwrap();
+        seed_every_privacy_table(&db);
+        db.set_metadata("api_calls_today", "7").unwrap();
+        db.set_metadata("api_calls_date", "2026-07-05").unwrap();
+        let schema_before = db.get_schema_version();
+        let sequence_before: i64 = db
+            .conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'fixes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sequence_before, 1);
+
+        let counts = db.wipe_privacy_data().unwrap();
+        assert_eq!(
+            counts,
+            PrivacyWipeCounts {
+                aps_deleted: 1,
+                pending_deleted: 1,
+                not_found_deleted: 1,
+                fixes_deleted: 1,
+                last_fix_deleted: 1,
+            }
+        );
+        assert_eq!(db.cached_ap_count().unwrap(), 0);
+        assert_eq!(db.pending_ap_count().unwrap(), 0);
+        assert_eq!(db.not_found_ap_count().unwrap(), 0);
+        assert!(db.get_fixes_in_range("0000", "9999").unwrap().is_empty());
+        assert!(db.get_last_fix().unwrap().is_none());
+        assert_eq!(db.get_schema_version(), schema_before);
+        assert_eq!(
+            db.get_metadata("api_calls_today").unwrap().as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            db.get_metadata("api_calls_date").unwrap().as_deref(),
+            Some("2026-07-05")
+        );
+        let sequence_after: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'fixes'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(sequence_after, None);
+        assert_eq!(
+            db.wipe_privacy_data().unwrap(),
+            PrivacyWipeCounts::default()
+        );
+
+        // Normal operation resumes, and resetting sqlite_sequence makes the
+        // first new history row start from a clean high-water mark.
+        seed_every_privacy_table(&db);
+        let new_id: i64 = db
+            .conn
+            .query_row("SELECT id FROM fixes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(new_id, 1);
+    }
+
+    #[test]
+    fn privacy_wipe_rolls_back_every_table_on_mid_transaction_error() {
+        let mut db = Database::open_memory().unwrap();
+        seed_every_privacy_table(&db);
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_fix_wipe BEFORE DELETE ON fixes
+                 BEGIN SELECT RAISE(ABORT, 'injected wipe failure'); END;",
+            )
+            .unwrap();
+
+        let error = db.wipe_privacy_data().unwrap_err();
+        assert!(error.to_string().contains("injected wipe failure"));
+        assert_eq!(db.cached_ap_count().unwrap(), 1);
+        assert_eq!(db.pending_ap_count().unwrap(), 1);
+        assert_eq!(db.not_found_ap_count().unwrap(), 1);
+        assert_eq!(db.get_fixes_in_range("0000", "9999").unwrap().len(), 1);
+        assert!(db.get_last_fix().unwrap().is_some());
+    }
+
+    #[test]
     fn file_database_uses_wal_normal_and_named_busy_timeout() {
         let dir = unique_tempdir("task0192-pragmas");
         let path = dir.join("whereami.db");
@@ -2718,6 +3236,40 @@ mod tests {
             sender.send(DbCommand::Run(Box::new(|_| {}))).is_err(),
             "surviving sender must observe the joined actor receiver as closed"
         );
+    }
+
+    #[test]
+    fn ordinary_actor_job_panic_is_recoverable() {
+        let actor =
+            DbActor::spawn("whereamid-test-recoverable-panic", Database::open_memory).unwrap();
+        let sender = actor.tx.clone();
+        let (panicking_started_tx, panicking_started_rx) = mpsc::channel();
+        sender
+            .send(DbCommand::Run(Box::new(move |_| {
+                panicking_started_tx.send(()).unwrap();
+                panic!("injected recoverable actor-job panic");
+            })))
+            .unwrap();
+        panicking_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ordinary panicking job must start");
+
+        let (followup_tx, followup_rx) = mpsc::channel();
+        sender
+            .send(DbCommand::Run(Box::new(move |db| {
+                let reusable = db.cached_ap_count().unwrap() == 0;
+                followup_tx.send(reusable).unwrap();
+            })))
+            .unwrap();
+        assert!(
+            followup_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("actor must execute work after an ordinary job panic"),
+            "ordinary panic recovery must leave the database connection usable"
+        );
+
+        drop(sender);
+        drop(actor);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2939,6 +3491,47 @@ mod tests {
         handle.writer_barrier().await.unwrap();
 
         assert_eq!(handle.get_metadata("cancelled-write").await.unwrap(), None);
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_queued_privacy_wipe_still_commits_durably() {
+        let (runtime, handle, legacy) = DbRuntime::open_test().unwrap();
+        seed_every_privacy_table(&legacy);
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker_handle = handle.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_handle
+                .hold_writer_until(blocked_tx, release_rx)
+                .await
+        });
+        blocked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer blocker must start");
+
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let wipe_handle = handle.clone();
+        let wipe =
+            tokio::spawn(async move { wipe_handle.wipe_privacy_data_queued(queued_tx).await });
+        queued_rx.await.unwrap();
+        wipe.abort();
+        assert!(wipe.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        handle.writer_barrier().await.unwrap();
+
+        let stats = handle.stats().await.unwrap();
+        assert_eq!(stats.cached_aps, 0);
+        assert_eq!(stats.pending_aps, 0);
+        assert_eq!(stats.not_found_aps, 0);
+        assert!(handle.get_last_fix().await.unwrap().is_none());
+        assert!(handle
+            .get_fixes_in_range("0000", "9999")
+            .await
+            .unwrap()
+            .is_empty());
         drop(handle);
         runtime.shutdown().await.unwrap();
     }
@@ -4049,11 +4642,9 @@ mod tests {
             "no fixes should be deleted with retention 0"
         );
 
-        // Defense-in-depth: a negative retention must also be a no-op, not a
-        // full wipe (cutoff would otherwise be in the future). validate()
-        // rejects negatives upstream, but this pub DELETE must fail safe.
-        let pruned_neg = db.prune_fixes(-5).unwrap();
-        assert_eq!(pruned_neg, 0, "negative retention must delete nothing");
+        // Defense-in-depth: a negative retention must be rejected before SQL,
+        // not converted into a future cutoff that could wipe live history.
+        assert!(db.prune_fixes(-5).is_err());
         let remaining = db
             .get_fixes_in_range("2000-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00")
             .unwrap();

@@ -43,14 +43,19 @@ Responsibilities:
 - Atomically reserve outbound WiGLE API calls against a daily quota
 - Persist last-known fix and a fix timeseries (location-history feature)
 - Drain pending lookups in the background when connectivity returns
+- Prune fix history and AP observations under independently configurable
+  retention windows (30 days by default; 0 keeps the table indefinitely)
+- Provide a confirmed, Unix-socket-only wipe of logical location/AP state
 - Drop `--address-approx` reverse-geocode calls onto a TTL'd cache so the
   locate hot path never blocks on Nominatim's 1 req/s rate limit
 
 ### whereami-client (Rust library crate)
 
-Thin TCP client. Connect, send JSON, read JSON response. Exists so Rust callers don't hand-roll the protocol. Other languages just open a TCP socket and send/receive JSON lines — no client library needed.
+Typed client for the Unix control socket, with explicit opt-in TCP support.
+Connect, send JSON, and read one JSON response. Other languages can open the
+Unix socket and use the same JSON-lines protocol without a client library.
 
-## TCP Protocol
+## Control Protocol
 
 Request and response are each a single line of JSON terminated by `\n`.
 
@@ -120,6 +125,34 @@ Response:
 ```json
 {"ok": true, "v": 1, "cached_aps": 14823, "pending_aps": 3, "not_found_aps": 12, "db_size_bytes": 2097152, "api_calls_today": 42}
 ```
+
+**`wipe`** — Delete logical location and observed-network state. This command
+is accepted only over the filesystem-permission-gated Unix socket and requires
+the exact confirmation literal. Every user authorized to connect to that socket
+can wipe; there is no read-only or per-command role. The literal prevents
+accidental invocation but is not an additional authorization layer.
+
+```json
+{"cmd":"wipe","confirm":"delete-all-location-data"}
+```
+
+Response:
+```json
+{"ok":true,"v":1,"aps_deleted":1,"pending_deleted":1,"not_found_deleted":1,"fixes_deleted":12,"last_fix_deleted":1}
+```
+
+The transaction also resets the `fixes` AUTOINCREMENT sequence, while retaining
+schema and operational metadata. After commit, all managed in-memory location
+state is cleared while exclusive and the publication epoch advances last. The
+exclusive boundary ends when the response-write attempt terminates by success,
+failure, timeout, or disconnect; collection remains enabled and can then
+repopulate. If no complete response arrives, completion is unknown: verify or
+retry the idempotent wipe. The operation is logical deletion, not forensic
+erasure of WAL/free pages, allocator/process-memory remnants outside managed
+caches, snapshots, backups, logs, or storage media. A panic in the post-commit
+memory/epoch continuation retains the publication boundary through fail-stop
+and exits nonzero; the daemon must never recover only its database actor and
+serve split persisted/in-memory state.
 
 ### Error shape
 
@@ -223,7 +256,11 @@ The **pending table** acts as a work queue. The daemon drains it in the backgrou
 - On network error / 429: `attempts` incremented, row stays in `pending`
 - On `attempts >= max_attempts` (default 20, configurable via `--pending-max-attempts`): row deleted from `pending`, treated as permanently unresolvable
 
-No expiry on `aps` by default. APs don't move often. A future `purge` command could remove entries older than N days. Entries in `not_found` can be re-checked after a configurable TTL (default 30 days).
+The daemon prunes `fixes` older than `--history-retention-days` and `aps` rows
+whose `last_seen` is older than `--aps-retention-days`. Both default to 30 days;
+0 keeps the corresponding table indefinitely. One sweep runs immediately at
+startup and then daily in alternating 1,000-row transactions. Entries in
+`not_found` can be re-checked after a configurable TTL (default 30 days).
 
 ## Wi-Fi Scanning
 
@@ -384,6 +421,7 @@ whereamid \
   --http-timeout-secs 15 \               # Apple/WiGLE total timeout
   --nominatim-timeout-secs 30 \          # Nominatim total timeout
   --history-retention-days 30 \          # prune fixes older than N days
+  --aps-retention-days 30 \              # prune APs not seen for N days
   --history-segment-distance-m 100 \     # stay-point clustering threshold
   --history-segment-min-duration-secs 300  # min stay-point duration
 ```
@@ -457,7 +495,8 @@ A NixOS module at `nix/module.nix` that provides:
 ```nix
 services.whereami = {
   enable = true;
-  allowedUsers = [ "alice" ];   # users allowed to query the unix socket
+  # Full control-socket access, including destructive wipe; no read-only role.
+  allowedUsers = [ "alice" ];
   # bind = "127.0.0.1:4747";    # opt-in, unauthenticated TCP (off by default)
   wifiInterface = "wlan0";
   wigle = {

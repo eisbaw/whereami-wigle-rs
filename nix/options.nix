@@ -9,11 +9,15 @@
 #   - lib.types.ints.positive  (>= 1): the daemon bails when the value is 0/<=0.
 #   - lib.types.ints.unsigned  (>= 0): the daemon accepts 0 — either because
 #     validate() has NO check for it (scanFastDuration, dailyLimit) or because 0
-#     is the documented "disabled" value (addressCacheTtlDays, historyRetentionDays).
+#     is the documented "disabled" value (addressCacheTtlDays and retention
+#     windows).
 # Upper bounds are intentionally omitted for the other tuning options, so
-# clap's numeric range remains their runtime guard. `maxConnections` has the
-# shared explicit Rust/Nix policy range 1..4096.
-{
+# clap's numeric range remains their runtime guard. `maxConnections` and both
+# retention windows have shared explicit Rust/Nix policy ranges.
+let
+  # Must match whereamid::db::MAX_RETENTION_DAYS.
+  maxRetentionDays = 365000;
+in {
   enable = lib.mkEnableOption "whereami Wi-Fi geolocation daemon";
 
   package = lib.mkOption {
@@ -59,10 +63,12 @@
     type = lib.types.listOf lib.types.str;
     default = [ ];
     description = ''
-      Users permitted to query the daemon (SYSTEM module ONLY): they are added to
-      the `whereami` group that owns the 0660 control socket. The home-manager
-      module IGNORES this option — its socket lives under $XDG_RUNTIME_DIR
-      (0700, user-owned), so it is single-user by construction.
+      Users granted full daemon control-socket access (SYSTEM module ONLY): they
+      are added to the `whereami` group that owns the 0660 socket. Every listed
+      user can invoke destructive `whereami wipe --yes`; there is no read-only or
+      per-command role. The home-manager module IGNORES this option — its socket
+      lives under $XDG_RUNTIME_DIR (0700, user-owned), so its owner has the same
+      full capability by construction.
     '';
   };
 
@@ -203,13 +209,24 @@
   };
 
   historyRetentionDays = lib.mkOption {
-    # i64, validate() bails on <0; 0 disables pruning (fixes kept indefinitely).
-    type = lib.types.ints.unsigned;
+    # Mirrors the daemon's checked i64 policy; 0 keeps fixes indefinitely.
+    type = lib.types.ints.between 0 maxRetentionDays;
     default = 30;
     description = ''
       Days to retain rows in the location-history `fixes` table. Older rows are
       pruned periodically. 0 disables retention (no pruning); fixes are kept
       indefinitely. This governs how long location PII lives on disk.
+    '';
+  };
+
+  apsRetentionDays = lib.mkOption {
+    type = lib.types.ints.between 0 maxRetentionDays;
+    default = 30;
+    description = ''
+      Days to retain resolved access-point rows after `last_seen`. Older rows are
+      pruned periodically. 0 disables retention (no pruning); AP rows are kept
+      indefinitely. This governs how long observed BSSID/SSID/location data
+      lives on disk.
     '';
   };
 
