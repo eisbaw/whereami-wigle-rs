@@ -3693,6 +3693,132 @@ mod dispatch_tests {
     }
 
     #[tokio::test]
+    async fn locate_skips_non_finite_cached_ap_and_warns_with_bssid() {
+        use std::sync::{Arc, Mutex};
+        use tracing::{
+            field::{Field, Visit},
+            instrument::WithSubscriber as _,
+            span, Event, Metadata, Subscriber,
+        };
+
+        #[derive(Clone, Default)]
+        struct CapturedEvents(Arc<Mutex<Vec<(tracing::Level, String, String)>>>);
+
+        struct MessageVisitor(String);
+
+        impl Visit for MessageVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    self.0 = value.to_owned();
+                }
+            }
+        }
+
+        impl Subscriber for CapturedEvents {
+            fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+
+            fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+            fn event(&self, event: &Event<'_>) {
+                let mut visitor = MessageVisitor(String::new());
+                event.record(&mut visitor);
+                self.0.lock().expect("capture lock poisoned").push((
+                    *event.metadata().level(),
+                    event.metadata().target().to_owned(),
+                    visitor.0,
+                ));
+            }
+
+            fn enter(&self, _span: &span::Id) {}
+            fn exit(&self, _span: &span::Id) {}
+        }
+
+        const POISONED_BSSID: &str = "02:00:00:00:52:ff";
+        let state = test_state();
+        assert_eq!(state.args.top_n, 10);
+
+        cache_ap(&state, POISONED_BSSID, f64::INFINITY, 12.56);
+        let mut sample = crate::debounce::ScanSample::new();
+        sample.insert(
+            POISONED_BSSID.to_owned(),
+            crate::debounce::ScanEntry {
+                signal_dbm: -20,
+                ssid: Some("poisoned-fixed".to_owned()),
+                channel: Some(1),
+            },
+        );
+        for (index, (lat, lon)) in [(55.6760, 12.5680), (55.6761, 12.5682), (55.6759, 12.5681)]
+            .into_iter()
+            .enumerate()
+        {
+            let bssid = format!("02:00:00:00:52:{index:02x}");
+            cache_ap(&state, &bssid, lat, lon);
+            sample.insert(
+                bssid,
+                crate::debounce::ScanEntry {
+                    signal_dbm: -60 - index as i32,
+                    ssid: Some(format!("fixed-home-{index}")),
+                    channel: Some(1),
+                },
+            );
+        }
+        {
+            let mut debouncer = state.debouncer.lock().await;
+            for _ in 0..state.args.debounce_threshold {
+                debouncer.push_scan(sample.clone());
+            }
+        }
+
+        // Attach the subscriber to the future itself: a thread-local guard
+        // around future construction would end before the async handler is
+        // polled and could silently miss the production warning.
+        let captured = CapturedEvents::default();
+        let events = captured.clone();
+        let response = dispatch_command(&Request::Locate, &state)
+            .with_subscriber(captured)
+            .await;
+
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], true, "locate failed: {response}");
+        assert_eq!(json["cached"], 3, "the poisoned row must not be admitted");
+        assert_eq!(json["sources"], 3, "the poisoned row must not be a source");
+        assert_eq!(json["visible"], 4);
+        assert_eq!(json["stable"], 4);
+        assert!((json["lat"].as_f64().unwrap() - 55.6760).abs() < 0.001);
+        assert!((json["lon"].as_f64().unwrap() - 12.5681).abs() < 0.001);
+
+        let events = events.0.lock().expect("capture lock poisoned").clone();
+        let server_target = module_path!()
+            .strip_suffix("::dispatch_tests")
+            .expect("test module path must end in dispatch_tests");
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|(level, target, _)| *level == tracing::Level::WARN && target == server_target)
+            .map(|(_, _, message)| message.as_str())
+            .collect();
+        assert_eq!(
+            warnings,
+            [format!(
+                "skipping AP {POISONED_BSSID}: non-finite cached position (inf, 12.56)"
+            )],
+            "captured events: {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn persisted_mobile_and_non_finite_rows_cannot_starve_fallback_top_n() {
         let state = test_state();
         assert!(state.args.debounce_threshold > 1);
