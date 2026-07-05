@@ -19,4 +19,15 @@
       + "above the ring-buffer window can never be met and whereamid's Args::validate() "
       + "rejects it at startup.";
   }
+  {
+    # systemd environment assignments are line-oriented. Reject CR/LF here
+    # instead of relying on the NixOS and Home Manager unit renderers to agree
+    # on how (or whether) an embedded line break is escaped.
+    assertion =
+      cfg.rustLog == null
+      || (!lib.hasInfix "\n" cfg.rustLog && !lib.hasInfix "\r" cfg.rustLog);
+    message =
+      "services.whereami.rustLog must be a single-line RUST_LOG filter; "
+      + "carriage returns and newlines are not supported by systemd Environment=.";
+  }
 ]

@@ -152,6 +152,7 @@ pkgs.testers.runNixOSTest {
         # exec-start.nix -> unit ExecStart), asserted below via `systemctl cat`.
         historyRetentionDays = 7;
         apsRetentionDays = 11;
+        rustLog = "whereamid=debug";
         # task-0205: a 0600 root:root secrets file the DynamicUser must reach only
         # via LoadCredential (the module wires --config to $CREDENTIALS_DIRECTORY).
         credentialsFile = "/etc/whereami/secrets.toml";
@@ -171,9 +172,9 @@ pkgs.testers.runNixOSTest {
           api_key = "dummy-not-a-real-key"
         '';
       };
-      # Put the `whereami` client on PATH so the socket-access assertions use
-      # the real client path-resolution, not a hand-rolled socket poke.
-      environment.systemPackages = [ config.services.whereami.package pkgs.sqlite ];
+      # sqlite is test tooling. The whereami package itself must come from the
+      # production module's environment.systemPackages contract (TASK-0219).
+      environment.systemPackages = [ pkgs.sqlite ];
       users.users.alice = { isNormalUser = true; };
       users.users.mallory = { isNormalUser = true; };
 
@@ -202,7 +203,6 @@ pkgs.testers.runNixOSTest {
         debounceWindow = 1;
         debounceThreshold = 1;
       };
-      environment.systemPackages = [ config.services.whereami.package ];
       systemd.tmpfiles.rules = [
         "f /run/whereami-scan-mode 0644 root root - nmcli"
       ];
@@ -325,6 +325,27 @@ pkgs.testers.runNixOSTest {
             "journalctl -u whereamid.service --no-pager | "
             "grep -F 'control channel: unix socket ready'"
         )
+
+    with subtest("task-0219: module installs CLI and applies operator service controls"):
+        # The node no longer adds cfg.package itself. A working command proves
+        # services.whereami.enable supplies the operator CLI on the system PATH.
+        cli = machine.succeed("command -v whereami").strip()
+        assert cli == "/run/current-system/sw/bin/whereami", \
+            f"module-provided whereami CLI missing from canonical PATH: {cli!r}"
+        machine.succeed(
+            "systemctl show whereamid.service -p Environment --value | "
+            "grep -F 'RUST_LOG=whereamid=debug'"
+        )
+        restart = machine.succeed(
+            "systemctl show whereamid.service -p Restart -p StartLimitBurst "
+            "-p StartLimitIntervalUSec"
+        )
+        props = dict(line.split("=", 1) for line in restart.strip().splitlines())
+        assert props == {
+            "Restart": "on-failure",
+            "StartLimitBurst": "5",
+            "StartLimitIntervalUSec": "1min",
+        }, f"operator restart contract drifted: {props!r}"
 
     with subtest("(e) non-loopback bind without allowNonlocalBind refuses to start"):
         # Check this intentionally failing node before its preserved restart
@@ -497,6 +518,11 @@ pkgs.testers.runNixOSTest {
         # was built with.
         assert '"git_rev":"${gitRev}"' in out.replace(" ", ""), \
             f"expected embedded git_rev ${gitRev}, got: {out!r}"
+        alice_uid = machine.succeed("id -u alice").strip()
+        machine.wait_until_succeeds(
+            "journalctl -u whereamid.service --no-pager | "
+            f"grep -F 'unix connection uid={alice_uid} '"
+        )
 
     with subtest("task-0206: a newly-exposed flag reaches the unit ExecStart"):
         # historyRetentionDays=7 on the node must appear as --history-retention-days
@@ -524,6 +550,18 @@ pkgs.testers.runNixOSTest {
         machine.fail(
             "journalctl -u whereamid.service --no-pager | "
             "grep -F 'WiGLE credentials not configured'"
+        )
+        # systemd's protected managed copy is 0440 on this image. The daemon
+        # must recognize only that exact $CREDENTIALS_DIRECTORY/config path,
+        # rather than emitting its generic warning for an ordinary loose 0440
+        # file. Unit tests pin the ordinary and near-miss cases.
+        machine.fail(
+            "journalctl -u whereamid.service --no-pager | "
+            "grep -F 'WiGLE credentials file' | grep -F 'permissions'"
+        )
+        machine.fail(
+            "journalctl -u whereamid.service --no-pager | "
+            "grep -F 'another local user'"
         )
         # AC#1/#2: LoadCredential COPIES the source; the original must stay
         # 0600 root:root (nothing widened it to make it world-readable).
@@ -631,11 +669,11 @@ pkgs.testers.runNixOSTest {
         assert sqlite_value("SELECT count(*) FROM aps;") == "1", \
             "TCP refusal must not delete state"
 
-        wipe = json.loads(machine.succeed(
+        member_wipe = json.loads(machine.succeed(
             "runuser -u alice -- env WHEREAMI_SOCKET=/run/whereami/whereamid.sock "
             "whereami --json wipe --yes"
         ))
-        assert wipe == {
+        assert member_wipe == {
             "ok": True,
             "v": 1,
             "aps_deleted": 1,
@@ -643,7 +681,23 @@ pkgs.testers.runNixOSTest {
             "not_found_deleted": 1,
             "fixes_deleted": 1,
             "last_fix_deleted": 1,
-        }, f"unexpected wipe response: {wipe!r}"
+        }, f"unexpected allowedUsers-member wipe response: {member_wipe!r}"
+
+        # Keep the documented root form covered independently. Wipe is
+        # idempotent, so the already-empty response must be an exact success.
+        root_wipe = json.loads(machine.succeed(
+            "env WHEREAMI_SOCKET=/run/whereami/whereamid.sock "
+            "whereami --json wipe --yes"
+        ))
+        assert root_wipe == {
+            "ok": True,
+            "v": 1,
+            "aps_deleted": 0,
+            "pending_deleted": 0,
+            "not_found_deleted": 0,
+            "fixes_deleted": 0,
+            "last_fix_deleted": 0,
+        }, f"unexpected idempotent root wipe response: {root_wipe!r}"
         assert sqlite_value(
             "SELECT (SELECT count(*) FROM aps) || ',' || "
             "(SELECT count(*) FROM pending) || ',' || "

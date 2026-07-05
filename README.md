@@ -21,15 +21,22 @@ Apple WPS on demand without an API key, and the cache lives on your disk.
 ## Quick start
 
 ```bash
-nix-shell                                     # or: nix develop (same dev shell)
-just build                                    # cargo build via Justfile
-cargo run --bin whereamid -- --interface $(ip -o link | awk -F': ' '/state UP/ && /wl/ {print $2; exit}')
+nix-shell                                      # or: nix develop (same dev shell)
+just build                                     # cargo build via Justfile
+export WHEREAMI_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/whereamid-$UID.sock"
+cargo run --bin whereamid -- \
+  --interface "$(ip -o link | awk -F': ' '/state UP/ && /wl/ {print $2; exit}')" \
+  --socket "$WHEREAMI_SOCKET" \
+  --db "$HOME/.local/share/whereami/aps.sqlite"
 # in another terminal:
-cargo run --bin whereami -- locate
+WHEREAMI_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/whereamid-$UID.sock" \
+  cargo run --bin whereami -- locate
 ```
 
 That's it. **Apple WPS works without any credentials.** WiGLE is optional and
-adds coverage; `wigle.net` gives a free key.
+adds coverage; `wigle.net` gives a free key. The explicit database and socket
+paths keep this manual, unprivileged run out of the compiled system defaults
+under `/var/lib` and `/run/whereami`.
 
 ## CLI usage
 
@@ -43,7 +50,7 @@ whereami debug               # per-BSSID debounce + DB classification
 whereami history 24h         # stay-point segments over the last 24 hours
 whereami history 7d          # last 7 days; supports s/m/h/d/w
 whereami history --from 2026-05-01T00:00:00+00:00 --to 2026-05-08T00:00:00+00:00
-whereami wipe --yes          # delete stored location and observed Wi-Fi data
+WHEREAMI_SOCKET=/path/to/whereamid.sock whereami wipe --yes # destructive; pin the daemon
 whereami version             # CLI + daemon versions
 whereami --json locate       # raw JSON output (any subcommand)
 whereami help
@@ -59,16 +66,19 @@ api_user = "AID..."   # optional; daemon runs without WiGLE creds
 api_key  = "..."
 ```
 
-Keep this file owner-only because another local user who can read or modify it
-can steal or replace the WiGLE API credentials:
+Manual and Home Manager deployments have the daemon read this ordinary file
+directly. Keep it owner-only because another local user who can read or modify
+it can steal or replace the WiGLE API credentials:
 
 ```bash
 chmod 600 ~/.config/whereami/config.toml
 ```
 
-At startup, the daemon warns when any group or world permission bit is set. It
-does not print credential values, change the mode, or reject the file; fix the
-permissions explicitly. Read-only owner access (`0400`) is also safe.
+For an ordinary file that it reads directly, the daemon warns when any group or
+world permission bit is set. It does not print credential values, change the
+mode, or reject the file; fix the permissions explicitly. Read-only owner
+access (`0400`) is also safe. The NixOS system service uses a separate,
+systemd-managed credential flow described below.
 
 Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
 
@@ -150,11 +160,10 @@ two tables. Configure the windows with `--history-retention-days` and
 `--aps-retention-days`, or the Nix options `historyRetentionDays` and
 `apsRetentionDays`. A value of `0` keeps that table indefinitely.
 
-To delete the daemon's current logical location data immediately:
-
-```bash
-whereami wipe --yes
-```
+To delete the daemon's current logical location data immediately, use the
+[socket-pinned wipe procedure](#verified-socket-pinned-wipe) for its deployment.
+Do not use an unpinned command on a machine that may run both a system and a
+personal daemon.
 
 The command uses the filesystem-permission-gated Unix control socket and is
 always refused over unauthenticated TCP, including loopback TCP. It atomically
@@ -248,7 +257,14 @@ harness reasons over `f64`; if it doesn't terminate in reasonable time
 on your hardware, comment it out — the same surface is exercised
 stochastically by the proptest suite.
 
-## NixOS module
+## Operating Nix deployments
+
+Both modules install the configured package, so `whereami` and `whereamid` are
+on the deployment's normal `PATH` after activation. A custom
+`services.whereami.package` must provide both `bin/whereamid` and
+`bin/whereami`; the flake's default package does.
+
+### NixOS system service
 
 ```nix
 {
@@ -256,29 +272,193 @@ stochastically by the proptest suite.
   services.whereami = {
     enable = true;
     wifiInterface = "wlp9s0f0";
-    credentialsFile = "/run/secrets/whereami.toml";
+    allowedUsers = [ "alice" ];
+    credentialsFile = "/etc/whereami/secrets.toml";
     addressApprox = true;
+    rustLog = "whereamid=debug"; # temporary troubleshooting only; normally null
   };
 }
 ```
 
-The systemd service runs with `CAP_NET_ADMIN`, `DynamicUser=true`, and
-hardened sandboxing. The flake also exposes `homeManagerModules.default` for
-per-user installations on non-NixOS systems.
+Activate the system configuration with your usual deployment command, for
+example `sudo nixos-rebuild switch --flake /path/to/config#hostname`.
+
+The daemon is `whereamid.service`; its system-owned activation socket is
+`whereamid.socket`. The service runs with `CAP_NET_ADMIN`, `DynamicUser=true`,
+and hardened sandboxing.
+
+```bash
+sudo systemctl status whereamid.service whereamid.socket
+sudo journalctl -u whereamid.service -f
+sudo systemctl restart whereamid.service
+```
+
+The system service uses `Restart=on-failure` and permits at most five starts in
+60 seconds. A persistent configuration or startup failure therefore settles in
+`failed` instead of hot-looping. Fix the cause, then clear the limit and start
+again:
+
+```bash
+sudo systemctl reset-failed whereamid.service
+sudo systemctl start whereamid.service
+```
+
+### Home Manager user service
+
+```nix
+{
+  imports = [ inputs.whereami.homeManagerModules.default ];
+  services.whereami = {
+    enable = true;
+    wifiInterface = "wlp9s0f0";
+    rustLog = null; # default: add no unit-specific RUST_LOG assignment
+  };
+}
+```
+
+Activate the user configuration with your usual deployment command, for
+example `home-manager switch --flake /path/to/config#user@hostname`.
+
+Home Manager creates only the per-user `whereamid.service`; the daemon
+self-binds `$XDG_RUNTIME_DIR/whereamid.sock`, so there is no separate user
+socket unit. Wi-Fi scanning requires NetworkManager to manage the interface,
+because a user service cannot grant the `CAP_NET_ADMIN` needed by the `iw`
+fallback.
+
+```bash
+systemctl --user status whereamid.service
+journalctl --user -u whereamid.service -f
+systemctl --user restart whereamid.service
+```
+
+The user unit also uses `Restart=on-failure`, but this project does not set a
+Home Manager start limit. After correcting a failure, `systemctl --user
+reset-failed whereamid.service` clears the recorded failed state if necessary,
+then `systemctl --user start whereamid.service` starts it.
+
+### Service logging and credentials
+
+`services.whereami.rustLog` is shared by both modules. Its default is `null`,
+which adds no unit-specific `RUST_LOG` assignment. If the service manager does
+not supply an inherited value either, the daemon uses its built-in `info`
+fallback. Normal warning-level records can contain BSSIDs. Debug records can
+additionally contain resolved coordinates and Unix peer UID/GID/PID. Journald
+is outside the wipe facility, so return the option to `null` after diagnosis
+and manage journal retention separately.
+
+For NixOS, `credentialsFile` names a source file read by the root system
+manager and copied to the DynamicUser through systemd `LoadCredential`. The
+daemon never opens or stats that source, so it cannot warn about a loose source
+mode: operators must independently keep it root-owned at `0600` (or immutable
+and read-only at `0400`) and must not put real secrets in a world-readable
+Nix-store literal. systemd places a protected managed copy at the exact
+`$CREDENTIALS_DIRECTORY/config` path. The daemon narrowly recognizes that
+regular managed file separately from ordinary file modes.
+
+Home Manager and manual runs instead open the configured file directly. Keep
+that ordinary file user-owned at `0600` or read-only `0400`; a loose `0440`
+file warns. Startup logs either `WiGLE credentials configured` or `WiGLE
+credentials not configured` without logging values. Wipe does not delete or
+alter credentials.
+
+### Deployment paths and permissions
+
+`services.whereami.dbPath` overrides the database path in either module.
+
+| Deployment | Default database | Control socket | Permission behavior |
+| --- | --- | --- | --- |
+| NixOS system | `/var/lib/whereami/aps.sqlite` | `/run/whereami/whereamid.sock` | State directory is enforced `0700`; the umask creates database, WAL, and SHM files `0600`, and the daemon checks existing files. Socket is `0660 root:whereami`. |
+| Home Manager | `$HOME/.local/share/whereami/aps.sqlite` | `$XDG_RUNTIME_DIR/whereamid.sock` | Newly created database parents are `0700`; database files are tightened to `0600`; socket is `0600`. |
+| Manual | Compiled default `/var/lib/whereami/aps.sqlite`, or `--db PATH` | `--socket PATH` or runtime default | Use a writable `--db` for unprivileged runs. Newly created parents are `0700` and database files are tightened to `0600`. |
+
+For Home Manager and manual paths, the daemon warns about a pre-existing loose
+parent directory but does not chmod a directory it did not create. In every
+deployment, failure to tighten an existing database or WAL/SHM sidecar is
+warned and operation continues; correct the filesystem permissions yourself.
+A custom NixOS `dbPath` outside `/var/lib/whereami` may also require an explicit
+systemd sandbox write-path adjustment because the stock unit uses
+`ProtectSystem=strict` and `StateDirectory=whereami`.
+
+### Retained data
+
+Retention sweeps run at startup and daily. Days are age thresholds, not secure
+erasure deadlines.
+
+| Store | Personal/operational data | Default lifecycle | Wipe behavior |
+| --- | --- | --- | --- |
+| `aps` | Resolved, stable cached access points: BSSID/SSID, coordinates, radio metadata, provenance, and timestamps | Prune 30 days after `last_seen`; `apsRetentionDays = 0` keeps indefinitely | Rows deleted |
+| `fixes` | Timestamped latitude/longitude, accuracy, and source count | Prune after 30 days; `historyRetentionDays = 0` keeps indefinitely | Rows deleted; its `sqlite_sequence` entry is removed |
+| `last_fix` | Latest coordinates, optional address, timestamp, accuracy, and source count | No age pruning; replaced by a newer accepted fix | Row deleted |
+| `pending` | Unresolved BSSID/SSID, radio metadata, timestamps, and attempt count | Queue lifecycle, not days; by default deleted after 20 failed drain passes, with no wall-clock guarantee | Rows deleted |
+| `not_found` | BSSID and observation/check timestamps for negative results | A 30-day TTL makes a row eligible to move back to `pending`; it is not guaranteed deletion on day 30 | Rows deleted |
+| `metadata` | Operational quota and shutdown-observability values | Retained until separately changed | Retained |
+| `schema_version` | Database schema version | Database lifetime | Retained |
+
+Transient access-point observations remain in the in-memory scan/debounce
+window; stable APs that are unresolved may enter `pending` instead of `aps`.
+The daemon also holds the last fix, address cache, geocode queue, and in-flight
+lookup identifiers in managed memory. Wipe clears those structures. SQLite
+free pages/WAL remnants, logs, backups, snapshots, and provider traffic already
+sent are outside this logical-retention model.
+
+### Verified socket-pinned wipe
+
+Pin the socket so a host running both deployments cannot wipe the wrong daemon.
+For the NixOS service, root can run:
+
+```bash
+sudo env WHEREAMI_SOCKET=/run/whereami/whereamid.sock whereami --json wipe --yes
+```
+
+A user listed in `allowedUsers` can run the same command without `sudo`:
+
+```bash
+env WHEREAMI_SOCKET=/run/whereami/whereamid.sock whereami --json wipe --yes
+```
+
+For Home Manager:
+
+```bash
+env WHEREAMI_SOCKET="$XDG_RUNTIME_DIR/whereamid.sock" whereami --json wipe --yes
+```
+
+A complete JSON response is the acknowledgement and reports deletion counts.
+If the response is missing or truncated, the result is unknown; verify state or
+retry, because wipe is idempotent. TCP requests are always refused. Socket
+filesystem access is the authority—confirmation prevents accidents but creates
+no read-only role. Collection remains enabled and can repopulate state after
+the response attempt ends. Wipe is logical, not forensic: database/WAL free
+space, journals and other logs, snapshots, backups, storage media, and provider
+traffic already sent remain outside its scope. See
+[Privacy, retention, and wiping](#privacy-retention-and-wiping) for the full
+concurrency boundary.
+
+### Command reference scope
+
+The project currently ships no man pages and no generated shell completions;
+adding `clap_mangen` or `clap_complete` is outside the current scope. The
+canonical installed interfaces are:
+
+```bash
+whereami --help
+whereami <command> --help
+whereamid --help
+```
 
 ## Protocol
 
 For language-agnostic clients: see [docs/protocol.md](docs/protocol.md). The
 wire format is JSON-lines on a one-shot connection over a Unix domain socket
 (access-controlled by filesystem permissions; opt-in TCP via `--bind`). Any
-language with a unix-socket client can talk to the daemon.
+language with a Unix-socket client can talk to the daemon.
 
 ## Architecture
 
 See [docs/adr/](docs/adr/) for Architecture Decision Records covering all
 major design choices. Highlights:
 
-- TCP JSON-lines, not HTTP (any language can be a client).
+- Unix-domain-socket JSON-lines is the canonical control channel. Opt-in,
+  unauthenticated TCP is a secondary compatibility transport; neither is HTTP.
 - `nmcli` for scanning, `iw` as fallback (no root needed for `nmcli`).
 - Debounce filter prevents transient APs from polluting the cache.
 - Spherical-mean trilateration (great-circle math, antimeridian-safe).
@@ -299,7 +479,7 @@ rendered to SVG. Click for full size.
 
 [![Scan & Resolve dataflow](docs/dataflow-scan.svg)](docs/dataflow-scan.svg)
 
-**Locate** — TCP request → cached AP lookup → outlier filter → trilateration → response:
+**Locate** — control-socket request → cached AP lookup → outlier filter → trilateration → response:
 
 [![Locate dataflow](docs/dataflow-locate.svg)](docs/dataflow-locate.svg)
 

@@ -23,6 +23,24 @@ and the project follows semver.
   `0` keeps indefinitely). AP and fix retention run immediately at startup and
   then daily in alternating 1,000-row transactions.
 
+### Added — Nix operator controls and handbook
+
+- The NixOS and Home Manager modules now share a nullable `rustLog` option.
+  Its `null` default adds no unit-specific `RUST_LOG` assignment (an inherited
+  manager value can still apply); configured values are safely quoted for
+  systemd. Normal warning records may expose BSSIDs, while debug can add
+  resolved coordinates and Unix peer identifiers. Enabling the NixOS module
+  now also installs the configured package, including the operator-facing
+  `whereami` CLI.
+- The daemon recognizes only systemd's exact, non-symlink managed credential
+  copy as protected at its supported mode. Ordinary files, unsafe future modes,
+  and path lookalikes retain the loose-permission warning; the separate NixOS
+  source remains an operator-managed root-only file.
+- The README now separates system and Home Manager operations, including unit
+  names, status/journal/restart recovery, credential handling, path and
+  permission expectations, exact data-retention lifecycles, and deployment-
+  specific socket-pinned wipe commands.
+
 ### Security / Changed — BREAKING: control channel is now a Unix domain socket
 
 The daemon's control channel moved from unauthenticated loopback TCP to a **Unix

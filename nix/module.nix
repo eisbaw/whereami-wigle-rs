@@ -32,6 +32,10 @@ in {
     # Empty by default, so only root connects until allowedUsers opts users in.
     users.groups.whereami.members = cfg.allowedUsers;
 
+    # Match the Home Manager module: enabling the service also installs both
+    # whereamid and the operator-facing whereami CLI from cfg.package.
+    environment.systemPackages = [ cfg.package ];
+
     # Socket activation is what makes the DynamicUser daemon reachable by the
     # owner: systemd creates the socket as root:whereami mode 0660 BEFORE the
     # (random-UID) service starts and hands it fd 3, so members of `whereami` can
@@ -50,6 +54,12 @@ in {
 
     systemd.services.whereamid = {
       description = "whereami Wi-Fi geolocation daemon";
+      environment = lib.optionalAttrs (cfg.rustLog != null) {
+        # NixOS quotes environment attr values in the generated unit, but
+        # systemd still expands `%` specifiers inside Environment=. Double them
+        # so an operator's RUST_LOG filter reaches the daemon byte-for-byte.
+        RUST_LOG = lib.replaceStrings [ "%" ] [ "%%" ] cfg.rustLog;
+      };
       after = [ "network.target" "NetworkManager.service" "whereamid.socket" ];
       requires = [ "whereamid.socket" ];
       # Scanning must run 24/7 (continuously build the AP cache + history), so
@@ -123,9 +133,11 @@ in {
       } // lib.optionalAttrs (cfg.credentialsFile != null) {
         # task-0205: deliver the WiGLE secrets to the DynamicUser via systemd
         # credentials. The manager (root) reads the source — which may stay
-        # 0600 root:root — and exposes a 0400 copy under $CREDENTIALS_DIRECTORY;
-        # ExecStart reads --config ${CREDENTIALS_DIRECTORY}/config. The source
-        # file's own mode is never widened (no world-readable secret required).
+        # 0600 root:root — and exposes a protected managed copy under
+        # $CREDENTIALS_DIRECTORY. ExecStart reads --config
+        # ${CREDENTIALS_DIRECTORY}/config; the daemon never opens or stats the
+        # source path itself. The source file's own mode is never widened (no
+        # world-readable secret required).
         LoadCredential = [ "config:${cfg.credentialsFile}" ];
       };
     };

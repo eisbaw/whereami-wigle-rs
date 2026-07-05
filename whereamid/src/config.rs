@@ -3,10 +3,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::io::{ErrorKind, Read};
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 /// Portable operational ceiling for active control-channel connections.
 /// Deliberately far below Tokio's target-dependent semaphore limit on every
@@ -49,7 +49,9 @@ pub struct Args {
     #[arg(long, default_value = "wlan0")]
     pub interface: String,
 
-    /// Path to TOML WiGLE API credentials file; keep owner-only (0600)
+    /// Path to TOML WiGLE API credentials file. Keep ordinary files owner-only
+    /// (0600); systemd's protected $CREDENTIALS_DIRECTORY/config copy is the
+    /// only supported exception.
     #[arg(long, default_value = "~/.config/whereami/config.toml")]
     pub config: String,
 
@@ -297,6 +299,37 @@ fn expand_tilde(path: &str) -> PathBuf {
 
 /// Load the TOML config file. Returns default if file does not exist.
 pub fn load_config_file(path: &str) -> Result<ConfigFile> {
+    let credentials_directory = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
+    load_config_file_with_credentials_directory(path, credentials_directory.as_deref())
+}
+
+/// Whether `path` is exactly the config credential delivered to this process
+/// by systemd. A nonempty absolute directory is required: relative, empty,
+/// sibling, and prefix paths must retain the ordinary owner-only mode check.
+fn is_systemd_config_credential(path: &Path, directory: Option<&Path>) -> bool {
+    let Some(directory) = directory else {
+        return false;
+    };
+    !directory.as_os_str().is_empty() && directory.is_absolute() && path == directory.join("config")
+}
+
+/// Verify that the configured path still names the regular file represented by
+/// the already-open descriptor metadata. `symlink_metadata` inspects the entry
+/// rather than following it. Device/inode equality detects a path replacement
+/// after open; inspection failure and every mismatch fail closed.
+fn direct_entry_identifies_open_file(path: &Path, opened: &Metadata) -> bool {
+    let Ok(entry) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    entry.file_type().is_file() && entry.dev() == opened.dev() && entry.ino() == opened.ino()
+}
+
+/// Injectable loader core. Tests pass the credential directory explicitly so
+/// parallel tests never mutate process-global CREDENTIALS_DIRECTORY.
+fn load_config_file_with_credentials_directory(
+    path: &str,
+    credentials_directory: Option<&Path>,
+) -> Result<ConfigFile> {
     let expanded = expand_tilde(path);
     // Open once, then inspect and read that exact descriptor. A separate
     // exists()/metadata()/read_to_string sequence would let a path be swapped
@@ -319,7 +352,16 @@ pub fn load_config_file(path: &str) -> Result<ConfigFile> {
     match file.metadata() {
         Ok(metadata) => {
             let mode = metadata.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
+            // systemd LoadCredential protects its per-service credential
+            // directory and exposes the supported config copy as 0440. That
+            // group bit does not make the file available to arbitrary local
+            // users. Keep the exception deliberately exact and reject an
+            // exact-name symlink or post-open path replacement: the direct
+            // path entry must be the same regular file as this descriptor.
+            let protected_systemd_copy = mode == 0o440
+                && is_systemd_config_credential(&expanded, credentials_directory)
+                && direct_entry_identifies_open_file(&expanded, &metadata);
+            if mode & 0o077 != 0 && !protected_systemd_copy {
                 tracing::warn!(
                     "WiGLE credentials file {:?} has permissions {:04o}; another local user may \
                      read or modify the WiGLE API credentials. Restrict it to owner-only mode \
@@ -448,10 +490,20 @@ mod tests {
     fn load_with_captured_events(
         path: &std::path::Path,
     ) -> (ConfigFile, Vec<(tracing::Level, String)>) {
+        load_with_captured_events_and_credentials_directory(path, None)
+    }
+
+    fn load_with_captured_events_and_credentials_directory(
+        path: &std::path::Path,
+        credentials_directory: Option<&std::path::Path>,
+    ) -> (ConfigFile, Vec<(tracing::Level, String)>) {
         let captured = CapturedEvents::default();
         let events = captured.clone();
         let config = subscriber::with_default(captured, || {
-            load_config_file(path.to_str().expect("UTF-8 config test path"))
+            load_config_file_with_credentials_directory(
+                path.to_str().expect("UTF-8 config test path"),
+                credentials_directory,
+            )
         })
         .expect("load config test file");
         let events = events.0.lock().expect("capture lock poisoned").clone();
@@ -476,7 +528,7 @@ mod tests {
     fn group_or_world_access_emits_warning_without_leaking_credentials() {
         let dir = TestDir::new("insecure-modes");
 
-        for mode in [0o640, 0o604] {
+        for mode in [0o440, 0o640, 0o604] {
             let path = dir.path().join(format!("config-{mode:04o}.toml"));
             write_config(&path, mode);
 
@@ -499,6 +551,200 @@ mod tests {
             assert!(
                 !output.contains(TEST_API_KEY),
                 "permission warning leaked the API key; events:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_systemd_config_credential_at_0440_does_not_warn() {
+        let dir = TestDir::new("systemd-credential-exact");
+        let credentials_directory = dir.path().join("run/credentials/whereamid.service");
+        std::fs::create_dir_all(&credentials_directory)
+            .expect("create systemd credential directory");
+        let path = credentials_directory.join("config");
+        write_config(&path, 0o440);
+        let opened = File::open(&path).expect("open exact credential");
+        let opened_metadata = opened.metadata().expect("stat opened exact credential");
+
+        assert!(is_systemd_config_credential(
+            &path,
+            Some(&credentials_directory)
+        ));
+        assert!(direct_entry_identifies_open_file(&path, &opened_metadata));
+        assert!(!is_systemd_config_credential(
+            &path,
+            Some(std::path::Path::new(""))
+        ));
+        assert!(!is_systemd_config_credential(
+            &path,
+            Some(std::path::Path::new("relative/credentials"))
+        ));
+
+        let (config, events) = load_with_captured_events_and_credentials_directory(
+            &path,
+            Some(&credentials_directory),
+        );
+        assert_eq!(config.wigle.api_key, TEST_API_KEY);
+        let output = rendered_events(&events);
+        assert!(
+            !events.iter().any(|(level, message)| {
+                *level == tracing::Level::WARN
+                    && (message.contains("WiGLE credentials file")
+                        || message.contains("another local user"))
+            }),
+            "systemd's exact protected 0440 config credential must not emit the generic \
+             loose-file warning; events:\n{output}"
+        );
+    }
+
+    #[test]
+    fn exact_systemd_config_credential_symlink_at_0440_still_warns() {
+        let dir = TestDir::new("systemd-credential-symlink");
+        let credentials_directory = dir.path().join("run/credentials/whereamid.service");
+        std::fs::create_dir_all(&credentials_directory)
+            .expect("create systemd credential directory");
+        let target = credentials_directory.join("target");
+        let path = credentials_directory.join("config");
+        write_config(&target, 0o440);
+        std::os::unix::fs::symlink(&target, &path).expect("create exact-name credential symlink");
+
+        let opened = File::open(&path).expect("open credential symlink target");
+        let opened_metadata = opened.metadata().expect("stat opened symlink target");
+        assert!(is_systemd_config_credential(
+            &path,
+            Some(&credentials_directory)
+        ));
+        assert!(std::fs::symlink_metadata(&path)
+            .expect("lstat credential symlink")
+            .file_type()
+            .is_symlink());
+        assert!(!direct_entry_identifies_open_file(&path, &opened_metadata));
+
+        let (config, events) = load_with_captured_events_and_credentials_directory(
+            &path,
+            Some(&credentials_directory),
+        );
+        assert_eq!(config.wigle.api_key, TEST_API_KEY);
+        let output = rendered_events(&events);
+        assert!(
+            events.iter().any(|(level, message)| {
+                *level == tracing::Level::WARN
+                    && message.contains("WiGLE credentials file")
+                    && message.contains("0440")
+                    && message.contains("another local user")
+            }),
+            "an exact-name 0440 symlink must not receive the managed-copy exemption; \
+             events:\n{output}"
+        );
+    }
+
+    #[test]
+    fn exact_systemd_config_credential_unsafe_modes_still_warn() {
+        let dir = TestDir::new("systemd-credential-unsafe-modes");
+
+        for mode in [0o444, 0o640] {
+            let credentials_directory = dir
+                .path()
+                .join(format!("run/credentials/whereamid-{mode:04o}.service"));
+            std::fs::create_dir_all(&credentials_directory)
+                .expect("create systemd credential directory");
+            let path = credentials_directory.join("config");
+            write_config(&path, mode);
+
+            let (config, events) = load_with_captured_events_and_credentials_directory(
+                &path,
+                Some(&credentials_directory),
+            );
+            assert_eq!(config.wigle.api_key, TEST_API_KEY);
+            let output = rendered_events(&events);
+            let expected_mode = format!("{mode:04o}");
+            assert!(
+                events.iter().any(|(level, message)| {
+                    *level == tracing::Level::WARN
+                        && message.contains("WiGLE credentials file")
+                        && message.contains(&expected_mode)
+                        && message.contains("another local user")
+                }),
+                "exact managed path at future/unsafe mode {expected_mode} must warn; \
+                 events:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn systemd_credential_direct_entry_must_match_opened_descriptor() {
+        let dir = TestDir::new("systemd-credential-path-identity");
+        let path = dir.path().join("config");
+        let original = dir.path().join("opened-original");
+        write_config(&path, 0o440);
+
+        let opened = File::open(&path).expect("open original credential");
+        let opened_metadata = opened.metadata().expect("stat opened credential");
+        assert!(direct_entry_identifies_open_file(&path, &opened_metadata));
+
+        std::fs::rename(&path, &original).expect("move opened credential path");
+        write_config(&path, 0o440);
+        assert!(
+            !direct_entry_identifies_open_file(&path, &opened_metadata),
+            "a replacement path entry must not identify the already-open descriptor"
+        );
+
+        std::fs::remove_file(&path).expect("remove replacement credential");
+        assert!(
+            !direct_entry_identifies_open_file(&path, &opened_metadata),
+            "direct-entry inspection failure must fail closed"
+        );
+    }
+
+    #[test]
+    fn systemd_credential_path_near_misses_at_0440_still_warn() {
+        let dir = TestDir::new("systemd-credential-near-misses");
+        let credentials_root = dir.path().join("run/credentials");
+        let credentials_directory = credentials_root.join("whereamid.service");
+        std::fs::create_dir_all(&credentials_directory)
+            .expect("create systemd credential directory");
+
+        let mut prefixed_directory = credentials_directory.as_os_str().to_os_string();
+        prefixed_directory.push("-lookalike");
+        let candidates = [
+            (
+                "near-miss name",
+                credentials_directory.join("config.backup"),
+            ),
+            (
+                "sibling directory",
+                credentials_root.join("sibling.service/config"),
+            ),
+            (
+                "directory-prefix lookalike",
+                PathBuf::from(prefixed_directory).join("config"),
+            ),
+        ];
+
+        for (case, path) in candidates {
+            std::fs::create_dir_all(path.parent().expect("candidate has parent"))
+                .expect("create candidate parent");
+            write_config(&path, 0o440);
+            assert!(
+                !is_systemd_config_credential(&path, Some(&credentials_directory)),
+                "{case} must not match the exact managed credential path"
+            );
+
+            let (config, events) = load_with_captured_events_and_credentials_directory(
+                &path,
+                Some(&credentials_directory),
+            );
+            assert_eq!(config.wigle.api_key, TEST_API_KEY);
+            let output = rendered_events(&events);
+            assert!(
+                events.iter().any(|(level, message)| {
+                    *level == tracing::Level::WARN
+                        && message.contains("WiGLE credentials file")
+                        && message.contains("0440")
+                        && message.contains("another local user")
+                }),
+                "{case} at mode 0440 must retain the ordinary permission warning; \
+                 events:\n{output}"
             );
         }
     }

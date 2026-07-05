@@ -22,7 +22,27 @@ in {
 
   package = lib.mkOption {
     type = lib.types.package;
-    description = "The whereami package to use.";
+    description = ''
+      The whereami package to use. Overrides must provide both bin/whereamid
+      for the service and bin/whereami for operator commands; both modules
+      install this package into their corresponding environment.
+    '';
+  };
+
+  rustLog = lib.mkOption {
+    type = lib.types.nullOr lib.types.str;
+    default = null;
+    example = "whereamid=debug";
+    description = ''
+      Optional RUST_LOG filter for the daemon service. null adds no
+      unit-specific RUST_LOG assignment; when the service manager supplies no
+      inherited value either, whereamid uses its built-in info fallback.
+      Normal warning-level records can contain sensitive BSSIDs. Debug records
+      can additionally contain resolved coordinates and Unix peer UID/GID/PID.
+      Journal entries are outside the wipe facility, so enable debug only
+      temporarily and manage journal retention separately. The filter must be
+      a single line.
+    '';
   };
 
   bind = lib.mkOption {
@@ -89,8 +109,10 @@ in {
     default = credentialsFileDefault;
     description = ''
       Path to a TOML file containing WiGLE credentials.
-      Keep this source file owner-only (mode 0600, or 0400 when immutable),
-      because another local user may otherwise read or modify the credentials.
+      On NixOS this is a source read by the root system manager; the daemon
+      cannot inspect its mode, so keep it root-owned at 0600 (or 0400 when
+      immutable). Home Manager passes this path directly to the daemon, which
+      warns when an ordinary file has group or world permission bits.
       Expected format:
         [wigle]
         api_user = "AID..."
@@ -225,8 +247,8 @@ in {
     description = ''
       Days to retain resolved access-point rows after `last_seen`. Older rows are
       pruned periodically. 0 disables retention (no pruning); AP rows are kept
-      indefinitely. This governs how long observed BSSID/SSID/location data
-      lives on disk.
+      indefinitely. This governs how long resolved, stable cached
+      BSSID/SSID/location data lives on disk.
     '';
   };
 

@@ -9,6 +9,14 @@ let
   # construction and the daemon tightens it to 0600.
   execStart = import ./exec-start.nix { inherit lib cfg; socketFlag = true; };
 
+  # Home Manager's Service.Environment option is rendered verbatim as an INI
+  # value. Quote the complete NAME=value assignment (JSON string escaping is
+  # compatible with systemd.syntax) and double `%` so systemd does not expand
+  # specifiers in an operator-supplied RUST_LOG filter. `$` is not expanded by
+  # Environment=. Shared assertions reject the unsupported CR/LF case.
+  environmentAssignment = name: value:
+    builtins.toJSON ("${name}=" + lib.replaceStrings [ "%" ] [ "%%" ] value);
+
   # task-0208: the USER service can only scan Wi-Fi via NetworkManager. The
   # scanner (scanner.rs wifi_scan) tries nmcli then falls back to `iw scan`, but
   # the iw path needs CAP_NET_ADMIN — a systemd --user unit cannot be granted
@@ -61,6 +69,8 @@ in {
         # for user units (no StateDirectoryMode to set); the daemon creates the
         # directory itself at mode 0700 and tightens the DB file at runtime.
         UMask = "0077";
+      } // lib.optionalAttrs (cfg.rustLog != null) {
+        Environment = [ (environmentAssignment "RUST_LOG" cfg.rustLog) ];
       };
       Install = {
         WantedBy = [ "default.target" ];
