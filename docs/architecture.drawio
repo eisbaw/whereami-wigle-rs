@@ -10,8 +10,8 @@
         <mxCell id="radio" value="Wi-Fi Radio&#xa;(kernel)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=10;fillColor=#dae8fc;strokeColor=#6c8ebf;" parent="1" vertex="1">
           <mxGeometry x="40" y="200" width="100" height="80" as="geometry" />
         </mxCell>
-        <mxCell id="scanner" value="scanner.rs&#xa;&#xa;nmcli rescan + list&#xa;(fallback: iw trigger/dump)&#xa;&#xa;Parse output →&#xa;Vec&lt;ScannedNetwork&gt;&#xa;(bssid, ssid, signal, ch)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" parent="1" vertex="1">
-          <mxGeometry x="200" y="170" width="220" height="130" as="geometry" />
+        <mxCell id="scanner" value="scanner.rs&#xa;&#xa;nmcli + D-Bus LastScan proof&#xa;(fallback: blocking iw scan)&#xa;cached reads: unconfirmed&#xa;&#xa;Parse → ScanBatch&#xa;(networks + BOOTTIME proof)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" parent="1" vertex="1">
+          <mxGeometry x="200" y="160" width="220" height="150" as="geometry" />
         </mxCell>
         <mxCell id="e1" style="" parent="1" source="radio" target="scanner" edge="1">
           <mxGeometry relative="1" as="geometry" />
@@ -25,7 +25,7 @@
         <mxCell id="e2" style="" parent="1" source="scanner" target="debounce" edge="1">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e2label" value="all APs&#xa;(push_scan)" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e2" vertex="1" connectable="0">
+        <mxCell id="e2label" value="sample + evidence&#xa;(atomic publish)" style="edgeLabel;html=1;align=center;fontSize=9;" parent="e2" vertex="1" connectable="0">
           <mxGeometry x="-0.2" relative="1" as="geometry">
             <mxPoint y="-14" as="offset" />
           </mxGeometry>

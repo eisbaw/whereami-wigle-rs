@@ -88,6 +88,7 @@
               pkgs.sqlite
               pkgs.iw
               pkgs.networkmanager
+              pkgs.systemd
             ];
 
             OPENSSL_DEV = pkgs.openssl.dev;

@@ -1,6 +1,7 @@
 //! whereamid library: exposes modules for integration and property tests.
 
 pub mod apple;
+pub mod boot_clock;
 pub mod db;
 pub mod debounce;
 pub mod geo;

@@ -266,17 +266,25 @@ startup and then daily in alternating 1,000-row transactions. Entries in
 
 Two backends, in preference order:
 
-1. **`nmcli device wifi list --rescan auto`** (preferred) — runs without
-   `CAP_NET_ADMIN` if NetworkManager is the system Wi-Fi manager. Stable
-   field-separator-escaped output that parses cleanly. Documented choice in
-   ADR-010.
-2. **`iw dev <iface> scan trigger` + `iw dev <iface> scan dump`** —
-   fallback for systems without NetworkManager. Requires `CAP_NET_ADMIN`.
-   The trigger-then-dump split avoids "Device or resource busy" while the
-   interface is associated to an AP.
+1. **Forced nmcli with NetworkManager generation proof** (preferred) — resolve
+   the NetworkManager unique D-Bus owner and device path with `busctl`, baseline
+   `Device.Wireless.LastScan`, then run `nmcli -t -f
+   BSSID,SSID,SIGNAL,CHAN,FREQ device wifi list ifname <iface> --rescan yes`.
+   Only a strictly advanced, nonfuture generation at/after the attempt followed
+   by a `--rescan no` relist and same-owner/path final fence is confirmed. All
+   device/property reads target the captured unique owner, and a trailing owner
+   check closes the final property-read race. This runs without `CAP_NET_ADMIN`
+   when NetworkManager manages the interface.
+2. **Blocking `iw dev <iface> scan`** — fallback when nmcli has no usable
+   result. Requires `CAP_NET_ADMIN`. Busy responses are retried; only the
+   successful attempt owns evidence. A separate `scan dump` after generic or
+   exhausted-busy failure is cached data and explicitly unconfirmed.
 
-The daemon picks `nmcli` when its output is parseable; otherwise it falls
-through to `iw`. Either path returns the same `ScannedNetwork` shape.
+The daemon preserves non-empty cached output for interactive continuity, but
+only a proved nmcli post-generation relist or successful blocking iw command is
+eligible for positive autonomous freshness. Each backend returns a `ScanBatch`
+containing networks plus optional `CLOCK_BOOTTIME` evidence; confirmed empty
+batches are retained rather than falling through to another backend.
 
 ### Scan filtering and debounce interaction
 
@@ -443,13 +451,14 @@ whereami/
   Cargo.toml          (workspace)
   shell.nix           (dev environment)
   nix/
-    package.nix       (rustPlatform.buildRustPackage)
+    package.nix       (Crane package plus shared build/check artifacts)
     module.nix        (NixOS service module)
   whereamid/          (binary — the daemon)
     src/
-      main.rs         (arg parsing, background tasks, TCP accept loop)
-      server.rs       (TCP connection handling, protocol dispatch, address cache)
-      scanner.rs      (Wi-Fi scan via iw, top-N RSSI filtering)
+      main.rs         (arg parsing, lifecycle/background tasks, canonical Unix listener setup)
+      server.rs       (shared Unix/optional-TCP accept loop, protocol dispatch, address cache)
+      scanner.rs      (nmcli+busctl generation proof, blocking iw fallback, scan parsing)
+      boot_clock.rs   (Linux CLOCK_BOOTTIME timestamps for suspend-inclusive freshness)
       debounce.rs     (sliding window, stable AP detection)
       resolver.rs     (provider chain orchestrator, in-flight dedup)
       provider.rs     (Provider enum: Apple / WiGLE; outcome shape)
@@ -482,7 +491,8 @@ entry point, and a NixOS module for deployment.
 `shell.nix` selects the local flake's `devShells.<system>.default` rather than
 duplicating the environment. Both `nix-shell` and `nix develop` therefore
 provide the same nightly Rust toolchain, `cargo-fuzz`, `just`, `pkg-config`,
-`openssl`, `sqlite`, `iw`, and NetworkManager tools.
+`openssl`, `sqlite`, `iw`, NetworkManager (`nmcli`), and systemd (`busctl`)
+tools.
 
 This development workflow requires a Git checkout and flakes-enabled Nix.
 The `shell.nix` `git+file`/`getFlake` compatibility path intentionally does
@@ -515,7 +525,11 @@ This generates:
 
 ### Package (`nix/package.nix`)
 
-Standard `rustPlatform.buildRustPackage` derivation. Wraps the binary with `makeWrapper` to ensure `iw` is on `PATH`.
+A Crane derivation builds dependencies once with `craneLib.buildDepsOnly`, then
+reuses those artifacts for `craneLib.buildPackage` and the package checks. The
+installed daemon is wrapped with `makeWrapper`; its runtime `PATH` includes the
+`iw`, NetworkManager, and systemd packages, which provide `iw`, `nmcli`, and
+`busctl` respectively.
 
 ## Operational notes
 

@@ -21,6 +21,11 @@ const _: () = assert!(MAX_CONNECTIONS <= tokio::sync::Semaphore::MAX_PERMITS);
 /// allowing an effectively dormant enabled loop. Zero remains the off-switch.
 pub const MAX_AUTOLOCATE_INTERVAL_SECS: u64 = 31_536_000;
 
+/// Operational ceiling for the autonomous scan-freshness threshold. Zero is
+/// an explicit legacy opt-out; positive values are bounded to one year so the
+/// Rust and Nix configuration surfaces share a finite, portable range.
+pub const MAX_AUTOLOCATE_SCAN_AGE_SECS: u64 = 31_536_000;
+
 /// whereamid: Wi-Fi geolocation daemon
 #[derive(Parser, Debug, Clone)]
 #[command(name = "whereamid", version, about)]
@@ -89,6 +94,16 @@ pub struct Args {
         value_parser = clap::value_parser!(u64).range(0..=MAX_AUTOLOCATE_INTERVAL_SECS)
     )]
     pub autolocate_interval_secs: u64,
+
+    /// Maximum age in seconds of a confirmed radio refresh used by autonomous
+    /// location history (0..=31536000). Equality is fresh. 0 accepts any
+    /// present snapshot, including unconfirmed cached scanner output.
+    #[arg(
+        long,
+        default_value_t = 180,
+        value_parser = clap::value_parser!(u64).range(0..=MAX_AUTOLOCATE_SCAN_AGE_SECS)
+    )]
+    pub autolocate_max_scan_age_secs: u64,
 
     /// Number of scan samples in debounce ring buffer
     #[arg(long, default_value_t = 10)]
@@ -249,6 +264,12 @@ impl Args {
             anyhow::bail!(
                 "--autolocate-interval-secs must be in 0..={} (0 disables autonomous location history)",
                 MAX_AUTOLOCATE_INTERVAL_SECS
+            );
+        }
+        if self.autolocate_max_scan_age_secs > MAX_AUTOLOCATE_SCAN_AGE_SECS {
+            anyhow::bail!(
+                "--autolocate-max-scan-age-secs must be in 0..={} (0 accepts legacy unconfirmed/stale snapshots)",
+                MAX_AUTOLOCATE_SCAN_AGE_SECS
             );
         }
         if self.top_n == 0 {
@@ -1123,6 +1144,61 @@ mod tests {
         assert!(section.contains("[default: 120]"));
         assert!(section.contains("0..=31536000"));
         assert!(section.contains("0 disables autonomous location history"));
+    }
+
+    #[test]
+    fn autolocate_max_scan_age_defaults_zero_override_and_bounds() {
+        let defaults = parse(&[]);
+        assert_eq!(defaults.autolocate_max_scan_age_secs, 180);
+        defaults.validate().unwrap();
+
+        let legacy = parse(&["--autolocate-max-scan-age-secs", "0"]);
+        assert_eq!(legacy.autolocate_max_scan_age_secs, 0);
+        legacy
+            .validate()
+            .expect("zero must enable the legacy override");
+
+        let maximum = parse(&["--autolocate-max-scan-age-secs", "31536000"]);
+        assert_eq!(
+            maximum.autolocate_max_scan_age_secs,
+            MAX_AUTOLOCATE_SCAN_AGE_SECS
+        );
+        maximum
+            .validate()
+            .expect("documented maximum must validate");
+
+        for invalid in ["-1", "31536001", "18446744073709551615"] {
+            assert!(Args::try_parse_from(
+                ["whereamid", "--autolocate-max-scan-age-secs", invalid,]
+            )
+            .is_err());
+        }
+
+        let mut bypassing_clap = parse(&[]);
+        bypassing_clap.autolocate_max_scan_age_secs = u64::MAX;
+        let error = bypassing_clap
+            .validate()
+            .expect_err("validate must reject a directly-constructed invalid value");
+        assert!(error.to_string().contains("--autolocate-max-scan-age-secs"));
+    }
+
+    #[test]
+    fn autolocate_max_scan_age_help_pins_default_boundary_and_zero_semantics() {
+        use clap::CommandFactory as _;
+        let mut help = Vec::new();
+        Args::command().write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        let section = help
+            .split("--autolocate-max-scan-age-secs")
+            .nth(1)
+            .expect("scan-age flag missing from help")
+            .split("--debounce-window")
+            .next()
+            .unwrap();
+        assert!(section.contains("[default: 180]"));
+        assert!(section.contains("0..=31536000"));
+        assert!(section.contains("Equality is fresh"));
+        assert!(section.contains("0 accepts any present snapshot"));
     }
 
     // --- task-0196: --bind opt-in TCP + non-loopback guard ---

@@ -73,6 +73,22 @@ let
       }).config.services.whereami.autolocateIntervalSecs)
       true);
 
+  evaluateAutolocateMaxScanAge = value:
+    builtins.tryEval (builtins.deepSeq
+      ((lib.evalModules {
+        modules = [
+          {
+            options.services.whereami = sharedOptions {
+              dbPathDefault = "/var/lib/whereami/aps.sqlite";
+              credentialsFileDefault = null;
+              socketPathDefault = "/run/whereami/whereamid.sock";
+            };
+            config.services.whereami.autolocateMaxScanAgeSecs = value;
+          }
+        ];
+      }).config.services.whereami.autolocateMaxScanAgeSecs)
+      true);
+
   optionDefault = defaults: option:
     (lib.evalModules {
       modules = [
@@ -209,12 +225,19 @@ let
     && (evaluateAutolocateInterval 31536000).success
     && !(evaluateAutolocateInterval (-1)).success
     && !(evaluateAutolocateInterval 31536001).success;
+  autolocateMaxScanAgeBoundsHold =
+    (evaluateAutolocateMaxScanAge 0).success
+    && (evaluateAutolocateMaxScanAge 1).success
+    && (evaluateAutolocateMaxScanAge 31536000).success
+    && !(evaluateAutolocateMaxScanAge (-1)).success
+    && !(evaluateAutolocateMaxScanAge 31536001).success;
 in
 assert atUpperBound.success && atUpperBound.value;
 assert !aboveUpperBound.success;
 assert retentionBoundsHold;
 assert speedBoundsHold;
 assert autolocateBoundsHold;
+assert autolocateMaxScanAgeBoundsHold;
 assert optionDefault systemDefaults "dbPath" == "/var/lib/whereami/aps.sqlite";
 assert optionDefault homeDefaults "dbPath" == "%h/.local/share/whereami/aps.sqlite";
 assert optionDefault systemDefaults "historyRetentionDays" == 30;
@@ -225,6 +248,8 @@ assert optionDefault systemDefaults "maxTravelSpeedKmh" == 250;
 assert optionDefault homeDefaults "maxTravelSpeedKmh" == 250;
 assert optionDefault systemDefaults "autolocateIntervalSecs" == 120;
 assert optionDefault homeDefaults "autolocateIntervalSecs" == 120;
+assert optionDefault systemDefaults "autolocateMaxScanAgeSecs" == 180;
+assert optionDefault homeDefaults "autolocateMaxScanAgeSecs" == 180;
 assert optionDefault systemDefaults "mobileSsidDenylist" == expectedMobileSsidDenylist;
 assert optionDefault homeDefaults "mobileSsidDenylist" == expectedMobileSsidDenylist;
 assert optionDefault systemDefaults "rustLog" == null;
@@ -246,7 +271,8 @@ pkgs.runCommand "whereami-option-bounds" { } ''
   echo "retention bounds OK: 0..365000 accepted, outside rejected"
   echo "maxTravelSpeedKmh bounds OK: positive numbers accepted, zero/negative rejected"
   echo "autolocateIntervalSecs bounds OK: 0..31536000 accepted, outside rejected"
-  echo "system/home defaults OK: dbPath, retention=30, maxTravelSpeedKmh=250, autolocateIntervalSecs=120, rustLog=null"
+  echo "autolocateMaxScanAgeSecs bounds OK: 0..31536000 accepted, outside rejected"
+  echo "system/home defaults OK: dbPath, retention=30, maxTravelSpeedKmh=250, autolocateIntervalSecs=120, autolocateMaxScanAgeSecs=180, rustLog=null"
   echo "shared credentialsFile docs OK: WiGLE keys present, BeaconDB absent"
   echo "home-manager RUST_LOG encoding OK: optional, quoted, percent-safe, CR/LF rejected"
   echo "mobile SSID defaults and CR/LF rejection OK"

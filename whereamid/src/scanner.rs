@@ -1,11 +1,36 @@
-//! Wi-Fi scanner: shells out to `iw dev <iface> scan trigger` then `iw dev <iface> scan dump`.
+//! Wi-Fi scanner with result provenance tied to one blocking refresh command.
 
-use anyhow::{bail, Context, Result};
+use std::future::Future;
+use std::pin::Pin;
+
+use anyhow::{anyhow, bail, Result};
 use tokio::process::Command;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{sleep, timeout, timeout_at, Duration, Instant as TokioInstant};
 use tracing::{debug, warn};
 
-const IW_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::boot_clock::BootTime;
+
+const SCAN_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const NM_FORCED_COMMAND_TIMEOUT: Duration = Duration::from_secs(18);
+const NM_REFRESH_DEADLINE: Duration = Duration::from_secs(20);
+const IW_BUSY_RETRIES: usize = 3;
+const NM_LAST_SCAN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const NM_SERVICE: &str = "org.freedesktop.NetworkManager";
+const NM_ROOT_PATH: &str = "/org/freedesktop/NetworkManager";
+const NM_WIRELESS_INTERFACE: &str = "org.freedesktop.NetworkManager.Device.Wireless";
+const DBUS_SERVICE: &str = "org.freedesktop.DBus";
+const DBUS_PATH: &str = "/org/freedesktop/DBus";
+
+#[derive(Clone, Copy)]
+struct NmRefreshTiming {
+    deadline: Duration,
+    poll_interval: Duration,
+}
+
+const NM_REFRESH_TIMING: NmRefreshTiming = NmRefreshTiming {
+    deadline: NM_REFRESH_DEADLINE,
+    poll_interval: NM_LAST_SCAN_POLL_INTERVAL,
+};
 
 /// Default comma-separated value accepted by `--mobile-ssid-denylist`.
 pub const DEFAULT_MOBILE_SSID_DENYLIST: &str =
@@ -78,70 +103,584 @@ pub struct ScannedNetwork {
     pub frequency: Option<i32>,
 }
 
-/// Scan Wi-Fi networks. Tries nmcli first (no privileges needed since NetworkManager
-/// runs as root), falls back to iw scan trigger/dump (needs CAP_NET_ADMIN).
-pub async fn wifi_scan(interface: &str) -> Result<Vec<ScannedNetwork>> {
-    // Try nmcli first — no special privileges needed
-    match wifi_scan_nmcli(interface).await {
-        Ok(networks) if !networks.is_empty() => return Ok(networks),
-        Ok(_) => debug!("nmcli returned no networks, falling back to iw"),
+/// One readable scanner batch plus optional proof that its backend completed a
+/// radio refresh before reading the batch. Networks remain useful to
+/// interactive commands when the proof is absent; autonomous history applies
+/// the stricter policy.
+#[derive(Debug, Clone)]
+pub struct ScanBatch {
+    pub networks: Vec<ScannedNetwork>,
+    pub confirmed_refresh_started_at: Option<BootTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanCommand {
+    program: String,
+    args: Vec<String>,
+    locale_c: bool,
+    timeout: Duration,
+    kill_on_drop: bool,
+}
+
+impl ScanCommand {
+    fn new(program: &str, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            program: program.to_owned(),
+            args: args.into_iter().map(Into::into).collect(),
+            locale_c: false,
+            timeout: SCAN_COMMAND_TIMEOUT,
+            kill_on_drop: true,
+        }
+    }
+
+    fn with_c_locale(mut self) -> Self {
+        self.locale_c = true;
+        self
+    }
+
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandOutcome {
+    Succeeded { stdout: String },
+    NonZero { stderr: String },
+    TimedOut,
+    FailedToStart { error: String },
+}
+
+type CommandFuture<'a> = Pin<Box<dyn Future<Output = CommandOutcome> + Send + 'a>>;
+type DelayFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// Narrow execution seam for the scanner's fixed command state machine. Tests
+/// inject exact command outcomes without replacing any other daemon behavior.
+trait ScanCommandRunner {
+    fn boot_time(&mut self) -> std::io::Result<BootTime>;
+    fn run<'a>(&'a mut self, command: ScanCommand) -> CommandFuture<'a>;
+    fn delay<'a>(&'a mut self, duration: Duration) -> DelayFuture<'a>;
+}
+
+struct TokioScanCommandRunner;
+
+impl ScanCommandRunner for TokioScanCommandRunner {
+    fn boot_time(&mut self) -> std::io::Result<BootTime> {
+        BootTime::now()
+    }
+
+    fn run<'a>(&'a mut self, command: ScanCommand) -> CommandFuture<'a> {
+        Box::pin(async move {
+            let mut process = Command::new(&command.program);
+            process
+                .args(&command.args)
+                .kill_on_drop(command.kill_on_drop);
+            if command.locale_c {
+                process.env("LC_ALL", "C");
+            }
+
+            match timeout(command.timeout, process.output()).await {
+                Ok(Ok(output)) if output.status.success() => CommandOutcome::Succeeded {
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                },
+                Ok(Ok(output)) => CommandOutcome::NonZero {
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                },
+                Ok(Err(error)) => CommandOutcome::FailedToStart {
+                    error: error.to_string(),
+                },
+                Err(_) => CommandOutcome::TimedOut,
+            }
+        })
+    }
+
+    fn delay<'a>(&'a mut self, duration: Duration) -> DelayFuture<'a> {
+        Box::pin(sleep(duration))
+    }
+}
+
+fn finish_refresh_evidence(
+    backend: &str,
+    started_at: std::io::Result<BootTime>,
+) -> Option<BootTime> {
+    match started_at {
+        Ok(evidence) => Some(evidence),
+        Err(error) => {
+            warn!(
+                "{backend} refresh succeeded but CLOCK_BOOTTIME could not timestamp its start: \
+                 {error}; autonomous scan freshness is unconfirmed"
+            );
+            None
+        }
+    }
+}
+
+fn nmcli_list_command(interface: &str, force_refresh: bool) -> ScanCommand {
+    ScanCommand::new(
+        "nmcli",
+        [
+            "-t",
+            "-f",
+            "BSSID,SSID,SIGNAL,CHAN,FREQ",
+            "device",
+            "wifi",
+            "list",
+            "ifname",
+            interface,
+            "--rescan",
+            if force_refresh { "yes" } else { "no" },
+        ],
+    )
+    .with_c_locale()
+    .with_timeout(if force_refresh {
+        NM_FORCED_COMMAND_TIMEOUT
+    } else {
+        SCAN_COMMAND_TIMEOUT
+    })
+}
+
+fn nm_device_path_command(owner: &str, interface: &str) -> ScanCommand {
+    ScanCommand::new(
+        "busctl",
+        [
+            "--json=short",
+            "--system",
+            "call",
+            owner,
+            NM_ROOT_PATH,
+            NM_SERVICE,
+            "GetDeviceByIpIface",
+            "s",
+            interface,
+        ],
+    )
+}
+
+fn nm_owner_command() -> ScanCommand {
+    ScanCommand::new(
+        "busctl",
+        [
+            "--json=short",
+            "--system",
+            "call",
+            DBUS_SERVICE,
+            DBUS_PATH,
+            DBUS_SERVICE,
+            "GetNameOwner",
+            "s",
+            NM_SERVICE,
+        ],
+    )
+}
+
+fn nm_last_scan_command(owner: &str, device_path: &str) -> ScanCommand {
+    ScanCommand::new(
+        "busctl",
+        [
+            "--json=short",
+            "--system",
+            "get-property",
+            owner,
+            device_path,
+            NM_WIRELESS_INTERFACE,
+            "LastScan",
+        ],
+    )
+}
+
+fn iw_direct_scan_command(interface: &str) -> ScanCommand {
+    ScanCommand::new("iw", ["dev", interface, "scan"])
+}
+
+fn iw_cached_dump_command(interface: &str) -> ScanCommand {
+    ScanCommand::new("iw", ["dev", interface, "scan", "dump"])
+}
+
+/// Scan Wi-Fi networks. NetworkManager's forced list is preferred because it
+/// needs no daemon capability. Only an unavailable or empty *unconfirmed*
+/// NetworkManager fallback proceeds to the CAP_NET_ADMIN `iw` path.
+pub async fn wifi_scan(interface: &str) -> Result<ScanBatch> {
+    let mut runner = TokioScanCommandRunner;
+    wifi_scan_with_runner(interface, &mut runner).await
+}
+
+async fn wifi_scan_with_runner<R: ScanCommandRunner>(
+    interface: &str,
+    runner: &mut R,
+) -> Result<ScanBatch> {
+    match wifi_scan_nmcli(interface, runner).await {
+        Ok(Some(batch)) => return Ok(batch),
+        Ok(None) => debug!("unconfirmed nmcli cache is empty, falling back to iw"),
         Err(e) => debug!("nmcli scan failed ({e}), falling back to iw"),
     }
 
-    wifi_scan_iw(interface).await
+    wifi_scan_iw(interface, runner).await
 }
 
-/// Scan via NetworkManager CLI. Triggers rescan then lists results.
-async fn wifi_scan_nmcli(interface: &str) -> Result<Vec<ScannedNetwork>> {
-    // Request a rescan (non-blocking, may silently fail if too frequent)
-    let _ = timeout(
-        IW_TIMEOUT,
-        Command::new("nmcli")
-            .args(["device", "wifi", "rescan", "ifname", interface])
-            // FREQ is human-readable even in terse mode; pin its unit suffix.
-            .env("LC_ALL", "C")
-            // task-0190: kill the child if this future is dropped mid-scan on
-            // shutdown, so a cancelled scan leaves no orphaned nmcli process.
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
+/// NetworkManager provenance requires more than nmcli's exit status: nmcli can
+/// force-finish `--rescan yes` with cached rows after a D-Bus request failure.
+/// Resolve the device and baseline its suspend-inclusive `LastScan` generation,
+/// run the forced command, wait for generation proof, then re-list with
+/// `--rescan no` so the retained rows cannot predate that completion.
+async fn wifi_scan_nmcli<R: ScanCommandRunner>(
+    interface: &str,
+    runner: &mut R,
+) -> Result<Option<ScanBatch>> {
+    wifi_scan_nmcli_with_timing(interface, runner, NM_REFRESH_TIMING).await
+}
 
-    // Brief pause for scan to complete
-    sleep(Duration::from_millis(1500)).await;
+async fn wifi_scan_nmcli_with_timing<R: ScanCommandRunner>(
+    interface: &str,
+    runner: &mut R,
+    timing: NmRefreshTiming,
+) -> Result<Option<ScanBatch>> {
+    let generation_baseline = match nm_owner(runner).await {
+        Ok(owner) => match nm_device_path(&owner, interface, runner).await {
+            Ok(device_path) => match nm_last_scan(&owner, &device_path, runner).await {
+                Ok(last_scan) => Some((owner, device_path, last_scan)),
+                Err(error) => {
+                    debug!(
+                        "cannot baseline NetworkManager LastScan; scan will be unconfirmed: {error}"
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                debug!(
+                    "cannot resolve NetworkManager Wi-Fi device; scan will be unconfirmed: {error}"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            debug!("cannot resolve NetworkManager owner; scan will be unconfirmed: {error}");
+            None
+        }
+    };
 
-    // List results in terse machine-readable format
-    let output = timeout(
-        IW_TIMEOUT,
-        Command::new("nmcli")
-            .args([
-                "-t",
-                "-f",
-                "BSSID,SSID,SIGNAL,CHAN,FREQ",
-                "device",
-                "wifi",
-                "list",
-                "ifname",
-                interface,
-            ])
-            // Keep the parsed ` MHz` suffix stable across host locales.
-            .env("LC_ALL", "C")
-            .kill_on_drop(true)
-            .output(),
+    let refresh_started_at = runner.boot_time();
+    let refresh_deadline = TokioInstant::now() + timing.deadline;
+    let forced_stdout = match timeout_at(
+        refresh_deadline,
+        run_checked(
+            runner,
+            nmcli_list_command(interface, true),
+            "forced nmcli wifi list",
+        ),
     )
     .await
-    .context("nmcli wifi list timed out")?
-    .context("failed to run nmcli")?;
+    {
+        Ok(Ok(stdout)) => Some(stdout),
+        Ok(Err(error)) => {
+            debug!("{error}; trying unconfirmed nmcli cache");
+            None
+        }
+        Err(_) => {
+            debug!("forced nmcli refresh deadline expired; trying unconfirmed nmcli cache");
+            None
+        }
+    };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("nmcli wifi list failed: {stderr}");
+    let refresh_started_at = if forced_stdout.is_some() {
+        finish_refresh_evidence("nmcli", refresh_started_at)
+    } else {
+        None
+    };
+    let provisional_generation = match (generation_baseline.as_ref(), refresh_started_at) {
+        (Some((owner, device_path, baseline)), Some(started_at)) if *baseline >= 0 => {
+            match wait_for_nm_generation(
+                owner,
+                device_path,
+                *baseline,
+                started_at,
+                refresh_deadline,
+                timing.poll_interval,
+                runner,
+            )
+            .await
+            {
+                Ok(Some(generation)) => {
+                    Some((started_at, generation, owner.clone(), device_path.clone()))
+                }
+                Ok(None) => {
+                    debug!(
+                        "forced nmcli exited successfully but NetworkManager LastScan did not \
+                             advance; scan will be unconfirmed"
+                    );
+                    None
+                }
+                Err(error) => {
+                    debug!(
+                        "cannot verify NetworkManager LastScan after forced scan; scan will be \
+                             unconfirmed: {error}"
+                    );
+                    None
+                }
+            }
+        }
+        (Some((_owner, _device_path, baseline)), Some(_started_at)) if *baseline < 0 => {
+            debug!(
+                "NetworkManager LastScan baseline is unset; first scan cycle cannot \
+                     distinguish scan-start from scan-completion and will be unconfirmed"
+            );
+            None
+        }
+        _ => None,
+    };
+
+    match run_checked(
+        runner,
+        nmcli_list_command(interface, false),
+        "post-refresh nmcli cached list",
+    )
+    .await
+    {
+        Ok(stdout) => {
+            let confirmed_refresh_started_at = match provisional_generation {
+                Some((started_at, proven_generation, expected_owner, expected_device_path)) => {
+                    match verify_nm_post_list(
+                        interface,
+                        &expected_owner,
+                        &expected_device_path,
+                        proven_generation,
+                        runner,
+                    )
+                    .await
+                    {
+                        Ok(true) => Some(started_at),
+                        Ok(false) => {
+                            debug!(
+                                "NetworkManager device path changed or LastScan regressed after \
+                                 post-refresh list; scan will be unconfirmed"
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            debug!(
+                                "cannot verify NetworkManager generation after post-refresh list; \
+                                 scan will be unconfirmed: {error}"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            let batch = nmcli_batch(&stdout, confirmed_refresh_started_at);
+            if batch.confirmed_refresh_started_at.is_none() && batch.networks.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(batch))
+            }
+        }
+        Err(post_error) => match forced_stdout {
+            Some(stdout) => {
+                let batch = nmcli_batch(&stdout, None);
+                if batch.networks.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(batch))
+                }
+            }
+            None => Err(post_error),
+        },
+    }
+}
+
+async fn run_checked<R: ScanCommandRunner>(
+    runner: &mut R,
+    command: ScanCommand,
+    label: &str,
+) -> Result<String> {
+    match runner.run(command).await {
+        CommandOutcome::Succeeded { stdout } => Ok(stdout),
+        CommandOutcome::NonZero { stderr } => bail!("{label} failed: {stderr}"),
+        CommandOutcome::TimedOut => bail!("{label} timed out"),
+        CommandOutcome::FailedToStart { error } => bail!("failed to start {label}: {error}"),
+    }
+}
+
+async fn nm_device_path<R: ScanCommandRunner>(
+    owner: &str,
+    interface: &str,
+    runner: &mut R,
+) -> Result<String> {
+    let stdout = run_checked(
+        runner,
+        nm_device_path_command(owner, interface),
+        "NetworkManager device-path lookup",
+    )
+    .await?;
+    parse_nm_device_path(&stdout)
+}
+
+async fn nm_owner<R: ScanCommandRunner>(runner: &mut R) -> Result<String> {
+    let stdout = run_checked(runner, nm_owner_command(), "NetworkManager owner lookup").await?;
+    parse_nm_owner(&stdout)
+}
+
+async fn nm_last_scan<R: ScanCommandRunner>(
+    owner: &str,
+    device_path: &str,
+    runner: &mut R,
+) -> Result<i64> {
+    let stdout = run_checked(
+        runner,
+        nm_last_scan_command(owner, device_path),
+        "NetworkManager LastScan read",
+    )
+    .await?;
+    parse_nm_last_scan(&stdout)
+}
+
+async fn wait_for_nm_generation<R: ScanCommandRunner>(
+    owner: &str,
+    device_path: &str,
+    baseline: i64,
+    refresh_started_at: BootTime,
+    deadline: TokioInstant,
+    poll_interval: Duration,
+    runner: &mut R,
+) -> Result<Option<i64>> {
+    loop {
+        let current = timeout_at(deadline, nm_last_scan(owner, device_path, runner))
+            .await
+            .map_err(|_| anyhow!("NetworkManager refresh deadline expired"))??;
+        let observed_at = runner.boot_time().map_err(|error| {
+            warn!("cannot timestamp NetworkManager LastScan observation: {error}");
+            anyhow!("cannot timestamp NetworkManager LastScan observation: {error}")
+        })?;
+        if last_scan_is_future(current, observed_at) {
+            warn!(
+                "NetworkManager LastScan {current}ms is in the future for the current boot clock; \
+                 scan freshness will be unconfirmed"
+            );
+            return Ok(None);
+        }
+        if nm_generation_confirms_refresh(baseline, current, refresh_started_at, observed_at) {
+            return Ok(Some(current));
+        }
+        timeout_at(deadline, runner.delay(poll_interval))
+            .await
+            .map_err(|_| anyhow!("NetworkManager refresh deadline expired"))?;
+    }
+}
+
+async fn verify_nm_post_list<R: ScanCommandRunner>(
+    interface: &str,
+    expected_owner: &str,
+    expected_device_path: &str,
+    proven_generation: i64,
+    runner: &mut R,
+) -> Result<bool> {
+    let final_owner = nm_owner(runner).await?;
+    if final_owner != expected_owner {
+        return Ok(false);
+    }
+    let final_device_path = nm_device_path(expected_owner, interface, runner).await?;
+    if final_device_path != expected_device_path {
+        return Ok(false);
+    }
+    let final_generation = nm_last_scan(expected_owner, &final_device_path, runner).await?;
+    let observed_at = runner.boot_time().map_err(|error| {
+        warn!("cannot timestamp final NetworkManager LastScan observation: {error}");
+        anyhow!("cannot timestamp final NetworkManager LastScan observation: {error}")
+    })?;
+    if last_scan_is_future(final_generation, observed_at) {
+        warn!(
+            "final NetworkManager LastScan {final_generation}ms is in the future for the current \
+             boot clock; scan freshness will be unconfirmed"
+        );
+        return Ok(false);
+    }
+    if final_generation < proven_generation {
+        return Ok(false);
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut networks = parse_nmcli_output(&stdout);
-    networks.sort_by_key(|n| std::cmp::Reverse(n.signal_dbm));
-    Ok(networks)
+    // This check must trail the property read. Otherwise NetworkManager can
+    // restart after the first owner check and a successor's compatible path
+    // and generation can be mistaken for evidence from the captured owner.
+    let trailing_owner = nm_owner(runner).await?;
+    Ok(trailing_owner == expected_owner)
+}
+
+fn nm_generation_confirms_refresh(
+    baseline: i64,
+    current: i64,
+    refresh_started_at: BootTime,
+    observed_at: BootTime,
+) -> bool {
+    let Some(start_ceiling_ms) = refresh_started_at.ceil_millis() else {
+        return false;
+    };
+    let Some(observed_floor_ms) = observed_at.floor_millis() else {
+        return false;
+    };
+    baseline >= 0
+        && current > baseline
+        && current >= start_ceiling_ms
+        && current <= observed_floor_ms
+}
+
+fn last_scan_is_future(last_scan: i64, observed_at: BootTime) -> bool {
+    match observed_at.floor_millis() {
+        Some(observed_floor_ms) => last_scan > observed_floor_ms,
+        None => true,
+    }
+}
+
+fn parse_nm_owner(stdout: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout)
+        .map_err(|error| anyhow!("invalid busctl owner JSON: {error}"))?;
+    let owner = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|data| (data.len() == 1).then_some(data))
+        .and_then(|data| data[0].as_str())
+        .filter(|owner| owner.starts_with(':') && !owner.chars().any(char::is_whitespace))
+        .ok_or_else(|| anyhow!("busctl returned no valid NetworkManager unique owner"))?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("s") {
+        bail!("busctl owner reply had the wrong D-Bus type");
+    }
+    Ok(owner.to_owned())
+}
+
+fn parse_nm_device_path(stdout: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout)
+        .map_err(|error| anyhow!("invalid busctl device-path JSON: {error}"))?;
+    let path = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|data| (data.len() == 1).then_some(data))
+        .and_then(|data| data[0].as_str())
+        .filter(|path| path.starts_with("/org/freedesktop/NetworkManager/Devices/"))
+        .ok_or_else(|| anyhow!("busctl returned no valid NetworkManager device path"))?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("o") {
+        bail!("busctl device-path reply had the wrong D-Bus type");
+    }
+    Ok(path.to_owned())
+}
+
+fn parse_nm_last_scan(stdout: &str) -> Result<i64> {
+    let value: serde_json::Value = serde_json::from_str(stdout)
+        .map_err(|error| anyhow!("invalid busctl LastScan JSON: {error}"))?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("x") {
+        bail!("busctl LastScan reply had the wrong D-Bus type");
+    }
+    value
+        .get("data")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| anyhow!("busctl LastScan reply had no signed 64-bit value"))
+}
+
+fn nmcli_batch(stdout: &str, confirmed_refresh_started_at: Option<BootTime>) -> ScanBatch {
+    let mut networks = parse_nmcli_output(stdout);
+    networks.sort_by_key(|network| std::cmp::Reverse(network.signal_dbm));
+    ScanBatch {
+        networks,
+        confirmed_refresh_started_at,
+    }
 }
 
 /// Parse nmcli terse output. In -t mode, nmcli escapes ':' in field values as '\:'.
@@ -247,64 +786,84 @@ pub fn split_nmcli_fields(line: &str) -> Vec<String> {
     fields
 }
 
-/// Scan via iw (needs CAP_NET_ADMIN for trigger). Falls back to cached dump.
-async fn wifi_scan_iw(interface: &str) -> Result<Vec<ScannedNetwork>> {
-    // Trigger a background scan
-    let mut retries = 3;
+/// Scan via iw (needs CAP_NET_ADMIN). `iw dev <iface> scan` blocks until its
+/// own refreshed results are available, so one successful command can confirm
+/// both provenance and output. Generic failures may preserve the old cached
+/// dump for interactive continuity, but spawn/timeout/interface-down failures
+/// retain the pre-existing total-error behavior and publish nothing.
+async fn wifi_scan_iw<R: ScanCommandRunner>(interface: &str, runner: &mut R) -> Result<ScanBatch> {
+    let mut retries_remaining = IW_BUSY_RETRIES;
     loop {
-        let output = timeout(
-            IW_TIMEOUT,
-            Command::new("iw")
-                .args(["dev", interface, "scan", "trigger"])
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .context("iw scan trigger timed out")?
-        .context("failed to run iw scan trigger")?;
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.success() {
-            break;
-        } else if stderr.contains("Device or resource busy") && retries > 0 {
-            retries -= 1;
-            debug!("scan trigger busy, retrying in 1s ({retries} retries left)");
-            sleep(Duration::from_secs(1)).await;
-        } else if stderr.contains("command failed: Network is down") {
-            bail!("wifi interface {interface} is down");
-        } else {
-            warn!("scan trigger failed: {stderr}");
-            break;
+        let refresh_started_at = runner.boot_time();
+        match runner.run(iw_direct_scan_command(interface)).await {
+            CommandOutcome::Succeeded { stdout } if iw_scan_was_aborted(&stdout) => {
+                warn!("iw direct scan was aborted; trying unconfirmed cached dump");
+                break;
+            }
+            CommandOutcome::Succeeded { stdout } => {
+                return Ok(iw_batch(
+                    &stdout,
+                    finish_refresh_evidence("iw", refresh_started_at),
+                ));
+            }
+            CommandOutcome::FailedToStart { error } => {
+                bail!("failed to run iw scan: {error}");
+            }
+            CommandOutcome::TimedOut => bail!("iw scan timed out"),
+            CommandOutcome::NonZero { stderr } if iw_errno(&stderr) == Some(-libc::ENETDOWN) => {
+                bail!("wifi interface {interface} is down");
+            }
+            CommandOutcome::NonZero { stderr }
+                if iw_errno(&stderr) == Some(-libc::EBUSY) && retries_remaining > 0 =>
+            {
+                retries_remaining -= 1;
+                debug!("iw direct scan busy, retrying in 1s ({retries_remaining} retries left)");
+                runner.delay(Duration::from_secs(1)).await;
+            }
+            CommandOutcome::NonZero { stderr } => {
+                warn!("iw direct scan failed; trying unconfirmed cached dump: {stderr}");
+                break;
+            }
         }
     }
 
-    // Brief pause for scan to complete
-    sleep(Duration::from_millis(500)).await;
-
-    // Dump results
-    let output = timeout(
-        IW_TIMEOUT,
-        Command::new("iw")
-            .args(["dev", interface, "scan", "dump"])
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .context("iw scan dump timed out")?
-    .context("failed to run iw scan dump")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("iw scan dump failed: {stderr}");
+    match runner.run(iw_cached_dump_command(interface)).await {
+        CommandOutcome::Succeeded { stdout } => Ok(iw_batch(&stdout, None)),
+        CommandOutcome::NonZero { stderr } => bail!("iw scan dump failed: {stderr}"),
+        CommandOutcome::TimedOut => bail!("iw scan dump timed out"),
+        CommandOutcome::FailedToStart { error } => {
+            bail!("failed to run iw scan dump: {error}")
+        }
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut networks = parse_iw_output(&stdout);
-    networks.sort_by_key(|n| std::cmp::Reverse(n.signal_dbm));
-    Ok(networks)
 }
 
-/// Parse the output of `iw dev <iface> scan dump`.
+fn iw_scan_was_aborted(stdout: &str) -> bool {
+    // iw exits zero for NL80211_CMD_SCAN_ABORTED and prints this sentinel
+    // instead of scan results. It is not a confirmed empty scan.
+    stdout.lines().any(|line| line.trim() == "scan aborted!")
+}
+
+fn iw_errno(stderr: &str) -> Option<i32> {
+    // iw formats nl80211 failures as `<strerror> (<negative errno>)`. Match the
+    // numeric errno because strerror wording differs between libc
+    // implementations (for example, EBUSY is "Resource busy" on musl).
+    stderr.lines().rev().find_map(|line| {
+        let open = line.rfind('(')?;
+        let close = line[open + 1..].find(')')? + open + 1;
+        line[open + 1..close].trim().parse().ok()
+    })
+}
+
+fn iw_batch(stdout: &str, confirmed_refresh_started_at: Option<BootTime>) -> ScanBatch {
+    let mut networks = parse_iw_output(stdout);
+    networks.sort_by_key(|network| std::cmp::Reverse(network.signal_dbm));
+    ScanBatch {
+        networks,
+        confirmed_refresh_started_at,
+    }
+}
+
+/// Parse the result output of `iw dev <iface> scan` or its cached `scan dump`.
 pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
     let mut networks = Vec::new();
     let mut current_bssid: Option<String> = None;
@@ -436,6 +995,1044 @@ pub fn scan_to_sample(networks: &[ScannedNetwork]) -> crate::debounce::ScanSampl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    const NMCLI_NETWORK: &str = "02\\:00\\:00\\:00\\:24\\:10:fixture-nmcli:80:6:2437 MHz\n";
+    const NMCLI_POST_NETWORK: &str =
+        "02\\:00\\:00\\:00\\:24\\:11:fixture-post-proof:75:11:2462 MHz\n";
+    const NM_DEVICE_PATH: &str = "/org/freedesktop/NetworkManager/Devices/42";
+    const NM_OWNER: &str = ":1.4242";
+    const IW_NETWORK: &str = "BSS 02:00:00:00:24:20(on wlan-test)\n\
+        freq: 5180\n\
+        signal: -61.00 dBm\n\
+        SSID: fixture-iw\n\
+        DS Parameter set: channel 36\n";
+
+    enum FakeClockOutcome {
+        Time(BootTime),
+        Failed,
+    }
+
+    struct FakeRunner {
+        clocks: VecDeque<FakeClockOutcome>,
+        outcomes: VecDeque<CommandOutcome>,
+        commands: Vec<ScanCommand>,
+        delays: Vec<Duration>,
+        timed_delays: bool,
+    }
+
+    impl FakeRunner {
+        fn new(clocks: Vec<FakeClockOutcome>, outcomes: Vec<CommandOutcome>) -> Self {
+            Self {
+                clocks: clocks.into(),
+                outcomes: outcomes.into(),
+                commands: Vec::new(),
+                delays: Vec::new(),
+                timed_delays: false,
+            }
+        }
+
+        fn with_timed_delays(mut self) -> Self {
+            self.timed_delays = true;
+            self
+        }
+
+        fn assert_exhausted(&self) {
+            assert!(self.clocks.is_empty(), "unused injected clock readings");
+            assert!(self.outcomes.is_empty(), "unused injected command outcomes");
+        }
+    }
+
+    impl ScanCommandRunner for FakeRunner {
+        fn boot_time(&mut self) -> std::io::Result<BootTime> {
+            match self
+                .clocks
+                .pop_front()
+                .expect("scanner requested an unexpected clock reading")
+            {
+                FakeClockOutcome::Time(value) => Ok(value),
+                FakeClockOutcome::Failed => {
+                    Err(std::io::Error::other("injected CLOCK_BOOTTIME failure"))
+                }
+            }
+        }
+
+        fn run<'a>(&'a mut self, command: ScanCommand) -> CommandFuture<'a> {
+            self.commands.push(command);
+            let outcome = self
+                .outcomes
+                .pop_front()
+                .expect("scanner ran an unexpected command");
+            Box::pin(async move { outcome })
+        }
+
+        fn delay<'a>(&'a mut self, duration: Duration) -> DelayFuture<'a> {
+            self.delays.push(duration);
+            if self.timed_delays {
+                Box::pin(sleep(duration))
+            } else {
+                Box::pin(async {})
+            }
+        }
+    }
+
+    struct HangingForcedRunner {
+        commands: Vec<ScanCommand>,
+    }
+
+    impl ScanCommandRunner for HangingForcedRunner {
+        fn boot_time(&mut self) -> std::io::Result<BootTime> {
+            Ok(BootTime::from_duration(Duration::from_secs(100)))
+        }
+
+        fn run<'a>(&'a mut self, command: ScanCommand) -> CommandFuture<'a> {
+            let is_forced = command.program == "nmcli"
+                && command.args.last().map(String::as_str) == Some("yes");
+            let is_post =
+                command.program == "nmcli" && command.args.last().map(String::as_str) == Some("no");
+            let is_owner =
+                command.program == "busctl" && command.args.iter().any(|arg| arg == "GetNameOwner");
+            let is_path = command.program == "busctl"
+                && command.args.iter().any(|arg| arg == "GetDeviceByIpIface");
+            self.commands.push(command);
+
+            if is_forced {
+                Box::pin(std::future::pending())
+            } else if is_post {
+                Box::pin(async { succeeded(NMCLI_POST_NETWORK) })
+            } else if is_owner {
+                Box::pin(async { owner_reply() })
+            } else if is_path {
+                Box::pin(async { device_path_reply() })
+            } else {
+                Box::pin(async { last_scan_reply(99_000) })
+            }
+        }
+
+        fn delay<'a>(&'a mut self, _duration: Duration) -> DelayFuture<'a> {
+            Box::pin(async {})
+        }
+    }
+
+    fn at(seconds: u64) -> FakeClockOutcome {
+        FakeClockOutcome::Time(BootTime::from_duration(Duration::from_secs(seconds)))
+    }
+
+    fn at_millis(milliseconds: u64) -> FakeClockOutcome {
+        FakeClockOutcome::Time(BootTime::from_duration(Duration::from_millis(milliseconds)))
+    }
+
+    fn succeeded(stdout: &str) -> CommandOutcome {
+        CommandOutcome::Succeeded {
+            stdout: stdout.to_owned(),
+        }
+    }
+
+    fn failed(stderr: &str) -> CommandOutcome {
+        CommandOutcome::NonZero {
+            stderr: stderr.to_owned(),
+        }
+    }
+
+    fn device_path_reply() -> CommandOutcome {
+        succeeded(r#"{"type":"o","data":["/org/freedesktop/NetworkManager/Devices/42"]}"#)
+    }
+
+    fn owner_reply() -> CommandOutcome {
+        succeeded(r#"{"type":"s","data":[":1.4242"]}"#)
+    }
+
+    fn last_scan_reply(milliseconds: i64) -> CommandOutcome {
+        succeeded(&format!(r#"{{"type":"x","data":{milliseconds}}}"#))
+    }
+
+    fn assert_production_command_contract(command: &ScanCommand) {
+        assert!(
+            command.kill_on_drop,
+            "every scanner subprocess must die when cancellation drops its future"
+        );
+    }
+
+    fn assert_literal_nmcli_command(command: &ScanCommand, rescan: &str) {
+        assert_eq!(command.program, "nmcli");
+        assert_eq!(
+            command.args,
+            [
+                "-t",
+                "-f",
+                "BSSID,SSID,SIGNAL,CHAN,FREQ",
+                "device",
+                "wifi",
+                "list",
+                "ifname",
+                "wlan-test",
+                "--rescan",
+                rescan,
+            ]
+        );
+        assert!(command.locale_c);
+        assert_eq!(
+            command.timeout,
+            if rescan == "yes" {
+                NM_FORCED_COMMAND_TIMEOUT
+            } else {
+                SCAN_COMMAND_TIMEOUT
+            }
+        );
+        assert_production_command_contract(command);
+    }
+
+    fn assert_literal_iw_direct_command(command: &ScanCommand) {
+        assert_eq!(command.program, "iw");
+        assert_eq!(command.args, ["dev", "wlan-test", "scan"]);
+        assert!(!command.locale_c);
+        assert_eq!(command.timeout, SCAN_COMMAND_TIMEOUT);
+        assert_production_command_contract(command);
+    }
+
+    fn assert_literal_iw_dump_command(command: &ScanCommand) {
+        assert_eq!(command.program, "iw");
+        assert_eq!(command.args, ["dev", "wlan-test", "scan", "dump"]);
+        assert!(!command.locale_c);
+        assert_eq!(command.timeout, SCAN_COMMAND_TIMEOUT);
+        assert_production_command_contract(command);
+    }
+
+    fn assert_literal_nm_device_path_command(command: &ScanCommand) {
+        assert_eq!(command.program, "busctl");
+        assert_eq!(
+            command.args,
+            [
+                "--json=short",
+                "--system",
+                "call",
+                ":1.4242",
+                "/org/freedesktop/NetworkManager",
+                "org.freedesktop.NetworkManager",
+                "GetDeviceByIpIface",
+                "s",
+                "wlan-test",
+            ]
+        );
+        assert!(!command.locale_c);
+        assert_eq!(command.timeout, SCAN_COMMAND_TIMEOUT);
+        assert_production_command_contract(command);
+    }
+
+    fn assert_literal_nm_owner_command(command: &ScanCommand) {
+        assert_eq!(command.program, "busctl");
+        assert_eq!(
+            command.args,
+            [
+                "--json=short",
+                "--system",
+                "call",
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "GetNameOwner",
+                "s",
+                "org.freedesktop.NetworkManager",
+            ]
+        );
+        assert!(!command.locale_c);
+        assert_eq!(command.timeout, SCAN_COMMAND_TIMEOUT);
+        assert_production_command_contract(command);
+    }
+
+    fn assert_literal_nm_last_scan_command(command: &ScanCommand) {
+        assert_eq!(command.program, "busctl");
+        assert_eq!(
+            command.args,
+            [
+                "--json=short",
+                "--system",
+                "get-property",
+                ":1.4242",
+                "/org/freedesktop/NetworkManager/Devices/42",
+                "org.freedesktop.NetworkManager.Device.Wireless",
+                "LastScan",
+            ]
+        );
+        assert!(!command.locale_c);
+        assert_eq!(command.timeout, SCAN_COMMAND_TIMEOUT);
+        assert_production_command_contract(command);
+    }
+
+    #[test]
+    fn networkmanager_busctl_json_and_generation_rules_are_strict() {
+        assert_eq!(
+            parse_nm_owner(r#"{"type":"s","data":[":1.4242"]}"#).unwrap(),
+            NM_OWNER
+        );
+        assert!(
+            parse_nm_owner(r#"{"type":"s","data":["org.freedesktop.NetworkManager"]}"#).is_err()
+        );
+        assert_eq!(
+            parse_nm_device_path(
+                r#"{"type":"o","data":["/org/freedesktop/NetworkManager/Devices/42"]}"#
+            )
+            .unwrap(),
+            NM_DEVICE_PATH
+        );
+        assert_eq!(
+            parse_nm_last_scan(r#"{"type":"x","data":12345}"#).unwrap(),
+            12_345
+        );
+        assert!(parse_nm_device_path(r#"{"type":"s","data":["wrong"]}"#).is_err());
+        assert!(parse_nm_last_scan(r#"{"type":"u","data":12345}"#).is_err());
+        assert!(parse_nm_last_scan(r#"{"type":"x","data":18446744073709551615}"#).is_err());
+        assert!(parse_nm_last_scan("not json").is_err());
+
+        let start = BootTime::from_duration(Duration::from_millis(10_000));
+        let observed = BootTime::from_duration(Duration::from_millis(10_001));
+        assert!(!nm_generation_confirms_refresh(
+            9_000, 9_000, start, observed
+        ));
+        assert!(nm_generation_confirms_refresh(
+            9_000, 10_000, start, observed
+        ));
+        let submillisecond_start =
+            BootTime::from_duration(Duration::from_millis(10_000) + Duration::from_nanos(1));
+        assert!(!nm_generation_confirms_refresh(
+            9_999,
+            10_000,
+            submillisecond_start,
+            observed,
+        ));
+        assert!(nm_generation_confirms_refresh(
+            9_999,
+            10_001,
+            submillisecond_start,
+            observed,
+        ));
+        assert!(!nm_generation_confirms_refresh(-1, -1, start, observed));
+        assert!(!nm_generation_confirms_refresh(-1, 10_001, start, observed));
+        assert!(!nm_generation_confirms_refresh(
+            9_000, 10_002, start, observed
+        ));
+    }
+
+    #[tokio::test]
+    async fn nmcli_generation_proof_relists_and_returns_post_completion_rows() {
+        let stamp = BootTime::from_duration(Duration::from_secs(10));
+        let mut runner = FakeRunner::new(
+            vec![at(10), at_millis(10_001), at_millis(10_002)],
+            vec![
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(9_000),
+                succeeded(NMCLI_NETWORK),
+                last_scan_reply(10_001),
+                succeeded(NMCLI_POST_NETWORK),
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(10_001),
+                owner_reply(),
+            ],
+        );
+
+        let batch = wifi_scan_with_runner("wlan-test", &mut runner)
+            .await
+            .expect("proved nmcli generation should succeed");
+
+        assert_eq!(batch.networks.len(), 1);
+        assert_eq!(
+            batch.networks[0].bssid, "02:00:00:00:24:11",
+            "forced-command rows must be discarded in favor of the post-proof list"
+        );
+        assert_eq!(batch.confirmed_refresh_started_at, Some(stamp));
+        assert_eq!(
+            runner.commands,
+            vec![
+                nm_owner_command(),
+                nm_device_path_command(NM_OWNER, "wlan-test"),
+                nm_last_scan_command(NM_OWNER, NM_DEVICE_PATH),
+                nmcli_list_command("wlan-test", true),
+                nm_last_scan_command(NM_OWNER, NM_DEVICE_PATH),
+                nmcli_list_command("wlan-test", false),
+                nm_owner_command(),
+                nm_device_path_command(NM_OWNER, "wlan-test"),
+                nm_last_scan_command(NM_OWNER, NM_DEVICE_PATH),
+                nm_owner_command(),
+            ]
+        );
+        assert_literal_nm_owner_command(&runner.commands[0]);
+        assert_literal_nm_device_path_command(&runner.commands[1]);
+        assert_literal_nm_last_scan_command(&runner.commands[2]);
+        assert_literal_nmcli_command(&runner.commands[3], "yes");
+        assert_literal_nm_last_scan_command(&runner.commands[4]);
+        assert_literal_nmcli_command(&runner.commands[5], "no");
+        assert_literal_nm_owner_command(&runner.commands[6]);
+        assert_literal_nm_device_path_command(&runner.commands[7]);
+        assert_literal_nm_last_scan_command(&runner.commands[8]);
+        assert_literal_nm_owner_command(&runner.commands[9]);
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn nmcli_unset_baseline_cannot_mistake_scan_start_update_for_completion() {
+        let mut runner = FakeRunner::new(
+            vec![at(25)],
+            vec![
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(-1),
+                succeeded(NMCLI_NETWORK),
+                // NetworkManager can update -1 at scan start; this cycle must
+                // not poll or accept that transition as completion proof.
+                succeeded(NMCLI_POST_NETWORK),
+            ],
+        );
+
+        let batch = wifi_scan_nmcli("wlan-test", &mut runner)
+            .await
+            .expect("post-list should remain readable")
+            .expect("non-empty post-list should be retained");
+
+        assert_eq!(batch.confirmed_refresh_started_at, None);
+        assert_eq!(runner.commands.len(), 5);
+        assert!(runner.delays.is_empty());
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn nmcli_proved_generation_preserves_confirmed_empty_post_list_without_iw() {
+        let stamp = BootTime::from_duration(Duration::from_secs(11));
+        let mut runner = FakeRunner::new(
+            vec![at(11), at_millis(11_001), at_millis(11_002)],
+            vec![
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(10_000),
+                succeeded(NMCLI_NETWORK),
+                last_scan_reply(11_001),
+                succeeded(""),
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(11_001),
+                owner_reply(),
+            ],
+        );
+
+        let batch = wifi_scan_with_runner("wlan-test", &mut runner)
+            .await
+            .expect("proved empty nmcli generation should be publishable");
+
+        assert!(batch.networks.is_empty());
+        assert_eq!(batch.confirmed_refresh_started_at, Some(stamp));
+        assert_eq!(
+            runner.commands.len(),
+            10,
+            "confirmed empty must not reach iw"
+        );
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nmcli_zero_exit_with_stale_last_scan_polls_to_deadline_unconfirmed() {
+        let timing = NmRefreshTiming {
+            deadline: Duration::from_millis(250),
+            poll_interval: Duration::from_millis(100),
+        };
+        let mut runner = FakeRunner::new(
+            vec![at(10), at(10), at(10), at(10)],
+            vec![
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(9_000),
+                succeeded(NMCLI_NETWORK),
+                last_scan_reply(9_000),
+                last_scan_reply(9_000),
+                last_scan_reply(9_000),
+                succeeded(NMCLI_POST_NETWORK),
+            ],
+        )
+        .with_timed_delays();
+        let started = TokioInstant::now();
+
+        let batch = wifi_scan_nmcli_with_timing("wlan-test", &mut runner, timing)
+            .await
+            .expect("post-list remains useful interactively")
+            .expect("non-empty post-list should be retained");
+
+        assert_eq!(batch.networks[0].bssid, "02:00:00:00:24:11");
+        assert_eq!(batch.confirmed_refresh_started_at, None);
+        assert_eq!(
+            runner.delays,
+            vec![Duration::from_millis(100); 3],
+            "the third delay is cancelled by the shared deadline"
+        );
+        assert_eq!(TokioInstant::now() - started, timing.deadline);
+        assert_eq!(runner.commands.len(), 8);
+        assert_literal_nmcli_command(runner.commands.last().unwrap(), "no");
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn nmcli_future_last_scan_is_unconfirmed_and_skips_final_fence() {
+        let mut runner = FakeRunner::new(
+            vec![at(10), at_millis(10_001)],
+            vec![
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(9_000),
+                succeeded(NMCLI_NETWORK),
+                last_scan_reply(10_002),
+                succeeded(NMCLI_POST_NETWORK),
+            ],
+        );
+
+        let batch = wifi_scan_nmcli("wlan-test", &mut runner)
+            .await
+            .expect("post-list remains useful after impossible property value")
+            .expect("non-empty post-list should be retained");
+
+        assert_eq!(batch.confirmed_refresh_started_at, None);
+        assert_eq!(
+            runner.commands.len(),
+            6,
+            "future value must not reach final fence"
+        );
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn nmcli_generation_poll_continues_beyond_five_reads_until_later_advance() {
+        let stamp = BootTime::from_duration(Duration::from_secs(20));
+        let mut clocks = vec![at(20)];
+        clocks.extend((0..6).map(|_| at(20)));
+        clocks.extend([at_millis(20_001), at_millis(20_002)]);
+        let mut outcomes = vec![
+            owner_reply(),
+            device_path_reply(),
+            last_scan_reply(19_000),
+            succeeded(NMCLI_NETWORK),
+        ];
+        outcomes.extend((0..6).map(|_| last_scan_reply(19_000)));
+        outcomes.extend([
+            last_scan_reply(20_001),
+            succeeded(NMCLI_POST_NETWORK),
+            owner_reply(),
+            device_path_reply(),
+            last_scan_reply(20_001),
+            owner_reply(),
+        ]);
+        let mut runner = FakeRunner::new(clocks, outcomes);
+
+        let batch = wifi_scan_nmcli("wlan-test", &mut runner)
+            .await
+            .expect("later generation should verify")
+            .expect("post-list should be returned");
+
+        assert_eq!(batch.confirmed_refresh_started_at, Some(stamp));
+        assert_eq!(
+            runner.delays,
+            vec![NM_LAST_SCAN_POLL_INTERVAL; 6],
+            "polling must not stop at the former fixed five-read cap"
+        );
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn nmcli_final_owner_path_or_generation_fence_downgrades_post_list() {
+        let changed_owner_reply = succeeded(r#"{"type":"s","data":[":1.9999"]}"#);
+        let changed_path_reply =
+            succeeded(r#"{"type":"o","data":["/org/freedesktop/NetworkManager/Devices/43"]}"#);
+        let scenarios = vec![
+            (vec![changed_owner_reply], vec![at(90), at_millis(90_001)]),
+            (
+                vec![owner_reply(), changed_path_reply],
+                vec![at(90), at_millis(90_001)],
+            ),
+            (
+                vec![owner_reply(), device_path_reply(), last_scan_reply(89_999)],
+                vec![at(90), at_millis(90_001), at_millis(90_002)],
+            ),
+            (
+                vec![
+                    owner_reply(),
+                    device_path_reply(),
+                    failed("final LastScan unavailable"),
+                ],
+                vec![at(90), at_millis(90_001)],
+            ),
+            (
+                vec![
+                    owner_reply(),
+                    device_path_reply(),
+                    last_scan_reply(90_001),
+                    succeeded(r#"{"type":"s","data":[":1.9999"]}"#),
+                ],
+                vec![at(90), at_millis(90_001), at_millis(90_002)],
+            ),
+        ];
+
+        for (final_checks, clocks) in scenarios {
+            let mut outcomes = vec![
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(89_000),
+                succeeded(NMCLI_NETWORK),
+                last_scan_reply(90_001),
+                succeeded(NMCLI_POST_NETWORK),
+            ];
+            outcomes.extend(final_checks);
+            let mut runner = FakeRunner::new(clocks, outcomes);
+
+            let batch = wifi_scan_nmcli("wlan-test", &mut runner)
+                .await
+                .expect("post-list should survive final-fence failure")
+                .expect("non-empty post-list should be retained");
+
+            assert_eq!(batch.networks[0].bssid, "02:00:00:00:24:11");
+            assert_eq!(batch.confirmed_refresh_started_at, None);
+            runner.assert_exhausted();
+        }
+    }
+
+    #[tokio::test]
+    async fn nmcli_forced_failures_use_only_separate_unconfirmed_post_list() {
+        let failures = [
+            failed("forced scan rejected"),
+            CommandOutcome::TimedOut,
+            CommandOutcome::FailedToStart {
+                error: "missing nmcli".to_owned(),
+            },
+        ];
+
+        for forced_failure in failures {
+            let mut runner = FakeRunner::new(
+                vec![at(30)],
+                vec![
+                    owner_reply(),
+                    device_path_reply(),
+                    last_scan_reply(29_000),
+                    forced_failure,
+                    succeeded(NMCLI_POST_NETWORK),
+                ],
+            );
+            let batch = wifi_scan_nmcli("wlan-test", &mut runner)
+                .await
+                .expect("cached nmcli list should remain readable")
+                .expect("non-empty cache should be returned");
+
+            assert_eq!(batch.networks.len(), 1);
+            assert_eq!(batch.confirmed_refresh_started_at, None);
+            assert_eq!(
+                runner.commands.len(),
+                5,
+                "failed force must not poll LastScan"
+            );
+            assert_literal_nmcli_command(&runner.commands[3], "yes");
+            assert_literal_nmcli_command(&runner.commands[4], "no");
+            runner.assert_exhausted();
+        }
+    }
+
+    #[tokio::test]
+    async fn nmcli_owner_path_and_property_failures_never_stamp() {
+        let scenarios = vec![
+            vec![
+                failed("owner unavailable"),
+                succeeded(NMCLI_NETWORK),
+                succeeded(NMCLI_POST_NETWORK),
+            ],
+            vec![
+                owner_reply(),
+                failed("device absent"),
+                succeeded(NMCLI_NETWORK),
+                succeeded(NMCLI_POST_NETWORK),
+            ],
+            vec![
+                owner_reply(),
+                device_path_reply(),
+                failed("LastScan unavailable"),
+                succeeded(NMCLI_NETWORK),
+                succeeded(NMCLI_POST_NETWORK),
+            ],
+            vec![
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(39_000),
+                succeeded(NMCLI_NETWORK),
+                failed("LastScan disappeared"),
+                succeeded(NMCLI_POST_NETWORK),
+            ],
+        ];
+
+        for outcomes in scenarios {
+            let mut runner = FakeRunner::new(vec![at(40)], outcomes);
+            let batch = wifi_scan_nmcli("wlan-test", &mut runner)
+                .await
+                .expect("readable post-list should survive verification failure")
+                .expect("non-empty post-list should be returned");
+
+            assert_eq!(batch.networks[0].bssid, "02:00:00:00:24:11");
+            assert_eq!(batch.confirmed_refresh_started_at, None);
+            assert_literal_nmcli_command(runner.commands.last().unwrap(), "no");
+            runner.assert_exhausted();
+        }
+    }
+
+    #[tokio::test]
+    async fn nmcli_post_list_failure_downgrades_readable_forced_rows() {
+        let mut runner = FakeRunner::new(
+            vec![at(50), at_millis(50_001)],
+            vec![
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(49_000),
+                succeeded(NMCLI_NETWORK),
+                last_scan_reply(50_001),
+                CommandOutcome::TimedOut,
+            ],
+        );
+
+        let batch = wifi_scan_nmcli("wlan-test", &mut runner)
+            .await
+            .expect("forced rows remain useful after post-list failure")
+            .expect("non-empty forced rows should be retained");
+
+        assert_eq!(batch.networks[0].bssid, "02:00:00:00:24:10");
+        assert_eq!(
+            batch.confirmed_refresh_started_at, None,
+            "rows not re-listed after completion must never inherit proof"
+        );
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn nmcli_forced_and_post_list_failure_is_total_for_nmcli_backend() {
+        let mut runner = FakeRunner::new(
+            vec![at(60)],
+            vec![
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(59_000),
+                failed("forced failed"),
+                CommandOutcome::TimedOut,
+            ],
+        );
+
+        let error = wifi_scan_nmcli("wlan-test", &mut runner)
+            .await
+            .expect_err("unavailable forced and cached commands must be an error");
+
+        assert!(error
+            .to_string()
+            .contains("post-refresh nmcli cached list timed out"));
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nmcli_forced_and_poll_share_one_bounded_refresh_deadline() {
+        let mut runner = HangingForcedRunner {
+            commands: Vec::new(),
+        };
+        let started = TokioInstant::now();
+
+        let batch = wifi_scan_nmcli("wlan-test", &mut runner)
+            .await
+            .expect("post-deadline cached list should remain readable")
+            .expect("non-empty post-list should be returned");
+
+        assert_eq!(TokioInstant::now() - started, NM_REFRESH_DEADLINE);
+        assert_eq!(batch.confirmed_refresh_started_at, None);
+        assert_eq!(runner.commands.len(), 5);
+        assert_literal_nmcli_command(&runner.commands[3], "yes");
+        assert_literal_nmcli_command(&runner.commands[4], "no");
+    }
+
+    #[tokio::test]
+    async fn empty_or_unavailable_unconfirmed_nmcli_post_list_falls_through_to_iw() {
+        for post_outcome in [succeeded(""), CommandOutcome::TimedOut] {
+            let iw_stamp = BootTime::from_duration(Duration::from_secs(71));
+            let mut runner = FakeRunner::new(
+                vec![at(70), at(71)],
+                vec![
+                    owner_reply(),
+                    device_path_reply(),
+                    last_scan_reply(69_000),
+                    failed("forced failed"),
+                    post_outcome,
+                    succeeded(IW_NETWORK),
+                ],
+            );
+
+            let batch = wifi_scan_with_runner("wlan-test", &mut runner)
+                .await
+                .expect("iw should recover from unusable nmcli output");
+
+            assert_eq!(batch.networks[0].bssid, "02:00:00:00:24:20");
+            assert_eq!(batch.confirmed_refresh_started_at, Some(iw_stamp));
+            assert_literal_iw_direct_command(runner.commands.last().unwrap());
+            runner.assert_exhausted();
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_nmcli_and_total_iw_failure_return_total_scanner_error() {
+        let mut runner = FakeRunner::new(
+            vec![at(80), at(81)],
+            vec![
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(79_000),
+                failed("forced failed"),
+                CommandOutcome::FailedToStart {
+                    error: "missing nmcli".to_owned(),
+                },
+                CommandOutcome::TimedOut,
+            ],
+        );
+
+        let error = wifi_scan_with_runner("wlan-test", &mut runner)
+            .await
+            .expect_err("no readable backend result must publish nothing");
+
+        assert!(error.to_string().contains("iw scan timed out"));
+        assert_literal_iw_direct_command(runner.commands.last().unwrap());
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn successful_iw_direct_scan_returns_its_nonempty_or_empty_output() {
+        for (stdout, expected_networks, seconds) in [(IW_NETWORK, 1, 50), ("", 0, 51)] {
+            let stamp = BootTime::from_duration(Duration::from_secs(seconds));
+            let mut runner = FakeRunner::new(vec![at(seconds)], vec![succeeded(stdout)]);
+
+            let batch = wifi_scan_iw("wlan-test", &mut runner)
+                .await
+                .expect("blocking iw direct scan should succeed");
+
+            assert_eq!(batch.networks.len(), expected_networks);
+            assert_eq!(batch.confirmed_refresh_started_at, Some(stamp));
+            assert_eq!(
+                runner.commands,
+                vec![iw_direct_scan_command("wlan-test")],
+                "successful direct output, including empty, must not use scan dump"
+            );
+            assert_literal_iw_direct_command(&runner.commands[0]);
+            runner.assert_exhausted();
+        }
+    }
+
+    #[tokio::test]
+    async fn iw_numeric_busy_errno_handles_musl_wording_and_uses_later_attempt_stamp() {
+        let later = BootTime::from_duration(Duration::from_secs(61));
+        let mut runner = FakeRunner::new(
+            vec![at(60), at(61)],
+            vec![
+                failed("command failed: Resource busy (-16)"),
+                succeeded(IW_NETWORK),
+            ],
+        );
+
+        let batch = wifi_scan_iw("wlan-test", &mut runner)
+            .await
+            .expect("second direct scan should succeed");
+
+        assert_eq!(batch.confirmed_refresh_started_at, Some(later));
+        assert_eq!(
+            runner.commands,
+            vec![
+                iw_direct_scan_command("wlan-test"),
+                iw_direct_scan_command("wlan-test"),
+            ]
+        );
+        assert_eq!(runner.delays, vec![Duration::from_secs(1)]);
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn exhausted_iw_busy_retries_use_unconfirmed_cached_dump() {
+        let mut runner = FakeRunner::new(
+            vec![at(70), at(71), at(72), at(73)],
+            vec![
+                failed("Device or resource busy (-16)"),
+                failed("Resource busy (-16)"),
+                failed("another libc translation (-16)"),
+                failed("EBUSY (-16)"),
+                succeeded(IW_NETWORK),
+            ],
+        );
+
+        let batch = wifi_scan_iw("wlan-test", &mut runner)
+            .await
+            .expect("cached iw dump should remain readable");
+
+        assert_eq!(batch.networks.len(), 1);
+        assert_eq!(batch.confirmed_refresh_started_at, None);
+        assert_eq!(runner.commands.len(), IW_BUSY_RETRIES + 2);
+        assert!(runner.commands[..=IW_BUSY_RETRIES]
+            .iter()
+            .all(|command| command == &iw_direct_scan_command("wlan-test")));
+        assert_eq!(
+            runner.commands.last(),
+            Some(&iw_cached_dump_command("wlan-test"))
+        );
+        assert_literal_iw_direct_command(&runner.commands[0]);
+        assert_literal_iw_dump_command(runner.commands.last().unwrap());
+        assert_eq!(runner.delays, vec![Duration::from_secs(1); IW_BUSY_RETRIES]);
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn generic_iw_failure_may_use_unconfirmed_cached_dump() {
+        let mut runner = FakeRunner::new(
+            vec![at(80)],
+            vec![failed("Operation not permitted"), succeeded(IW_NETWORK)],
+        );
+
+        let batch = wifi_scan_iw("wlan-test", &mut runner)
+            .await
+            .expect("generic failure should preserve cached interactive continuity");
+
+        assert_eq!(batch.networks.len(), 1);
+        assert_eq!(batch.confirmed_refresh_started_at, None);
+        assert_eq!(
+            runner.commands,
+            vec![
+                iw_direct_scan_command("wlan-test"),
+                iw_cached_dump_command("wlan-test"),
+            ]
+        );
+        assert_literal_iw_direct_command(&runner.commands[0]);
+        assert_literal_iw_dump_command(&runner.commands[1]);
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn iw_zero_exit_abort_sentinel_is_not_a_confirmed_empty_scan() {
+        let mut runner = FakeRunner::new(
+            vec![at(85)],
+            vec![succeeded("scan aborted!\n"), succeeded(IW_NETWORK)],
+        );
+
+        let batch = wifi_scan_iw("wlan-test", &mut runner)
+            .await
+            .expect("aborted iw scan may retain readable cached output");
+
+        assert_eq!(batch.networks.len(), 1);
+        assert_eq!(batch.confirmed_refresh_started_at, None);
+        assert_eq!(
+            runner.commands,
+            vec![
+                iw_direct_scan_command("wlan-test"),
+                iw_cached_dump_command("wlan-test"),
+            ]
+        );
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn iw_spawn_timeout_and_network_down_are_total_without_cached_dump() {
+        let failures = [
+            CommandOutcome::FailedToStart {
+                error: "missing iw".to_owned(),
+            },
+            CommandOutcome::TimedOut,
+            failed("command failed: interface unavailable (-100)"),
+        ];
+
+        for direct_failure in failures {
+            let mut runner = FakeRunner::new(vec![at(90)], vec![direct_failure]);
+            let error = wifi_scan_iw("wlan-test", &mut runner)
+                .await
+                .expect_err("failure must publish nothing");
+
+            assert!(!error.to_string().is_empty());
+            assert_eq!(
+                runner.commands,
+                vec![iw_direct_scan_command("wlan-test")],
+                "total direct-scan failures must not read or publish stale cache"
+            );
+            runner.assert_exhausted();
+        }
+    }
+
+    #[tokio::test]
+    async fn clock_failure_leaves_post_list_unconfirmed_without_iw_fallback() {
+        let mut runner = FakeRunner::new(
+            vec![FakeClockOutcome::Failed],
+            vec![
+                owner_reply(),
+                device_path_reply(),
+                last_scan_reply(99_000),
+                succeeded(NMCLI_NETWORK),
+                succeeded(NMCLI_POST_NETWORK),
+            ],
+        );
+
+        let batch = wifi_scan_with_runner("wlan-test", &mut runner)
+            .await
+            .expect("readable post-list remains useful interactively");
+
+        assert_eq!(batch.networks.len(), 1);
+        assert_eq!(batch.networks[0].bssid, "02:00:00:00:24:11");
+        assert_eq!(batch.confirmed_refresh_started_at, None);
+        assert_eq!(runner.commands.len(), 5);
+        assert_literal_nmcli_command(&runner.commands[3], "yes");
+        assert_literal_nmcli_command(&runner.commands[4], "no");
+        runner.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn tokio_runner_kills_child_when_scan_future_is_cancelled() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock should be after Unix epoch")
+            .as_nanos();
+        let pid_file = std::env::temp_dir().join(format!(
+            "whereamid-scanner-cancel-{}-{unique}",
+            std::process::id()
+        ));
+        let script = format!("printf '%s' $$ > {}; exec sleep 60", pid_file.display());
+        let command = ScanCommand::new("sh", ["-c", script.as_str()]);
+        assert_production_command_contract(&command);
+
+        let task = tokio::spawn(async move {
+            let mut runner = TokioScanCommandRunner;
+            runner.run(command).await
+        });
+        let child_pid = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+                    break contents
+                        .parse::<u32>()
+                        .expect("child must write its numeric PID");
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scanner child did not start in time");
+
+        task.abort();
+        let aborted = task.await.expect_err("scanner future should be cancelled");
+        assert!(aborted.is_cancelled());
+
+        let proc_path = std::path::PathBuf::from(format!("/proc/{child_pid}"));
+        let gone = timeout(Duration::from_secs(5), async {
+            loop {
+                if !proc_path.exists() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let _ = std::fs::remove_file(&pid_file);
+        if gone.is_err() {
+            // Keep a failing regression test from leaking its fixture process.
+            // SAFETY: `child_pid` came from the exact child this test spawned.
+            unsafe {
+                libc::kill(child_pid as libc::pid_t, libc::SIGKILL);
+            }
+            panic!("cancelled scanner child {child_pid} remained alive");
+        }
+    }
 
     fn patterns(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()

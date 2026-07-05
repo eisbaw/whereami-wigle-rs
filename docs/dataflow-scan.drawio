@@ -19,11 +19,11 @@
         <mxCell id="scanloop" value="scan loop&#xa;fast 10s / slow 60s" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;dashed=1;strokeWidth=2;fontStyle=2;fontSize=13;" parent="1" vertex="1">
           <mxGeometry x="600" y="105" width="220" height="55" as="geometry" />
         </mxCell>
-        <mxCell id="scanner" value="scanner.rs&#xa;&#xa;nmcli (iw fallback)&#xa;parse → Vec&amp;lt;ScannedAp&amp;gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
-          <mxGeometry x="600" y="170" width="220" height="110" as="geometry" />
+        <mxCell id="scanner" value="scanner.rs&#xa;&#xa;nmcli + LastScan proof&#xa;blocking iw fallback&#xa;→ ScanBatch" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
+          <mxGeometry x="600" y="165" width="220" height="120" as="geometry" />
         </mxCell>
-        <mxCell id="debouncer" value="Debouncer&#xa;&#xa;ring buffer per BSSID,&#xa;≥ M / N stable" style="whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
-          <mxGeometry x="900" y="170" width="220" height="110" as="geometry" />
+        <mxCell id="debouncer" value="Debouncer&#xa;&#xa;atomic sample + proof&#xa;ring buffer per BSSID,&#xa;≥ M / N stable" style="whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
+          <mxGeometry x="900" y="165" width="220" height="120" as="geometry" />
         </mxCell>
 
         <!-- Middle row: resolver + providers -->
@@ -73,7 +73,7 @@
         <mxCell id="el_loop_scan" value="trigger" style="edgeLabel;html=1;fontSize=11;" parent="e_loop_scan" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
 
         <mxCell id="e_scan_deb" style="endArrow=classic;html=1;strokeWidth=2;" parent="1" source="scanner" target="debouncer" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
-        <mxCell id="el_scan_deb" value="Vec&amp;lt;ScannedAp&amp;gt;" style="edgeLabel;html=1;fontSize=11;" parent="e_scan_deb" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_scan_deb" value="ScanBatch" style="edgeLabel;html=1;fontSize=10;" parent="e_scan_deb" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry"><mxPoint y="-12" as="offset" /></mxGeometry></mxCell>
 
         <mxCell id="e_deb_res" style="endArrow=classic;html=1;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="debouncer" target="resolver" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
         <mxCell id="el_deb_res" value="stable BSSIDs" style="edgeLabel;html=1;fontSize=11;" parent="e_deb_res" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>

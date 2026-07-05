@@ -16,9 +16,10 @@ use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::apple::AppleClient;
+use crate::boot_clock::BootTime;
 use crate::config::Args;
 use crate::db::{DbHandle, DebugDbStatus};
-use crate::debounce::Debouncer;
+use crate::debounce::{Debouncer, TimestampedScan};
 use crate::nominatim::NominatimClient;
 use crate::wigle::WigleClient;
 
@@ -1512,12 +1513,109 @@ enum LocatePurpose {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AutolocateOutcome {
     Written,
+    NoScanSnapshot,
+    UnconfirmedScanSnapshot,
+    StaleScanSnapshot,
+    ScanClockFailure,
     NoStableCandidates,
     NoCachedPositions,
     Deduplicated,
     LastFixPreferred,
     Invalidated,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutolocateScanFreshness {
+    Fresh,
+    Absent,
+    Unconfirmed,
+    Stale { age: Duration },
+}
+
+#[derive(Debug)]
+enum AutolocateScanClockError {
+    Read(std::io::Error),
+    FutureEvidence {
+        now: BootTime,
+        refresh_started_at: BootTime,
+    },
+}
+
+impl std::fmt::Display for AutolocateScanClockError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(error) => write!(formatter, "failed to read CLOCK_BOOTTIME: {error}"),
+            Self::FutureEvidence {
+                now,
+                refresh_started_at,
+            } => write!(
+                formatter,
+                "confirmed refresh start {refresh_started_at:?} is ahead of current \
+                 CLOCK_BOOTTIME {now:?}"
+            ),
+        }
+    }
+}
+
+fn classify_autolocate_scan<F>(
+    snapshot: Option<&TimestampedScan>,
+    max_age_secs: u64,
+    read_boot_time: F,
+) -> Result<AutolocateScanFreshness, AutolocateScanClockError>
+where
+    F: FnOnce() -> std::io::Result<BootTime>,
+{
+    let Some(snapshot) = snapshot else {
+        return Ok(AutolocateScanFreshness::Absent);
+    };
+    // Explicit compatibility escape hatch: a present sample is accepted
+    // without confirmation or age inspection. Absence was rejected above.
+    if max_age_secs == 0 {
+        return Ok(AutolocateScanFreshness::Fresh);
+    }
+    let Some(refresh_started_at) = snapshot.confirmed_refresh_started_at else {
+        return Ok(AutolocateScanFreshness::Unconfirmed);
+    };
+    let now = read_boot_time().map_err(AutolocateScanClockError::Read)?;
+    let Some(age) = now.checked_duration_since(refresh_started_at) else {
+        return Err(AutolocateScanClockError::FutureEvidence {
+            now,
+            refresh_started_at,
+        });
+    };
+    let maximum = Duration::from_secs(max_age_secs);
+    if age <= maximum {
+        Ok(AutolocateScanFreshness::Fresh)
+    } else {
+        Ok(AutolocateScanFreshness::Stale { age })
+    }
+}
+
+fn admit_autolocate_scan<F>(
+    snapshot: Option<&TimestampedScan>,
+    max_age_secs: u64,
+    read_boot_time: F,
+) -> Result<(), AutolocateOutcome>
+where
+    F: FnOnce() -> std::io::Result<BootTime>,
+{
+    match classify_autolocate_scan(snapshot, max_age_secs, read_boot_time) {
+        Ok(AutolocateScanFreshness::Fresh) => Ok(()),
+        Ok(AutolocateScanFreshness::Absent) => Err(AutolocateOutcome::NoScanSnapshot),
+        Ok(AutolocateScanFreshness::Unconfirmed) => Err(AutolocateOutcome::UnconfirmedScanSnapshot),
+        Ok(AutolocateScanFreshness::Stale { age }) => {
+            debug!(
+                ?age,
+                max_age_secs, "autolocate skipped stale confirmed scan snapshot"
+            );
+            Err(AutolocateOutcome::StaleScanSnapshot)
+        }
+        Err(error) => {
+            warn!("autolocate scan freshness check failed closed before cache access: {error}");
+            Err(AutolocateOutcome::ScanClockFailure)
+        }
+    }
 }
 
 enum LocateOutcome {
@@ -1529,6 +1627,23 @@ enum LocateClock {
     System,
     #[cfg(test)]
     Fixed(chrono::DateTime<chrono::Utc>),
+}
+
+#[derive(Clone, Copy)]
+enum ScanAgeClock {
+    System,
+    #[cfg(test)]
+    Fixed(BootTime),
+}
+
+impl ScanAgeClock {
+    fn now(self) -> std::io::Result<BootTime> {
+        match self {
+            Self::System => BootTime::now(),
+            #[cfg(test)]
+            Self::Fixed(now) => Ok(now),
+        }
+    }
 }
 
 impl LocateClock {
@@ -1581,12 +1696,40 @@ pub(crate) async fn run_autolocate_pass_at(
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn run_autolocate_pass_at_boot_time(
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+    now: chrono::DateTime<chrono::Utc>,
+    boot_now: BootTime,
+) -> AutolocateOutcome {
+    match compute_locate_with_clock(
+        state,
+        ticket,
+        LocatePurpose::Autolocate,
+        LocateClock::Fixed(now),
+        ScanAgeClock::Fixed(boot_now),
+    )
+    .await
+    {
+        LocateOutcome::Autolocate(outcome) => outcome,
+        LocateOutcome::Interactive(_) => unreachable!("autolocate returned interactive outcome"),
+    }
+}
+
 async fn compute_locate(
     state: &Arc<DaemonState>,
     ticket: crate::privacy::PrivacyTicket,
     purpose: LocatePurpose,
 ) -> LocateOutcome {
-    compute_locate_with_clock(state, ticket, purpose, LocateClock::System).await
+    compute_locate_with_clock(
+        state,
+        ticket,
+        purpose,
+        LocateClock::System,
+        ScanAgeClock::System,
+    )
+    .await
 }
 
 /// Shared locate pipeline. `now` is injected for deterministic cadence and
@@ -1598,7 +1741,14 @@ async fn compute_locate_at(
     purpose: LocatePurpose,
     now: chrono::DateTime<chrono::Utc>,
 ) -> LocateOutcome {
-    compute_locate_with_clock(state, ticket, purpose, LocateClock::Fixed(now)).await
+    compute_locate_with_clock(
+        state,
+        ticket,
+        purpose,
+        LocateClock::Fixed(now),
+        ScanAgeClock::System,
+    )
+    .await
 }
 
 async fn compute_locate_with_clock(
@@ -1606,6 +1756,7 @@ async fn compute_locate_with_clock(
     ticket: crate::privacy::PrivacyTicket,
     purpose: LocatePurpose,
     clock: LocateClock,
+    scan_age_clock: ScanAgeClock,
 ) -> LocateOutcome {
     use crate::resolver;
     use crate::trilaterate::{trilaterate, PositionedAp};
@@ -1618,6 +1769,19 @@ async fn compute_locate_with_clock(
         );
     };
     let debouncer = state.debouncer.lock().await;
+    // TASK-0246: freshness admission is the first autonomous operation under
+    // the privacy + Debouncer guards. It must precede stability calculation,
+    // candidate cloning, every DB/cache actor call, plausibility, last_fix and
+    // persistence. Interactive locate deliberately retains legacy behavior.
+    if purpose == LocatePurpose::Autolocate {
+        if let Err(outcome) = admit_autolocate_scan(
+            debouncer.latest_snapshot(),
+            state.args.autolocate_max_scan_age_secs,
+            || scan_age_clock.now(),
+        ) {
+            return LocateOutcome::Autolocate(outcome);
+        }
+    }
     let stable = debouncer.stable_bssids();
     let visible = debouncer.latest_scan().map(|s| s.len()).unwrap_or(0);
 
@@ -3452,9 +3616,18 @@ mod dispatch_tests {
     }
 
     async fn push_stable_scan(state: &Arc<DaemonState>, sample: crate::debounce::ScanSample) {
+        let refresh_started_at = BootTime::now().expect("tests require Linux CLOCK_BOOTTIME");
+        push_stable_scan_with_evidence(state, sample, Some(refresh_started_at)).await;
+    }
+
+    async fn push_stable_scan_with_evidence(
+        state: &Arc<DaemonState>,
+        sample: crate::debounce::ScanSample,
+        confirmed_refresh_started_at: Option<BootTime>,
+    ) {
         let mut debouncer = state.debouncer.lock().await;
         for _ in 0..state.args.debounce_threshold {
-            debouncer.push_scan(sample.clone());
+            debouncer.push_scan_with_refresh_evidence(sample.clone(), confirmed_refresh_started_at);
         }
     }
 
@@ -3496,6 +3669,18 @@ mod dispatch_tests {
     }
 
     async fn seed_autolocate_cluster(state: &Arc<DaemonState>, prefix: u8, lat: f64, lon: f64) {
+        let refresh_started_at = BootTime::now().expect("tests require Linux CLOCK_BOOTTIME");
+        seed_autolocate_cluster_with_evidence(state, prefix, lat, lon, Some(refresh_started_at))
+            .await;
+    }
+
+    async fn seed_autolocate_cluster_with_evidence(
+        state: &Arc<DaemonState>,
+        prefix: u8,
+        lat: f64,
+        lon: f64,
+        confirmed_refresh_started_at: Option<BootTime>,
+    ) {
         let mut sample = crate::debounce::ScanSample::new();
         for index in 0..3 {
             add_cached_scan_ap(
@@ -3508,7 +3693,7 @@ mod dispatch_tests {
                 Some("fixed-autolocate-test"),
             );
         }
-        push_stable_scan(state, sample).await;
+        push_stable_scan_with_evidence(state, sample, confirmed_refresh_started_at).await;
     }
 
     async fn history_len(state: &Arc<DaemonState>) -> usize {
@@ -3518,6 +3703,145 @@ mod dispatch_tests {
             .await
             .unwrap()
             .len()
+    }
+
+    fn scan_snapshot_with_evidence(
+        confirmed_refresh_started_at: Option<BootTime>,
+    ) -> TimestampedScan {
+        TimestampedScan {
+            sample: crate::debounce::ScanSample::new(),
+            received_at: std::time::Instant::now(),
+            // Deliberately unrelated to BootTime. Wall-clock movement must not
+            // affect autonomous freshness.
+            wall_clock: fixed_autolocate_time() + chrono::TimeDelta::days(365),
+            confirmed_refresh_started_at,
+        }
+    }
+
+    #[test]
+    fn autolocate_scan_freshness_exact_boundary_and_one_nanosecond_over() {
+        let refresh = BootTime::from_duration(Duration::from_secs(100));
+        let snapshot = scan_snapshot_with_evidence(Some(refresh));
+        let exact = BootTime::from_duration(Duration::from_secs(280));
+        let over = BootTime::from_duration(Duration::from_secs(280) + Duration::from_nanos(1));
+
+        assert_eq!(
+            classify_autolocate_scan(Some(&snapshot), 180, || Ok(exact)).unwrap(),
+            AutolocateScanFreshness::Fresh,
+            "maximum age equality must remain fresh"
+        );
+        assert_eq!(
+            classify_autolocate_scan(Some(&snapshot), 180, || Ok(over)).unwrap(),
+            AutolocateScanFreshness::Stale {
+                age: Duration::from_secs(180) + Duration::from_nanos(1)
+            },
+            "one nanosecond over the maximum must be stale"
+        );
+    }
+
+    #[test]
+    fn absent_unconfirmed_and_zero_override_do_not_read_boot_clock_unnecessarily() {
+        assert_eq!(
+            classify_autolocate_scan(None, 180, || panic!("absent must not read clock")).unwrap(),
+            AutolocateScanFreshness::Absent
+        );
+        assert_eq!(
+            classify_autolocate_scan(None, 0, || panic!("absent must not read clock")).unwrap(),
+            AutolocateScanFreshness::Absent,
+            "zero never manufactures a missing snapshot"
+        );
+
+        let unconfirmed = scan_snapshot_with_evidence(None);
+        assert_eq!(
+            classify_autolocate_scan(Some(&unconfirmed), 180, || {
+                panic!("unconfirmed must reject before reading clock")
+            })
+            .unwrap(),
+            AutolocateScanFreshness::Unconfirmed
+        );
+        assert_eq!(
+            classify_autolocate_scan(Some(&unconfirmed), 0, || {
+                panic!("legacy override must not read clock")
+            })
+            .unwrap(),
+            AutolocateScanFreshness::Fresh,
+            "zero explicitly accepts a present unconfirmed snapshot"
+        );
+    }
+
+    #[test]
+    fn boot_time_not_received_or_wall_time_controls_suspend_inclusive_age() {
+        let refresh = BootTime::from_duration(Duration::from_secs(1));
+        let snapshot = scan_snapshot_with_evidence(Some(refresh));
+        // received_at was just created and wall_clock is a year ahead, but a
+        // 181-second CLOCK_BOOTTIME delta (including a hypothetical suspend)
+        // still rejects the snapshot.
+        assert_eq!(
+            classify_autolocate_scan(Some(&snapshot), 180, || {
+                Ok(BootTime::from_duration(Duration::from_secs(182)))
+            })
+            .unwrap(),
+            AutolocateScanFreshness::Stale {
+                age: Duration::from_secs(181)
+            }
+        );
+    }
+
+    #[test]
+    fn clock_read_and_future_evidence_fail_closed_with_actionable_warning() {
+        let refresh = BootTime::from_duration(Duration::from_secs(20));
+        let snapshot = scan_snapshot_with_evidence(Some(refresh));
+
+        let captured = CapturedEvents::default();
+        let events = captured.clone();
+        let outcome = tracing::subscriber::with_default(captured, || {
+            admit_autolocate_scan(Some(&snapshot), 180, || {
+                Err(std::io::Error::other("injected boot clock failure"))
+            })
+        });
+        assert_eq!(outcome, Err(AutolocateOutcome::ScanClockFailure));
+        let warnings: Vec<String> = events
+            .0
+            .lock()
+            .expect("capture lock poisoned")
+            .iter()
+            .filter(|(level, _, _)| *level == tracing::Level::WARN)
+            .map(|(_, _, message)| message.clone())
+            .collect();
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("failed closed before cache access")
+                    && message.contains("failed to read CLOCK_BOOTTIME")
+                    && message.contains("injected boot clock failure")
+            }),
+            "missing actionable clock warning: {warnings:?}"
+        );
+
+        let captured = CapturedEvents::default();
+        let events = captured.clone();
+        let outcome = tracing::subscriber::with_default(captured, || {
+            admit_autolocate_scan(Some(&snapshot), 180, || {
+                Ok(BootTime::from_duration(Duration::from_secs(19)))
+            })
+        });
+        assert_eq!(outcome, Err(AutolocateOutcome::ScanClockFailure));
+        let warnings: Vec<String> = events
+            .0
+            .lock()
+            .expect("capture lock poisoned")
+            .iter()
+            .filter(|(level, _, _)| *level == tracing::Level::WARN)
+            .map(|(_, _, message)| message.clone())
+            .collect();
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("failed closed before cache access")
+                    && message.contains("is ahead of current CLOCK_BOOTTIME")
+                    && message.contains("BootTime(20s)")
+                    && message.contains("BootTime(19s)")
+            }),
+            "missing actionable future-evidence warning: {warnings:?}"
+        );
     }
 
     #[test]
@@ -3739,7 +4063,12 @@ mod dispatch_tests {
                 channel: Some(1),
             },
         );
-        state.debouncer.lock().await.push_scan(sample.clone());
+        let refresh_started_at = BootTime::now().expect("tests require Linux CLOCK_BOOTTIME");
+        state
+            .debouncer
+            .lock()
+            .await
+            .push_scan_with_refresh_evidence(sample.clone(), Some(refresh_started_at));
         let now = fixed_autolocate_time();
         assert_eq!(
             run_autolocate_pass_at(&state, state.privacy.ticket(), now).await,
@@ -3748,7 +4077,7 @@ mod dispatch_tests {
         {
             let mut debouncer = state.debouncer.lock().await;
             for _ in 1..state.args.debounce_threshold {
-                debouncer.push_scan(sample.clone());
+                debouncer.push_scan_with_refresh_evidence(sample.clone(), Some(refresh_started_at));
             }
         }
         assert_eq!(
@@ -3766,6 +4095,194 @@ mod dispatch_tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_scan_rejects_before_db_cache_and_every_autonomous_side_effect() {
+        let state = test_state();
+        let wall_now = fixed_autolocate_time();
+        let previous = LastFix {
+            lat: 55.6761,
+            lon: 12.5683,
+            accuracy_m: 5.0,
+            address: Some("must remain unchanged".to_string()),
+            at: wall_now - chrono::TimeDelta::minutes(1),
+            sources: 3,
+        };
+        state
+            .db
+            .set_last_fix(crate::db::LastFixRow::from(&previous))
+            .await
+            .unwrap();
+        *state.last_fix.lock().await = Some(previous.clone());
+
+        let refresh = BootTime::from_duration(Duration::from_secs(100));
+        seed_autolocate_cluster_with_evidence(&state, 0x7c, 55.6761, 12.5683, Some(refresh)).await;
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        state
+            .db
+            .install_writer_commit_counter(Arc::clone(&commits))
+            .await
+            .unwrap();
+
+        // If freshness admission reaches even the read-only cache actor, this
+        // pass blocks here and the timeout fails. The reader trap is stronger
+        // than checking AP last_seen, because autonomous cache reads are
+        // intentionally non-touching even when they do execute.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker_db = state.db.clone();
+        let mut blocker =
+            tokio::spawn(async move { blocker_db.hold_reader_until(entered_tx, release_rx).await });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reader blocker did not start");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(250),
+            run_autolocate_pass_at_boot_time(
+                &state,
+                state.privacy.ticket(),
+                wall_now,
+                BootTime::from_duration(Duration::from_secs(280) + Duration::from_nanos(1)),
+            ),
+        )
+        .await;
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), &mut blocker)
+            .await
+            .expect("reader blocker did not stop")
+            .expect("reader blocker task panicked")
+            .expect("reader blocker failed");
+        assert_eq!(outcome.unwrap(), AutolocateOutcome::StaleScanSnapshot);
+
+        assert_eq!(history_len(&state).await, 0);
+        assert_eq!(
+            state.db.get_last_fix().await.unwrap().unwrap().at_rfc3339,
+            previous.at.to_rfc3339()
+        );
+        assert_eq!(
+            state.last_fix.lock().await.as_ref().unwrap().at,
+            previous.at
+        );
+        assert_eq!(
+            state
+                .autolocate_fixes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(commits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(lock_db(&state).pending_ap_count().unwrap(), 0);
+        assert!(state.inflight.lock().unwrap().is_empty());
+        assert_eq!(state.tasks.lock().unwrap().len(), 0);
+        assert_eq!(state.geocode.snapshot().pending, 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_scanner_errors_keep_snapshot_stale_until_confirmed_recovery() {
+        let state = test_state();
+        let wall_now = fixed_autolocate_time();
+        let old_refresh = BootTime::from_duration(Duration::from_secs(100));
+        seed_autolocate_cluster_with_evidence(&state, 0x7d, 55.6761, 12.5683, Some(old_refresh))
+            .await;
+        let stale_now = BootTime::from_duration(Duration::from_secs(281));
+
+        // Total scanner errors publish no batch, so repeated attempts leave
+        // the exact retained evidence untouched and cannot rejuvenate it.
+        for _ in 0..2 {
+            assert_eq!(
+                run_autolocate_pass_at_boot_time(
+                    &state,
+                    state.privacy.ticket(),
+                    wall_now,
+                    stale_now,
+                )
+                .await,
+                AutolocateOutcome::StaleScanSnapshot
+            );
+        }
+        assert_eq!(history_len(&state).await, 0);
+
+        // One new confirmed radio refresh atomically replaces the latest
+        // sample/evidence. The pre-existing ring already establishes
+        // stability, so the next pass can recover immediately.
+        let sample = state
+            .debouncer
+            .lock()
+            .await
+            .latest_scan()
+            .expect("fixture scan missing")
+            .clone();
+        state
+            .debouncer
+            .lock()
+            .await
+            .push_scan_with_refresh_evidence(sample, Some(stale_now));
+        assert_eq!(
+            run_autolocate_pass_at_boot_time(&state, state.privacy.ticket(), wall_now, stale_now,)
+                .await,
+            AutolocateOutcome::Written
+        );
+        assert_eq!(history_len(&state).await, 1);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_scan_rejects_by_default_but_zero_restores_legacy_behavior() {
+        let state = test_state();
+        seed_autolocate_cluster_with_evidence(&state, 0x7e, 55.6761, 12.5683, None).await;
+        assert_eq!(
+            run_autolocate_pass_at_boot_time(
+                &state,
+                state.privacy.ticket(),
+                fixed_autolocate_time(),
+                BootTime::from_duration(Duration::from_secs(999)),
+            )
+            .await,
+            AutolocateOutcome::UnconfirmedScanSnapshot
+        );
+        assert_eq!(history_len(&state).await, 0);
+
+        let mut legacy = test_state();
+        Arc::get_mut(&mut legacy)
+            .expect("state must be uniquely owned")
+            .args
+            .autolocate_max_scan_age_secs = 0;
+        seed_autolocate_cluster_with_evidence(&legacy, 0x7f, 55.6761, 12.5683, None).await;
+        assert_eq!(
+            run_autolocate_pass_at_boot_time(
+                &legacy,
+                legacy.privacy.ticket(),
+                fixed_autolocate_time(),
+                BootTime::from_duration(Duration::from_secs(999)),
+            )
+            .await,
+            AutolocateOutcome::Written
+        );
+        assert_eq!(history_len(&legacy).await, 1);
+    }
+
+    #[tokio::test]
+    async fn interactive_locate_keeps_unconfirmed_and_stale_snapshot_compatibility() {
+        let unconfirmed = test_state();
+        seed_autolocate_cluster_with_evidence(&unconfirmed, 0x80, 55.6761, 12.5683, None).await;
+        let response: serde_json::Value =
+            serde_json::from_str(&dispatch_command(&Request::Locate, &unconfirmed).await).unwrap();
+        assert_eq!(response["ok"], true);
+
+        let stale = test_state();
+        seed_autolocate_cluster_with_evidence(
+            &stale,
+            0x81,
+            55.6761,
+            12.5683,
+            Some(BootTime::from_duration(Duration::ZERO)),
+        )
+        .await;
+        let response: serde_json::Value =
+            serde_json::from_str(&dispatch_command(&Request::Locate, &stale).await).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(history_len(&unconfirmed).await, 1);
+        assert_eq!(history_len(&stale).await, 1);
     }
 
     #[tokio::test]
@@ -3895,7 +4412,7 @@ mod dispatch_tests {
     }
 
     #[tokio::test]
-    async fn stale_autolocate_ticket_cannot_publish_but_fresh_pass_can() {
+    async fn wipe_clears_scan_evidence_and_recovery_requires_new_confirmed_scan() {
         let state = test_state();
         seed_autolocate_cluster(&state, 0x77, 55.6761, 12.5683).await;
         let stale = state.privacy.ticket();
@@ -3910,6 +4427,11 @@ mod dispatch_tests {
         assert_eq!(
             run_autolocate_pass_at(&state, stale, fixed_autolocate_time()).await,
             AutolocateOutcome::Invalidated
+        );
+        assert_eq!(
+            run_autolocate_pass_at(&state, state.privacy.ticket(), fixed_autolocate_time(),).await,
+            AutolocateOutcome::NoScanSnapshot,
+            "fresh post-wipe ticket must see the atomically cleared sample/evidence"
         );
         assert_eq!(history_len(&state).await, 0);
 
@@ -3974,10 +4496,14 @@ mod dispatch_tests {
         outlier_only.insert(OUTLIER.to_string(), sample[OUTLIER].clone());
         {
             let mut debouncer = state.debouncer.lock().await;
+            let refresh_started_at = BootTime::now().expect("tests require Linux CLOCK_BOOTTIME");
             for _ in 1..state.args.debounce_threshold {
-                debouncer.push_scan(outlier_only.clone());
+                debouncer.push_scan_with_refresh_evidence(
+                    outlier_only.clone(),
+                    Some(refresh_started_at),
+                );
             }
-            debouncer.push_scan(sample);
+            debouncer.push_scan_with_refresh_evidence(sample, Some(refresh_started_at));
             assert_eq!(debouncer.latest_scan().unwrap().len(), 5);
             assert_eq!(debouncer.stable_bssids(), [OUTLIER.to_string()].into());
         }

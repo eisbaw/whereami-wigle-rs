@@ -6,6 +6,7 @@
 //! TCP is opt-in and unauthenticated (`--bind`).
 
 mod apple;
+mod boot_clock;
 mod config;
 mod db;
 mod debounce;
@@ -890,56 +891,11 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
             r = scanner::wifi_scan(&state.args.interface) => r,
         };
 
-        match scan_result {
-            Ok(networks) => {
-                let count = networks.len();
-                let sample = scanner::scan_to_sample(&networks);
-                let Some(_privacy) = state.privacy.read(privacy_ticket).await else {
-                    continue;
-                };
-                let mut debouncer = state.debouncer.lock().await;
-                debouncer.push_scan(sample);
-                let stable = debouncer.stable_bssids();
-                let stable_count = stable.len();
-                let sample_count = debouncer.sample_count();
-                let stable_observations: Vec<resolver::ObservedAp> = stable
-                    .iter()
-                    .filter_map(|bssid| {
-                        debouncer
-                            .most_recent_entry(bssid)
-                            .map(|entry| resolver::ObservedAp {
-                                bssid: bssid.clone(),
-                                ssid: entry.ssid.clone(),
-                            })
-                    })
-                    .collect();
-                drop(debouncer);
-
-                info!(
-                    "scan: {} networks, {} stable ({} samples in buffer)",
-                    count, stable_count, sample_count
-                );
-
-                // Proactively resolve newly-stable APs in the background.
-                // Tracked so the shutdown drain waits for it (task-0102);
-                // spawn_tracked also refuses once cancelled (task-0190 AC#2).
-                // The is_cancelled() guard here just avoids the needless
-                // Arc/Vec clone when we already know we are shutting down.
-                if !stable_observations.is_empty() && !state.shutdown.is_cancelled() {
-                    let resolve_state = Arc::clone(&state);
-                    state.spawn_tracked(async move {
-                        resolver::resolve_background(
-                            &stable_observations,
-                            &resolve_state,
-                            privacy_ticket,
-                        )
-                        .await;
-                    });
-                }
-            }
-            Err(e) => {
-                tracing::warn!("wifi scan failed: {e}");
-            }
+        if !publish_scan_result(&state, privacy_ticket, scan_result).await {
+            // Preserve the pre-existing wipe-race behavior: a scan captured
+            // under the old epoch is discarded and the loop retries without
+            // imposing an extra cadence sleep on post-wipe recovery.
+            continue;
         }
 
         // Sleep between scans, waking immediately on shutdown (task-0190).
@@ -949,6 +905,62 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
             _ = sleep(interval) => {}
         }
     }
+}
+
+/// Publish only complete readable batches. A total scanner error deliberately
+/// leaves both the retained sample and refresh evidence untouched. The return
+/// value is false only when wipe invalidated the scan's privacy ticket.
+async fn publish_scan_result(
+    state: &Arc<DaemonState>,
+    privacy_ticket: crate::privacy::PrivacyTicket,
+    scan_result: anyhow::Result<scanner::ScanBatch>,
+) -> bool {
+    let batch = match scan_result {
+        Ok(batch) => batch,
+        Err(error) => {
+            tracing::warn!("wifi scan failed: {error}");
+            return true;
+        }
+    };
+
+    let count = batch.networks.len();
+    let sample = scanner::scan_to_sample(&batch.networks);
+    let Some(_privacy) = state.privacy.read(privacy_ticket).await else {
+        return false;
+    };
+    let mut debouncer = state.debouncer.lock().await;
+    debouncer.push_scan_with_refresh_evidence(sample, batch.confirmed_refresh_started_at);
+    let stable = debouncer.stable_bssids();
+    let stable_count = stable.len();
+    let sample_count = debouncer.sample_count();
+    let stable_observations: Vec<resolver::ObservedAp> = stable
+        .iter()
+        .filter_map(|bssid| {
+            debouncer
+                .most_recent_entry(bssid)
+                .map(|entry| resolver::ObservedAp {
+                    bssid: bssid.clone(),
+                    ssid: entry.ssid.clone(),
+                })
+        })
+        .collect();
+    drop(debouncer);
+
+    info!(
+        "scan: {} networks, {} stable ({} samples in buffer)",
+        count, stable_count, sample_count
+    );
+
+    // Proactively resolve newly-stable APs in the background. Tracked so the
+    // shutdown drain waits for it; spawn_tracked refuses once cancelled.
+    if !stable_observations.is_empty() && !state.shutdown.is_cancelled() {
+        let resolve_state = Arc::clone(state);
+        state.spawn_tracked(async move {
+            resolver::resolve_background(&stable_observations, &resolve_state, privacy_ticket)
+                .await;
+        });
+    }
+    true
 }
 
 #[cfg(test)]
@@ -965,7 +977,113 @@ mod autolocate_loop_tests {
         state
     }
 
+    #[tokio::test]
+    async fn scan_publication_retains_confirmed_empty_and_replaces_evidence_exactly() {
+        let state = configure_state(120);
+        let first = crate::boot_clock::BootTime::from_duration(Duration::from_secs(10));
+        publish_scan_result(
+            &state,
+            state.privacy.ticket(),
+            Ok(scanner::ScanBatch {
+                networks: Vec::new(),
+                confirmed_refresh_started_at: Some(first),
+            }),
+        )
+        .await;
+        {
+            let debouncer = state.debouncer.lock().await;
+            assert_eq!(debouncer.sample_count(), 1);
+            assert!(
+                debouncer.latest_snapshot().unwrap().sample.is_empty(),
+                "a confirmed empty backend result is a real scan, not fallback control flow"
+            );
+            assert_eq!(
+                debouncer
+                    .latest_snapshot()
+                    .unwrap()
+                    .confirmed_refresh_started_at,
+                Some(first)
+            );
+        }
+
+        for attempt in 1..=2 {
+            publish_scan_result(
+                &state,
+                state.privacy.ticket(),
+                Err(anyhow::anyhow!("injected total scanner error {attempt}")),
+            )
+            .await;
+        }
+        {
+            let debouncer = state.debouncer.lock().await;
+            assert_eq!(
+                debouncer.sample_count(),
+                1,
+                "total scanner errors must publish neither sample nor timestamp"
+            );
+            assert_eq!(
+                debouncer
+                    .latest_snapshot()
+                    .unwrap()
+                    .confirmed_refresh_started_at,
+                Some(first)
+            );
+        }
+
+        publish_scan_result(
+            &state,
+            state.privacy.ticket(),
+            Ok(scanner::ScanBatch {
+                networks: Vec::new(),
+                confirmed_refresh_started_at: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            state
+                .debouncer
+                .lock()
+                .await
+                .latest_snapshot()
+                .unwrap()
+                .confirmed_refresh_started_at,
+            None,
+            "readable cached output must replace older proof as unconfirmed"
+        );
+
+        let recovery = crate::boot_clock::BootTime::from_duration(Duration::from_secs(20));
+        publish_scan_result(
+            &state,
+            state.privacy.ticket(),
+            Ok(scanner::ScanBatch {
+                networks: Vec::new(),
+                confirmed_refresh_started_at: Some(recovery),
+            }),
+        )
+        .await;
+        assert_eq!(
+            state
+                .debouncer
+                .lock()
+                .await
+                .latest_snapshot()
+                .unwrap()
+                .confirmed_refresh_started_at,
+            Some(recovery),
+            "new confirmed batch must recover with its own evidence"
+        );
+    }
+
     async fn seed_stable_cached_cluster(state: &Arc<DaemonState>) {
+        let refresh_started_at =
+            crate::boot_clock::BootTime::now().expect("tests require Linux CLOCK_BOOTTIME");
+        seed_stable_cached_cluster_with_evidence(state, refresh_started_at).await;
+    }
+
+    async fn seed_stable_cached_cluster_with_evidence(
+        state: &Arc<DaemonState>,
+        refresh_started_at: crate::boot_clock::BootTime,
+    ) {
         let mut sample = crate::debounce::ScanSample::new();
         for index in 0..3 {
             let bssid = format!("02:00:00:00:96:{index:02x}");
@@ -995,7 +1113,7 @@ mod autolocate_loop_tests {
         }
         let mut debouncer = state.debouncer.lock().await;
         for _ in 0..state.args.debounce_threshold {
-            debouncer.push_scan(sample.clone());
+            debouncer.push_scan_with_refresh_evidence(sample.clone(), Some(refresh_started_at));
         }
     }
 
@@ -1041,10 +1159,19 @@ mod autolocate_loop_tests {
         });
 
         tokio::task::yield_now().await;
-        assert_eq!(history_len(&state).await, 0, "first pass must be delayed");
+        assert_eq!(state.autolocate_fixes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            completed_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "first pass must be delayed"
+        );
         tokio::time::advance(Duration::from_millis(999)).await;
         tokio::task::yield_now().await;
-        assert_eq!(history_len(&state).await, 0);
+        assert_eq!(state.autolocate_fixes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            completed_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
 
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(
@@ -1056,11 +1183,13 @@ mod autolocate_loop_tests {
             completed_rx.recv().await,
             Some(server::AutolocateOutcome::Written)
         );
-        assert_eq!(history_len(&state).await, 2);
-        assert_eq!(state.autolocate_fixes_written.load(Ordering::Relaxed), 2);
-
+        // Stop the loop before awaiting the DB actor below. With Tokio time
+        // paused, awaiting an external actor response can auto-advance to the
+        // next registered timer and make this cadence test race a third tick.
         state.shutdown.cancel();
         handle.await.unwrap();
+        assert_eq!(history_len(&state).await, 2);
+        assert_eq!(state.autolocate_fixes_written.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1127,6 +1256,62 @@ mod autolocate_loop_tests {
         handle.await.unwrap();
         tokio::time::advance(Duration::from_secs(120)).await;
         assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn actual_loop_reports_stale_once_then_shutdown_prevents_later_admission() {
+        let mut state = configure_state(1);
+        Arc::get_mut(&mut state)
+            .expect("state must be uniquely owned")
+            .args
+            .autolocate_max_scan_age_secs = 1;
+        let refresh = crate::boot_clock::BootTime::from_duration(Duration::from_secs(100));
+        seed_stable_cached_cluster_with_evidence(&state, refresh).await;
+        let boot_now = crate::boot_clock::BootTime::from_duration(
+            Duration::from_secs(101) + Duration::from_nanos(1),
+        );
+        let wall_now = chrono::DateTime::parse_from_rfc3339("2026-07-05T12:00:00.123456789+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let (outcome_tx, mut outcome_rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_autolocate_loop_with_pass(
+                loop_state,
+                Duration::from_secs(1),
+                move |pass_state, ticket| {
+                    let outcome_tx = outcome_tx.clone();
+                    async move {
+                        let outcome = server::run_autolocate_pass_at_boot_time(
+                            &pass_state,
+                            ticket,
+                            wall_now,
+                            boot_now,
+                        )
+                        .await;
+                        outcome_tx.send(outcome).unwrap();
+                        outcome
+                    }
+                },
+            )
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            outcome_rx.recv().await,
+            Some(server::AutolocateOutcome::StaleScanSnapshot)
+        );
+        state.shutdown.cancel();
+        handle.await.unwrap();
+        assert_eq!(history_len(&state).await, 0);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(
+            outcome_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
+            "shutdown must prevent every later pass admission"
+        );
     }
 
     #[tokio::test(start_paused = true)]

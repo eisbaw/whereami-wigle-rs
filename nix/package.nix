@@ -5,6 +5,7 @@
 , sqlite
 , iw
 , networkmanager
+, systemd
 , craneLib
   # The flake's own git revision, threaded in from flake.nix (self.shortRev).
   # This REPLACES an in-package `builtins.fetchGit { url = ./..; }`, which
@@ -70,7 +71,7 @@ let
 
     postInstall = ''
       wrapProgram $out/bin/whereamid \
-        --prefix PATH : ${lib.makeBinPath [ iw networkmanager ]}
+        --prefix PATH : ${lib.makeBinPath [ iw networkmanager systemd ]}
     '';
 
     meta = with lib; {

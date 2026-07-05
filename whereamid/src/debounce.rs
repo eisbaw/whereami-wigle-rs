@@ -4,6 +4,9 @@
 //! when it appears in >= M of those N samples.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
+
+use crate::boot_clock::BootTime;
 
 /// Per-AP info stored in each scan sample.
 #[derive(Debug, Clone)]
@@ -19,8 +22,14 @@ pub type ScanSample = HashMap<String, ScanEntry>;
 /// A timestamped scan sample.
 pub struct TimestampedScan {
     pub sample: ScanSample,
-    pub at: std::time::Instant,
+    /// When this batch was received by the daemon. Used only for scan/debug
+    /// latency display; autonomous freshness uses suspend-inclusive evidence.
+    pub received_at: Instant,
     pub wall_clock: chrono::DateTime<chrono::Utc>,
+    /// Start of the radio refresh attempt that produced this batch. `None`
+    /// means the backend returned readable cached output without proving that
+    /// a new refresh succeeded.
+    pub confirmed_refresh_started_at: Option<BootTime>,
 }
 
 /// Debounce ring buffer for stable AP detection.
@@ -42,14 +51,42 @@ impl Debouncer {
     }
 
     /// Push a new scan sample into the ring buffer. Drops the oldest if at capacity.
+    /// Direct callers have no radio-refresh proof, so this convenience path is
+    /// deliberately unconfirmed. The scanner loop uses the evidence-aware API.
+    #[allow(dead_code)]
     pub fn push_scan(&mut self, sample: ScanSample) {
+        self.push_scan_with_refresh_evidence(sample, None);
+    }
+
+    /// Atomically retain one sample and its optional confirmed-refresh proof.
+    pub fn push_scan_with_refresh_evidence(
+        &mut self,
+        sample: ScanSample,
+        confirmed_refresh_started_at: Option<BootTime>,
+    ) {
+        self.push_scan_at(
+            sample,
+            Instant::now(),
+            chrono::Utc::now(),
+            confirmed_refresh_started_at,
+        );
+    }
+
+    fn push_scan_at(
+        &mut self,
+        sample: ScanSample,
+        received_at: Instant,
+        wall_clock: chrono::DateTime<chrono::Utc>,
+        confirmed_refresh_started_at: Option<BootTime>,
+    ) {
         if self.ring.len() >= self.window {
             self.ring.pop_front();
         }
         self.ring.push_back(TimestampedScan {
             sample,
-            at: std::time::Instant::now(),
-            wall_clock: chrono::Utc::now(),
+            received_at,
+            wall_clock,
+            confirmed_refresh_started_at,
         });
     }
 
@@ -135,11 +172,18 @@ impl Debouncer {
         self.ring.back().map(|ts| &ts.sample)
     }
 
+    /// Get the latest sample and its timestamps/evidence as one atomic ring
+    /// entry. Callers holding the Debouncer lock cannot accidentally pair a
+    /// newer sample with older refresh evidence.
+    pub fn latest_snapshot(&self) -> Option<&TimestampedScan> {
+        self.ring.back()
+    }
+
     /// Age of the most recent scan in milliseconds. None if no scans yet.
     pub fn latest_scan_age_ms(&self) -> Option<u64> {
         self.ring
             .back()
-            .map(|ts| ts.at.elapsed().as_millis() as u64)
+            .map(|ts| ts.received_at.elapsed().as_millis() as u64)
     }
 
     /// Wall-clock UTC time of the most recent scan.
@@ -213,7 +257,34 @@ mod tests {
         d.clear();
         assert_eq!(d.sample_count(), 0);
         assert!(d.latest_scan().is_none());
+        assert!(d.latest_snapshot().is_none());
         assert!(d.stable_bssids().is_empty());
+    }
+
+    #[test]
+    fn sample_and_refresh_evidence_are_replaced_and_cleared_atomically() {
+        let mut d = Debouncer::new(1, 1);
+        let first_evidence = BootTime::from_duration(std::time::Duration::from_secs(10));
+        let second_evidence = BootTime::from_duration(std::time::Duration::from_secs(20));
+
+        let mut first = HashMap::new();
+        first.insert("AA:BB:CC:DD:EE:01".to_string(), entry(-50));
+        d.push_scan_with_refresh_evidence(first, Some(first_evidence));
+        assert_eq!(
+            d.latest_snapshot().unwrap().confirmed_refresh_started_at,
+            Some(first_evidence)
+        );
+
+        let mut second = HashMap::new();
+        second.insert("AA:BB:CC:DD:EE:02".to_string(), entry(-60));
+        d.push_scan_with_refresh_evidence(second, Some(second_evidence));
+        let latest = d.latest_snapshot().unwrap();
+        assert!(latest.sample.contains_key("AA:BB:CC:DD:EE:02"));
+        assert!(!latest.sample.contains_key("AA:BB:CC:DD:EE:01"));
+        assert_eq!(latest.confirmed_refresh_started_at, Some(second_evidence));
+
+        d.clear();
+        assert!(d.latest_snapshot().is_none());
     }
 
     #[test]

@@ -58,36 +58,92 @@ EOF
     set -euo pipefail
     mode="$(${pkgs.coreutils}/bin/cat /run/whereami-scan-mode)"
 
-    if (( $# == 5 )) \
-      && [[ "$1" == "device" && "$2" == "wifi" && "$3" == "rescan" \
-            && "$4" == "ifname" && "$5" == "vmwifi0" ]]; then
-      [[ "''${LC_ALL-}" == "C" ]] || {
-        echo "nmcli mock requires LC_ALL=C" >&2
-        exit 65
-      }
-      [[ "$mode" == "nmcli" ]] || exit 1
-      exit 0
-    fi
-    if (( $# == 8 )) \
+    if (( $# == 10 )) \
       && [[ "$1" == "-t" && "$2" == "-f" \
             && "$3" == "BSSID,SSID,SIGNAL,CHAN,FREQ" \
             && "$4" == "device" && "$5" == "wifi" && "$6" == "list" \
-            && "$7" == "ifname" && "$8" == "vmwifi0" ]]; then
+            && "$7" == "ifname" && "$8" == "vmwifi0" \
+            && "$9" == "--rescan" ]]; then
       [[ "''${LC_ALL-}" == "C" ]] || {
         echo "nmcli mock requires LC_ALL=C" >&2
         exit 65
       }
-      [[ "$mode" == "nmcli" ]] || {
-        echo "VM test forcing nmcli failure for iw fallback" >&2
-        exit 1
-      }
-      ${realNmcliProbe}/bin/nmcli-real --terse general status >/dev/null
-      printf '%s\n' ok > /var/lib/whereami/nmcli-dbus-probe-ok
-      printf '%s\n' '02\:00\:00\:00\:21\:10:VM-nmcli:80:6:2437 MHz'
-      exit 0
+      rescan="''${10}"
+      printf '%s\n' "$rescan" >> /var/lib/whereami/nmcli-lifecycle.log
+      case "$mode:$rescan" in
+        nmcli:yes)
+          ${realNmcliProbe}/bin/nmcli-real --terse general status >/dev/null
+          printf '%s\n' ok > /var/lib/whereami/nmcli-dbus-probe-ok
+          ${pkgs.coreutils}/bin/sleep 0.01
+          ${pkgs.gawk}/bin/awk '{ printf "%d\n", int($1 * 1000) }' \
+            /proc/uptime > /run/whereami-last-scan
+          # Poison the forced command's rows. Production must discard these
+          # and publish only the post-generation --rescan no list below.
+          printf '%s\n' '02\:00\:00\:00\:21\:99:POISON-forced-output:10:1:2412 MHz'
+          exit 0
+          ;;
+        nmcli:no)
+          printf '%s\n' '02\:00\:00\:00\:21\:10:VM-nmcli:80:6:2437 MHz'
+          exit 0
+          ;;
+        iw:yes)
+          echo "VM test forcing nmcli refresh failure for iw fallback" >&2
+          exit 1
+          ;;
+        iw:no)
+          # A successful but empty cached list is unconfirmed and must be the
+          # only nmcli result allowed to fall through to blocking iw scan.
+          exit 0
+          ;;
+        *)
+          echo "unexpected nmcli lifecycle: $mode:$rescan" >&2
+          exit 66
+          ;;
+      esac
     fi
 
     echo "unexpected nmcli arguments: $*" >&2
+    exit 64
+  '';
+
+  mockBusctl = pkgs.writeShellScriptBin "busctl" ''
+    set -euo pipefail
+    printf '%s\n' "$*" >> /var/lib/whereami/busctl-lifecycle.log
+
+    if (( $# == 9 )) \
+      && [[ "$1" == "--json=short" && "$2" == "--system" \
+            && "$3" == "call" && "$4" == "org.freedesktop.DBus" \
+            && "$5" == "/org/freedesktop/DBus" \
+            && "$6" == "org.freedesktop.DBus" && "$7" == "GetNameOwner" \
+            && "$8" == "s" && "$9" == "org.freedesktop.NetworkManager" ]]; then
+      printf '%s\n' '{"type":"s","data":[":1.4242"]}'
+      exit 0
+    fi
+
+    if (( $# == 9 )) \
+      && [[ "$1" == "--json=short" && "$2" == "--system" \
+            && "$3" == "call" && "$4" == ":1.4242" \
+            && "$5" == "/org/freedesktop/NetworkManager" \
+            && "$6" == "org.freedesktop.NetworkManager" \
+            && "$7" == "GetDeviceByIpIface" && "$8" == "s" \
+            && "$9" == "vmwifi0" ]]; then
+      printf '%s\n' '{"type":"o","data":["/org/freedesktop/NetworkManager/Devices/42"]}'
+      exit 0
+    fi
+
+    if (( $# == 7 )) \
+      && [[ "$1" == "--json=short" && "$2" == "--system" \
+            && "$3" == "get-property" \
+            && "$4" == ":1.4242" \
+            && "$5" == "/org/freedesktop/NetworkManager/Devices/42" \
+            && "$6" == "org.freedesktop.NetworkManager.Device.Wireless" \
+            && "$7" == "LastScan" ]]; then
+      value="$(${pkgs.coreutils}/bin/cat /run/whereami-last-scan)"
+      printf '{"type":"x","data":%s}\n' "$value"
+      exit 0
+    fi
+
+    echo "unexpected busctl arguments: $*" >&2
     exit 64
   '';
 
@@ -98,9 +154,14 @@ EOF
       echo "poisoned iw invoked during $mode phase" >&2
       exit 90
     fi
-    if (( $# != 4 )) \
-      || [[ "$1" != "dev" || "$2" != "vmwifi0" || "$3" != "scan" ]] \
-      || [[ "$4" != "trigger" && "$4" != "dump" ]]; then
+    if (( $# == 3 )) \
+      && [[ "$1" == "dev" && "$2" == "vmwifi0" && "$3" == "scan" ]]; then
+      operation=direct
+    elif (( $# == 4 )) \
+      && [[ "$1" == "dev" && "$2" == "vmwifi0" && "$3" == "scan" \
+            && "$4" == "dump" ]]; then
+      operation=dump
+    else
       echo "unexpected iw arguments: $*" >&2
       exit 64
     fi
@@ -113,13 +174,10 @@ EOF
       exit 77
     fi
     ${netlinkProbe}/bin/netlink-generic-probe
-    printf '%s %s\n' "$4" "''${cap_hex,,}" >> /var/lib/whereami/iw-capeff.log
+    printf '%s %s\n' "$operation" "''${cap_hex,,}" >> /var/lib/whereami/iw-capeff.log
 
-    case "$4" in
-      trigger)
-        exit 0
-        ;;
-      dump)
+    case "$operation" in
+      direct|dump)
         ${pkgs.coreutils}/bin/cat <<'EOF'
 BSS 02:00:00:00:21:20(on vmwifi0)
         freq: 5180
@@ -213,11 +271,13 @@ pkgs.testers.runNixOSTest {
       };
       systemd.tmpfiles.rules = [
         "f /run/whereami-scan-mode 0644 root root - nmcli"
+        "f /run/whereami-last-scan 0666 root root - 1"
       ];
       systemd.services.whereamid = {
         after = [ "systemd-tmpfiles-setup.service" ];
         serviceConfig.BindReadOnlyPaths = [
           "${mockNmcli}/bin/nmcli:${pkgs.networkmanager}/bin/nmcli"
+          "${mockBusctl}/bin/busctl:${pkgs.systemd}/bin/busctl"
           "${mockIw}/bin/iw:${pkgs.iw}/bin/iw"
         ];
       };
@@ -430,6 +490,21 @@ pkgs.testers.runNixOSTest {
             "channel": 6,
         }, f"nmcli parser/wire response drifted: {nmcli_scan!r}"
         scan.succeed("test -f /var/lib/whereami/nmcli-dbus-probe-ok")
+        scan.succeed(
+            "grep -F 'GetNameOwner s org.freedesktop.NetworkManager' "
+            "/var/lib/whereami/busctl-lifecycle.log"
+        )
+        scan.succeed(
+            "grep -F 'call :1.4242 /org/freedesktop/NetworkManager "
+            "org.freedesktop.NetworkManager GetDeviceByIpIface s vmwifi0' "
+            "/var/lib/whereami/busctl-lifecycle.log"
+        )
+        scan.succeed(
+            "grep -F 'get-property :1.4242 "
+            "/org/freedesktop/NetworkManager/Devices/42 "
+            "org.freedesktop.NetworkManager.Device.Wireless LastScan' "
+            "/var/lib/whereami/busctl-lifecycle.log"
+        )
         scan.succeed("test ! -e /var/lib/whereami/iw-capeff.log")
         scan.fail(
             "journalctl -u whereamid.service --no-pager | "
@@ -465,11 +540,13 @@ pkgs.testers.runNixOSTest {
         assert all(n["bssid"] != "02:00:00:00:21:10" for n in iw_networks), \
             f"stale nmcli result survived deterministic switch: {iw_scan!r}"
         scan.succeed(
-            "grep -Fx 'trigger 0000000000001000' /var/lib/whereami/iw-capeff.log"
+            "grep -Fx 'direct 0000000000001000' /var/lib/whereami/iw-capeff.log"
         )
-        scan.succeed(
-            "grep -Fx 'dump 0000000000001000' /var/lib/whereami/iw-capeff.log"
+        scan.fail(
+            "grep -F 'dump ' /var/lib/whereami/iw-capeff.log"
         )
+        scan.succeed("grep -Fx yes /var/lib/whereami/nmcli-lifecycle.log")
+        scan.succeed("grep -Fx no /var/lib/whereami/nmcli-lifecycle.log")
         assert scan.succeed(
             "systemctl show -p MainPID --value whereamid.service"
         ).strip() == scan_pid, "iw scan restarted the daemon"
@@ -478,7 +555,7 @@ pkgs.testers.runNixOSTest {
         ).strip()) == 0, "iw scan incremented NRestarts"
         scan.fail(
             "journalctl -u whereamid.service --no-pager | "
-            "grep -E 'poisoned iw|unexpected (nmcli|iw) arguments|"
+            "grep -E 'poisoned iw|unexpected (nmcli|iw|busctl) arguments|"
             "CAP_NET_ADMIN is not the exact|Operation not permitted|"
             "Permission denied|Bad system call|NETLINK_GENERIC'"
         )
@@ -717,7 +794,10 @@ pkgs.testers.runNixOSTest {
         assert sqlite_value(
             "SELECT value FROM metadata WHERE key = 'wipe-vm-retained';"
         ) == "yes", "wipe must retain operational metadata"
-        assert sqlite_value("SELECT version FROM schema_version WHERE id = 1;") == "5"
+        # Privacy wipe retains the current operational schema marker. This
+        # fixture predates the v6 mobile-AP migration and must track the schema
+        # version the production daemon actually initialized above.
+        assert sqlite_value("SELECT version FROM schema_version WHERE id = 1;") == "6"
 
         after = machine.fail(
             "runuser -u alice -- env WHEREAMI_SOCKET=/run/whereami/whereamid.sock "

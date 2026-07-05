@@ -14,13 +14,16 @@
 #   - addCheck number (> 0): finite positive floating-point tuning values such
 #     as maxTravelSpeedKmh.
 # Upper bounds are intentionally omitted for the other tuning options, so
-# clap's numeric range remains their runtime guard. `maxConnections` and both
-# retention windows have shared explicit Rust/Nix policy ranges.
+# clap's numeric range remains their runtime guard. `maxConnections`, both
+# retention windows, and both autonomous interval/age controls have shared
+# explicit Rust/Nix policy ranges.
 let
   # Must match whereamid::db::MAX_RETENTION_DAYS.
   maxRetentionDays = 365000;
   # Must match whereamid::config::MAX_AUTOLOCATE_INTERVAL_SECS.
   maxAutolocateIntervalSecs = 31536000;
+  # Must match whereamid::config::MAX_AUTOLOCATE_SCAN_AGE_SECS.
+  maxAutolocateScanAgeSecs = 31536000;
 in {
   enable = lib.mkEnableOption "whereami Wi-Fi geolocation daemon";
 
@@ -167,6 +170,20 @@ in {
       Seconds between autonomous cache-only location fixes. The first pass is
       delayed by one interval. Valid range: 0..31536000 (365 days). 0 disables
       autonomous location history.
+    '';
+  };
+
+  autolocateMaxScanAgeSecs = lib.mkOption {
+    type = lib.types.ints.between 0 maxAutolocateScanAgeSecs;
+    default = 180;
+    description = ''
+      Maximum CLOCK_BOOTTIME age of the confirmed radio refresh behind a scan
+      snapshot used for autonomous history. Equality is fresh. The default is
+      three times the default steady scan cadence; custom scan intervals should
+      budget scan runtime and scheduling jitter. 0 explicitly restores legacy
+      behavior for present unconfirmed or arbitrarily old snapshots, but never
+      makes a missing snapshot usable. This does not disable the autonomous
+      loop; use autolocateIntervalSecs = 0 for that.
     '';
   };
 

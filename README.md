@@ -96,6 +96,7 @@ Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
 --scan-fast-duration <S>            Fast phase duration [60]
 --scan-interval-slow <S>            Steady-state scan interval [60]
 --autolocate-interval-secs <S>      Autonomous interval, 0..31536000; 0 disables [120]
+--autolocate-max-scan-age-secs <S>  Confirmed scan age, 0..31536000; 0 legacy [180]
 --debounce-window <N>               Ring buffer size [10]
 --debounce-threshold <N>            Min appearances to be stable [5]
 --top-n <N>                         Strongest APs for trilateration [10]
@@ -175,13 +176,42 @@ Set `--autolocate-interval-secs=0` (or the shared NixOS/Home Manager option
 `autolocateIntervalSecs = 0`) to turn it off. Enabled intervals are capped at
 31,536,000 seconds (365 days).
 
-The autonomous loop currently has no independent scan-age cutoff: if scanning
-starts failing, the Debouncer's retained stable snapshot may be reused on later
-ticks. Distance/time dedup limits identical near-term rows, but an interval
-boundary can still append the retained position. This favors continuity during
-brief scanner outages over freshness; disable autonomous fixes when that
-trade-off is unsuitable. A dedicated stale-snapshot policy is tracked
-separately from this collection loop.
+Autonomous history additionally requires a recent, **confirmed forced-scan
+lifecycle**. The default maximum age is 180 seconds, measured with Linux
+`CLOCK_BOOTTIME` so laptop suspend time counts. Exact equality is accepted; even
+one nanosecond older is skipped. For NetworkManager, the daemon records its
+unique D-Bus owner, device object path, and `Device.Wireless.LastScan`
+generation; captures `CLOCK_BOOTTIME`; then runs `nmcli device wifi list ...
+--rescan yes`. Device and property reads are addressed to that unique owner. It
+confirms only a strictly advanced `LastScan` at or after that attempt, re-lists
+with `--rescan no`, and verifies that the owner/path remained the same and the
+generation did not regress, including a trailing owner check after the final
+property read. This matters because nmcli can exit zero with cached rows when a
+forced request fails internally. A first-ever
+`LastScan = -1` cycle is conservatively unconfirmed because NetworkManager may
+update it at scan start as well as completion.
+
+The fallback uses blocking `iw dev <iface> scan`, which returns its own results.
+A proved nmcli post-generation list or successful iw direct output, including
+empty output, is a valid fresh batch. Failed verification or refresh may retain
+a non-empty cached nmcli `--rescan no` list for interactive `locate`, `scan`, and
+`debug`, but it is explicitly unconfirmed. An unavailable or empty unconfirmed
+nmcli cache proceeds to `iw`. Generic or exhausted-busy `iw` failures may
+similarly use a separate cached `scan dump` as unconfirmed; an aborted direct
+scan is not mistaken for a confirmed empty result. `iw` spawn failures,
+timeouts, and a down interface are total errors and publish nothing. Any other
+total scanner error also leaves the previous snapshot aging, and a privacy wipe
+clears both the retained sample and its refresh evidence.
+
+The 180-second default is three times the default 60-second steady scan cadence
+and intentionally independent of the 120-second autonomous cadence. If scan
+cadence is customized, budget the scan interval plus command runtime and
+scheduling jitter; changing how often autolocate runs never makes an old scan
+fresh. `--autolocate-max-scan-age-secs=0` (Nix:
+`autolocateMaxScanAgeSecs = 0`) is an explicit legacy compatibility override:
+it accepts any *present* snapshot, even unconfirmed or arbitrarily old. It does
+not make a missing snapshot usable and does not disable the loop; use
+`autolocateIntervalSecs = 0` for that. Positive values are capped at 31,536,000.
 
 ## Privacy, retention, and wiping
 
@@ -494,7 +524,8 @@ major design choices. Highlights:
 
 - Unix-domain-socket JSON-lines is the canonical control channel. Opt-in,
   unauthenticated TCP is a secondary compatibility transport; neither is HTTP.
-- `nmcli` for scanning, `iw` as fallback (no root needed for `nmcli`).
+- `nmcli` plus systemd's `busctl` for verified NetworkManager scanning; `iw` as
+  fallback (no root needed for the NetworkManager path).
 - Debounce filter prevents transient APs from polluting the cache.
 - Mobile-AP filtering is a coarse, case-insensitive SSID-denylist heuristic:
   current scanner matches are excluded before cache lookup, then persisted

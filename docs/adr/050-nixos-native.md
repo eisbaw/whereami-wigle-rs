@@ -16,7 +16,9 @@ Provide: `shell.nix` for development, `nix/package.nix` for building, `nix/modul
 - NixOS modules are the idiomatic way to deploy services. Declarative, reproducible, rollback-able.
 - `AmbientCapabilities = CAP_NET_ADMIN` grants scan privileges without root. Combined with `DynamicUser = true`, the daemon runs as an ephemeral unprivileged user.
 - Hardening (ProtectSystem=strict, PrivateTmp, NoNewPrivileges) limits blast radius if the daemon is compromised.
-- `makeWrapper` ensures `iw` and `nmcli` are on PATH regardless of system configuration.
+- The package's `makeWrapper` runtime `PATH` prefix includes the `iw`,
+  NetworkManager, and systemd packages, making `iw`, `nmcli`, and `busctl`
+  available to `whereamid` without relying on the service manager's `PATH`.
 
 ## Consequences
 
