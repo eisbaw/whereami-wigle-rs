@@ -23,15 +23,27 @@ use std::fmt;
 ///   geometric median, but signals the algorithm did not fully settle.
 /// - `Antipodal`: mid-iteration unit-vector sum cancelled to ~0. The
 ///   cluster has near-antipodal members; no meaningful center exists.
-/// - `Degenerate`: the seed (spherical mean of input) already cancelled
-///   to ~0. The input itself is antipodal at the start — even more
-///   pathological than `Antipodal`.
+/// - `Degenerate`: no usable spherical-mean seed exists. This covers empty or
+///   invalid/non-finite coordinate input as well as a seed vector that cancels
+///   to ~0 for balanced antipodal input. Seed cancellation is more
+///   pathological than mid-iteration `Antipodal`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GeoMedianResult {
     Converged((f64, f64)),
     Capped((f64, f64)),
     Antipodal,
     Degenerate,
+}
+
+/// Result of a cancellation-aware geometric-median execution.
+///
+/// Cancellation is deliberately a sibling of `Completed`, rather than an
+/// `Option<GeoMedianResult>`, so callers cannot mistake a cancelled request
+/// for a geometrically degenerate input.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CancellableGeoMedianResult {
+    Completed(GeoMedianResult),
+    Cancelled,
 }
 
 impl fmt::Display for GeoMedianResult {
@@ -73,7 +85,7 @@ pub struct Position {
 }
 
 /// Map (lat, lon) in degrees to a 3D unit vector on the sphere.
-fn to_unit_vec(lat_deg: f64, lon_deg: f64) -> (f64, f64, f64) {
+pub(crate) fn to_unit_vec(lat_deg: f64, lon_deg: f64) -> (f64, f64, f64) {
     let lat = lat_deg.to_radians();
     let lon = lon_deg.to_radians();
     let cl = lat.cos();
@@ -82,7 +94,7 @@ fn to_unit_vec(lat_deg: f64, lon_deg: f64) -> (f64, f64, f64) {
 
 /// Map a (not necessarily unit) 3-vector back to (lat, lon) in degrees.
 /// The vector is normalized internally.
-fn from_unit_vec(x: f64, y: f64, z: f64) -> (f64, f64) {
+pub(crate) fn from_unit_vec(x: f64, y: f64, z: f64) -> (f64, f64) {
     let mag = (x * x + y * y + z * z).sqrt();
     // Caller is expected to guard against mag ~ 0 (antipodal cancellation);
     // we still divide to produce *something* finite for the fallback paths.
@@ -196,7 +208,7 @@ pub fn filter_outliers(aps: &[PositionedAp]) -> Vec<PositionedAp> {
             tracing::warn!(
                 target: "whereamid::trilaterate",
                 n = survivor_coords.len(),
-                "filter_outliers: geometric_median produced {result} (seed cancellation; antipodal input); keeping stage-1 survivors as-is"
+                "filter_outliers: geometric_median produced {result} (unusable seed: invalid/non-finite input or antipodal cancellation); keeping stage-1 survivors as-is"
             );
             return survivor_idx.iter().map(|&i| aps[i]).collect();
         }
@@ -286,31 +298,73 @@ fn drop_isolated(coords: &[(f64, f64)]) -> Vec<usize> {
 /// unit sphere each step). Capped at `WEISZFELD_MAX_ITERS` iterations or
 /// `WEISZFELD_CONVERGENCE` chord distance, whichever comes first.
 pub(crate) fn geometric_median_detailed(coords: &[(f64, f64)]) -> GeoMedianResult {
+    let mut never_cancelled = || false;
+    match geometric_median_detailed_cancellable(coords, &mut never_cancelled) {
+        CancellableGeoMedianResult::Completed(result) => result,
+        CancellableGeoMedianResult::Cancelled => {
+            unreachable!("the non-cancellable geometric-median wrapper cannot be cancelled")
+        }
+    }
+}
+
+/// Cancellation-aware geometric median used by history segmentation.
+///
+/// The callback is checked before the seed pass, for every input in that
+/// pass, at every Weiszfeld iteration, and for every input within an
+/// iteration. This bounds cancellation latency even for one very large
+/// retained history segment. The ordinary `geometric_median_detailed`
+/// API remains a zero-cancellation wrapper for existing callers.
+pub(crate) fn geometric_median_detailed_cancellable<C>(
+    coords: &[(f64, f64)],
+    is_cancelled: &mut C,
+) -> CancellableGeoMedianResult
+where
+    C: FnMut() -> bool + ?Sized,
+{
+    if is_cancelled() {
+        return CancellableGeoMedianResult::Cancelled;
+    }
     if coords.is_empty() {
-        return GeoMedianResult::Degenerate;
+        return CancellableGeoMedianResult::Completed(GeoMedianResult::Degenerate);
     }
     // Seed: spherical mean.
     let (mut sx, mut sy, mut sz) = (0.0, 0.0, 0.0);
     for &(lat, lon) in coords {
+        if is_cancelled() {
+            return CancellableGeoMedianResult::Cancelled;
+        }
+        if !lat.is_finite() || !lon.is_finite() {
+            // Invalid coordinates cannot form a usable spherical seed. Keep
+            // this distinct from cancellation, but use the existing
+            // Degenerate fallback rather than returning a NaN point.
+            return CancellableGeoMedianResult::Completed(GeoMedianResult::Degenerate);
+        }
         let (x, y, z) = to_unit_vec(lat, lon);
         sx += x;
         sy += y;
         sz += z;
     }
     let m = (sx * sx + sy * sy + sz * sz).sqrt();
-    if m < 1e-9 {
-        // Seed itself collapsed — input contains a near-antipodal balance
-        // from the very start (e.g. two diametrically opposed points with
-        // equal weight). More pathological than mid-iteration cancellation.
-        return GeoMedianResult::Degenerate;
+    if !m.is_finite() || m < 1e-9 {
+        // The aggregate seed is unusable: it either became non-finite or
+        // collapsed under a near-antipodal balance (e.g. two diametrically
+        // opposed points with equal weight). More pathological than
+        // mid-iteration cancellation.
+        return CancellableGeoMedianResult::Completed(GeoMedianResult::Degenerate);
     }
     let (mut cx, mut cy, mut cz) = (sx / m, sy / m, sz / m);
     let mut converged = false;
 
     // Weiszfeld iterations on the unit sphere (chord-distance weighting).
     for _ in 0..WEISZFELD_MAX_ITERS {
+        if is_cancelled() {
+            return CancellableGeoMedianResult::Cancelled;
+        }
         let (mut nx, mut ny, mut nz, mut wsum) = (0.0, 0.0, 0.0, 0.0);
         for &(lat, lon) in coords {
+            if is_cancelled() {
+                return CancellableGeoMedianResult::Cancelled;
+            }
             let (x, y, z) = to_unit_vec(lat, lon);
             let dx = x - cx;
             let dy = y - cy;
@@ -333,7 +387,7 @@ pub(crate) fn geometric_median_detailed(coords: &[(f64, f64)]) -> GeoMedianResul
         if nm < 1e-9 {
             // Antipodal-like cancellation under iteration. Cluster has
             // near-antipodal members; no meaningful single center exists.
-            return GeoMedianResult::Antipodal;
+            return CancellableGeoMedianResult::Completed(GeoMedianResult::Antipodal);
         }
         let (ncx, ncy, ncz) = (nx / nm, ny / nm, nz / nm);
         let dx = ncx - cx;
@@ -350,20 +404,21 @@ pub(crate) fn geometric_median_detailed(coords: &[(f64, f64)]) -> GeoMedianResul
     }
     let point = from_unit_vec(cx, cy, cz);
     if converged {
-        GeoMedianResult::Converged(point)
+        CancellableGeoMedianResult::Completed(GeoMedianResult::Converged(point))
     } else {
-        GeoMedianResult::Capped(point)
+        CancellableGeoMedianResult::Completed(GeoMedianResult::Capped(point))
     }
 }
 
 /// Thin adapter: returns Some(lat, lon) for Converged and Capped (since the
 /// capped iterate is usually still close to the median), None for Antipodal
-/// and Degenerate. For callers that only need a best-effort centroid and
-/// don't care about the convergence story (e.g. history.rs::segment_fixes).
+/// and Degenerate. This remains useful to tests and callers that only need a
+/// best-effort `Option` and do not care about the convergence story. History
+/// production uses the detailed cancellable path so cancellation stays
+/// distinct from geometric degeneracy.
 ///
-/// `#[allow(dead_code)]`: `history` is part of the binary, not the
-/// library crate (`lib.rs` does not declare `pub mod history`), so the
-/// library-only `cargo clippy` view sees this adapter as unused.
+/// `#[allow(dead_code)]`: current production paths use the detailed APIs; this
+/// convenience adapter is exercised by tests but is unused in non-test builds.
 #[allow(dead_code)]
 pub(crate) fn geometric_median(coords: &[(f64, f64)]) -> Option<(f64, f64)> {
     match geometric_median_detailed(coords) {
@@ -1210,6 +1265,35 @@ mod tests {
             GeoMedianResult::Degenerate,
             "expected Degenerate for pole-pair, got {res}"
         );
+    }
+
+    /// task-0087: cancellation is checked inside a Weiszfeld coordinate
+    /// pass, not merely between complete iterations. For three points the
+    /// first four checks cover entry + seed inputs, the fifth starts the
+    /// iteration, and the sixth reaches its first coordinate.
+    #[test]
+    fn geometric_median_cancels_during_weiszfeld_iteration() {
+        let coords = [(55.700, 12.580), (55.701, 12.581), (55.699, 12.579)];
+        let mut checks = 0;
+        let result = geometric_median_detailed_cancellable(&coords, &mut || {
+            checks += 1;
+            checks >= 6
+        });
+        assert_eq!(result, CancellableGeoMedianResult::Cancelled);
+        assert_eq!(
+            checks, 6,
+            "cancellation should stop at the first coordinate of the iteration"
+        );
+    }
+
+    #[test]
+    fn geometric_median_non_finite_input_is_degenerate_not_nan() {
+        let coords = [(55.7, 12.58), (f64::NAN, 12.59), (55.71, 12.60)];
+        assert_eq!(
+            geometric_median_detailed(&coords),
+            GeoMedianResult::Degenerate
+        );
+        assert_eq!(geometric_median(&coords), None);
     }
 
     #[test]

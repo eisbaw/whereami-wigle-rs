@@ -4,6 +4,7 @@ title: 'history segment_fixes: surface geometric_median Capped result'
 status: To Do
 assignee: []
 created_date: '2026-05-20 21:24'
+updated_date: '2026-07-05 02:11'
 labels:
   - observability
   - history
@@ -23,3 +24,9 @@ src/history.rs:84-110. Calls geometric_median with .unwrap_or((cur[0].lat, cur[0
 - [ ] #3 geometric_median_detailed becomes pub(crate) so history.rs (binary crate) can reach it (this either depends on task-0112 OR uses crate-local path)
 - [ ] #4 Test: history with a deliberately-pathological cluster that triggers Capped — verify a debug log fired (custom subscriber)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Forward update from TASK-0087 (2026-07-05): history no longer uses the thin Option median adapter in production and no longer computes a median for membership. It calls the detailed cancellation-aware median once at retained-segment flush. A Capped iterate therefore cannot change membership anymore; this task remains an observability task only for the reported final centroid and Antipodal/Degenerate fallback. TASK-0142 is a duplicate with the same narrowed scope.
+<!-- SECTION:NOTES:END -->

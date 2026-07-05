@@ -565,11 +565,12 @@ async fn load_orphan_count_async(db: &crate::db::DbHandle) -> u64 {
 /// quota lease) have dropped before DB actor shutdown. Therefore `budget`
 /// bounds the graceful phase, not arbitrary non-cooperative Rust code after
 /// abort: named/tracked futures must reach a cancellation point before reap can
-/// finish. History segmentation still has a known O(n²), non-yielding CPU
-/// phase (deferred to TASK-0201/TASK-0087), so this is not a generic hard wall
-/// for that separate defect. The accept-loop server remains separately bounded
-/// because a non-cooperative server JoinHandle may ignore abort (task-0241);
-/// it does not itself issue database commands.
+/// finish. TASK-0087 reduced history segmentation to O(N * bounded Weiszfeld
+/// iterations), but production request handling remains synchronous and
+/// non-yielding until TASK-0201 offloads it. A very large history request can
+/// therefore still delay tracked-task abort. The accept-loop server remains
+/// separately bounded because a non-cooperative server JoinHandle may ignore
+/// abort (task-0241); it does not itself issue database commands.
 async fn run_shutdown_drain(
     budget: Duration,
     mut named: Vec<tokio::task::JoinHandle<()>>,
