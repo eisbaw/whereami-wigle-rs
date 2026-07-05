@@ -117,9 +117,6 @@ in {
         [wigle]
         api_user = "AID..."
         api_key = "..."
-
-        [beacondb]
-        enabled = true
     '';
   };
 

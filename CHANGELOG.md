@@ -35,7 +35,8 @@ and the project follows semver.
 - The daemon recognizes only systemd's exact, non-symlink managed credential
   copy as protected at its supported mode. Ordinary files, unsafe future modes,
   and path lookalikes retain the loose-permission warning; the separate NixOS
-  source remains an operator-managed root-only file.
+  source remains an operator-managed root-only file. The shared option example
+  now documents only the supported `[wigle]` credential keys.
 - The README now separates system and Home Manager operations, including unit
   names, status/journal/restart recovery, credential handling, path and
   permission expectations, exact data-retention lifecycles, and deployment-

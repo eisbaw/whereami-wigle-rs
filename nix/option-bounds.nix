@@ -50,6 +50,15 @@ let
       ];
     }).config.services.whereami.${option};
 
+  optionDescription = defaults: option:
+    (lib.evalModules {
+      modules = [
+        {
+          options.services.whereami = sharedOptions defaults;
+        }
+      ];
+    }).options.services.whereami.${option}.description;
+
   systemDefaults = {
     dbPathDefault = "/var/lib/whereami/aps.sqlite";
     credentialsFileDefault = null;
@@ -60,6 +69,15 @@ let
     credentialsFileDefault = "%h/.config/whereami/config.toml";
     socketPathDefault = "%t/whereamid.sock";
   };
+
+  systemCredentialsDescription =
+    optionDescription systemDefaults "credentialsFile";
+  homeCredentialsDescription = optionDescription homeDefaults "credentialsFile";
+  credentialsDescriptionIsCurrent = description:
+    lib.hasInfix "[wigle]" description
+    && lib.hasInfix "api_user" description
+    && lib.hasInfix "api_key" description
+    && !(lib.hasInfix "beacondb" (lib.toLower description));
 
   # Evaluate the real Home Manager module with the smallest surrounding option
   # surface it needs. This pins both sides of the optional Environment contract
@@ -134,6 +152,9 @@ assert optionDefault homeDefaults "historyRetentionDays" == 30;
 assert optionDefault homeDefaults "apsRetentionDays" == 30;
 assert optionDefault systemDefaults "rustLog" == null;
 assert optionDefault homeDefaults "rustLog" == null;
+assert credentialsDescriptionIsCurrent systemCredentialsDescription;
+assert credentialsDescriptionIsCurrent homeCredentialsDescription;
+assert systemCredentialsDescription == homeCredentialsDescription;
 assert !(homeServiceWithoutRustLog ? Environment);
 assert homeServiceWithRustLog.Environment == [
   "\"RUST_LOG=whereamid=debug,my crate=\\\"trace\\\"%%n$HOME\""
@@ -145,6 +166,7 @@ pkgs.runCommand "whereami-option-bounds" { } ''
   echo "maxConnections bounds OK: 4096 accepted, 4097 rejected"
   echo "retention bounds OK: 0..365000 accepted, outside rejected"
   echo "system/home defaults OK: dbPath, retention=30, rustLog=null"
+  echo "shared credentialsFile docs OK: WiGLE keys present, BeaconDB absent"
   echo "home-manager RUST_LOG encoding OK: optional, quoted, percent-safe, CR/LF rejected"
   touch "$out"
 ''
