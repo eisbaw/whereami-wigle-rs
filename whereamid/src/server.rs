@@ -42,6 +42,7 @@ const MAX_RESOLVE_BSSIDS: usize = 256;
 mod address_cache;
 use address_cache::address_cache_key;
 pub use address_cache::AddressCache;
+pub(crate) mod geocode;
 
 /// Acquire the DB lock, logging a warning if the mutex was poisoned.
 pub fn lock_db(state: &DaemonState) -> std::sync::MutexGuard<'_, crate::db::Database> {
@@ -79,9 +80,10 @@ impl DaemonState {
 
     /// Spawn a detached background task tracked by the shutdown drain
     /// (task-0102). The scan loop's proactive resolve, the locate handler's
-    /// fallback resolve, and the Nominatim address backfill all route through
-    /// here so a SIGTERM can wait for them under one budget and force-abort any
-    /// stragglers instead of killing them mid-API-call at process exit.
+    /// fallback resolve, and similar detached work route through here so a
+    /// SIGTERM can wait under one budget and force-abort stragglers instead of
+    /// killing them mid-API-call at process exit. Nominatim is a separate
+    /// named one-worker loop (task-0193), never a detached spawn.
     ///
     /// Refuses to spawn once shutdown has been signalled — this structurally
     /// enforces "no new work after shutdown began" (task-0190 AC#2); the future
@@ -115,6 +117,9 @@ pub struct DaemonState {
     pub wigle: WigleClient,
     pub apple: AppleClient,
     pub nominatim: NominatimClient,
+    /// One-worker, latest-only reverse-geocode scheduler (task-0193). Locate
+    /// handlers publish into its single pending slot; they never spawn a task.
+    pub(crate) geocode: geocode::GeocodeScheduler,
     pub last_fix: tokio::sync::Mutex<Option<LastFix>>,
     /// BSSIDs currently undergoing remote provider lookup. Used by
     /// `resolver::resolve_chain` to coalesce concurrent requests for the
@@ -144,9 +149,9 @@ pub struct DaemonState {
     /// once cancelled.
     pub shutdown: tokio_util::sync::CancellationToken,
     /// Detached background tasks (proactive `resolve_background` from the scan
-    /// loop and the locate handler, plus the Nominatim address backfill) are
-    /// tracked here so the shutdown drain can wait for them under one budget
-    /// and force-abort any stragglers (task-0102). A `std::sync::Mutex` guards
+    /// loop and the locate handler) are tracked here so the shutdown drain can
+    /// wait for them under one budget and force-abort any stragglers
+    /// (task-0102). A `std::sync::Mutex` guards
     /// the `JoinSet` because it is not `Sync` for concurrent spawn; the guard
     /// is only ever held to spawn/reap/take, never across an await.
     pub tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
@@ -284,6 +289,53 @@ async fn persist_last_fix_and_history(state: &Arc<DaemonState>, new_fix: LastFix
     }
     drop(db);
     drop(last);
+}
+
+/// Persist a newly computed locate and atomically publish its address-cache
+/// observation to the geocode scheduler.
+///
+/// The `last_fix -> address_cache -> scheduler` critical section is
+/// load-bearing. A newer locate cannot supersede generation A until its own
+/// last_fix B is installed, so an A worker that races for backfill either
+/// completes before supersession or sees B's mismatching rounded key. The
+/// cache guard also makes miss publication atomic with worker insertion, then
+/// is released before the potentially contended SQLite section. `last_fix`
+/// remains held through DB persistence to preserve task-0046 ordering.
+async fn persist_locate_fix_and_schedule(
+    state: &Arc<DaemonState>,
+    mut new_fix: LastFix,
+) -> Option<String> {
+    let mut last = state.last_fix.lock().await;
+    let cache = state.address_cache.lock().unwrap_or_else(|e| {
+        warn!("address cache mutex poisoned — recovering");
+        e.into_inner()
+    });
+    let address = cache.get(new_fix.lat, new_fix.lon);
+    new_fix.address = address.clone();
+    let row: crate::db::LastFixRow = (&new_fix).into();
+    *last = Some(new_fix);
+
+    state.geocode.observe(row.lat, row.lon, address.is_none());
+    drop(cache);
+
+    let db = lock_db(state);
+    if let Err(e) = db.set_last_fix(&row) {
+        warn!("failed to persist last_fix: {e}");
+        state.record_db_failure();
+    }
+    if let Err(e) = db.insert_fix(
+        &row.at_rfc3339,
+        row.lat,
+        row.lon,
+        row.accuracy_m,
+        row.sources,
+    ) {
+        warn!("failed to record fix in history: {e}");
+        state.record_db_failure();
+    }
+    drop(db);
+    drop(last);
+    address
 }
 
 #[cfg(test)]
@@ -484,9 +536,9 @@ struct StatsResponse {
     /// write permissions, etc.). Reset on daemon restart. task-0076.
     db_write_failures: u64,
     /// Number of background tasks (tracked resolve/backfill spawns and the
-    /// named scan/drain/prune/server loops) force-aborted at the end of the
-    /// LAST clean shutdown because they did not finish within the drain
-    /// budget. Persisted at shutdown and reloaded at startup — the count is
+    /// named scan/pending/geocode/prune/server loops) force-aborted at the end
+    /// of the LAST clean shutdown because they did not finish within the
+    /// drain budget. Persisted at shutdown and reloaded at startup — the count is
     /// produced after the server socket closes, so the previous run's value
     /// is the only observable one. A crash/SIGKILL does not update it.
     /// task-0102.
@@ -1009,71 +1061,6 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
 
     match trilaterate(&positioned_aps) {
         Ok(pos) => {
-            // Address resolution is decoupled from the locate response.
-            //
-            // Hot path: probe the in-memory address cache by rounded
-            // (lat, lon). Hit -> attach immediately. Miss -> attach
-            // None and spawn a background task that calls Nominatim;
-            // the next locate at this rounded position will hit.
-            //
-            // This keeps the locate latency at trilateration time
-            // (~ms) instead of Nominatim time (~1s, with a 1 req/s
-            // rate-limit mutex that previously also serialised
-            // concurrent locate calls).
-            let address = if state.args.address_approx {
-                let cached = {
-                    let cache = state.address_cache.lock().unwrap_or_else(|e| {
-                        warn!("address cache mutex poisoned — recovering");
-                        e.into_inner()
-                    });
-                    cache.get(pos.lat, pos.lon)
-                };
-                if cached.is_none() {
-                    // task-0102: track the backfill so shutdown drains it
-                    // rather than aborting it mid-Nominatim-call.
-                    let bg_state = Arc::clone(state);
-                    let bg_lat = pos.lat;
-                    let bg_lon = pos.lon;
-                    state.spawn_tracked(async move {
-                        match bg_state.nominatim.reverse_geocode(bg_lat, bg_lon).await {
-                            Ok(addr) => {
-                                let display = addr.display;
-                                {
-                                    let mut cache =
-                                        bg_state.address_cache.lock().unwrap_or_else(|e| {
-                                            warn!(
-                                                "address cache mutex poisoned on insert \
-                                                 — recovering"
-                                            );
-                                            e.into_inner()
-                                        });
-                                    cache.insert(bg_lat, bg_lon, display.clone());
-                                }
-                                // Backfill only if this is still the current
-                                // position. The helper keeps the last_fix
-                                // mutex live through the DB write (task-0046).
-                                if let Err(e) = backfill_last_fix_address_with(
-                                    &bg_state,
-                                    bg_lat,
-                                    bg_lon,
-                                    &display,
-                                    |state, row| lock_db(state).set_last_fix(row),
-                                )
-                                .await
-                                {
-                                    warn!("failed to persist last_fix address backfill: {e}");
-                                    bg_state.record_db_failure();
-                                }
-                            }
-                            Err(e) => warn!("background reverse geocode failed: {e}"),
-                        }
-                    });
-                }
-                cached
-            } else {
-                None
-            };
-
             // Save as last-known fix: in-memory + SQLite, both under the
             // last_fix mutex (task-0046).
             //
@@ -1094,11 +1081,20 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
                 lat: pos.lat,
                 lon: pos.lon,
                 accuracy_m: pos.accuracy_m,
-                address: address.clone(),
+                address: None,
                 at: chrono::Utc::now(),
                 sources: cached_count,
             };
-            persist_last_fix_and_history(state, new_fix).await;
+            // Address resolution remains off the response-critical network
+            // path. An address-enabled locate atomically persists its fix and
+            // observes the rounded cache cell; misses replace one bounded
+            // scheduler slot and hits supersede stale rate-waiting work.
+            let address = if state.args.address_approx {
+                persist_locate_fix_and_schedule(state, new_fix).await
+            } else {
+                persist_last_fix_and_history(state, new_fix).await;
+                None
+            };
 
             let resp = LocateResponse {
                 ok: true,
@@ -1520,8 +1516,16 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
 /// HTTP clients only (no I/O at construction), so this is cheap and hermetic.
 #[cfg(test)]
 pub(crate) fn test_state() -> std::sync::Arc<DaemonState> {
+    test_state_with_nominatim(crate::nominatim::NominatimClient::new())
+}
+
+#[cfg(test)]
+pub(crate) fn test_state_with_nominatim(
+    nominatim: crate::nominatim::NominatimClient,
+) -> std::sync::Arc<DaemonState> {
     use clap::Parser;
     let args = crate::config::Args::parse_from(["whereamid"]);
+    let shutdown = tokio_util::sync::CancellationToken::new();
     std::sync::Arc::new(DaemonState {
         db: std::sync::Mutex::new(crate::db::Database::open_memory().unwrap()),
         debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(
@@ -1530,12 +1534,13 @@ pub(crate) fn test_state() -> std::sync::Arc<DaemonState> {
         )),
         wigle: crate::wigle::WigleClient::new("", ""),
         apple: crate::apple::AppleClient::new(),
-        nominatim: crate::nominatim::NominatimClient::new(),
+        nominatim,
+        geocode: geocode::GeocodeScheduler::new(shutdown.clone()),
         last_fix: tokio::sync::Mutex::new(None),
         inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         address_cache: std::sync::Mutex::new(AddressCache::new()),
         db_write_failures: std::sync::atomic::AtomicU64::new(0),
-        shutdown: tokio_util::sync::CancellationToken::new(),
+        shutdown,
         tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
         args,

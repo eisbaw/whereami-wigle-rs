@@ -219,6 +219,7 @@ mod tests {
     fn test_state() -> Arc<DaemonState> {
         let db = Database::open_memory().unwrap();
         let args = Args::parse_from(["whereamid"]);
+        let shutdown = tokio_util::sync::CancellationToken::new();
         Arc::new(DaemonState {
             db: std::sync::Mutex::new(db),
             debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(10, 5)),
@@ -226,11 +227,12 @@ mod tests {
             wigle: crate::wigle::WigleClient::new("", ""),
             apple: crate::apple::AppleClient::new(),
             nominatim: crate::nominatim::NominatimClient::new(),
+            geocode: crate::server::geocode::GeocodeScheduler::new(shutdown.clone()),
             last_fix: tokio::sync::Mutex::new(None),
             inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
             db_write_failures: std::sync::atomic::AtomicU64::new(0),
-            shutdown: tokio_util::sync::CancellationToken::new(),
+            shutdown,
             tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
             orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
         })

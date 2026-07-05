@@ -151,11 +151,13 @@ async fn main() -> Result<()> {
         tracing::warn!("WiGLE credentials not configured - remote lookups disabled");
     }
 
+    let shutdown = tokio_util::sync::CancellationToken::new();
     let state = Arc::new(DaemonState {
         db: std::sync::Mutex::new(db),
         debouncer: tokio::sync::Mutex::new(debouncer),
         apple: apple::AppleClient::with_timeout(http_timeout),
         nominatim: nominatim::NominatimClient::with_timeout(nominatim_timeout),
+        geocode: server::geocode::GeocodeScheduler::new(shutdown.clone()),
         address_cache: std::sync::Mutex::new(server::AddressCache::with_ttl_days(
             args.address_cache_ttl_days,
         )),
@@ -164,7 +166,7 @@ async fn main() -> Result<()> {
         last_fix: tokio::sync::Mutex::new(initial_last_fix),
         inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         db_write_failures: std::sync::atomic::AtomicU64::new(0),
-        shutdown: tokio_util::sync::CancellationToken::new(),
+        shutdown,
         tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(orphans_last_shutdown),
     });
@@ -180,6 +182,11 @@ async fn main() -> Result<()> {
     let pending_state = Arc::clone(&state);
     let pending_handle = tokio::spawn(async move {
         pending::run_pending_drain(pending_state).await;
+    });
+
+    let geocode_state = Arc::clone(&state);
+    let geocode_handle = tokio::spawn(async move {
+        server::geocode::run_worker(geocode_state).await;
     });
 
     // History-prune task: drop fixes older than retention_days every 24h.
@@ -273,7 +280,7 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let named = vec![scan_handle, pending_handle, history_handle];
+    let named = vec![scan_handle, pending_handle, geocode_handle, history_handle];
 
     // Take the tracked-spawn JoinSet out of shared state so we can drive it to
     // completion here (a std::sync::Mutex guard cannot be held across await).
