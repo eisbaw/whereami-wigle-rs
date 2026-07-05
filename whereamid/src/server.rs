@@ -3366,6 +3366,102 @@ mod dispatch_tests {
         assert!(populated_scan["scanned_at"].is_string());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn debug_releases_debouncer_before_waiting_for_db_reader() {
+        let state = test_state();
+        let bssid = "02:00:00:00:20:02";
+        let mut sample = crate::debounce::ScanSample::new();
+        sample.insert(
+            bssid.to_string(),
+            crate::debounce::ScanEntry {
+                signal_dbm: -48,
+                ssid: Some("debug-lock-scope".to_string()),
+                channel: Some(11),
+            },
+        );
+        state.debouncer.lock().await.push_scan(sample);
+
+        // Stall the real reader actor so debug_statuses cannot finish. One
+        // populated BSSID ensures this covers the former per-BSSID DB-await
+        // shape rather than the empty-debug shortcut.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker_db = state.db.clone();
+        let mut blocker =
+            tokio::spawn(async move { blocker_db.hold_reader_until(entered_tx, release_rx).await });
+        let reader_entered = entered_rx.recv_timeout(Duration::from_secs(2));
+
+        // Poll debug once while the mutex is held here. That puts its lock
+        // future at the front of Tokio Mutex's FIFO queue without relying on a
+        // scheduler sleep. Once this guard drops, debug must acquire first.
+        let debouncer = state.debouncer.lock().await;
+        let debug_state = Arc::clone(&state);
+        let mut debug = Box::pin(async move { handle_debug(&debug_state).await });
+        let early_debug =
+            std::future::poll_fn(|cx| match std::future::Future::poll(debug.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(None),
+                std::task::Poll::Ready(response) => std::task::Poll::Ready(Some(response)),
+            })
+            .await;
+        if let Some(response) = early_debug {
+            drop(debouncer);
+            let _ = release_tx.send(());
+            if tokio::time::timeout(Duration::from_secs(2), &mut blocker)
+                .await
+                .is_err()
+            {
+                blocker.abort();
+                let _ = blocker.await;
+            }
+            panic!("debug finished while the debouncer mutex was held: {response}");
+        }
+        let mut debug = tokio::spawn(debug);
+        drop(debouncer);
+
+        // Scan isolates the debouncer: unlike locate it has no DB dependency.
+        // It can complete only if debug dropped the guard before its blocked
+        // reader await. The timeout also makes the old lock scope fail fast.
+        let scan = tokio::time::timeout(Duration::from_millis(500), handle_scan(&state)).await;
+        let debug_still_waiting = !debug.is_finished();
+
+        // Always release and join the actor blocker before making assertions
+        // about the observed ordering, so a failure cannot strand DB threads.
+        let release_result = release_tx.send(());
+        let blocker_result = tokio::time::timeout(Duration::from_secs(2), &mut blocker).await;
+        if blocker_result.is_err() {
+            blocker.abort();
+            let _ = blocker.await;
+        }
+        let debug_result = tokio::time::timeout(Duration::from_secs(2), &mut debug).await;
+        if debug_result.is_err() {
+            debug.abort();
+            let _ = debug.await;
+        }
+
+        reader_entered.expect("reader blocker must enter within two seconds");
+        release_result.expect("reader blocker must still be waiting for release");
+        blocker_result
+            .expect("reader blocker must finish after release")
+            .expect("reader blocker task must not panic")
+            .expect("reader blocker must succeed");
+        assert!(
+            debug_still_waiting,
+            "debug must remain stalled on the occupied reader actor"
+        );
+
+        let scan = scan.expect("scan must not wait behind debug's DB lookup");
+        let scan: serde_json::Value = serde_json::from_str(&scan).unwrap();
+        assert_eq!(scan["ok"], true);
+        assert_eq!(scan["networks"][0]["bssid"], bssid);
+
+        let debug = debug_result
+            .expect("debug must finish after reader release")
+            .expect("debug task must not panic");
+        let debug: serde_json::Value = serde_json::from_str(&debug).unwrap();
+        assert_eq!(debug["ok"], true);
+        assert_eq!(debug["bssids"][0]["bssid"], bssid);
+    }
+
     /// task-0184: a history request whose range overflows chrono must return
     /// the protocol-mandated `ok:false` error envelope rather than panic the
     /// connection task (a panic would hand the client a dropped socket, not

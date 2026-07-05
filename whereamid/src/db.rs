@@ -998,7 +998,7 @@ impl DbHandle {
     }
 
     #[cfg(test)]
-    async fn hold_reader_until(
+    pub(crate) async fn hold_reader_until(
         &self,
         entered: mpsc::Sender<()>,
         release: mpsc::Receiver<()>,
