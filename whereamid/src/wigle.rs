@@ -10,7 +10,7 @@ use crate::http::{client_with_timeout, REQUEST_TIMEOUT_FAST};
 /// Error variants specific to WiGLE lookups.
 #[derive(Debug)]
 pub enum WigleError {
-    /// BSSID not found in WiGLE database (HTTP 200, zero results).
+    /// BSSID not found in WiGLE database (HTTP 200, no positioned result).
     NotFound,
     /// Rate limited (HTTP 429 or daily quota exceeded).
     RateLimited,
@@ -50,9 +50,6 @@ struct WigleSearchResponse {
     message: Option<String>,
     #[serde(default)]
     results: Vec<WigleResult>,
-    #[serde(rename = "totalResults")]
-    #[serde(default)]
-    total_results: i64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -170,7 +167,8 @@ impl WigleClient {
 /// without a live HTTP call. WiGLE reports query errors and (historically)
 /// daily-quota exhaustion as HTTP 200 with `{"success": false, ...}`; that
 /// is NOT an authoritative "not found" and must never be negative-cached.
-/// Only `success:true` with zero results is a genuine NotFound (task-0188).
+/// Only `success:true` with no result containing a complete coordinate pair is
+/// a genuine NotFound (task-0089 and task-0188).
 fn interpret_response(body: WigleSearchResponse, bssid: &str) -> Result<ApInfo, WigleError> {
     if !body.success {
         let message = body.message.unwrap_or_default();
@@ -187,13 +185,18 @@ fn interpret_response(body: WigleSearchResponse, bssid: &str) -> Result<ApInfo, 
         )));
     }
 
-    if body.total_results == 0 || body.results.is_empty() {
-        return Err(WigleError::NotFound);
-    }
-
-    let r = &body.results[0];
-    let lat = r.trilat.ok_or(WigleError::NotFound)?;
-    let lon = r.trilong.ok_or(WigleError::NotFound)?;
+    // Use the records themselves as the source of truth. `totalResults` can
+    // disagree with the returned array, and a one-sided coordinate is not a
+    // usable position. Preserve response order by selecting the first record
+    // that contains both coordinates.
+    let (r, lat, lon) = body
+        .results
+        .iter()
+        .find_map(|result| match (result.trilat, result.trilong) {
+            (Some(lat), Some(lon)) => Some((result, lat, lon)),
+            _ => None,
+        })
+        .ok_or(WigleError::NotFound)?;
 
     Ok(ApInfo {
         bssid: bssid.to_string(),
@@ -269,7 +272,7 @@ mod tests {
         );
     }
 
-    /// Control: success:true with zero results is the ONLY genuine NotFound.
+    /// Control: success:true with no results has no complete coordinate pair.
     #[test]
     fn success_true_zero_results_is_not_found() {
         let body = parse(r#"{"success":true,"totalResults":0,"results":[]}"#);
@@ -290,5 +293,103 @@ mod tests {
         assert_eq!(ap.lat, 12.34);
         assert_eq!(ap.lon, 56.78);
         assert!(matches!(ap.source, crate::db::Source::Wigle));
+    }
+
+    /// `results` is authoritative even when `totalResults` is inconsistent.
+    /// Selection must skip an unpositioned first record and copy all metadata
+    /// from the later positioned record, not mix fields across records.
+    #[test]
+    fn success_true_selects_first_positioned_result_and_its_metadata() {
+        let body = parse(
+            r#"{
+                "success": true,
+                "totalResults": 0,
+                "results": [
+                    {
+                        "netid": "AA:BB:CC:DD:EE:FF",
+                        "ssid": "unpositioned",
+                        "trilat": null,
+                        "trilong": null,
+                        "encryption": "none",
+                        "channel": 1,
+                        "frequency": 2412,
+                        "city": "Wrong City",
+                        "country": "ZZ"
+                    },
+                    {
+                        "netid": "AA:BB:CC:DD:EE:FF",
+                        "ssid": "positioned",
+                        "trilat": 55.7,
+                        "trilong": 12.5,
+                        "encryption": "wpa2",
+                        "channel": 44,
+                        "frequency": 5220,
+                        "city": "Copenhagen",
+                        "country": "DK"
+                    },
+                    {
+                        "netid": "AA:BB:CC:DD:EE:FF",
+                        "ssid": "later-positioned",
+                        "trilat": 40.0,
+                        "trilong": -74.0,
+                        "encryption": "wpa3",
+                        "channel": 149,
+                        "frequency": 5745,
+                        "city": "New York",
+                        "country": "US"
+                    }
+                ]
+            }"#,
+        );
+
+        let ap = interpret_response(body, "aa:bb:cc:dd:ee:ff").expect("should resolve");
+
+        assert_eq!(ap.bssid, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(ap.ssid.as_deref(), Some("positioned"));
+        assert_eq!(ap.lat, 55.7);
+        assert_eq!(ap.lon, 12.5);
+        assert_eq!(ap.encryption.as_deref(), Some("wpa2"));
+        assert_eq!(ap.channel, Some(44));
+        assert_eq!(ap.frequency, Some(5220));
+        assert_eq!(ap.city.as_deref(), Some("Copenhagen"));
+        assert_eq!(ap.country.as_deref(), Some("DK"));
+        assert!(matches!(ap.source, crate::db::Source::Wigle));
+    }
+
+    #[test]
+    fn success_true_skips_one_sided_result_for_later_complete_pair() {
+        let body = parse(
+            r#"{
+                "success": true,
+                "results": [
+                    {"trilat": 1.0, "trilong": null},
+                    {"ssid": "complete", "trilat": 55.7, "trilong": 12.5}
+                ]
+            }"#,
+        );
+
+        let ap = interpret_response(body, "aa:bb:cc:dd:ee:ff").expect("should resolve");
+
+        assert_eq!(ap.ssid.as_deref(), Some("complete"));
+        assert_eq!((ap.lat, ap.lon), (55.7, 12.5));
+    }
+
+    #[test]
+    fn success_true_without_any_complete_coordinate_pair_is_not_found() {
+        let body = parse(
+            r#"{
+                "success": true,
+                "totalResults": 3,
+                "results": [
+                    {"trilat": null, "trilong": null},
+                    {"trilat": 55.7, "trilong": null},
+                    {"trilat": null, "trilong": 12.5}
+                ]
+            }"#,
+        );
+
+        let err = interpret_response(body, "aa:bb:cc:dd:ee:ff").unwrap_err();
+
+        assert!(matches!(err, WigleError::NotFound));
     }
 }
