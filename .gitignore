@@ -1,4 +1,9 @@
 /target/
+
+# Nix build output links (repository root only).
+/result
+/result-*
+
 wigle-wifi-wardriving/
 apple_bssid_locator/
 geowifi/
