@@ -142,6 +142,14 @@ The three conditional fields use omission, not `null` or a false sentinel:
 - `age_s` is present only with a stale fix and is its non-negative age in
   seconds. It is omitted from a fresh fix.
 
+For a fresh fix, `cached` is the number of scanner-eligible, finite, persisted-
+fixed cache rows admitted after the top-N limit; rows examined and rejected as
+mobile or non-finite are not counted. `sources` is the number of AP positions
+submitted to trilateration. `locate` never fetches synchronously, so these two
+counts are equal for a fresh response; they remain separate wire fields for
+compatibility. `visible` and `stable` are raw scanner/debouncer counts before
+the positioning eligibility policy.
+
 ### `scan` — currently visible Wi-Fi networks
 
 ```json

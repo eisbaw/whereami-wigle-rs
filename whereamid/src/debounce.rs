@@ -88,6 +88,7 @@ impl Debouncer {
 
     /// Get the signal reading for a BSSID from the most recent scan only.
     /// Returns None if the BSSID was not in the latest scan.
+    #[allow(dead_code)]
     pub fn latest_signal(&self, bssid: &str) -> Option<i32> {
         self.ring
             .back()
@@ -98,6 +99,17 @@ impl Debouncer {
     #[allow(dead_code)]
     pub fn latest_entry(&self, bssid: &str) -> Option<&ScanEntry> {
         self.ring.back().and_then(|ts| ts.sample.get(bssid))
+    }
+
+    /// Get the newest scanner observation retained for a BSSID, even when it
+    /// was absent from the latest scan. Stable BSSIDs can remain in the ring
+    /// for several samples; background resolution still needs the exact SSID
+    /// from their most recent local observation.
+    pub fn most_recent_entry(&self, bssid: &str) -> Option<&ScanEntry> {
+        self.ring
+            .iter()
+            .rev()
+            .find_map(|timestamped| timestamped.sample.get(bssid))
     }
 
     /// Count how many of the last N samples contain this BSSID.
@@ -250,5 +262,29 @@ mod tests {
 
         // Should return None since it's not in the latest scan
         assert_eq!(d.latest_signal("AA:BB:CC:DD:EE:FF"), None);
+    }
+
+    #[test]
+    fn most_recent_entry_preserves_scanner_ssid_when_latest_scan_misses_bssid() {
+        let mut d = Debouncer::new(5, 1);
+        let bssid = "AA:BB:CC:DD:EE:FF";
+        let mut first = HashMap::new();
+        first.insert(
+            bssid.to_owned(),
+            ScanEntry {
+                signal_dbm: -45,
+                ssid: Some("MOVIA_BUS_42".to_owned()),
+                channel: Some(6),
+            },
+        );
+        d.push_scan(first);
+        d.push_scan(HashMap::new());
+
+        assert!(d.latest_entry(bssid).is_none());
+        assert_eq!(
+            d.most_recent_entry(bssid)
+                .and_then(|entry| entry.ssid.as_deref()),
+            Some("MOVIA_BUS_42")
+        );
     }
 }

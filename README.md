@@ -96,6 +96,7 @@ Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
 --debounce-window <N>               Ring buffer size [10]
 --debounce-threshold <N>            Min appearances to be stable [5]
 --top-n <N>                         Strongest APs for trilateration [10]
+--mobile-ssid-denylist <GLOBS>      Comma-separated mobile-SSID globs [built-in list]
 --pending-interval <S>              Pending queue drain interval [300]
 --pending-max-attempts <N>          Give up after N failures [20]
 --daily-limit <N>                   Max WiGLE API calls/day [100]
@@ -461,6 +462,13 @@ major design choices. Highlights:
   unauthenticated TCP is a secondary compatibility transport; neither is HTTP.
 - `nmcli` for scanning, `iw` as fallback (no root needed for `nmcli`).
 - Debounce filter prevents transient APs from polluting the cache.
+- Mobile-AP filtering is a coarse, case-insensitive SSID-denylist heuristic:
+  current scanner matches are excluded before cache lookup, then persisted
+  mobile flags and finite coordinates are checked before filling the strongest
+  top-N slots. Trilateration repeats the persisted check as defense in depth.
+  Existing cache rows themselves are reclassified only when a provider result
+  causes that AP to be upserted again, not merely when it is seen in a scan.
+  Task-0094 tracks the principled mobility-detection mechanism.
 - Spherical-mean trilateration (great-circle math, antimeridian-safe).
 - Adaptive outlier rejection via median distance.
 - Source-priority ladder so Apple-resolved fixes don't get overwritten by

@@ -101,9 +101,10 @@ async fn main() -> Result<()> {
     let config_file = load_config_file(&args.config)?;
 
     // Open database
-    let (db_runtime, db) = DbRuntime::open(&args.db)
-        .await
-        .context("opening database")?;
+    let (db_runtime, db) =
+        DbRuntime::open_with_mobile_ssid_denylist(&args.db, args.mobile_ssid_denylist.clone())
+            .await
+            .context("opening database")?;
 
     // Rehydrate last_fix from disk so the daemon can answer "where am I"
     // immediately after a restart, before the first scan-and-resolve cycle
@@ -832,6 +833,17 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
                 let stable = debouncer.stable_bssids();
                 let stable_count = stable.len();
                 let sample_count = debouncer.sample_count();
+                let stable_observations: Vec<resolver::ObservedAp> = stable
+                    .iter()
+                    .filter_map(|bssid| {
+                        debouncer
+                            .most_recent_entry(bssid)
+                            .map(|entry| resolver::ObservedAp {
+                                bssid: bssid.clone(),
+                                ssid: entry.ssid.clone(),
+                            })
+                    })
+                    .collect();
                 drop(debouncer);
 
                 info!(
@@ -844,12 +856,15 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
                 // spawn_tracked also refuses once cancelled (task-0190 AC#2).
                 // The is_cancelled() guard here just avoids the needless
                 // Arc/Vec clone when we already know we are shutting down.
-                if !stable.is_empty() && !state.shutdown.is_cancelled() {
+                if !stable_observations.is_empty() && !state.shutdown.is_cancelled() {
                     let resolve_state = Arc::clone(&state);
-                    let stable_vec: Vec<String> = stable.into_iter().collect();
                     state.spawn_tracked(async move {
-                        resolver::resolve_background(&stable_vec, &resolve_state, privacy_ticket)
-                            .await;
+                        resolver::resolve_background(
+                            &stable_observations,
+                            &resolve_state,
+                            privacy_ticket,
+                        )
+                        .await;
                     });
                 }
             }
@@ -884,6 +899,7 @@ mod retention_tests {
             frequency: None,
             city: None,
             country: None,
+            is_mobile: false,
             source: Source::Manual,
         };
         db.upsert_ap(&ap).unwrap();

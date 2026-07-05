@@ -22,6 +22,12 @@ pub struct ApInfo {
     pub frequency: Option<i32>,
     pub city: Option<String>,
     pub country: Option<String>,
+    /// Whether this AP's most recently persisted scanner SSID matched the
+    /// mobile-SSID denylist. The value is recomputed on every upsert using
+    /// the daemon's current denylist. Existing rows are deliberately NOT
+    /// retroactively re-evaluated when that denylist changes; they update only
+    /// after a later successful resolution reaches this AP's upsert path.
+    pub is_mobile: bool,
     /// Provenance of the position. Internally a typed enum; the SQLite
     /// boundary stringifies via `Source::as_str` and parses back via
     /// `Source::from_db_str`. No string literals appear in production
@@ -35,16 +41,22 @@ pub struct ApInfo {
 mod source;
 pub use source::Source;
 
-// task-0060: PendingAp struct removed. `get_pending` now returns the
-// minimal `(bssid, attempts)` tuple — the four metadata fields the
-// struct used to carry (ssid/channel/frequency/signal_dbm) had no
-// production consumer and only existed to suppress dead_code lints.
-// The SQL `pending` table still records them for debug queries; widen
-// the projection (and reintroduce a struct) the moment a real consumer
-// appears.
+/// Pending lookup work. The scanner-observed SSID must survive an offline
+/// provider pass so the eventual cache upsert classifies the same observation,
+/// rather than Apple/WiGLE metadata (task-0093).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAp {
+    pub bssid: String,
+    pub ssid: Option<String>,
+    pub attempts: i32,
+}
 
 pub(crate) struct Database {
     conn: Connection,
+    /// Immutable for one daemon process, but supplied to every writer actor
+    /// from that process's current CLI configuration. Keeping it at the DB
+    /// boundary makes every upsert use the same authoritative classifier.
+    mobile_ssid_denylist: Vec<String>,
 }
 
 /// How long a database actor waits for another SQLite connection to release a
@@ -448,23 +460,46 @@ impl DbRuntime {
     /// Open/migrate the writer, then open the independent WAL reader. Startup
     /// coordination itself waits on Tokio's blocking pool; SQLite remains
     /// confined to the two dedicated actors.
+    #[allow(dead_code)]
     pub async fn open(path: &Path) -> Result<(Self, DbHandle)> {
+        Self::open_with_mobile_ssid_denylist(path, crate::scanner::default_mobile_ssid_denylist())
+            .await
+    }
+
+    /// Open the database actors with the process's configured mobile-SSID
+    /// denylist. The writer owns this value so all current and future upsert
+    /// paths classify at one persistence boundary.
+    pub async fn open_with_mobile_ssid_denylist(
+        path: &Path,
+        mobile_ssid_denylist: Vec<String>,
+    ) -> Result<(Self, DbHandle)> {
         let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || Self::open_blocking(path))
+        tokio::task::spawn_blocking(move || Self::open_blocking(path, mobile_ssid_denylist))
             .await
             .context("joining database startup coordinator")?
     }
 
-    fn open_blocking(path: PathBuf) -> Result<(Self, DbHandle)> {
-        Self::open_blocking_with_reader(path, |reader_path| Database::open_reader(&reader_path))
+    fn open_blocking(path: PathBuf, mobile_ssid_denylist: Vec<String>) -> Result<(Self, DbHandle)> {
+        Self::open_blocking_with_reader(
+            path,
+            move |writer_path| {
+                Database::open_with_mobile_ssid_denylist(&writer_path, mobile_ssid_denylist)
+            },
+            |reader_path| Database::open_reader(&reader_path),
+        )
     }
 
-    fn open_blocking_with_reader<F>(path: PathBuf, open_reader: F) -> Result<(Self, DbHandle)>
+    fn open_blocking_with_reader<W, R>(
+        path: PathBuf,
+        open_writer: W,
+        open_reader: R,
+    ) -> Result<(Self, DbHandle)>
     where
-        F: FnOnce(PathBuf) -> Result<Database> + Send + 'static,
+        W: FnOnce(PathBuf) -> Result<Database> + Send + 'static,
+        R: FnOnce(PathBuf) -> Result<Database> + Send + 'static,
     {
         let writer_path = path.clone();
-        let writer = DbActor::spawn("whereamid-db-writer", move || Database::open(&writer_path))?;
+        let writer = DbActor::spawn("whereamid-db-writer", move || open_writer(writer_path))?;
         let reader = match DbActor::spawn("whereamid-db-reader", move || open_reader(path)) {
             Ok(reader) => reader,
             Err(error) => {
@@ -566,7 +601,10 @@ impl DbRuntime {
         let conn = Connection::open_with_flags(&uri, flags)?;
         conn.busy_timeout(DB_BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let legacy = Database { conn };
+        let legacy = Database {
+            conn,
+            mobile_ssid_denylist: crate::scanner::default_mobile_ssid_denylist(),
+        };
         let handle = DbHandle {
             writer: writer.tx.clone(),
             reader: reader.tx.clone(),
@@ -814,11 +852,15 @@ impl DbHandle {
             .await
     }
 
-    pub async fn insert_pending_many(&self, bssids: Vec<String>) -> Result<()> {
-        self.write(move |db| db.insert_pending_many(&bssids)).await
+    pub async fn insert_pending_many(
+        &self,
+        observations: Vec<(String, Option<String>)>,
+    ) -> Result<()> {
+        self.write(move |db| db.insert_pending_many(&observations))
+            .await
     }
 
-    pub async fn get_pending(&self, limit: usize) -> Result<Vec<(String, i32)>> {
+    pub async fn get_pending(&self, limit: usize) -> Result<Vec<PendingAp>> {
         self.read(move |db| db.get_pending(limit)).await
     }
 
@@ -1457,7 +1499,7 @@ pub enum DebugDbStatus {
     New,
 }
 
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CorruptApiCallsValue {
@@ -1655,7 +1697,15 @@ impl Database {
     }
 
     /// Open or create the database at `path`. Sets WAL mode and creates schema if needed.
+    #[allow(dead_code)]
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_mobile_ssid_denylist(path, crate::scanner::default_mobile_ssid_denylist())
+    }
+
+    fn open_with_mobile_ssid_denylist(
+        path: &Path,
+        mobile_ssid_denylist: Vec<String>,
+    ) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open database at {}", path.display()))?;
 
@@ -1689,7 +1739,10 @@ impl Database {
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("failed to enable foreign keys")?;
 
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            mobile_ssid_denylist,
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -1716,7 +1769,10 @@ impl Database {
             .context("failed to set reader SQLite busy timeout")?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("failed to enable reader foreign keys")?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            mobile_ssid_denylist: Vec::new(),
+        })
     }
 
     #[cfg(test)]
@@ -1728,7 +1784,10 @@ impl Database {
         let conn = Connection::open_with_flags(uri, flags)?;
         conn.busy_timeout(DB_BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            mobile_ssid_denylist: crate::scanner::default_mobile_ssid_denylist(),
+        };
         if migrate {
             db.migrate()?;
         }
@@ -1738,8 +1797,15 @@ impl Database {
     /// Open an in-memory database (for testing).
     #[allow(dead_code)]
     pub fn open_memory() -> Result<Self> {
+        Self::open_memory_with_mobile_ssid_denylist(crate::scanner::default_mobile_ssid_denylist())
+    }
+
+    fn open_memory_with_mobile_ssid_denylist(mobile_ssid_denylist: Vec<String>) -> Result<Self> {
         let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            mobile_ssid_denylist,
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -1750,16 +1816,17 @@ impl Database {
         // task-0191 AC#3: heal a DB whose stored version is newer than its
         // actual table shape. This is exactly the corruption the old
         // migrate_v2_to_v3 SCHEMA_VERSION-stamping bug could produce: a crash
-        // between the v2->v3 commit and the v3->v4 commit left version=5 on
-        // disk with neither last_fix (v4) nor fixes (v5) present, after which
-        // every later open read 5, skipped both migrations, and stranded the
-        // daemon permanently with no self-heal.
+        // between the v2->v3 commit and the v3->v4 commit left a final-version
+        // stamp on disk with neither last_fix (v4) nor fixes (v5) present,
+        // after which every later open accepted the stamp, skipped the missing
+        // migrations, and stranded the daemon permanently with no self-heal.
         //
         // Repair = reset the stored version DOWN to the highest version whose
         // shape is actually satisfied, then let the normal chain below re-run
         // and rebuild the missing tables. This is safe ONLY because every
         // migration is idempotency-guarded (v1->v2 has_priority probe, v2->v3
-        // already_constrained probe, v3->v4/v4->v5 CREATE TABLE IF NOT EXISTS),
+        // already_constrained probe, v3->v4/v4->v5 CREATE TABLE IF NOT EXISTS,
+        // v5->v6 column probe),
         // so re-running heals rather than harms.
         //
         // Guard rail: only repair when version <= SCHEMA_VERSION. A version
@@ -1767,15 +1834,15 @@ impl Database {
         // written by a future binary; its tables are simply unknown to us and
         // must NOT be "repaired" down (that would corrupt a forward-compatible
         // DB). The forward-compat warning at the end of migrate() handles that
-        // case instead. A missing shape can only be observed at v4+ (last_fix)
-        // and v5 (fixes); v1..v3 touch only tables create_schema_v1 always
-        // creates, so there is no sub-v4 shape to lose.
+        // case instead. A missing shape can only be observed at v4+
+        // (last_fix/fixes/is_mobile); v1..v3 touch only tables
+        // create_schema_v1 always creates, so there is no sub-v4 shape to lose.
         if version <= SCHEMA_VERSION {
             let satisfied = self.highest_satisfied_shape_version(version);
             if satisfied < version {
                 tracing::warn!(
                     "database stamped v{version} but its table shape only satisfies \
-                     v{satisfied} (missing last_fix/fixes); resetting the stored \
+                     v{satisfied} (missing a required table/column); resetting the stored \
                      version down and re-running migrations to heal (task-0191)"
                 );
                 // A stored version >= 4 implies the schema_version table
@@ -1827,6 +1894,12 @@ impl Database {
             info!("migrating database v{version} -> v5 (fixes timeseries table)");
             self.migrate_v4_to_v5()?;
             version = 5;
+        }
+
+        if version < 6 {
+            info!("migrating database v{version} -> v6 (mobile AP classification)");
+            self.migrate_v5_to_v6()?;
+            version = 6;
         }
 
         if version == SCHEMA_VERSION {
@@ -1943,12 +2016,12 @@ impl Database {
             // migration's postcondition version, NOT the moving SCHEMA_VERSION
             // constant (task-0191, mirroring migrate_v1_to_v2's literal 2):
             // stamping SCHEMA_VERSION here strands a crash-interrupted DB at a
-            // version whose v4/v5 tables do not exist yet. INSERT OR IGNORE
-            // creates the row iff absent (the id = 1 PK makes a second insert a
-            // no-op); the guarded UPDATE then advances it to 3 only when it is
-            // behind. Together they never downgrade a row a later migration
-            // already moved to 4/5 (if this path is ever reached out of order),
-            // and never error on a pre-existing row.
+            // version whose later-version tables/columns do not exist yet.
+            // INSERT OR IGNORE creates the row iff absent (the id = 1 PK makes
+            // a second insert a no-op); the guarded UPDATE then advances it to
+            // 3 only when it is behind. Together they never downgrade a row a
+            // later migration already advanced (if this path is ever reached
+            // out of order), and never error on a pre-existing row.
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 3)",
                 [],
@@ -1983,7 +2056,7 @@ impl Database {
         // be >= 3 if a malformed source held a higher value; the `version < 3`
         // guard keeps that higher value rather than downgrading it. Stamping
         // SCHEMA_VERSION here was the original defect: a crash before the
-        // v3->v4 commit left version=5 on disk with no last_fix/fixes table.
+        // v3->v4 commit left a final-version stamp on disk with no later tables.
         tx.execute(
             "UPDATE schema_version SET version = 3 WHERE id = 1 AND version < 3",
             [],
@@ -2044,6 +2117,40 @@ impl Database {
         })
     }
 
+    /// v5 -> v6: persist the coarse mobile-SSID classification alongside
+    /// each resolved AP. Existing rows intentionally receive the default 0;
+    /// they are not retroactively re-evaluated and will be recomputed only on
+    /// their next upsert. Wrapped in `run_migration` so the column and version
+    /// stamp commit or roll back together.
+    fn migrate_v5_to_v6(&self) -> Result<()> {
+        self.run_migration(|tx| {
+            let has_is_mobile = {
+                let mut stmt = tx.prepare("PRAGMA table_info(aps)")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                let mut found = false;
+                for column in rows {
+                    if column? == "is_mobile" {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            if !has_is_mobile {
+                tx.execute(
+                    "ALTER TABLE aps ADD COLUMN is_mobile INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .context("failed to add aps.is_mobile column")?;
+            }
+            tx.execute(
+                "UPDATE schema_version SET version = ?1 WHERE id = 1",
+                params![6],
+            )?;
+            Ok(())
+        })
+    }
+
     fn get_schema_version(&self) -> i32 {
         // Table may not exist yet
         let result: Result<i32, _> =
@@ -2072,9 +2179,10 @@ impl Database {
 
     /// task-0191 AC#3: the highest schema version whose on-disk *table shape*
     /// is actually present, capped at the `stamped` version (we never claim a
-    /// shape newer than the stored stamp). v4 introduced `last_fix` and v5
-    /// introduced `fixes`; v5 layers on v4, so a missing `last_fix` caps us at
-    /// 3 even if `fixes` somehow exists. Versions below 4 touch only tables
+    /// shape newer than the stored stamp). v4 introduced `last_fix`, v5
+    /// introduced `fixes`, and v6 introduced `aps.is_mobile`. Each layer
+    /// depends on the previous one, so a missing earlier shape caps the
+    /// satisfied version before it. Versions below 4 touch only tables
     /// create_schema_v1 always creates, so anything < 4 is shape-satisfied by
     /// definition and returned unchanged (no sqlite_master probe needed).
     fn highest_satisfied_shape_version(&self, stamped: i32) -> i32 {
@@ -2084,7 +2192,25 @@ impl Database {
         if stamped >= 5 && !self.table_exists("fixes") {
             return 4;
         }
+        if stamped >= 6 && !self.column_exists("aps", "is_mobile") {
+            return 5;
+        }
         stamped
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> bool {
+        let Ok(mut stmt) = self.conn.prepare(&format!("PRAGMA table_info({table})")) else {
+            return false;
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else {
+            return false;
+        };
+        for name in rows {
+            if name.is_ok_and(|name| name == column) {
+                return true;
+            }
+        }
+        false
     }
 
     fn create_schema_v1(&self) -> Result<()> {
@@ -2162,7 +2288,7 @@ impl Database {
         let result = self
             .conn
             .query_row(
-                "SELECT bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source
+                "SELECT bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, is_mobile
                  FROM aps WHERE bssid = ?1",
                 params![bssid],
                 |row| {
@@ -2177,6 +2303,7 @@ impl Database {
                         frequency: row.get(6)?,
                         city: row.get(7)?,
                         country: row.get(8)?,
+                        is_mobile: row.get::<_, i64>(10)? != 0,
                         source: Source::from_db_str(&source_str),
                     })
                 },
@@ -2187,28 +2314,35 @@ impl Database {
 
     /// Insert or update a resolved AP.
     ///
-    /// Source priority is enforced: an existing row is overwritten only if
+    /// Source priority is enforced for provider-owned position metadata: an
+    /// existing row is overwritten only if
     /// the incoming row's source priority is **strictly greater than or
     /// equal to** the stored row's. This keeps better fixes (Apple) sticky
     /// against later, lower-quality writes (WiGLE/BeaconDB) for the same
     /// BSSID.
     ///
-    /// `last_seen` is **always** advanced regardless of priority decision —
-    /// observing a BSSID is independent of whose data is authoritative.
+    /// Scanner-owned `ssid`, derived `is_mobile`, and `last_seen` are always
+    /// refreshed regardless of provider priority. Observation metadata is
+    /// independent of whose remote position is authoritative.
     #[cfg(test)]
     pub fn upsert_ap(&self, ap: &ApInfo) -> Result<()> {
-        Self::upsert_ap_on(&self.conn, ap)
+        Self::upsert_ap_on(&self.conn, ap, &self.mobile_ssid_denylist)
     }
 
-    fn upsert_ap_on(conn: &Connection, ap: &ApInfo) -> Result<()> {
+    fn upsert_ap_on(conn: &Connection, ap: &ApInfo, mobile_ssid_denylist: &[String]) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let source_str = ap.source.as_str();
         let priority = ap.source.priority();
+        let is_mobile = i64::from(crate::scanner::is_mobile_ssid(
+            ap.ssid.as_deref(),
+            mobile_ssid_denylist,
+        ));
         conn.execute(
-            "INSERT INTO aps (bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, source_priority, first_seen, last_seen, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?12)
+            "INSERT INTO aps (bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, source_priority, is_mobile, first_seen, last_seen, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?13)
              ON CONFLICT(bssid) DO UPDATE SET
-                ssid       = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.ssid       ELSE aps.ssid       END,
+                ssid       = excluded.ssid,
+                is_mobile  = excluded.is_mobile,
                 lat        = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.lat        ELSE aps.lat        END,
                 lon        = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.lon        ELSE aps.lon        END,
                 encryption = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.encryption ELSE aps.encryption END,
@@ -2220,16 +2354,17 @@ impl Database {
                 source_priority  = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.source_priority  ELSE aps.source_priority  END,
                 fetched_at       = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.fetched_at       ELSE aps.fetched_at       END,
                 last_seen  = excluded.last_seen",
-            params![ap.bssid, ap.ssid, ap.lat, ap.lon, ap.encryption, ap.channel, ap.frequency, ap.city, ap.country, source_str, priority, now],
+            params![ap.bssid, ap.ssid, ap.lat, ap.lon, ap.encryption, ap.channel, ap.frequency, ap.city, ap.country, source_str, priority, is_mobile, now],
         )?;
         Ok(())
     }
 
     fn cache_resolved_ap(&mut self, ap: &ApInfo, delete_pending: bool) -> Result<()> {
+        let mobile_ssid_denylist = &self.mobile_ssid_denylist;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Self::upsert_ap_on(&tx, ap)?;
+        Self::upsert_ap_on(&tx, ap, mobile_ssid_denylist)?;
         if delete_pending {
             tx.execute("DELETE FROM pending WHERE bssid = ?1", params![ap.bssid])?;
         }
@@ -2249,7 +2384,7 @@ impl Database {
         for bssid in bssids {
             let ap = tx
                 .query_row(
-                    "SELECT bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source
+                    "SELECT bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, is_mobile
                      FROM aps WHERE bssid = ?1",
                     params![bssid],
                     |row| {
@@ -2264,6 +2399,7 @@ impl Database {
                             frequency: row.get(6)?,
                             city: row.get(7)?,
                             country: row.get(8)?,
+                            is_mobile: row.get::<_, i64>(10)? != 0,
                             source: Source::from_db_str(&source_str),
                         })
                     },
@@ -2351,7 +2487,7 @@ impl Database {
             "INSERT INTO pending (bssid, ssid, channel, frequency, signal_dbm, first_seen, last_seen, attempts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0)
              ON CONFLICT(bssid) DO UPDATE SET
-                ssid = COALESCE(excluded.ssid, pending.ssid),
+                ssid = excluded.ssid,
                 last_seen = excluded.last_seen,
                 signal_dbm = CASE WHEN excluded.signal_dbm > pending.signal_dbm THEN excluded.signal_dbm ELSE pending.signal_dbm END",
             params![bssid, ssid, channel, frequency, signal_dbm, now],
@@ -2359,32 +2495,31 @@ impl Database {
         Ok(())
     }
 
-    fn insert_pending_many(&mut self, bssids: &[String]) -> Result<()> {
+    fn insert_pending_many(&mut self, observations: &[(String, Option<String>)]) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for bssid in bssids {
-            Self::insert_pending_on(&tx, bssid, None, None, None, None)?;
+        for (bssid, ssid) in observations {
+            Self::insert_pending_on(&tx, bssid, ssid.as_deref(), None, None, None)?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Get up to `limit` pending `(bssid, attempts)` rows, ordered by
-    /// fewest attempts first.
-    ///
-    /// task-0060: returns a tuple instead of the former `PendingAp`
-    /// struct. Production callers only need the BSSID; `attempts` is
-    /// retained for tests that assert the retry counter advances. Widen
-    /// the projection if a real consumer needs ssid/channel/frequency/
-    /// signal_dbm.
-    pub fn get_pending(&self, limit: usize) -> Result<Vec<(String, i32)>> {
+    /// Get up to `limit` pending observations, ordered by fewest attempts.
+    /// SSID is a production input: pending retries must classify the scanner
+    /// value captured before the original provider request.
+    pub fn get_pending(&self, limit: usize) -> Result<Vec<PendingAp>> {
         let mut stmt = self.conn.prepare(
-            "SELECT bssid, attempts
+            "SELECT bssid, ssid, attempts
              FROM pending ORDER BY attempts ASC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+            Ok(PendingAp {
+                bssid: row.get(0)?,
+                ssid: row.get(1)?,
+                attempts: row.get(2)?,
+            })
         })?;
         let mut result = Vec::new();
         for row in rows {
@@ -3055,6 +3190,7 @@ mod tests {
             frequency: Some(2_412),
             city: None,
             country: None,
+            is_mobile: false,
             source: Source::Apple,
         }
     }
@@ -3278,6 +3414,31 @@ mod tests {
         runtime.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn configured_actor_denylist_reaches_every_cache_upsert() {
+        let dir = unique_tempdir("task0093-configured-denylist");
+        let path = dir.join("whereami.db");
+        let (runtime, handle) =
+            DbRuntime::open_with_mobile_ssid_denylist(&path, vec!["Shuttle-*".to_owned()])
+                .await
+                .unwrap();
+        let mut ap = sample_ap(3);
+        ap.ssid = Some("shuttle-42".to_owned());
+
+        handle.cache_resolved_ap(ap.clone(), false).await.unwrap();
+
+        let stored = handle
+            .lookup_cached_touch(vec![ap.bssid])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(stored.is_mobile);
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn seed_every_privacy_table(db: &Database) {
         db.upsert_ap(&sample_ap(1)).unwrap();
         db.insert_pending("pending", Some("ssid"), Some(6), Some(2437), Some(-40))
@@ -3422,9 +3583,11 @@ mod tests {
         let path = dir.join("whereami.db");
         let failed_path = path.clone();
         let result = tokio::task::spawn_blocking(move || {
-            DbRuntime::open_blocking_with_reader(failed_path, |_| {
-                anyhow::bail!("injected reader startup failure")
-            })
+            DbRuntime::open_blocking_with_reader(
+                failed_path,
+                |writer_path| Database::open(&writer_path),
+                |_| anyhow::bail!("injected reader startup failure"),
+            )
         })
         .await
         .unwrap();
@@ -4316,7 +4479,10 @@ mod tests {
              CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )
         .unwrap();
-        let db = Database { conn };
+        let db = Database {
+            conn,
+            mobile_ssid_denylist: crate::scanner::default_mobile_ssid_denylist(),
+        };
         // Looks like v2 to get_schema_version() because LIMIT 1 returns one
         // of the rows; we don't care which. The point is migrate() must
         // collapse to a single row regardless.
@@ -4358,6 +4524,7 @@ mod tests {
     fn fresh_v2_db() -> Database {
         let db = Database {
             conn: Connection::open_in_memory().unwrap(),
+            mobile_ssid_denylist: crate::scanner::default_mobile_ssid_denylist(),
         };
         db.create_schema_v1().unwrap();
         db.migrate_v1_to_v2().unwrap();
@@ -4369,8 +4536,8 @@ mod tests {
     /// time, asserting the stored stamp AND the table shape after EACH step.
     /// This is the direct regression guard for the v2->v3
     /// SCHEMA_VERSION-stamping bug: applied in isolation, migrate_v2_to_v3
-    /// must leave the stamp at EXACTLY 3 (not 5), with neither last_fix nor
-    /// fixes present yet.
+    /// must leave the stamp at EXACTLY 3 (not the current version), with
+    /// neither last_fix nor fixes present yet.
     #[test]
     fn migration_chain_stamps_each_version_in_lockstep() {
         let db = fresh_v2_db();
@@ -4406,6 +4573,12 @@ mod tests {
         assert_eq!(db.get_schema_version(), 5);
         assert!(db.table_exists("last_fix"));
         assert!(db.table_exists("fixes"), "fixes present at v5");
+        assert!(!db.column_exists("aps", "is_mobile"));
+
+        // --- v5 -> v6: stamp 6, mobile classification column appears ---
+        db.migrate_v5_to_v6().unwrap();
+        assert_eq!(db.get_schema_version(), 6);
+        assert!(db.column_exists("aps", "is_mobile"));
     }
 
     /// task-0191 AC#3 (positive): a DB stamped newer than its shape — the
@@ -4428,27 +4601,112 @@ mod tests {
             .unwrap();
         assert_eq!(db.get_schema_version(), 5);
 
-        // Heal: warn + reset to 3 + re-run v3->v4->v5.
+        // Heal: warn + reset to 3 + re-run the complete migration chain.
         db.migrate().unwrap();
-        assert_eq!(db.get_schema_version(), 5, "healed DB ends at v5");
+        assert_eq!(
+            db.get_schema_version(),
+            SCHEMA_VERSION,
+            "healed DB ends at the current version"
+        );
         assert!(db.table_exists("last_fix"), "repair must create last_fix");
         assert!(db.table_exists("fixes"), "repair must create fixes");
+        assert!(db.column_exists("aps", "is_mobile"));
     }
 
-    /// task-0191 AC#3 (negative): an intact v5 DB passes the shape check
+    /// task-0191 AC#3 (negative): an intact current DB passes the shape check
     /// untouched — no spurious repair. Re-running migrate() is a no-op:
-    /// version stays 5 and both tables remain present.
+    /// version stays current and every shape remains present.
     #[test]
-    fn migrate_does_not_repair_intact_v5() {
+    fn migrate_does_not_repair_intact_current_schema() {
         let db = Database::open_memory().unwrap();
         assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
         assert!(db.table_exists("last_fix"));
         assert!(db.table_exists("fixes"));
+        assert!(db.column_exists("aps", "is_mobile"));
 
         db.migrate().unwrap();
-        assert_eq!(db.get_schema_version(), 5, "intact v5 must stay at 5");
+        assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
         assert!(db.table_exists("last_fix"));
         assert!(db.table_exists("fixes"));
+        assert!(db.column_exists("aps", "is_mobile"));
+    }
+
+    #[test]
+    fn migrate_v5_to_v6_defaults_existing_rows_to_fixed() {
+        let db = fresh_v2_db();
+        db.migrate_v2_to_v3().unwrap();
+        db.migrate_v3_to_v4().unwrap();
+        db.migrate_v4_to_v5().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO aps (
+                    bssid, ssid, lat, lon, source, source_priority,
+                    first_seen, last_seen, fetched_at
+                 ) VALUES ('B8:50:01:00:00:01', 'DSB_Wi-Fi', 55.0, 12.0,
+                           'apple', 40, 't', 't', 't')",
+                [],
+            )
+            .unwrap();
+
+        db.migrate_v5_to_v6().unwrap();
+
+        assert_eq!(db.get_schema_version(), 6);
+        assert!(db.column_exists("aps", "is_mobile"));
+        let is_mobile: i64 = db
+            .conn
+            .query_row(
+                "SELECT is_mobile FROM aps WHERE bssid = 'B8:50:01:00:00:01'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            is_mobile, 0,
+            "migration must not retroactively classify existing rows"
+        );
+    }
+
+    #[test]
+    fn migrate_v5_to_v6_rolls_back_column_when_stamp_fails() {
+        let db = fresh_v2_db();
+        db.migrate_v2_to_v3().unwrap();
+        db.migrate_v3_to_v4().unwrap();
+        db.migrate_v4_to_v5().unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_v6_stamp
+                 BEFORE UPDATE ON schema_version
+                 WHEN NEW.version = 6
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected v6 stamp failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = db.migrate_v5_to_v6().unwrap_err();
+        assert!(format!("{error:#}").contains("injected v6 stamp failure"));
+        assert_eq!(db.get_schema_version(), 5);
+        assert!(
+            !db.column_exists("aps", "is_mobile"),
+            "ALTER TABLE must roll back with the failed version stamp"
+        );
+    }
+
+    #[test]
+    fn migrate_repairs_v6_stamp_missing_is_mobile_column() {
+        let db = fresh_v2_db();
+        db.migrate_v2_to_v3().unwrap();
+        db.migrate_v3_to_v4().unwrap();
+        db.migrate_v4_to_v5().unwrap();
+        db.conn
+            .execute("UPDATE schema_version SET version = 6 WHERE id = 1", [])
+            .unwrap();
+        assert!(!db.column_exists("aps", "is_mobile"));
+
+        db.migrate().unwrap();
+
+        assert_eq!(db.get_schema_version(), 6);
+        assert!(db.column_exists("aps", "is_mobile"));
     }
 
     /// task-0191 AC#3 guard rail: a genuinely-newer schema from a FUTURE
@@ -4482,6 +4740,7 @@ mod tests {
             frequency: Some(2437),
             city: None,
             country: None,
+            is_mobile: false,
             source: Source::Wigle,
         };
         db.upsert_ap(&ap).unwrap();
@@ -4489,6 +4748,49 @@ mod tests {
         assert_eq!(got.ssid, Some("TestWiFi".to_string()));
         assert!((got.lat - 55.6684).abs() < 1e-6);
         assert_eq!(got.source, Source::Wigle);
+    }
+
+    #[test]
+    fn null_ssid_with_train_oui_is_not_mobile() {
+        let db = Database::open_memory().unwrap();
+        let mut ap = sample_ap(1);
+        ap.bssid = "B8:50:01:AA:BB:CC".to_owned();
+        ap.ssid = None;
+
+        db.upsert_ap(&ap).unwrap();
+
+        let stored = db.get_ap(&ap.bssid).unwrap().unwrap();
+        assert!(!stored.is_mobile, "OUI alone must never classify mobility");
+    }
+
+    #[test]
+    fn upsert_recomputes_mobile_flag_and_does_not_retroactively_reclassify() {
+        let mut db = Database::open_memory_with_mobile_ssid_denylist(Vec::new()).unwrap();
+        let mut ap = sample_ap(2);
+        ap.ssid = Some("DSB_Wi-Fi".to_owned());
+        ap.is_mobile = true; // ignored: persistence recomputes from its denylist
+        db.upsert_ap(&ap).unwrap();
+        assert!(!db.get_ap(&ap.bssid).unwrap().unwrap().is_mobile);
+
+        db.mobile_ssid_denylist = crate::scanner::default_mobile_ssid_denylist();
+        assert!(
+            !db.get_ap(&ap.bssid).unwrap().unwrap().is_mobile,
+            "changing the denylist must not rewrite existing rows"
+        );
+
+        db.upsert_ap(&ap).unwrap();
+        assert!(
+            db.get_ap(&ap.bssid).unwrap().unwrap().is_mobile,
+            "the next actual upsert must use the current denylist"
+        );
+
+        ap.ssid = Some("fixed-home-network".to_owned());
+        ap.is_mobile = true;
+        db.upsert_ap(&ap).unwrap();
+        assert!(
+            !db.get_ap(&ap.bssid).unwrap().unwrap().is_mobile,
+            "incoming flags are never trusted; a later fixed SSID clears the bit"
+        );
     }
 
     /// Build an ApInfo with the given source and lat (used to tell rows
@@ -4504,6 +4806,7 @@ mod tests {
             frequency: Some(2437),
             city: None,
             country: None,
+            is_mobile: false,
             source,
         }
     }
@@ -4573,6 +4876,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lower_priority_upsert_refreshes_scanner_ssid_and_mobile_flag_only() {
+        let db = Database::open_memory().unwrap();
+        let mut apple = ap_with(Source::Apple, 55.0);
+        apple.ssid = Some("fixed-home-network".to_owned());
+        db.upsert_ap(&apple).unwrap();
+
+        let mut manual_observation = ap_with(Source::Manual, 1.0);
+        manual_observation.ssid = Some("MOVIA_BUS_42".to_owned());
+        db.upsert_ap(&manual_observation).unwrap();
+
+        let stored = db.get_ap(&apple.bssid).unwrap().unwrap();
+        assert_eq!(stored.source, Source::Apple);
+        assert_eq!(stored.lat, 55.0, "lower-priority position must not win");
+        assert_eq!(stored.ssid.as_deref(), Some("MOVIA_BUS_42"));
+        assert!(stored.is_mobile);
+    }
+
     /// Migration v1 -> v2 backfills source_priority from the source string.
     /// We construct a v1 database by hand, then call `migrate` and verify
     /// the column exists and is populated correctly.
@@ -4599,7 +4920,10 @@ mod tests {
              CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )
         .unwrap();
-        let db = Database { conn };
+        let db = Database {
+            conn,
+            mobile_ssid_denylist: crate::scanner::default_mobile_ssid_denylist(),
+        };
         db.migrate().unwrap();
         assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
 
@@ -4646,12 +4970,13 @@ mod tests {
         .unwrap();
         let pending = db.get_pending(10).unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].0, "AA:BB:CC:DD:EE:FF");
-        assert_eq!(pending[0].1, 0);
+        assert_eq!(pending[0].bssid, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(pending[0].ssid.as_deref(), Some("Test"));
+        assert_eq!(pending[0].attempts, 0);
 
         db.increment_pending_attempts("AA:BB:CC:DD:EE:FF").unwrap();
         let pending = db.get_pending(10).unwrap();
-        assert_eq!(pending[0].1, 1);
+        assert_eq!(pending[0].attempts, 1);
 
         db.delete_pending("AA:BB:CC:DD:EE:FF").unwrap();
         let pending = db.get_pending(10).unwrap();

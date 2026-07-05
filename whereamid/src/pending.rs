@@ -6,7 +6,8 @@ use tracing::{debug, info, warn};
 
 use crate::provider::Provider;
 use crate::resolver::{
-    resolve_chain, ChainPolicy, HardStopAction, NetErrorAction, NotFoundPolicy, SkipAction,
+    resolve_chain_with_observations, ChainPolicy, HardStopAction, NetErrorAction, NotFoundPolicy,
+    ObservedAp, SkipAction,
 };
 use crate::server::DaemonState;
 
@@ -137,7 +138,14 @@ async fn drain_once(
     // drain_cleanup_after_chain.
     let bssids: Vec<String> = pending
         .iter()
-        .map(|(bssid, _attempts)| bssid.clone())
+        .map(|pending| pending.bssid.clone())
+        .collect();
+    let observations: Vec<ObservedAp> = pending
+        .iter()
+        .map(|pending| ObservedAp {
+            bssid: pending.bssid.clone(),
+            ssid: pending.ssid.clone(),
+        })
         .collect();
     let policy = ChainPolicy {
         skip_cached: false,
@@ -152,7 +160,9 @@ async fn drain_once(
         on_network_error: NetErrorAction::Ignore,
         on_hard_stop: HardStopAction::Stop,
     };
-    let _ = resolve_chain(&bssids, state, providers, &policy, ticket).await;
+    let _ =
+        resolve_chain_with_observations(&bssids, state, providers, &policy, ticket, &observations)
+            .await;
 
     // task-0189: advance the attempts counter once per drain pass for every
     // BSSID we just tried. resolve_chain deletes rows it resolved or
@@ -314,6 +324,49 @@ mod tests {
 
     fn mock(name: &'static str, outcome: fn(&str) -> ProviderOutcome) -> Provider {
         Provider::Mock(std::sync::Arc::new(MockProvider::new(name, outcome)))
+    }
+
+    #[tokio::test]
+    async fn pending_retry_preserves_scanner_ssid_for_classification() {
+        let state = test_state();
+        let mobile = "aa:bb:cc:dd:ee:b1".to_owned();
+        let hidden = "b8:50:01:aa:bb:cc".to_owned();
+        {
+            let db = crate::server::lock_db(&state);
+            db.insert_pending(&mobile, Some("MOVIA_BUS_42"), None, None, None)
+                .unwrap();
+            db.insert_pending(&hidden, None, None, None, None).unwrap();
+        }
+        let provider = mock("apple-like", |bssid| {
+            ProviderOutcome::Found(crate::db::ApInfo {
+                bssid: bssid.to_owned(),
+                ssid: Some("DSB_Wi-Fi".to_owned()),
+                lat: 55.0,
+                lon: 12.0,
+                encryption: None,
+                channel: None,
+                frequency: None,
+                city: None,
+                country: None,
+                is_mobile: false,
+                source: crate::db::Source::Apple,
+            })
+        });
+
+        drain_once(&state, 20, &[provider], state.privacy.ticket()).await;
+
+        let db = crate::server::lock_db(&state);
+        let mobile_ap = db.get_ap(&mobile).unwrap().unwrap();
+        assert_eq!(mobile_ap.ssid.as_deref(), Some("MOVIA_BUS_42"));
+        assert!(mobile_ap.is_mobile);
+        let hidden_ap = db.get_ap(&hidden).unwrap().unwrap();
+        assert_eq!(hidden_ap.ssid, None);
+        assert!(
+            !hidden_ap.is_mobile,
+            "hidden scanner observation must survive provider metadata"
+        );
+        assert!(!db.is_pending(&mobile).unwrap());
+        assert!(!db.is_pending(&hidden).unwrap());
     }
 
     /// task-0189 AC#1: with WiGLE unconfigured (Skipped) and Apple
@@ -538,7 +591,7 @@ mod tests {
             .unwrap();
         assert_eq!(all.len(), total, "no rows resolved/removed (all Skipped)");
         assert!(
-            all.iter().all(|(_, attempts)| *attempts >= 1),
+            all.iter().all(|pending| pending.attempts >= 1),
             "every pending row must advance across two passes (no starvation): {all:?}"
         );
     }

@@ -22,12 +22,16 @@ let
   # DROPS whereamid/tests/proptests.proptest-regressions, the committed
   # proptest counterexample corpus (task-0071). Without it the `test` check
   # runs proptests WITHOUT the deterministic regression pins that `just test`
-  # has. Same default filter, plus that corpus (task-0209 review, mped L1).
+  # has. server.rs also compiles the exact docs/protocol.md into a protocol
+  # contract test via include_str!, so that single non-Cargo input must be in
+  # the source closure too; including all docs would needlessly invalidate the
+  # Rust build for unrelated documentation edits.
   src = lib.cleanSourceWith {
     src = ./..;
     filter = path: type:
       (craneLib.filterCargoSources path type)
-      || lib.hasSuffix ".proptest-regressions" path;
+      || lib.hasSuffix ".proptest-regressions" path
+      || lib.hasSuffix "/docs/protocol.md" path;
     name = "source";
   };
 

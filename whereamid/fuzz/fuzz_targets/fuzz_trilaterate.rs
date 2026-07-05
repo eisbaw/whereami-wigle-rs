@@ -15,6 +15,7 @@ struct FuzzAp {
     /// Signal in dBm, typically [-100, 0]
     signal_raw: i8,
     has_signal: bool,
+    is_mobile: bool,
 }
 
 impl FuzzAp {
@@ -31,6 +32,7 @@ impl FuzzAp {
             lat,
             lon,
             signal_dbm: signal,
+            is_mobile: self.is_mobile,
         }
     }
 }
@@ -50,7 +52,8 @@ fuzz_target!(|input: FuzzInput| {
 
     // filter_outliers must not panic
     let filtered = filter_outliers(&positioned);
-    assert!(!filtered.is_empty() || positioned.len() <= 2);
+    assert!(!filtered.is_empty() || positioned.iter().all(|ap| ap.is_mobile));
+    assert!(filtered.iter().all(|ap| !ap.is_mobile));
 
     // trilaterate must not panic (it returns Result, so Err is fine)
     let _ = trilaterate(&positioned);

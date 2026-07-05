@@ -208,6 +208,7 @@ fn interpret_response(body: WigleSearchResponse, bssid: &str) -> Result<ApInfo, 
         frequency: r.frequency,
         city: r.city.clone(),
         country: r.country.clone(),
+        is_mobile: false,
         source: crate::db::Source::Wigle,
     })
 }

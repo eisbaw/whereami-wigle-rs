@@ -30,4 +30,15 @@
       "services.whereami.rustLog must be a single-line RUST_LOG filter; "
       + "carriage returns and newlines are not supported by systemd Environment=.";
   }
+  {
+    # Keep the comma-separated ExecStart argument single-line. The systemd
+    # encoder safely handles spaces/quotes/$/%/semicolon, but CR/LF make the
+    # operator-facing module value and generated unit unnecessarily ambiguous.
+    assertion = lib.all (pattern:
+      !lib.hasInfix "\n" pattern && !lib.hasInfix "\r" pattern
+    ) cfg.mobileSsidDenylist;
+    message =
+      "services.whereami.mobileSsidDenylist entries must be single-line patterns; "
+      + "carriage returns and newlines are not supported.";
+  }
 ]

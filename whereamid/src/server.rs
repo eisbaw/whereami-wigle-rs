@@ -1222,6 +1222,26 @@ async fn dispatch_command_for_transport(
     }
 }
 
+/// Select bounded cold-start provider work after cache lookup. Cached rows are
+/// removed before the limit because the provider chain skips them; allowing
+/// persisted-mobile or non-finite cache hits to occupy this list would waste
+/// every slot and starve genuinely unknown scanner-eligible APs.
+fn bounded_uncached_observations(
+    candidates: &[(String, i32, Option<String>)],
+    cached_bssids: &std::collections::HashSet<String>,
+    limit: usize,
+) -> Vec<crate::resolver::ObservedAp> {
+    candidates
+        .iter()
+        .filter(|(bssid, _, _)| !cached_bssids.contains(bssid))
+        .take(limit)
+        .map(|(bssid, _, ssid)| crate::resolver::ObservedAp {
+            bssid: bssid.clone(),
+            ssid: ssid.clone(),
+        })
+        .collect()
+}
+
 async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::PrivacyTicket) -> String {
     use crate::resolver;
     use crate::trilaterate::{trilaterate, PositionedAp};
@@ -1239,26 +1259,45 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
     // (task-0051) — fake readings poison trilateration weights, which is
     // exactly the bug task-0043 fixed in the nmcli parser.
     let stable_count = stable.len();
-    let mut candidates: Vec<(String, i32)> = stable
+    let mut candidates: Vec<(String, i32, Option<String>)> = stable
         .iter()
-        .filter_map(|b| debouncer.latest_signal(b).map(|s| (b.clone(), s)))
+        .filter_map(|bssid| {
+            debouncer
+                .latest_entry(bssid)
+                // Current scanner evidence takes effect immediately. Do this
+                // before sorting/truncating so stronger train/bus hotspots
+                // cannot consume every top-N slot and starve fixed APs.
+                .filter(|entry| {
+                    !crate::scanner::is_mobile_ssid(
+                        entry.ssid.as_deref(),
+                        &state.args.mobile_ssid_denylist,
+                    )
+                })
+                .map(|entry| (bssid.clone(), entry.signal_dbm, entry.ssid.clone()))
+        })
         .collect();
     candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
-    candidates.truncate(state.args.top_n);
 
-    // Cold-start fallback: if no stable APs have cached positions,
-    // use ALL visible APs from latest scan (bypass debounce for the query).
-    // They won't be committed to cache — just used for this one response.
-    let fallback_candidates: Vec<(String, i32)> = if candidates.is_empty() {
+    // Cold-start fallback: if no scanner-eligible stable APs exist, use all
+    // scanner-eligible APs from the latest scan (bypass debounce for the
+    // query). Do not truncate either list yet: persisted-mobile and poisoned
+    // non-finite cache rows are not known until after the cache lookup, and an
+    // ineligible stronger row must not consume a top-N positioning slot.
+    let fallback_candidates: Vec<(String, i32, Option<String>)> = if candidates.is_empty() {
         debouncer
             .latest_scan()
             .map(|scan| {
-                let mut v: Vec<(String, i32)> = scan
+                let mut v: Vec<(String, i32, Option<String>)> = scan
                     .iter()
-                    .map(|(b, e)| (b.clone(), e.signal_dbm))
+                    .filter(|(_, entry)| {
+                        !crate::scanner::is_mobile_ssid(
+                            entry.ssid.as_deref(),
+                            &state.args.mobile_ssid_denylist,
+                        )
+                    })
+                    .map(|(b, e)| (b.clone(), e.signal_dbm, e.ssid.clone()))
                     .collect();
                 v.sort_by_key(|c| std::cmp::Reverse(c.1));
-                v.truncate(state.args.top_n);
                 v
             })
             .unwrap_or_default()
@@ -1278,45 +1317,27 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
     };
 
     if active_candidates.is_empty() {
-        return return_last_fix_or_error(
-            state,
-            ticket,
-            "no APs detected yet",
-            visible,
-            stable_count,
-        )
-        .await;
+        let error = if visible == 0 {
+            "no APs detected yet"
+        } else {
+            "no eligible fixed APs detected"
+        };
+        return return_last_fix_or_error(state, ticket, error, visible, stable_count).await;
     }
 
-    let bssids: Vec<String> = active_candidates.iter().map(|(b, _)| b.clone()).collect();
-    let signal_map: std::collections::HashMap<String, i32> =
-        active_candidates.iter().cloned().collect();
+    let bssids: Vec<String> = active_candidates
+        .iter()
+        .map(|(bssid, _, _)| bssid.clone())
+        .collect();
+    let signal_map: std::collections::HashMap<String, i32> = active_candidates
+        .iter()
+        .map(|(bssid, signal, _)| (bssid.clone(), *signal))
+        .collect();
 
     // Cache-only lookup — never blocks on WiGLE. Instant response.
+    // lookup_cached_touch preserves input order, so the returned hits remain
+    // RSSI ordered even though absent BSSIDs are omitted.
     let cached_aps = resolver::lookup_cached(&bssids, state, ticket).await;
-    let cached_count = cached_aps.len();
-
-    if cached_aps.is_empty() {
-        // Nothing cached. If using fallback, queue all for background resolution.
-        if using_fallback {
-            // task-0102: track so the shutdown drain waits for this resolve
-            // instead of killing it mid-API-call (which would leak a WiGLE
-            // quota lease / leave partial writes).
-            let resolve_state = Arc::clone(state);
-            let bssids_clone = bssids.clone();
-            state.spawn_tracked(async move {
-                resolver::resolve_background(&bssids_clone, &resolve_state, ticket).await;
-            });
-        }
-        return return_last_fix_or_error(
-            state,
-            ticket,
-            "no cached positions for visible APs (resolving in background)",
-            visible,
-            stable_count,
-        )
-        .await;
-    }
 
     // Build trilateration input.
     //
@@ -1327,24 +1348,70 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
     // defense) and name the offending bssid so the poisoned cache row is
     // traceable. trilaterate() re-filters as defense in depth for callers
     // that bypass this path.
+    // Persisted mobile classification and finite-coordinate eligibility must
+    // both run before take(top_n). Otherwise stronger ineligible cache rows can
+    // fill every slot and starve weaker fixed rows. trilaterate() independently
+    // re-applies these guards for callers that bypass this server path.
     let positioned_aps: Vec<PositionedAp> = cached_aps
         .iter()
-        .filter(|ap| {
+        .filter_map(|ap| {
             let finite = ap.lat.is_finite() && ap.lon.is_finite();
             if !finite {
                 warn!(
                     "skipping AP {}: non-finite cached position ({}, {})",
                     ap.bssid, ap.lat, ap.lon
                 );
+                return None;
             }
-            finite
+            if ap.is_mobile {
+                return None;
+            }
+            Some(PositionedAp {
+                lat: ap.lat,
+                lon: ap.lon,
+                signal_dbm: signal_map.get(&ap.bssid).copied(),
+                is_mobile: ap.is_mobile,
+            })
         })
-        .map(|ap| PositionedAp {
-            lat: ap.lat,
-            lon: ap.lon,
-            signal_dbm: signal_map.get(&ap.bssid).copied(),
-        })
+        .take(state.args.top_n)
         .collect();
+    // `cached` counts only finite fixed cache hits admitted to this solve, not
+    // every row examined while filling top-N. `sources` is the number handed
+    // to trilateration; locate is cache-only, so they coincide for fresh fixes.
+    let cached_count = positioned_aps.len();
+    let source_count = positioned_aps.len();
+
+    if positioned_aps.is_empty() {
+        // Cold-start provider work must stay bounded even though cache lookup
+        // examines every scanner-eligible candidate to backfill top-N around
+        // persisted-mobile/non-finite rows. Cached rows cannot benefit from the
+        // skip-cached provider chain, so omit them before taking the limit; this
+        // prevents stronger invalid cache hits from starving unknown fixed APs.
+        let cached_bssids: std::collections::HashSet<String> =
+            cached_aps.iter().map(|ap| ap.bssid.clone()).collect();
+        let unresolved_observations: Vec<resolver::ObservedAp> = if using_fallback {
+            bounded_uncached_observations(active_candidates, &cached_bssids, state.args.top_n)
+        } else {
+            Vec::new()
+        };
+        let resolving_in_background = !unresolved_observations.is_empty();
+        if resolving_in_background {
+            // task-0102: track so the shutdown drain waits for this resolve
+            // instead of killing it mid-API-call (which would leak a WiGLE
+            // quota lease / leave partial writes).
+            let resolve_state = Arc::clone(state);
+            state.spawn_tracked(async move {
+                resolver::resolve_background(&unresolved_observations, &resolve_state, ticket)
+                    .await;
+            });
+        }
+        let error = if resolving_in_background {
+            "no cached positions for visible APs (resolving in background)"
+        } else {
+            "no eligible cached positions for visible APs"
+        };
+        return return_last_fix_or_error(state, ticket, error, visible, stable_count).await;
+    }
 
     match trilaterate(&positioned_aps) {
         Ok(pos) => {
@@ -1367,7 +1434,7 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
                 accuracy_m: pos.accuracy_m,
                 address: None,
                 at: chrono::Utc::now(),
-                sources: cached_count,
+                sources: source_count,
             };
             // Address resolution remains off the response-critical network
             // path. An address-enabled locate atomically persists its fix and
@@ -1386,7 +1453,7 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
                 lat: pos.lat,
                 lon: pos.lon,
                 accuracy_m: pos.accuracy_m,
-                sources: cached_count,
+                sources: source_count,
                 cached: cached_count,
                 fetched: 0,
                 pending: 0,
@@ -2541,9 +2608,167 @@ mod dispatch_tests {
             frequency: None,
             city: None,
             country: None,
+            is_mobile: false,
             source: crate::db::Source::Manual,
         };
         lock_db(state).upsert_ap(&ap).unwrap();
+    }
+
+    /// Build a real cache/scan fixture where every persisted-mobile and
+    /// non-finite row is stronger than every usable fixed row. Scanner SSIDs
+    /// deliberately hide or disagree with the persisted mobile SSIDs, so only
+    /// the post-DB eligibility pass can reject those rows.
+    fn cached_ineligible_rows_ahead_of_fixed(
+        state: &Arc<DaemonState>,
+        prefix: u8,
+    ) -> crate::debounce::ScanSample {
+        let mut sample = crate::debounce::ScanSample::new();
+
+        for index in 0..11 {
+            let bssid = format!("02:00:00:{prefix:02x}:00:{index:02x}");
+            lock_db(state)
+                .upsert_ap(&crate::db::ApInfo {
+                    bssid: bssid.clone(),
+                    ssid: Some(format!("MOVIA_PERSISTED_{index}")),
+                    lat: 55.7390 + index as f64 / 100_000.0,
+                    lon: 12.5500,
+                    encryption: None,
+                    channel: None,
+                    frequency: None,
+                    city: None,
+                    country: None,
+                    is_mobile: false,
+                    source: crate::db::Source::Apple,
+                })
+                .unwrap();
+            sample.insert(
+                bssid,
+                crate::debounce::ScanEntry {
+                    signal_dbm: -10 - index,
+                    // Exercise both scanner-hidden and currently nonmatching
+                    // observations. Neither can reclassify the persisted row.
+                    ssid: (index % 2 != 0).then(|| format!("ordinary-{index}")),
+                    channel: Some(1),
+                },
+            );
+        }
+
+        for index in 0..11 {
+            let bssid = format!("02:00:00:{prefix:02x}:01:{index:02x}");
+            lock_db(state)
+                .upsert_ap(&crate::db::ApInfo {
+                    bssid: bssid.clone(),
+                    ssid: Some(format!("poisoned-fixed-{index}")),
+                    lat: f64::INFINITY,
+                    lon: 12.56,
+                    encryption: None,
+                    channel: None,
+                    frequency: None,
+                    city: None,
+                    country: None,
+                    is_mobile: false,
+                    source: crate::db::Source::Apple,
+                })
+                .unwrap();
+            sample.insert(
+                bssid,
+                crate::debounce::ScanEntry {
+                    signal_dbm: -30 - index,
+                    ssid: Some(format!("poisoned-fixed-{index}")),
+                    channel: Some(1),
+                },
+            );
+        }
+
+        for (index, (lat, lon)) in [(55.6760, 12.5680), (55.6761, 12.5682), (55.6759, 12.5681)]
+            .into_iter()
+            .enumerate()
+        {
+            let bssid = format!("02:00:00:{prefix:02x}:02:{index:02x}");
+            let ssid = format!("fixed-home-{index}");
+            lock_db(state)
+                .upsert_ap(&crate::db::ApInfo {
+                    bssid: bssid.clone(),
+                    ssid: Some(ssid.clone()),
+                    lat,
+                    lon,
+                    encryption: None,
+                    channel: None,
+                    frequency: None,
+                    city: None,
+                    country: None,
+                    is_mobile: false,
+                    source: crate::db::Source::Apple,
+                })
+                .unwrap();
+            sample.insert(
+                bssid,
+                crate::debounce::ScanEntry {
+                    signal_dbm: -80 - index as i32,
+                    ssid: Some(ssid),
+                    channel: Some(1),
+                },
+            );
+        }
+
+        let db = lock_db(state);
+        assert!(
+            db.get_ap(&format!("02:00:00:{prefix:02x}:00:00"))
+                .unwrap()
+                .unwrap()
+                .is_mobile,
+            "fixture must persist mobile=true independently of current scanner SSID"
+        );
+        assert!(
+            !db.get_ap(&format!("02:00:00:{prefix:02x}:01:00"))
+                .unwrap()
+                .unwrap()
+                .is_mobile,
+            "non-finite fixture must exercise finite eligibility, not mobile filtering"
+        );
+        sample
+    }
+
+    fn assert_three_fixed_sources(response: &str) {
+        let json: serde_json::Value = serde_json::from_str(response).unwrap();
+        assert_eq!(json["ok"], true, "locate failed: {response}");
+        assert_eq!(json["cached"], 3, "only admitted cache rows count");
+        assert_eq!(json["sources"], 3, "only fixed finite rows are sources");
+        assert!((json["lat"].as_f64().unwrap() - 55.6760).abs() < 0.001);
+        assert!((json["lon"].as_f64().unwrap() - 12.5681).abs() < 0.001);
+    }
+
+    #[test]
+    fn fallback_resolution_skips_cached_rows_before_applying_top_n_bound() {
+        let cached: std::collections::HashSet<String> = (0..11)
+            .map(|index| format!("cached-mobile-{index}"))
+            .collect();
+        let candidates: Vec<(String, i32, Option<String>)> = cached
+            .iter()
+            .cloned()
+            .map(|bssid| (bssid, -10, None))
+            .chain((0..12).map(|index| {
+                (
+                    format!("unknown-fixed-{index}"),
+                    -40 - index,
+                    Some(format!("fixed-{index}")),
+                )
+            }))
+            .collect();
+
+        let observations = bounded_uncached_observations(&candidates, &cached, 10);
+        assert_eq!(observations.len(), 10, "provider work must stay bounded");
+        assert!(observations
+            .iter()
+            .all(|observation| !cached.contains(&observation.bssid)));
+        let observed: std::collections::HashSet<&str> = observations
+            .iter()
+            .map(|observation| observation.bssid.as_str())
+            .collect();
+        for index in 0..10 {
+            let expected = format!("unknown-fixed-{index}");
+            assert!(observed.contains(expected.as_str()));
+        }
     }
 
     async fn seed_wipe_state(state: &Arc<DaemonState>) {
@@ -2721,6 +2946,7 @@ mod dispatch_tests {
                 frequency: None,
                 city: None,
                 country: None,
+                is_mobile: false,
                 source: crate::db::Source::Manual,
             })
             .unwrap();
@@ -3302,6 +3528,232 @@ mod dispatch_tests {
             .await
             .unwrap();
         assert_eq!(history.len(), 1, "locate must append one history row");
+    }
+
+    #[tokio::test]
+    async fn locate_excludes_mobile_cache_rows_and_reports_only_fixed_sources() {
+        let state = test_state();
+        let rows = [
+            ("02:00:00:00:30:01", "home-a", 55.6760, 12.5680),
+            ("02:00:00:00:30:02", "home-b", 55.6761, 12.5682),
+            ("02:00:00:00:30:03", "home-c", 55.6759, 12.5681),
+            ("02:00:00:00:30:04", "MOVIA_BUS_42", 55.7390, 12.5500),
+            ("02:00:00:00:30:05", "DSB_Wi-Fi", 55.7391, 12.5501),
+        ];
+        let mut sample = crate::debounce::ScanSample::new();
+        for (index, (bssid, ssid, lat, lon)) in rows.iter().enumerate() {
+            lock_db(&state)
+                .upsert_ap(&crate::db::ApInfo {
+                    bssid: (*bssid).to_owned(),
+                    ssid: Some((*ssid).to_owned()),
+                    lat: *lat,
+                    lon: *lon,
+                    encryption: None,
+                    channel: None,
+                    frequency: None,
+                    city: None,
+                    country: None,
+                    is_mobile: false,
+                    source: crate::db::Source::Apple,
+                })
+                .unwrap();
+            sample.insert(
+                (*bssid).to_owned(),
+                crate::debounce::ScanEntry {
+                    signal_dbm: -50 - index as i32,
+                    ssid: Some((*ssid).to_owned()),
+                    channel: Some(1),
+                },
+            );
+        }
+        {
+            let mut debouncer = state.debouncer.lock().await;
+            for _ in 0..state.args.debounce_threshold {
+                debouncer.push_scan(sample.clone());
+            }
+        }
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], true, "locate failed: {response}");
+        assert_eq!(json["cached"], 3);
+        assert_eq!(json["sources"], 3);
+        let lat = json["lat"].as_f64().unwrap();
+        let lon = json["lon"].as_f64().unwrap();
+        assert!(
+            (lat - 55.6760).abs() < 0.001,
+            "mobile APs pulled lat: {lat}"
+        );
+        assert!(
+            (lon - 12.5681).abs() < 0.001,
+            "mobile APs pulled lon: {lon}"
+        );
+        assert_eq!(state.db.get_last_fix().await.unwrap().unwrap().sources, 3);
+    }
+
+    #[tokio::test]
+    async fn stronger_mobile_scans_cannot_starve_weaker_fixed_top_n_candidates() {
+        let state = test_state();
+        assert_eq!(state.args.top_n, 10);
+        let mut sample = crate::debounce::ScanSample::new();
+
+        // Eleven stronger mobile APs exceed top_n by themselves. Filtering
+        // after truncation would therefore leave no fixed candidate at all.
+        for index in 0..11 {
+            let bssid = format!("02:00:00:00:40:{index:02x}");
+            let ssid = format!("MOVIA_BUS_{index}");
+            lock_db(&state)
+                .upsert_ap(&crate::db::ApInfo {
+                    bssid: bssid.clone(),
+                    ssid: Some(ssid.clone()),
+                    lat: 55.7390 + index as f64 / 100_000.0,
+                    lon: 12.5500,
+                    encryption: None,
+                    channel: None,
+                    frequency: None,
+                    city: None,
+                    country: None,
+                    is_mobile: false,
+                    source: crate::db::Source::Apple,
+                })
+                .unwrap();
+            sample.insert(
+                bssid,
+                crate::debounce::ScanEntry {
+                    signal_dbm: -20 - index,
+                    ssid: Some(ssid),
+                    channel: Some(1),
+                },
+            );
+        }
+        for (index, (lat, lon)) in [(55.6760, 12.5680), (55.6761, 12.5682), (55.6759, 12.5681)]
+            .into_iter()
+            .enumerate()
+        {
+            let bssid = format!("02:00:00:00:41:{index:02x}");
+            let ssid = format!("fixed-home-{index}");
+            lock_db(&state)
+                .upsert_ap(&crate::db::ApInfo {
+                    bssid: bssid.clone(),
+                    ssid: Some(ssid.clone()),
+                    lat,
+                    lon,
+                    encryption: None,
+                    channel: None,
+                    frequency: None,
+                    city: None,
+                    country: None,
+                    is_mobile: false,
+                    source: crate::db::Source::Apple,
+                })
+                .unwrap();
+            sample.insert(
+                bssid,
+                crate::debounce::ScanEntry {
+                    signal_dbm: -80 - index as i32,
+                    ssid: Some(ssid),
+                    channel: Some(1),
+                },
+            );
+        }
+        {
+            let mut debouncer = state.debouncer.lock().await;
+            for _ in 0..state.args.debounce_threshold {
+                debouncer.push_scan(sample.clone());
+            }
+        }
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], true, "locate failed: {response}");
+        assert_eq!(json["cached"], 3);
+        assert_eq!(json["sources"], 3);
+        assert!((json["lat"].as_f64().unwrap() - 55.6760).abs() < 0.001);
+        assert!((json["lon"].as_f64().unwrap() - 12.5681).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn persisted_mobile_and_non_finite_rows_cannot_starve_stable_top_n() {
+        let state = test_state();
+        assert_eq!(state.args.top_n, 10);
+        let sample = cached_ineligible_rows_ahead_of_fixed(&state, 0x50);
+        assert!(sample.len() > state.args.top_n * 2);
+        {
+            let mut debouncer = state.debouncer.lock().await;
+            for _ in 0..state.args.debounce_threshold {
+                debouncer.push_scan(sample.clone());
+            }
+        }
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        assert_three_fixed_sources(&response);
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["visible"], 25);
+        assert_eq!(json["stable"], 25);
+    }
+
+    #[tokio::test]
+    async fn persisted_mobile_and_non_finite_rows_cannot_starve_fallback_top_n() {
+        let state = test_state();
+        assert!(state.args.debounce_threshold > 1);
+        let sample = cached_ineligible_rows_ahead_of_fixed(&state, 0x51);
+        state.debouncer.lock().await.push_scan(sample);
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        assert_three_fixed_sources(&response);
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["visible"], 25);
+        assert_eq!(
+            json["stable"], 0,
+            "one scan must exercise cold-start fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_mobile_cold_start_fallback_cannot_fabricate_a_position() {
+        let state = test_state();
+        assert!(state.args.debounce_threshold > 1);
+        let mut sample = crate::debounce::ScanSample::new();
+        for index in 0..3 {
+            let bssid = format!("02:00:00:00:42:{index:02x}");
+            let ssid = format!("MOVIA_BUS_{index}");
+            lock_db(&state)
+                .upsert_ap(&crate::db::ApInfo {
+                    bssid: bssid.clone(),
+                    ssid: Some(ssid.clone()),
+                    lat: 55.7,
+                    lon: 12.5,
+                    encryption: None,
+                    channel: None,
+                    frequency: None,
+                    city: None,
+                    country: None,
+                    is_mobile: false,
+                    source: crate::db::Source::Apple,
+                })
+                .unwrap();
+            sample.insert(
+                bssid,
+                crate::debounce::ScanEntry {
+                    signal_dbm: -20 - index,
+                    ssid: Some(ssid),
+                    channel: Some(1),
+                },
+            );
+        }
+        state.debouncer.lock().await.push_scan(sample);
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], false, "all-mobile scan must fail: {response}");
+        assert_eq!(json["error"], "no eligible fixed APs detected");
+        assert!(state.db.get_last_fix().await.unwrap().is_none());
+        assert!(state
+            .db
+            .get_fixes_in_range("0000", "9999")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -4236,6 +4688,7 @@ mod transport_tests {
             frequency: None,
             city: None,
             country: None,
+            is_mobile: false,
             source: crate::db::Source::Manual,
         };
         lock_db(&unix_state).upsert_ap(&ap).unwrap();
@@ -4279,6 +4732,7 @@ mod transport_tests {
             frequency: None,
             city: None,
             country: None,
+            is_mobile: false,
             source: crate::db::Source::Manual,
         };
         lock_db(&state).upsert_ap(&ap).unwrap();
@@ -4321,6 +4775,7 @@ mod transport_tests {
             frequency: None,
             city: None,
             country: None,
+            is_mobile: false,
             source: crate::db::Source::Manual,
         };
         lock_db(&state).upsert_ap(&ap).unwrap();

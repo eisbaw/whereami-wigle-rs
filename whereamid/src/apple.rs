@@ -258,6 +258,7 @@ pub fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
                 frequency: None,
                 city: None,
                 country: None,
+                is_mobile: false,
                 source: crate::db::Source::Apple,
             }))
         }

@@ -20,7 +20,7 @@ proptest! {
     ) {
         let aps: Vec<PositionedAp> = coords
             .iter()
-            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60) })
+            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60), is_mobile: false })
             .collect();
         let filtered = filter_outliers(&aps);
         prop_assert!(!filtered.is_empty(), "filter_outliers returned empty for {} APs", aps.len());
@@ -70,7 +70,7 @@ proptest! {
     ) {
         let aps: Vec<PositionedAp> = coords
             .iter()
-            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60) })
+            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60), is_mobile: false })
             .collect();
 
         // Only test with APs that survive outlier filtering
@@ -113,7 +113,7 @@ proptest! {
     ) {
         let aps: Vec<PositionedAp> = coords
             .iter()
-            .map(|&(lat, lon, sig)| PositionedAp { lat, lon, signal_dbm: sig })
+            .map(|&(lat, lon, sig)| PositionedAp { lat, lon, signal_dbm: sig, is_mobile: false })
             .collect();
 
         let filtered = filter_outliers(&aps);
@@ -160,14 +160,14 @@ proptest! {
     ) {
         let mut aps: Vec<PositionedAp> = coords
             .iter()
-            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60) })
+            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60), is_mobile: false })
             .collect();
         // One poisoned AP with a strong signal (-30 dBm) that WOULD dominate
         // the weighted centroid if it reached the math.
         let poisoned = if bad_in_lat {
-            PositionedAp { lat: bad, lon: 12.0, signal_dbm: Some(-30) }
+            PositionedAp { lat: bad, lon: 12.0, signal_dbm: Some(-30), is_mobile: false }
         } else {
-            PositionedAp { lat: 55.0, lon: bad, signal_dbm: Some(-30) }
+            PositionedAp { lat: 55.0, lon: bad, signal_dbm: Some(-30), is_mobile: false }
         };
         aps.push(poisoned);
 
@@ -200,11 +200,13 @@ proptest! {
             lat: lat_a,
             lon: lon_a,
             signal_dbm: Some(strong),
+            is_mobile: false,
         };
         let weak_ap = PositionedAp {
             lat: lat_a + offset_lat,
             lon: lon_a + offset_lon,
             signal_dbm: Some(weak),
+            is_mobile: false,
         };
         let aps = vec![strong_ap, weak_ap];
         let result = trilaterate(&aps).unwrap();

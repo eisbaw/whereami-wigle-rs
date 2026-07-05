@@ -9,9 +9,12 @@
 #  - true (system + DynamicUser): the file arrives via LoadCredential (module.nix)
 #    because the random DynamicUser UID cannot read a 0600 root:root file; the
 #    daemon reads it from systemd's credentials directory instead.
-{ lib, cfg, socketFlag ? true, credentialsFromSystemd ? false }:
+{ config ? { }, lib, pkgs, cfg, socketFlag ? true, credentialsFromSystemd ? false }:
 
 let
+  systemdUtils = import "${pkgs.path}/nixos/lib/utils.nix" {
+    inherit config lib pkgs;
+  };
   # ${CREDENTIALS_DIRECTORY} is substituted by systemd IN ExecStart (systemd.exec(5)
   # documents `${CREDENTIALS_DIRECTORY}/mycred`); the "\${" stops Nix interpolating
   # it so systemd receives the literal specifier. The daemon's load_config_file
@@ -28,6 +31,12 @@ let
   bindArg = lib.optionalString (cfg.bind != null) "--bind ${cfg.bind}";
   nonlocalArg = lib.optionalString (cfg.bind != null && cfg.allowNonlocalBind)
     "--allow-nonlocal-bind";
+  # One canonical argv item. The `=` keeps even a value beginning with `--`
+  # attached to this option, while the NixOS systemd encoder JSON-quotes spaces
+  # and punctuation and doubles both specifier (`%`) and environment (`$`)
+  # expansion markers. No shell is involved at runtime.
+  mobileSsidDenylistArg = systemdUtils.escapeSystemdExecArg
+    ("--mobile-ssid-denylist=" + lib.concatStringsSep "," cfg.mobileSsidDenylist);
 in
 lib.concatStringsSep " " ([
   "${cfg.package}/bin/whereamid"
@@ -40,6 +49,7 @@ lib.concatStringsSep " " ([
   "--debounce-window" (toString cfg.debounceWindow)
   "--debounce-threshold" (toString cfg.debounceThreshold)
   "--top-n" (toString cfg.topN)
+  mobileSsidDenylistArg
   "--pending-interval" (toString cfg.pendingInterval)
   "--pending-max-attempts" (toString cfg.pendingMaxAttempts)
   "--daily-limit" (toString cfg.dailyLimit)

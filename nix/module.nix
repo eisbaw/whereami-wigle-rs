@@ -7,7 +7,7 @@ let
   # NOT pass --socket (socketFlag = false); cfg.socketPath is instead the socket
   # unit's ListenStream path.
   execStart = import ./exec-start.nix {
-    inherit lib cfg;
+    inherit config lib pkgs cfg;
     socketFlag = false;
     # DynamicUser's random UID cannot read a 0600 root config, so secrets are
     # delivered via systemd LoadCredential and --config points at the credentials

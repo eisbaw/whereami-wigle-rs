@@ -81,6 +81,15 @@ pub struct ResolveResult {
     pub not_found: HashSet<String>,
 }
 
+/// A BSSID paired with the SSID captured by the local scanner before any
+/// provider await. `ssid: None` is a real observation (hidden network), not a
+/// request to fall back to provider metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedAp {
+    pub bssid: String,
+    pub ssid: Option<String>,
+}
+
 /// What the orchestrator should do when a provider is `Skipped`
 /// (rate-limited, not configured, etc.) for a given BSSID.
 #[derive(Clone, Copy)]
@@ -192,6 +201,35 @@ pub async fn resolve_chain(
     providers: &[Provider],
     policy: &ChainPolicy,
     ticket: crate::privacy::PrivacyTicket,
+) -> ResolveResult {
+    resolve_chain_with_observations(bssids, state, providers, policy, ticket, &[]).await
+}
+
+/// Resolve with scanner observations attached to provider results before any
+/// write-through cache upsert. This is crate-visible for the pending drain,
+/// which reloads the original scanner SSID after a deferred retry.
+pub(crate) async fn resolve_chain_with_observations(
+    bssids: &[String],
+    state: &Arc<DaemonState>,
+    providers: &[Provider],
+    policy: &ChainPolicy,
+    ticket: crate::privacy::PrivacyTicket,
+    observations: &[ObservedAp],
+) -> ResolveResult {
+    let observed_ssids: std::collections::HashMap<&str, &Option<String>> = observations
+        .iter()
+        .map(|observation| (observation.bssid.as_str(), &observation.ssid))
+        .collect();
+    resolve_chain_inner(bssids, state, providers, policy, ticket, &observed_ssids).await
+}
+
+async fn resolve_chain_inner(
+    bssids: &[String],
+    state: &Arc<DaemonState>,
+    providers: &[Provider],
+    policy: &ChainPolicy,
+    ticket: crate::privacy::PrivacyTicket,
+    observed_ssids: &std::collections::HashMap<&str, &Option<String>>,
 ) -> ResolveResult {
     let mut positioned: Vec<ApInfo> = Vec::new();
     let mut fetched_bssids: HashSet<String> = HashSet::new();
@@ -313,7 +351,14 @@ pub async fn resolve_chain(
             let outcome = provider.lookup(state, bssid).await;
 
             match outcome {
-                ProviderOutcome::Found(ap) => {
+                ProviderOutcome::Found(mut ap) => {
+                    // Provider SSIDs are not the classification source. Apple
+                    // supplies none and WiGLE supplies remote metadata; when a
+                    // local scanner observation exists, preserve it exactly —
+                    // including None for a hidden network — through the upsert.
+                    if let Some(observed_ssid) = observed_ssids.get(bssid.as_str()) {
+                        ap.ssid = (*observed_ssid).clone();
+                    }
                     // task-0073: per-BSSID resolution at debug! — Apple is
                     // free + unbounded so info! per resolution fills the
                     // journal during fast-scan in busy areas.
@@ -400,7 +445,19 @@ pub async fn resolve_chain(
     // Apply deferred pending inserts.
     if !to_pend_at_end.is_empty() {
         if let Some(_privacy) = state.privacy.read(ticket).await {
-            if let Err(e) = state.db.insert_pending_many(to_pend_at_end.clone()).await {
+            let pending_observations = to_pend_at_end
+                .iter()
+                .map(|bssid| {
+                    (
+                        bssid.clone(),
+                        observed_ssids
+                            .get(bssid.as_str())
+                            .map(|ssid| (*ssid).clone())
+                            .unwrap_or(None),
+                    )
+                })
+                .collect();
+            if let Err(e) = state.db.insert_pending_many(pending_observations).await {
                 warn!("failed to insert deferred pending BSSIDs: {e}");
                 state.record_db_failure();
             }
@@ -529,10 +586,14 @@ pub async fn resolve_readonly(
 /// Background resolution: resolve uncached stable BSSIDs proactively.
 /// Apple first (free), then WiGLE for remaining. Writes to aps cache.
 pub async fn resolve_background(
-    bssids: &[String],
+    observations: &[ObservedAp],
     state: &Arc<DaemonState>,
     ticket: crate::privacy::PrivacyTicket,
 ) {
+    let bssids: Vec<String> = observations
+        .iter()
+        .map(|observation| observation.bssid.clone())
+        .collect();
     let policy = ChainPolicy {
         skip_cached: true,
         skip_not_found: true,
@@ -546,12 +607,13 @@ pub async fn resolve_background(
         on_network_error: NetErrorAction::QueuePending,
         on_hard_stop: HardStopAction::QueuePendingAndStop,
     };
-    let _ = resolve_chain(
-        bssids,
+    let _ = resolve_chain_with_observations(
+        &bssids,
         state,
         &[Provider::Apple, Provider::Wigle],
         &policy,
         ticket,
+        observations,
     )
     .await;
 }
@@ -609,6 +671,7 @@ mod tests {
             frequency: None,
             city: None,
             country: None,
+            is_mobile: false,
             source,
         }
     }
@@ -688,6 +751,67 @@ mod tests {
         assert!(
             cached.is_some(),
             "successful resolution must write through to cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_ssid_overrides_provider_metadata_for_mobile_classification() {
+        let state = test_state();
+        let bssids = vec![
+            "aa:bb:cc:dd:ee:11".to_owned(),
+            "b8:50:01:aa:bb:cc".to_owned(),
+            "aa:bb:cc:dd:ee:13".to_owned(),
+        ];
+        let observations = vec![
+            ObservedAp {
+                bssid: bssids[0].clone(),
+                ssid: Some("MOVIA_BUS_42".to_owned()),
+            },
+            ObservedAp {
+                bssid: bssids[1].clone(),
+                ssid: None,
+            },
+            ObservedAp {
+                bssid: bssids[2].clone(),
+                ssid: Some("fixed-home-network".to_owned()),
+            },
+        ];
+        let mock = std::sync::Arc::new(MockProvider::new("apple-like", |bssid| {
+            let mut ap = mk_ap(bssid, 55.0, 12.0, Source::Apple);
+            // Deliberately contradictory provider metadata. The scanner
+            // observation must win in all three cases, including explicit
+            // hidden/None rather than falling back to this value.
+            ap.ssid = match bssid {
+                "aa:bb:cc:dd:ee:11" => None,
+                _ => Some("DSB_Wi-Fi".to_owned()),
+            };
+            ProviderOutcome::Found(ap)
+        }));
+
+        let result = resolve_chain_with_observations(
+            &bssids,
+            &state,
+            &[Provider::Mock(mock)],
+            &permissive_policy(),
+            state.privacy.ticket(),
+            &observations,
+        )
+        .await;
+
+        assert_eq!(result.positioned.len(), 3);
+        let cached = state.db.lookup_cached_touch(bssids.clone()).await.unwrap();
+        assert_eq!(cached.len(), 3);
+        assert_eq!(cached[0].ssid.as_deref(), Some("MOVIA_BUS_42"));
+        assert!(cached[0].is_mobile, "Apple None must not erase MOVIA");
+        assert_eq!(cached[1].ssid, None);
+        assert!(
+            !cached[1].is_mobile,
+            "hidden B8:50:01 must not inherit provider mobile metadata"
+        );
+        assert_eq!(cached[2].ssid.as_deref(), Some("fixed-home-network"));
+        assert!(
+            !cached[2].is_mobile,
+            "fixed scanner SSID must override provider DSB metadata"
         );
     }
 

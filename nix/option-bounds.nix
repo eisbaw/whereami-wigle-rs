@@ -83,7 +83,7 @@ let
   # surface it needs. This pins both sides of the optional Environment contract
   # without duplicating Home Manager's INI renderer (TASK-0234 owns a full HM
   # activation test).
-  evaluateHomeModule = rustLog:
+  evaluateHomeModule = { rustLog, mobileSsidDenylist ? optionDefault homeDefaults "mobileSsidDenylist" }:
     (lib.evalModules {
       specialArgs = { inherit pkgs; };
       modules = [
@@ -112,16 +112,24 @@ let
           services.whereami = {
             enable = true;
             package = pkgs.hello;
-            inherit rustLog;
+            inherit rustLog mobileSsidDenylist;
           };
         }
       ];
     }).config;
 
-  homeWithoutRustLog = evaluateHomeModule null;
-  homeWithRustLog = evaluateHomeModule ''whereamid=debug,my crate="trace"%n$HOME'';
-  homeWithMultilineRustLog = evaluateHomeModule "whereamid=debug\nother=trace";
-  homeWithCarriageReturnRustLog = evaluateHomeModule "whereamid=debug\rother=trace";
+  homeWithoutRustLog = evaluateHomeModule { rustLog = null; };
+  homeWithRustLog = evaluateHomeModule { rustLog = ''whereamid=debug,my crate="trace"%n$HOME''; };
+  homeWithMultilineRustLog = evaluateHomeModule { rustLog = "whereamid=debug\nother=trace"; };
+  homeWithCarriageReturnRustLog = evaluateHomeModule { rustLog = "whereamid=debug\rother=trace"; };
+  homeWithMultilineMobilePattern = evaluateHomeModule {
+    rustLog = null;
+    mobileSsidDenylist = [ "MOVIA*\nBus*" ];
+  };
+  homeWithCarriageReturnMobilePattern = evaluateHomeModule {
+    rustLog = null;
+    mobileSsidDenylist = [ "MOVIA*\rBus*" ];
+  };
   homeServiceWithoutRustLog =
     homeWithoutRustLog.systemd.user.services.whereamid.Service;
   homeServiceWithRustLog = homeWithRustLog.systemd.user.services.whereamid.Service;
@@ -130,6 +138,24 @@ let
     lib.any (entry:
       !entry.assertion && lib.hasInfix "single-line RUST_LOG" entry.message
     ) evaluated.assertions;
+
+  hasFailedMobilePatternAssertion = evaluated:
+    lib.any (entry:
+      !entry.assertion && lib.hasInfix "mobileSsidDenylist entries must be single-line" entry.message
+    ) evaluated.assertions;
+
+  expectedMobileSsidDenylist = [
+    "DSB_Wi-Fi"
+    ".DSB_Wi-Fi"
+    "dsb-mng-wifi"
+    "MOVIA*"
+    "Bus_WiFi"
+    "Bus WiFi"
+    "*_iPhone"
+    "*_Hotspot"
+    "iPhone"
+    "AndroidAP*"
+  ];
 
   atUpperBound = evaluateMaxConnections 4096;
   aboveUpperBound = evaluateMaxConnections 4097;
@@ -150,6 +176,8 @@ assert optionDefault systemDefaults "historyRetentionDays" == 30;
 assert optionDefault systemDefaults "apsRetentionDays" == 30;
 assert optionDefault homeDefaults "historyRetentionDays" == 30;
 assert optionDefault homeDefaults "apsRetentionDays" == 30;
+assert optionDefault systemDefaults "mobileSsidDenylist" == expectedMobileSsidDenylist;
+assert optionDefault homeDefaults "mobileSsidDenylist" == expectedMobileSsidDenylist;
 assert optionDefault systemDefaults "rustLog" == null;
 assert optionDefault homeDefaults "rustLog" == null;
 assert credentialsDescriptionIsCurrent systemCredentialsDescription;
@@ -162,11 +190,14 @@ assert homeServiceWithRustLog.Environment == [
 assert lib.all (entry: entry.assertion) homeWithRustLog.assertions;
 assert hasFailedRustLogAssertion homeWithMultilineRustLog;
 assert hasFailedRustLogAssertion homeWithCarriageReturnRustLog;
+assert hasFailedMobilePatternAssertion homeWithMultilineMobilePattern;
+assert hasFailedMobilePatternAssertion homeWithCarriageReturnMobilePattern;
 pkgs.runCommand "whereami-option-bounds" { } ''
   echo "maxConnections bounds OK: 4096 accepted, 4097 rejected"
   echo "retention bounds OK: 0..365000 accepted, outside rejected"
   echo "system/home defaults OK: dbPath, retention=30, rustLog=null"
   echo "shared credentialsFile docs OK: WiGLE keys present, BeaconDB absent"
   echo "home-manager RUST_LOG encoding OK: optional, quoted, percent-safe, CR/LF rejected"
+  echo "mobile SSID defaults and CR/LF rejection OK"
   touch "$out"
 ''

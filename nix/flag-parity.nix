@@ -20,8 +20,9 @@
 
 let
   # Every option exec-start.nix reads, set so all conditional flags fire. Values
-  # are dummies (only the flag NAMES matter); none start with "--" so they are
-  # never mistaken for flags by the prefix filter below.
+  # are dummies (only the flag NAMES matter). The mobile patterns are
+  # intentionally adversarial because that option is emitted as one encoded
+  # --flag=value argument and its value must never become another option.
   # DELIBERATE duplication of the option list: if exec-start.nix grows a cfg
   # field missing here, the import below throws `attribute missing` — a loud
   # eval error, never a silent pass.
@@ -36,6 +37,17 @@ let
     debounceWindow = 1;
     debounceThreshold = 1;
     topN = 1;
+    mobileSsidDenylist = [
+      "--adversarial"
+      "Bus WiFi"
+      "MOVIA*"
+      ""
+      "$HOME"
+      "%n"
+      ''double"quote''
+      "single'quote"
+      "semi;colon"
+    ];
     pendingInterval = 1;
     pendingMaxAttempts = 1;
     dailyLimit = 1;
@@ -54,16 +66,51 @@ let
     historySegmentMinDurationSecs = 1;
   };
 
-  execStart = import ./exec-start.nix { inherit lib cfg; socketFlag = true; };
+  execStart = import ./exec-start.nix {
+    config = { };
+    inherit lib pkgs cfg;
+    socketFlag = true;
+  };
+  emptyMobileExecStart = import ./exec-start.nix {
+    config = { };
+    inherit lib pkgs;
+    cfg = cfg // { mobileSsidDenylist = [ ]; };
+    socketFlag = true;
+  };
 
-  # Split the space-joined ExecStart and keep the tokens that are flags.
+  expectedAdversarialMobileArg =
+    "\"--mobile-ssid-denylist=--adversarial,Bus WiFi,MOVIA*,,$$HOME,%%n,double\\\"quote,single'quote,semi;colon\"";
+  expectedEmptyMobileArg = "\"--mobile-ssid-denylist=\"";
+
+  sharedOptions = import ./options.nix {
+    inherit lib;
+    dbPathDefault = "/var/lib/whereami/aps.sqlite";
+    credentialsFileDefault = null;
+    socketPathDefault = "/run/whereami/whereamid.sock";
+  };
+  moduleMobileDefault = (lib.evalModules {
+    modules = [ { options.services.whereami = sharedOptions; } ];
+  }).config.services.whereami.mobileSsidDenylist;
+  moduleMobileDefaultJoined = lib.concatStringsSep "," moduleMobileDefault;
+
+  # Split the space-joined ExecStart and keep the tokens that begin with a flag
+  # after removing escapeSystemdExecArg's opening quote. For canonical
+  # `"--flag=value"` arguments retain only the name before `=`. A quoted value
+  # can contain spaces, so later fragments are ignored unless they independently
+  # begin with a real `--` token.
+  tokenFlag = token:
+    builtins.head (lib.splitString "=" (lib.removePrefix "\"" token));
   emittedFlags = lib.unique
-    (builtins.filter (s: lib.hasPrefix "--" s) (lib.splitString " " execStart));
+    (builtins.filter (s: lib.hasPrefix "--" s)
+      (map tokenFlag (lib.splitString " " execStart)));
 in
+assert lib.hasInfix expectedAdversarialMobileArg execStart;
+assert lib.hasInfix expectedEmptyMobileArg emptyMobileExecStart;
 pkgs.runCommand "whereami-flag-parity"
 {
   nativeBuildInputs = [ package ];
   emitted = lib.concatStringsSep "\n" (lib.sort (a: b: a < b) emittedFlags);
+  inherit moduleMobileDefaultJoined;
 } ''
   set -euo pipefail
   printf '%s\n' "$emitted" | sort -u > emitted-flags
@@ -91,6 +138,14 @@ pkgs.runCommand "whereami-flag-parity"
     exit 1
   fi
 
+  help_mobile_default="$(${package}/bin/whereamid --help \
+    | sed -n '/--mobile-ssid-denylist/,/--pending-interval/ s/.*\[default: "\(.*\)"\].*/\1/p')"
+  if [[ -z "$help_mobile_default" || "$help_mobile_default" != "$moduleMobileDefaultJoined" ]]; then
+    echo "mobile SSID default drift: Rust help='$help_mobile_default' Nix module='$moduleMobileDefaultJoined'" >&2
+    exit 1
+  fi
+
   echo "flag parity OK: $(wc -l < help-flags) flags match between --help and exec-start.nix"
+  echo "mobile SSID default parity OK"
   touch $out
 ''

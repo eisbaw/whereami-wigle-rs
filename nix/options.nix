@@ -175,6 +175,33 @@ in {
     description = "Number of strongest APs to use for trilateration.";
   };
 
+  mobileSsidDenylist = lib.mkOption {
+    type = lib.types.listOf lib.types.str;
+    default = [
+      "DSB_Wi-Fi"
+      ".DSB_Wi-Fi"
+      "dsb-mng-wifi"
+      "MOVIA*"
+      "Bus_WiFi"
+      "Bus WiFi"
+      "*_iPhone"
+      "*_Hotspot"
+      "iPhone"
+      "AndroidAP*"
+    ];
+    description = ''
+      Scanner-observed SSID patterns classified as mobile access points and
+      excluded from positioning. Patterns are anchored globs using
+      locale-independent Unicode lowercase comparison: * matches any substring
+      and ? matches one Unicode scalar. An empty list disables the heuristic;
+      missing, empty, and <hidden> SSIDs never match.
+      Current scanner matches are excluded immediately before strongest-AP
+      selection. Existing persisted rows themselves are reclassified only
+      when they are relearned and upserted, not on every scan or configuration
+      reload. Entries must not contain carriage returns or newlines.
+    '';
+  };
+
   pendingInterval = lib.mkOption {
     type = lib.types.ints.positive;
     default = 300;

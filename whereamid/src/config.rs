@@ -8,6 +8,8 @@ use std::io::{ErrorKind, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::scanner::DEFAULT_MOBILE_SSID_DENYLIST;
+
 /// Portable operational ceiling for active control-channel connections.
 /// Deliberately far below Tokio's target-dependent semaphore limit on every
 /// supported target, while still allowing unusually busy local deployments.
@@ -84,6 +86,17 @@ pub struct Args {
     /// Only consider top-N strongest APs for trilateration
     #[arg(long, default_value_t = 10)]
     pub top_n: usize,
+
+    /// Comma-separated anchored `*`/`?` globs for scanner-observed SSIDs that
+    /// identify mobile access points. Matching uses locale-independent Unicode
+    /// lowercase comparison. An empty value disables the heuristic;
+    /// missing/empty/`<hidden>` SSIDs never match.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = DEFAULT_MOBILE_SSID_DENYLIST
+    )]
+    pub mobile_ssid_denylist: Vec<String>,
 
     /// Seconds between pending queue drain runs
     #[arg(long, default_value_t = 300)]
@@ -214,6 +227,15 @@ impl Args {
         }
         if self.top_n == 0 {
             anyhow::bail!("--top-n must be > 0");
+        }
+        if self
+            .mobile_ssid_denylist
+            .iter()
+            .any(|pattern| pattern.contains('\n') || pattern.contains('\r'))
+        {
+            anyhow::bail!(
+                "--mobile-ssid-denylist patterns must not contain carriage returns or newlines"
+            );
         }
         if self.pending_interval == 0 {
             anyhow::bail!("--pending-interval must be > 0");
@@ -857,6 +879,55 @@ mod tests {
         args.validate().expect("default Args must validate");
         assert_eq!(args.history_retention_days, 30);
         assert_eq!(args.aps_retention_days, 30);
+        assert_eq!(
+            args.mobile_ssid_denylist,
+            [
+                "DSB_Wi-Fi",
+                ".DSB_Wi-Fi",
+                "dsb-mng-wifi",
+                "MOVIA*",
+                "Bus_WiFi",
+                "Bus WiFi",
+                "*_iPhone",
+                "*_Hotspot",
+                "iPhone",
+                "AndroidAP*",
+            ]
+        );
+    }
+
+    #[test]
+    fn mobile_ssid_denylist_parses_one_comma_separated_argument() {
+        let args = parse(&["--mobile-ssid-denylist", "MOVIA*,Bus WiFi,?_Hotspot"]);
+        assert_eq!(
+            args.mobile_ssid_denylist,
+            ["MOVIA*", "Bus WiFi", "?_Hotspot"]
+        );
+    }
+
+    #[test]
+    fn empty_mobile_ssid_denylist_disables_matching() {
+        let args = parse(&["--mobile-ssid-denylist", ""]);
+        assert!(!crate::scanner::is_mobile_ssid(
+            Some("MOVIA_BUS_42"),
+            &args.mobile_ssid_denylist
+        ));
+    }
+
+    #[test]
+    fn mobile_ssid_denylist_equals_form_keeps_leading_hyphen_as_data() {
+        let args = parse(&["--mobile-ssid-denylist=--adversarial,MOVIA*"]);
+        assert_eq!(args.mobile_ssid_denylist, ["--adversarial", "MOVIA*"]);
+    }
+
+    #[test]
+    fn mobile_ssid_denylist_rejects_cr_and_lf() {
+        for value in ["MOVIA*\nBus*", "MOVIA*\rBus*"] {
+            let error = parse(&["--mobile-ssid-denylist", value])
+                .validate()
+                .expect_err("multiline pattern must fail validation");
+            assert!(error.to_string().contains("--mobile-ssid-denylist"));
+        }
     }
 
     #[test]

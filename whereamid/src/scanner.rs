@@ -7,6 +7,66 @@ use tracing::{debug, warn};
 
 const IW_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default comma-separated value accepted by `--mobile-ssid-denylist`.
+pub const DEFAULT_MOBILE_SSID_DENYLIST: &str =
+    "DSB_Wi-Fi,.DSB_Wi-Fi,dsb-mng-wifi,MOVIA*,Bus_WiFi,Bus WiFi,*_iPhone,*_Hotspot,iPhone,AndroidAP*";
+
+pub fn default_mobile_ssid_denylist() -> Vec<String> {
+    DEFAULT_MOBILE_SSID_DENYLIST
+        .split(',')
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Return whether a scanner-observed SSID is classified as mobile.
+///
+/// Missing, empty, and the scanner sentinel `<hidden>` are always treated as
+/// fixed, even when a broad pattern such as `*` would otherwise match. Patterns
+/// are anchored globs: `*` matches zero or more Unicode scalar values and `?`
+/// exactly one. Literal scalars compare by their locale-independent Unicode
+/// lowercase expansions; this is not locale-sensitive collation or full
+/// Unicode case folding.
+pub fn is_mobile_ssid(ssid: Option<&str>, denylist: &[String]) -> bool {
+    let Some(ssid) = ssid else {
+        return false;
+    };
+    if ssid.is_empty() || ssid.eq_ignore_ascii_case("<hidden>") {
+        return false;
+    }
+
+    denylist.iter().any(|pattern| glob_matches(pattern, ssid))
+}
+
+/// Match one anchored `*`/`?` glob case-insensitively. A dynamic-programming
+/// row keeps matching total for arbitrary UTF-8 and avoids backtracking.
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+
+    let mut previous = vec![false; value.len() + 1];
+    previous[0] = true;
+
+    for token in pattern {
+        let mut current = vec![false; value.len() + 1];
+        if token == '*' {
+            current[0] = previous[0];
+        }
+        for index in 1..=value.len() {
+            current[index] = match token {
+                '*' => previous[index] || current[index - 1],
+                '?' => previous[index - 1],
+                literal => {
+                    previous[index - 1]
+                        && literal.to_lowercase().eq(value[index - 1].to_lowercase())
+                }
+            };
+        }
+        previous = current;
+    }
+
+    previous[value.len()]
+}
+
 /// A single observed Wi-Fi network from a scan.
 #[derive(Debug, Clone)]
 pub struct ScannedNetwork {
@@ -376,6 +436,43 @@ pub fn scan_to_sample(networks: &[ScannedNetwork]) -> crate::debounce::ScanSampl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn patterns(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn mobile_movia_glob_is_anchored_and_case_insensitive() {
+        let denylist = patterns(&["MOVIA*"]);
+        assert!(is_mobile_ssid(Some("MOVIA_BUS_42"), &denylist));
+        assert!(is_mobile_ssid(Some("movia-night"), &denylist));
+        assert!(!is_mobile_ssid(Some("mymoviabus"), &denylist));
+    }
+
+    #[test]
+    fn mobile_question_mark_matches_one_unicode_scalar() {
+        let denylist = patterns(&["Bus_?"]);
+        assert!(is_mobile_ssid(Some("bus_4"), &denylist));
+        assert!(is_mobile_ssid(Some("BUS_å"), &denylist));
+        assert!(!is_mobile_ssid(Some("Bus_42"), &denylist));
+        assert!(!is_mobile_ssid(Some("Bus_"), &denylist));
+    }
+
+    #[test]
+    fn mobile_missing_empty_and_hidden_are_never_flagged() {
+        let denylist = patterns(&["*"]);
+        assert!(!is_mobile_ssid(None, &denylist));
+        assert!(!is_mobile_ssid(Some(""), &denylist));
+        assert!(!is_mobile_ssid(Some("<hidden>"), &denylist));
+        assert!(!is_mobile_ssid(Some("<HIDDEN>"), &denylist));
+    }
+
+    #[test]
+    fn mobile_glob_specials_are_limited_to_star_and_question_mark() {
+        let denylist = patterns(&["bus[0-9]"]);
+        assert!(is_mobile_ssid(Some("BUS[0-9]"), &denylist));
+        assert!(!is_mobile_ssid(Some("bus4"), &denylist));
+    }
 
     #[test]
     fn test_parse_iw_output() {

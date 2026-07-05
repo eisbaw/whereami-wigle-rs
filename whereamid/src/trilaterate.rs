@@ -63,17 +63,20 @@ impl fmt::Display for GeoMedianResult {
 
 /// Input for trilateration: a positioned AP with optional signal.
 ///
-/// `Copy` (task-0086): every field is itself `Copy` (f64, f64, Option<i32>),
+/// `Copy` (task-0086): every field is itself `Copy` (f64, f64, Option<i32>, bool),
 /// so cloning is already a bitwise memcpy. Deriving `Copy` removes the
 /// ergonomic noise of explicit `.clone()` calls. Caveat: this is a soft
 /// promise to consumers — if a future field is non-Copy (e.g. an owning
 /// SSID `String` or a `Source` enum), reverting forces every by-value call
 /// site to clone or take a reference.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PositionedAp {
     pub lat: f64,
     pub lon: f64,
     pub signal_dbm: Option<i32>,
+    /// Persisted scanner-SSID mobility classification. Mobile APs are never
+    /// allowed to participate in outlier clustering or centroid math.
+    pub is_mobile: bool,
 }
 
 /// Trilateration result.
@@ -151,6 +154,11 @@ const WEISZFELD_CONVERGENCE: f64 = 1e-8;
 ///    assumption that APs in a neighborhood are within ~200m. The 3×
 ///    multiplier adapts to actual cluster spread.
 pub fn filter_outliers(aps: &[PositionedAp]) -> Vec<PositionedAp> {
+    // Mobile APs must be removed before even the small-input early return and,
+    // critically, before drop_isolated: a cluster of train/bus BSSIDs must not
+    // count as neighbors that save one another from stage 1.
+    let fixed: Vec<PositionedAp> = aps.iter().copied().filter(|ap| !ap.is_mobile).collect();
+    let aps = fixed.as_slice();
     if aps.len() <= 2 {
         return aps.to_vec();
     }
@@ -539,25 +547,25 @@ pub fn trilaterate(aps: &[PositionedAp]) -> Result<Position> {
     // input coordinate that is now guaranteed finite. This is defense in
     // depth behind the server-side cache-read filter (server.rs); direct
     // callers (tests, future consumers) get the same guarantee.
-    let finite: Vec<PositionedAp> = aps
+    let finite_fixed: Vec<PositionedAp> = aps
         .iter()
         .copied()
-        .filter(|ap| ap.lat.is_finite() && ap.lon.is_finite())
+        .filter(|ap| !ap.is_mobile && ap.lat.is_finite() && ap.lon.is_finite())
         .collect();
-    if finite.is_empty() {
-        // Every input AP had a non-finite coordinate: nothing positionable,
-        // the same non-result as the empty-input case but reported distinctly
-        // so a direct caller can tell a poisoned batch from an empty one.
+    if finite_fixed.is_empty() {
         bail!(
-            "no positioned APs for trilateration: all {} input APs had non-finite coordinates",
+            "no fixed, finite positioned APs for trilateration among {} inputs",
             aps.len()
         );
     }
-    let aps: &[PositionedAp] = &finite;
+    let aps: &[PositionedAp] = &finite_fixed;
 
     // Filter outliers before computing centroid
     let filtered = filter_outliers(aps);
-    let aps = if filtered.is_empty() { aps } else { &filtered };
+    if filtered.is_empty() {
+        bail!("no fixed positioned APs survived outlier filtering");
+    }
+    let aps = filtered.as_slice();
 
     if aps.len() == 1 {
         return finite_position(Position {
@@ -653,6 +661,7 @@ mod tests {
             lat: 55.6684,
             lon: 12.5541,
             signal_dbm: Some(-65),
+            is_mobile: false,
         }];
         let pos = trilaterate(&aps).unwrap();
         assert!((pos.lat - 55.6684).abs() < 1e-6);
@@ -668,11 +677,13 @@ mod tests {
                 lat: 48.8570,
                 lon: 2.3510,
                 signal_dbm: None,
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 48.8580,
                 lon: 2.3520,
                 signal_dbm: None,
+                is_mobile: false,
             },
         ];
         let pos = trilaterate(&aps).unwrap();
@@ -687,11 +698,13 @@ mod tests {
                 lat: 55.0,
                 lon: 12.0,
                 signal_dbm: Some(-40), // very strong
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 56.0,
                 lon: 13.0,
                 signal_dbm: Some(-80), // weak
+                is_mobile: false,
             },
         ];
         let pos = trilaterate(&aps).unwrap();
@@ -703,6 +716,105 @@ mod tests {
     #[test]
     fn test_empty_aps_error() {
         assert!(trilaterate(&[]).is_err());
+    }
+
+    #[test]
+    fn mobile_aps_are_removed_before_filtering_and_trilateration() {
+        let aps = vec![
+            PositionedAp {
+                lat: 55.6760,
+                lon: 12.5680,
+                signal_dbm: Some(-60),
+                is_mobile: false,
+            },
+            PositionedAp {
+                lat: 55.6761,
+                lon: 12.5682,
+                signal_dbm: Some(-60),
+                is_mobile: false,
+            },
+            PositionedAp {
+                lat: 55.6759,
+                lon: 12.5681,
+                signal_dbm: Some(-60),
+                is_mobile: false,
+            },
+            // A coherent train cluster kilometers away. It must be removed
+            // before drop_isolated so the two mobile APs cannot save each
+            // other as neighbors.
+            PositionedAp {
+                lat: 55.7390,
+                lon: 12.5500,
+                signal_dbm: Some(-30),
+                is_mobile: true,
+            },
+            PositionedAp {
+                lat: 55.7391,
+                lon: 12.5501,
+                signal_dbm: Some(-30),
+                is_mobile: true,
+            },
+        ];
+
+        let filtered = filter_outliers(&aps);
+        assert_eq!(filtered.len(), 3);
+        assert!(filtered.iter().all(|ap| !ap.is_mobile));
+
+        let expected = trilaterate(&aps[..3]).unwrap();
+        let actual = trilaterate(&aps).unwrap();
+        assert!((actual.lat - expected.lat).abs() < 1e-12);
+        assert!((actual.lon - expected.lon).abs() < 1e-12);
+        assert!((actual.accuracy_m - expected.accuracy_m).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mobile_filter_applies_before_small_input_fast_path() {
+        let fixed = PositionedAp {
+            lat: 55.6761,
+            lon: 12.5683,
+            signal_dbm: Some(-80),
+            is_mobile: false,
+        };
+        let aps = vec![
+            fixed,
+            PositionedAp {
+                lat: 10.0,
+                lon: 20.0,
+                signal_dbm: Some(-20),
+                is_mobile: true,
+            },
+            PositionedAp {
+                lat: 10.1,
+                lon: 20.1,
+                signal_dbm: Some(-20),
+                is_mobile: true,
+            },
+        ];
+
+        assert_eq!(filter_outliers(&aps), vec![fixed]);
+        let result = trilaterate(&aps).unwrap();
+        assert_eq!(result.lat, fixed.lat);
+        assert_eq!(result.lon, fixed.lon);
+    }
+
+    #[test]
+    fn all_mobile_input_has_no_position() {
+        let aps = vec![
+            PositionedAp {
+                lat: 55.0,
+                lon: 12.0,
+                signal_dbm: Some(-40),
+                is_mobile: true,
+            },
+            PositionedAp {
+                lat: 55.1,
+                lon: 12.1,
+                signal_dbm: Some(-50),
+                is_mobile: true,
+            },
+        ];
+        assert!(filter_outliers(&aps).is_empty());
+        assert!(trilaterate(&aps).is_err());
     }
 
     /// task-0185: median must not panic when the slice contains NaN — which
@@ -727,16 +839,19 @@ mod tests {
                 lat: 0.0,
                 lon: 0.0,
                 signal_dbm: Some(-80),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 0.0,
                 lon: 0.0,
                 signal_dbm: Some(-90),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 0.0,
                 lon: 0.0,
                 signal_dbm: None,
+                is_mobile: false,
             },
         ];
         let fb = missing_signal_dbm(&aps);
@@ -767,16 +882,19 @@ mod tests {
                 lat: 55.700,
                 lon: 12.580,
                 signal_dbm: Some(i32::MAX),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.701,
                 lon: 12.581,
                 signal_dbm: Some(i32::MIN),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.700,
                 lon: 12.585,
                 signal_dbm: None,
+                is_mobile: false,
             },
         ];
         let pos = trilaterate(&aps).unwrap();
@@ -800,6 +918,7 @@ mod tests {
                 lat: bad,
                 lon: 12.5,
                 signal_dbm: Some(-60),
+                is_mobile: false,
             }];
             assert!(
                 trilaterate(&lat_bad).is_err(),
@@ -809,6 +928,7 @@ mod tests {
                 lat: 55.6,
                 lon: bad,
                 signal_dbm: None,
+                is_mobile: false,
             }];
             assert!(
                 trilaterate(&lon_bad).is_err(),
@@ -831,16 +951,19 @@ mod tests {
                     lat: bad,
                     lon: bad,
                     signal_dbm: Some(-30),
+                    is_mobile: false,
                 },
                 PositionedAp {
                     lat: 55.700,
                     lon: 12.580,
                     signal_dbm: Some(-60),
+                    is_mobile: false,
                 },
                 PositionedAp {
                     lat: 55.701,
                     lon: 12.581,
                     signal_dbm: Some(-65),
+                    is_mobile: false,
                 },
             ];
             let pos = trilaterate(&aps).unwrap();
@@ -877,31 +1000,37 @@ mod tests {
                 lat: 48.857,
                 lon: 2.351,
                 signal_dbm: Some(-60),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 48.857,
                 lon: 2.352,
                 signal_dbm: Some(-65),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 48.858,
                 lon: 2.351,
                 signal_dbm: Some(-70),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 48.856,
                 lon: 2.352,
                 signal_dbm: Some(-75),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 48.857,
                 lon: 2.350,
                 signal_dbm: Some(-68),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: -12.894,
                 lon: -38.292,
                 signal_dbm: Some(-60),
+                is_mobile: false,
             }, // distant outlier
         ];
         let pos = trilaterate(&aps).unwrap();
@@ -917,26 +1046,31 @@ mod tests {
                 lat: 48.857,
                 lon: 2.351,
                 signal_dbm: Some(-60),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 48.857,
                 lon: 2.352,
                 signal_dbm: Some(-65),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 48.858,
                 lon: 2.351,
                 signal_dbm: Some(-70),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 48.857,
                 lon: 2.350,
                 signal_dbm: Some(-68),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 48.875,
                 lon: 2.325,
                 signal_dbm: Some(-62),
+                is_mobile: false,
             }, // ~2km away
         ];
         let filtered = filter_outliers(&aps);
@@ -952,11 +1086,13 @@ mod tests {
                 lat: 0.0,
                 lon: 179.0,
                 signal_dbm: Some(-50),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 0.0,
                 lon: -179.0,
                 signal_dbm: Some(-50),
+                is_mobile: false,
             },
         ];
         let pos = trilaterate(&aps).unwrap();
@@ -976,16 +1112,19 @@ mod tests {
                 lat: 0.0,
                 lon: 179.99,
                 signal_dbm: Some(-60),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 0.0,
                 lon: -179.99,
                 signal_dbm: Some(-60),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 0.001,
                 lon: 180.0_f64.copysign(1.0),
                 signal_dbm: Some(-60),
+                is_mobile: false,
             },
         ];
         let kept = filter_outliers(&aps);
@@ -1007,11 +1146,13 @@ mod tests {
                 lat: 89.0,
                 lon: 0.0,
                 signal_dbm: Some(-50),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 89.0,
                 lon: 180.0,
                 signal_dbm: Some(-50),
+                is_mobile: false,
             },
         ];
         let pos = trilaterate(&aps).unwrap();
@@ -1039,11 +1180,13 @@ mod tests {
                 lat: 0.0,
                 lon: 0.0,
                 signal_dbm: Some(-40),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 0.0,
                 lon: 180.0,
                 signal_dbm: Some(-80),
+                is_mobile: false,
             },
         ];
         let pos = trilaterate(&aps).unwrap();
@@ -1070,22 +1213,26 @@ mod tests {
                 lat: 55.707,
                 lon: 12.585,
                 signal_dbm: Some(-70),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.708,
                 lon: 12.585,
                 signal_dbm: Some(-72),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.706,
                 lon: 12.586,
                 signal_dbm: Some(-74),
+                is_mobile: false,
             },
             // Brazil — no neighbor within NEIGHBOR_RADIUS_M.
             PositionedAp {
                 lat: -12.894,
                 lon: -38.292,
                 signal_dbm: Some(-49),
+                is_mobile: false,
             },
         ];
         let coords: Vec<(f64, f64)> = aps.iter().map(|a| (a.lat, a.lon)).collect();
@@ -1125,16 +1272,19 @@ mod tests {
                 lat: 55.0,
                 lon: 12.0,
                 signal_dbm: None,
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.5,
                 lon: 12.5,
                 signal_dbm: None,
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 56.0,
                 lon: 13.0,
                 signal_dbm: None,
+                is_mobile: false,
             },
         ];
         let kept = filter_outliers(&aps);
@@ -1157,47 +1307,56 @@ mod tests {
                 lat: 55.700,
                 lon: 12.580,
                 signal_dbm: None,
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.701,
                 lon: 12.581,
                 signal_dbm: None,
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.699,
                 lon: 12.579,
                 signal_dbm: None,
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.700,
                 lon: 12.582,
                 signal_dbm: None,
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.702,
                 lon: 12.580,
                 signal_dbm: None,
+                is_mobile: false,
             },
             // 4 outliers on 4 different continents
             PositionedAp {
                 lat: -33.87,
                 lon: 151.21,
                 signal_dbm: None,
+                is_mobile: false,
             }, // Sydney
             PositionedAp {
                 lat: 35.68,
                 lon: 139.69,
                 signal_dbm: None,
+                is_mobile: false,
             }, // Tokyo
             PositionedAp {
                 lat: -12.89,
                 lon: -38.29,
                 signal_dbm: None,
+                is_mobile: false,
             }, // Salvador
             PositionedAp {
                 lat: 40.71,
                 lon: -74.00,
                 signal_dbm: None,
+                is_mobile: false,
             }, // NYC
         ];
         let coords: Vec<(f64, f64)> = aps.iter().map(|a| (a.lat, a.lon)).collect();
@@ -1393,16 +1552,19 @@ mod tests {
                     lat: 0.0,
                     lon: 0.0,
                     signal_dbm: Some(-60),
+                    is_mobile: false,
                 },
                 PositionedAp {
                     lat: 0.0,
                     lon: 0.0001,
                     signal_dbm: Some(-60),
+                    is_mobile: false,
                 },
                 PositionedAp {
                     lat: 0.0,
                     lon: 180.0,
                     signal_dbm: Some(-60),
+                    is_mobile: false,
                 },
             ];
             // Stage 1: the antipodal point at (0, 180) is >2 km from both
@@ -1424,21 +1586,25 @@ mod tests {
                     lat: 0.0,
                     lon: 0.0,
                     signal_dbm: Some(-60),
+                    is_mobile: false,
                 },
                 PositionedAp {
                     lat: 0.0,
                     lon: 0.0,
                     signal_dbm: Some(-60),
+                    is_mobile: false,
                 },
                 PositionedAp {
                     lat: 0.0,
                     lon: 180.0,
                     signal_dbm: Some(-60),
+                    is_mobile: false,
                 },
                 PositionedAp {
                     lat: 0.0,
                     lon: 180.0,
                     signal_dbm: Some(-60),
+                    is_mobile: false,
                 },
             ];
             let _ = filter_outliers(&aps_deg);
@@ -1494,31 +1660,37 @@ mod tests {
                 lat: 55.70696,
                 lon: 12.58566,
                 signal_dbm: Some(-76),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.70709,
                 lon: 12.58565,
                 signal_dbm: Some(-72),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.70735,
                 lon: 12.58569,
                 signal_dbm: Some(-73),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.70714,
                 lon: 12.58544,
                 signal_dbm: Some(-73),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.70713,
                 lon: 12.58544,
                 signal_dbm: Some(-73),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 55.70662,
                 lon: 12.58570,
                 signal_dbm: Some(-77),
+                is_mobile: false,
             },
             // 1 Brazilian outlier — STRONGEST signal, so without filtering
             // it would dominate the weighted centroid.
@@ -1526,6 +1698,7 @@ mod tests {
                 lat: -12.89422,
                 lon: -38.29226,
                 signal_dbm: Some(-49),
+                is_mobile: false,
             },
         ];
         let kept = filter_outliers(&aps);
@@ -1569,16 +1742,19 @@ mod tests {
                 lat: 48.8570,
                 lon: 2.3510,
                 signal_dbm: Some(-60),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 48.8571,
                 lon: 2.3515,
                 signal_dbm: Some(-65),
+                is_mobile: false,
             },
             PositionedAp {
                 lat: 48.8569,
                 lon: 2.3512,
                 signal_dbm: Some(-70),
+                is_mobile: false,
             },
         ];
         let filtered = filter_outliers(&aps);

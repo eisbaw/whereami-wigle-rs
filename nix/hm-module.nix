@@ -7,7 +7,10 @@ let
   # passes --socket cfg.socketPath). No group is needed: %t is $XDG_RUNTIME_DIR
   # (/run/user/<uid>, mode 0700, user-owned), so the socket is single-user by
   # construction and the daemon tightens it to 0600.
-  execStart = import ./exec-start.nix { inherit lib cfg; socketFlag = true; };
+  execStart = import ./exec-start.nix {
+    inherit config lib pkgs cfg;
+    socketFlag = true;
+  };
 
   # Home Manager's Service.Environment option is rendered verbatim as an INI
   # value. Quote the complete NAME=value assignment (JSON string escaping is
