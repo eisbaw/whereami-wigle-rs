@@ -295,6 +295,7 @@ fn render_stats(resp: &StatsResponse) -> String {
          inflight:      {}\n\
          db size:       {} KB\n\
          API today:     {}\n\
+         API counter corruption denials: {}\n\
          db write fail: {}\n\
          tasks aborted at last clean shutdown: {}\n",
         resp.cached_aps,
@@ -303,6 +304,7 @@ fn render_stats(resp: &StatsResponse) -> String {
         resp.inflight,
         resp.db_size_bytes / 1024,
         resp.api_calls_today,
+        resp.api_counter_corruption_denials,
         resp.db_write_failures,
         resp.orphan_tasks_aborted,
     )
@@ -932,6 +934,7 @@ mod tests {
             not_found_aps: 4,
             db_size_bytes: 49_152,
             api_calls_today: 5,
+            api_counter_corruption_denials: 9,
             inflight: 6,
             db_write_failures: 7,
             orphan_tasks_aborted: 8,
@@ -946,6 +949,7 @@ mod tests {
              inflight:      6\n\
              db size:       48 KB\n\
              API today:     5\n\
+             API counter corruption denials: 9\n\
              db write fail: 7\n\
              tasks aborted at last clean shutdown: 8\n"
         );

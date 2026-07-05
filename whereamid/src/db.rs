@@ -172,6 +172,25 @@ pub(crate) struct QuotaLease {
     active: bool,
 }
 
+/// Result of the synchronous, transactional quota decision. Corruption is a
+/// policy decision rather than a SQLite failure: it denies the reservation
+/// without changing the persisted row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuotaDecision {
+    Reserved,
+    Exhausted,
+    CounterCorrupt,
+}
+
+/// Actor-facing quota decision. A successful reservation transfers the
+/// cancellation-owned lease; the two denial cases carry no lease.
+#[allow(dead_code)]
+pub(crate) enum QuotaReservation {
+    Reserved(QuotaLease),
+    Exhausted,
+    CounterCorrupt,
+}
+
 #[allow(dead_code)]
 impl QuotaLease {
     fn new(
@@ -213,7 +232,11 @@ impl Drop for QuotaLease {
             // makes the conditional refund exactly-once.
             if committed.swap(false, Ordering::AcqRel) {
                 if let Err(error) = db.refund_api_call() {
-                    tracing::warn!("failed to refund WiGLE quota lease on drop: {error}");
+                    // Counter corruption already emitted the more accurate,
+                    // escaped refund-context warning at the parse boundary.
+                    if error.downcast_ref::<CorruptApiCallsValue>().is_none() {
+                        tracing::warn!("failed to refund WiGLE quota lease on drop: {error}");
+                    }
                     failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -225,12 +248,13 @@ impl Drop for QuotaLease {
     }
 }
 
-#[cfg(test)]
 #[derive(Default)]
 struct ReservationTestHooks {
     queued: Option<tokio::sync::oneshot::Sender<()>>,
     committed: Option<tokio::sync::oneshot::Sender<()>>,
     release_after_commit: Option<mpsc::Receiver<()>>,
+    decision: Option<tokio::sync::oneshot::Sender<QuotaDecision>>,
+    release_after_decision: Option<mpsc::Receiver<()>>,
 }
 
 struct DbActor {
@@ -849,9 +873,15 @@ impl DbHandle {
         &self,
         daily_limit: u32,
         failures: Arc<std::sync::atomic::AtomicU64>,
-    ) -> Result<Option<QuotaLease>> {
-        self.reserve_api_call_inner(daily_limit, failures, None, None, None)
-            .await
+        corruption_denials: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<QuotaReservation> {
+        self.reserve_api_call_inner(
+            daily_limit,
+            failures,
+            corruption_denials,
+            ReservationTestHooks::default(),
+        )
+        .await
     }
 
     #[allow(dead_code)]
@@ -859,10 +889,16 @@ impl DbHandle {
         &self,
         daily_limit: u32,
         failures: Arc<std::sync::atomic::AtomicU64>,
-        queued: Option<tokio::sync::oneshot::Sender<()>>,
-        committed_signal: Option<tokio::sync::oneshot::Sender<()>>,
-        release_after_commit: Option<mpsc::Receiver<()>>,
-    ) -> Result<Option<QuotaLease>> {
+        corruption_denials: Arc<std::sync::atomic::AtomicU64>,
+        hooks: ReservationTestHooks,
+    ) -> Result<QuotaReservation> {
+        let ReservationTestHooks {
+            queued,
+            committed: committed_signal,
+            release_after_commit,
+            decision: decision_signal,
+            release_after_decision,
+        } = hooks;
         let committed = Arc::new(AtomicBool::new(false));
         // Construct ownership before enqueue/await. If this future is dropped,
         // the lease appends its conditional refund behind this command.
@@ -871,9 +907,15 @@ impl DbHandle {
         let reservation = Self::call_cancellable(
             &self.writer,
             move |db| {
-                let reserved = db.try_reserve_api_call(daily_limit)?;
-                if reserved {
-                    // The DB method returns true only after COMMIT succeeds.
+                let decision = db.try_reserve_api_call(daily_limit)?;
+                if decision == QuotaDecision::CounterCorrupt {
+                    // Count the executed denial before publishing its result.
+                    // A waiter may disappear after this point, but the actor
+                    // still observed and denied one reservation attempt.
+                    corruption_denials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if decision == QuotaDecision::Reserved {
+                    // The DB method returns Reserved only after COMMIT succeeds.
                     operation_committed.store(true, Ordering::Release);
                     if let Some(signal) = committed_signal {
                         let _ = signal.send(());
@@ -884,17 +926,29 @@ impl DbHandle {
                         })?;
                     }
                 }
-                Ok(reserved)
+                if let Some(signal) = decision_signal {
+                    let _ = signal.send(decision);
+                }
+                if let Some(release) = release_after_decision {
+                    release
+                        .recv()
+                        .map_err(|_| anyhow::anyhow!("reservation decision release closed"))?;
+                }
+                Ok(decision)
             },
             queued,
         )
         .await;
 
         match reservation {
-            Ok(true) => Ok(Some(lease)),
-            Ok(false) => {
+            Ok(QuotaDecision::Reserved) => Ok(QuotaReservation::Reserved(lease)),
+            Ok(QuotaDecision::Exhausted) => {
                 lease.disarm();
-                Ok(None)
+                Ok(QuotaReservation::Exhausted)
+            }
+            Ok(QuotaDecision::CounterCorrupt) => {
+                lease.disarm();
+                Ok(QuotaReservation::CounterCorrupt)
             }
             Err(error) => {
                 // A normal DB error occurs before a successful commit and can
@@ -913,16 +967,11 @@ impl DbHandle {
         &self,
         daily_limit: u32,
         failures: Arc<std::sync::atomic::AtomicU64>,
+        corruption_denials: Arc<std::sync::atomic::AtomicU64>,
         hooks: ReservationTestHooks,
-    ) -> Result<Option<QuotaLease>> {
-        self.reserve_api_call_inner(
-            daily_limit,
-            failures,
-            hooks.queued,
-            hooks.committed,
-            hooks.release_after_commit,
-        )
-        .await
+    ) -> Result<QuotaReservation> {
+        self.reserve_api_call_inner(daily_limit, failures, corruption_denials, hooks)
+            .await
     }
 
     /// A FIFO writer round-trip used to observe preceding fire-and-forget
@@ -1162,7 +1211,7 @@ impl DbHandle {
                 pending_aps: db.pending_ap_count()?,
                 not_found_aps: db.not_found_ap_count()?,
                 db_size_bytes: db.db_size_bytes()?,
-                api_calls_today: db.api_calls_today().unwrap_or(0),
+                api_calls_today: db.api_calls_today_for_stats()?,
             })
         })
         .await
@@ -1410,27 +1459,30 @@ pub enum DebugDbStatus {
 
 const SCHEMA_VERSION: i32 = 5;
 
-/// Parse the `metadata.api_calls_today` raw value.
-///
-/// `None` (key absent) is a legitimate "no calls recorded yet today" and
-/// maps to `Ok(0)`. A present-but-non-numeric value is corruption (disk
-/// gremlins, partial write) and returns `Err` so callers fail **closed**
-/// (task-0097): `try_reserve_api_call` denies the slot rather than silently
-/// resetting the counter to 0 and re-charging the full daily WiGLE quota on
-/// top of whatever was already spent — the WiGLE budget is irreversible.
-/// The `warn` (task-0077) keeps the corruption visible in logs; it now
-/// describes the deny action instead of the old "treating as 0" heal.
-fn parse_api_calls_value(raw: Option<String>) -> Result<u32> {
-    match raw.as_deref() {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CorruptApiCallsValue {
+    raw: String,
+}
+
+impl std::fmt::Display for CorruptApiCallsValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "metadata.api_calls_today is not a valid u32 ({:?})",
+            self.raw
+        )
+    }
+}
+
+impl std::error::Error for CorruptApiCallsValue {}
+
+/// Parse the `metadata.api_calls_today` raw value without logging or applying
+/// caller policy. `None` is the legitimate zero-call state; a malformed value
+/// remains available to the caller for an escaped, context-specific warning.
+fn parse_api_calls_value(raw: Option<String>) -> std::result::Result<u32, CorruptApiCallsValue> {
+    match raw {
         None => Ok(0),
-        Some(s) => s.parse::<u32>().map_err(|_| {
-            tracing::warn!(
-                "metadata.api_calls_today is not a valid u32 ({:?}); \
-                 denying API reservation to avoid double-spending the daily quota",
-                s
-            );
-            anyhow::anyhow!("corrupt metadata.api_calls_today value: {s:?}")
-        }),
+        Some(raw) => raw.parse::<u32>().map_err(|_| CorruptApiCallsValue { raw }),
     }
 }
 
@@ -1484,6 +1536,64 @@ pub struct LastFixRow {
     /// chrono::DateTime<Utc> for age computation across restarts.
     pub at_rfc3339: String,
     pub sources: i64,
+}
+
+const UPSERT_LAST_FIX_SQL: &str =
+    "INSERT INTO last_fix (id, lat, lon, accuracy_m, address, at_rfc3339, sources)
+     VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+     ON CONFLICT(id) DO UPDATE SET
+        lat        = excluded.lat,
+        lon        = excluded.lon,
+        accuracy_m = excluded.accuracy_m,
+        address    = excluded.address,
+        at_rfc3339 = excluded.at_rfc3339,
+        sources    = excluded.sources
+     WHERE excluded.at_rfc3339 >= last_fix.at_rfc3339";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LastFixUpdate {
+    Applied,
+    DroppedOlder { incoming: String, stored: String },
+}
+
+fn upsert_last_fix(connection: &Connection, fix: &LastFixRow) -> Result<LastFixUpdate> {
+    let changed = connection.execute(
+        UPSERT_LAST_FIX_SQL,
+        params![
+            fix.lat,
+            fix.lon,
+            fix.accuracy_m,
+            fix.address,
+            fix.at_rfc3339,
+            fix.sources
+        ],
+    )?;
+    match changed {
+        1 => Ok(LastFixUpdate::Applied),
+        0 => {
+            let stored = connection.query_row(
+                "SELECT at_rfc3339 FROM last_fix WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(LastFixUpdate::DroppedOlder {
+                incoming: fix.at_rfc3339.clone(),
+                stored,
+            })
+        }
+        changed => anyhow::bail!("last_fix UPSERT changed an unexpected {changed} rows"),
+    }
+}
+
+fn warn_if_last_fix_dropped(outcome: LastFixUpdate) {
+    if let LastFixUpdate::DroppedOlder { incoming, stored } = outcome {
+        tracing::warn!(
+            "persisted last_fix update rejected as older: incoming timestamp {:?}, \
+             stored timestamp {:?}; memory/history may still contain the incoming observation",
+            incoming,
+            stored
+        );
+    }
 }
 
 /// task-0197: tighten the SQLite database file (and any pre-existing -wal/-shm
@@ -2353,19 +2463,27 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
+    // The library target omits provider.rs, whose binary-target tests use this
+    // helper to induce a genuine SQLite reservation failure.
+    #[allow(dead_code)]
+    pub(crate) fn drop_metadata_table_for_test(&self) -> Result<()> {
+        self.conn.execute_batch("DROP TABLE metadata")?;
+        Ok(())
+    }
+
     /// Atomically reserve an API call slot for today.
     ///
     /// Performs daily-counter reset, current-count read, and increment in a
-    /// single IMMEDIATE transaction. Returns `Ok(true)` if a slot was reserved
-    /// (caller may proceed with the network call) or `Ok(false)` if the
-    /// daily limit is already exhausted.
+    /// single IMMEDIATE transaction. Distinguishes a committed reservation,
+    /// normal daily exhaustion, and fail-closed persisted-counter corruption.
     ///
     /// On any transient failure of the network call afterwards, the caller
     /// SHOULD call [`Database::refund_api_call`] to give the slot back.
     /// Slots that map to actual completed lookups (Found / NotFound) should
     /// not be refunded.
     #[allow(dead_code)]
-    pub fn try_reserve_api_call(&mut self, daily_limit: u32) -> Result<bool> {
+    pub fn try_reserve_api_call(&mut self, daily_limit: u32) -> Result<QuotaDecision> {
         #[cfg(test)]
         let result = self.try_reserve_api_call_inner(daily_limit, None);
         #[cfg(not(test))]
@@ -2379,7 +2497,7 @@ impl Database {
         &mut self,
         daily_limit: u32,
         mut observe_transaction: F,
-    ) -> Result<bool>
+    ) -> Result<QuotaDecision>
     where
         F: FnMut(rusqlite::TransactionState),
     {
@@ -2390,7 +2508,7 @@ impl Database {
         &mut self,
         daily_limit: u32,
         #[cfg(test)] observe_transaction: Option<&mut dyn FnMut(rusqlite::TransactionState)>,
-    ) -> Result<bool> {
+    ) -> Result<QuotaDecision> {
         let today = Utc::now().format("%Y-%m-%d").to_string();
         let tx = self
             .conn
@@ -2423,8 +2541,16 @@ impl Database {
                 // the counter and re-charge up to `daily_limit` fresh WiGLE
                 // calls on top of whatever was already spent. Dropping `tx`
                 // uncommitted rolls back cleanly (no write has happened on this
-                // branch). The warn already fired inside parse_api_calls_value.
-                Err(_) => return Ok(false),
+                // branch). Parsing is side-effect-free; this reservation
+                // context owns the precise warning.
+                Err(corrupt) => {
+                    tracing::warn!(
+                        "{}; WiGLE quota reservation denied to avoid \
+                         double-spending the daily quota",
+                        corrupt
+                    );
+                    return Ok(QuotaDecision::CounterCorrupt);
+                }
             }
         } else {
             tx.execute(
@@ -2443,7 +2569,7 @@ impl Database {
                 params![count.to_string()],
             )?;
             tx.commit()?;
-            return Ok(false);
+            return Ok(QuotaDecision::Exhausted);
         }
 
         let new_count = count + 1;
@@ -2453,7 +2579,7 @@ impl Database {
             params![new_count.to_string()],
         )?;
         tx.commit()?;
-        Ok(true)
+        Ok(QuotaDecision::Reserved)
     }
 
     /// Refund a previously reserved API slot. Clamped at 0. Only meaningful
@@ -2487,7 +2613,17 @@ impl Database {
         // task-0097: a corrupt counter propagates as Err (tx rolls back, no
         // write). Refunding by healing the garbage to "0" would re-introduce
         // the double-spend heal this task closes, so fail closed here too.
-        let count: u32 = parse_api_calls_value(raw)?;
+        let count = match parse_api_calls_value(raw) {
+            Ok(count) => count,
+            Err(corrupt) => {
+                tracing::warn!(
+                    "{}; WiGLE quota refund skipped so the corrupt persisted \
+                     counter remains untouched",
+                    corrupt
+                );
+                return Err(corrupt.into());
+            }
+        };
         let new_count = count.saturating_sub(1);
         tx.execute(
             "INSERT INTO metadata (key, value) VALUES ('api_calls_today', ?1)
@@ -2499,11 +2635,24 @@ impl Database {
     }
 
     /// Get the number of API calls made today.
+    #[cfg(test)]
     pub fn api_calls_today(&self) -> Result<u32> {
-        // task-0097: corrupt counter -> Err. The only caller (status display)
-        // uses `.unwrap_or(0)`, so a garbage row renders as 0 in stats without
-        // affecting the enforcement path in try_reserve_api_call.
-        parse_api_calls_value(self.get_metadata("api_calls_today")?)
+        parse_api_calls_value(self.get_metadata("api_calls_today")?).map_err(Into::into)
+    }
+
+    fn api_calls_today_for_stats(&self) -> Result<u32> {
+        let raw = self.get_metadata("api_calls_today")?;
+        match parse_api_calls_value(raw) {
+            Ok(count) => Ok(count),
+            Err(corrupt) => {
+                tracing::warn!(
+                    "{}; stats reports api_calls_today fallback 0 while the \
+                     persisted counter remains untouched",
+                    corrupt
+                );
+                Ok(0)
+            }
+        }
     }
 
     // --- stats ---
@@ -2574,13 +2723,13 @@ impl Database {
 
     /// Persist the last-known position into the single-row `last_fix` table.
     ///
-    /// **Invariant: monotonic by `at_rfc3339` — older writes are silently
-    /// dropped.** The UPSERT overwrites the existing row only when the
-    /// incoming `at_rfc3339` is `>=` the stored one (see the trailing
-    /// `WHERE`). Concurrent locates are serialized by the daemon's `last_fix`
-    /// guard and writer FIFO (task-0046); this guard instead defends against the wall clock
-    /// moving backwards (NTP step, container time fix on restart) letting a
-    /// stale fix clobber a newer one (task-0100).
+    /// **Invariant: monotonic by `at_rfc3339` — older writes are rejected and
+    /// warned after the transaction commits.** The UPSERT overwrites the
+    /// existing row only when the incoming `at_rfc3339` is `>=` the stored one
+    /// (see the trailing `WHERE`). Concurrent locates are serialized by the
+    /// daemon's `last_fix` guard and writer FIFO (task-0046); this guard instead
+    /// defends against the wall clock moving backwards (NTP step, container
+    /// time fix on restart) letting a stale fix clobber a newer one (task-0100).
     ///
     /// The string `>=` is a valid chronological test only because every
     /// writer produces `DateTime::<Utc>::to_rfc3339()`: a fixed-width
@@ -2590,26 +2739,10 @@ impl Database {
     /// fraction sorts after the `+` of the offset.) A non-UTC offset, or a
     /// writer switching timestamp formats, would break this.
     pub fn set_last_fix(&self, fix: &LastFixRow) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO last_fix (id, lat, lon, accuracy_m, address, at_rfc3339, sources)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(id) DO UPDATE SET
-                lat        = excluded.lat,
-                lon        = excluded.lon,
-                accuracy_m = excluded.accuracy_m,
-                address    = excluded.address,
-                at_rfc3339 = excluded.at_rfc3339,
-                sources    = excluded.sources
-             WHERE excluded.at_rfc3339 >= last_fix.at_rfc3339",
-            params![
-                fix.lat,
-                fix.lon,
-                fix.accuracy_m,
-                fix.address,
-                fix.at_rfc3339,
-                fix.sources
-            ],
-        )?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let outcome = upsert_last_fix(&tx, fix)?;
+        tx.commit()?;
+        warn_if_last_fix_dropped(outcome);
         Ok(())
     }
 
@@ -2649,23 +2782,7 @@ impl Database {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT INTO last_fix (id, lat, lon, accuracy_m, address, at_rfc3339, sources)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(id) DO UPDATE SET
-                lat = excluded.lat, lon = excluded.lon,
-                accuracy_m = excluded.accuracy_m, address = excluded.address,
-                at_rfc3339 = excluded.at_rfc3339, sources = excluded.sources
-             WHERE excluded.at_rfc3339 >= last_fix.at_rfc3339",
-            params![
-                fix.lat,
-                fix.lon,
-                fix.accuracy_m,
-                fix.address,
-                fix.at_rfc3339,
-                fix.sources
-            ],
-        )?;
+        let outcome = upsert_last_fix(&tx, fix)?;
         tx.execute(
             "INSERT INTO fixes (at_rfc3339, lat, lon, accuracy_m, n_sources)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -2678,6 +2795,7 @@ impl Database {
             ],
         )?;
         tx.commit()?;
+        warn_if_last_fix_dropped(outcome);
         Ok(())
     }
 
@@ -2808,6 +2926,123 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use tracing::{
+        field::{Field, Visit},
+        span, subscriber, Event, Metadata, Subscriber,
+    };
+
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    struct MessageVisitor(String);
+
+    impl Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.0 = value.to_owned();
+            }
+        }
+    }
+
+    impl Subscriber for CapturedEvents {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .expect("capture lock poisoned")
+                .push((*event.metadata().level(), visitor.0));
+        }
+
+        fn enter(&self, _span: &span::Id) {}
+        fn exit(&self, _span: &span::Id) {}
+    }
+
+    fn capture_events<T>(operation: impl FnOnce() -> T) -> (T, Vec<(tracing::Level, String)>) {
+        let captured = CapturedEvents::default();
+        let events = captured.clone();
+        let result = subscriber::with_default(captured, operation);
+        let events = events.0.lock().expect("capture lock poisoned").clone();
+        (result, events)
+    }
+
+    fn warning_messages(events: &[(tracing::Level, String)]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|(level, message)| {
+                (*level == tracing::Level::WARN).then_some(message.as_str())
+            })
+            .collect()
+    }
+
+    fn assert_one_last_fix_drop_warning(
+        events: &[(tracing::Level, String)],
+        incoming: &str,
+        stored: &str,
+    ) {
+        let all_warnings = warning_messages(events);
+        assert_eq!(all_warnings.len(), 1, "events: {events:?}");
+        let warnings: Vec<_> = all_warnings
+            .into_iter()
+            .filter(|message| message.contains("persisted last_fix update rejected"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "events: {events:?}");
+        assert!(
+            warnings[0].contains(&format!("{incoming:?}")),
+            "incoming timestamp missing or unescaped: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains(&format!("{stored:?}")),
+            "stored timestamp missing or unescaped: {}",
+            warnings[0]
+        );
+        assert!(warnings[0].contains("memory/history may still contain the incoming observation"));
+    }
+
+    fn install_commit_marker(db: &Database, captured: &CapturedEvents) {
+        let events = Arc::clone(&captured.0);
+        db.conn.commit_hook(Some(move || {
+            events
+                .lock()
+                .expect("capture lock poisoned")
+                .push((tracing::Level::INFO, "test commit".to_owned()));
+            false
+        }));
+    }
+
+    fn assert_commit_precedes_last_fix_warning(events: &[(tracing::Level, String)]) {
+        let commit = events
+            .iter()
+            .position(|(_, message)| message == "test commit")
+            .expect("transaction commit marker missing");
+        let warning = events
+            .iter()
+            .position(|(_, message)| message.contains("persisted last_fix update rejected"))
+            .expect("last_fix drop warning missing");
+        assert!(
+            commit < warning,
+            "last_fix warning preceded transaction commit: {events:?}"
+        );
+    }
 
     fn sample_ap(index: usize) -> ApInfo {
         ApInfo {
@@ -2822,6 +3057,15 @@ mod tests {
             country: None,
             source: Source::Apple,
         }
+    }
+
+    fn seed_api_counter_for_today(db: &Database, raw: &str) {
+        db.set_metadata(
+            "api_calls_date",
+            &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        )
+        .unwrap();
+        db.set_metadata("api_calls_today", raw).unwrap();
     }
 
     #[test]
@@ -3457,7 +3701,7 @@ mod tests {
         let reserved = db
             .try_reserve_api_call_observing(1, |state| observed = Some(state))
             .unwrap();
-        assert!(reserved);
+        assert_eq!(reserved, QuotaDecision::Reserved);
         assert_eq!(observed, Some(rusqlite::TransactionState::Write));
     }
 
@@ -3729,6 +3973,7 @@ mod tests {
     async fn quota_reservation_cancelled_while_queued_cannot_leak() {
         let (runtime, handle, _legacy) = DbRuntime::open_test().unwrap();
         let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let corruption_denials = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (blocked_tx, blocked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let blocker_handle = handle.clone();
@@ -3744,11 +3989,13 @@ mod tests {
         let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
         let reserve_handle = handle.clone();
         let reserve_failures = Arc::clone(&failures);
+        let reserve_corruption_denials = Arc::clone(&corruption_denials);
         let reservation = tokio::spawn(async move {
             reserve_handle
                 .reserve_api_call_with_hooks(
                     1,
                     reserve_failures,
+                    reserve_corruption_denials,
                     ReservationTestHooks {
                         queued: Some(queued_tx),
                         ..Default::default()
@@ -3765,6 +4012,7 @@ mod tests {
 
         assert_eq!(handle.api_calls_today().await.unwrap(), 0);
         assert_eq!(failures.load(Ordering::Relaxed), 0);
+        assert_eq!(corruption_denials.load(Ordering::Relaxed), 0);
         drop(handle);
         runtime.shutdown().await.unwrap();
     }
@@ -3773,6 +4021,7 @@ mod tests {
     async fn quota_reservation_cancelled_after_commit_is_refunded() {
         let (runtime, handle, _legacy) = DbRuntime::open_test().unwrap();
         let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let corruption_denials = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         handle
             .install_writer_commit_counter(Arc::clone(&commits))
@@ -3783,11 +4032,13 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let reserve_handle = handle.clone();
         let reserve_failures = Arc::clone(&failures);
+        let reserve_corruption_denials = Arc::clone(&corruption_denials);
         let reservation = tokio::spawn(async move {
             reserve_handle
                 .reserve_api_call_with_hooks(
                     1,
                     reserve_failures,
+                    reserve_corruption_denials,
                     ReservationTestHooks {
                         committed: Some(committed_tx),
                         release_after_commit: Some(release_rx),
@@ -3809,6 +4060,149 @@ mod tests {
             "one reservation COMMIT plus exactly one refund COMMIT expected"
         );
         assert_eq!(failures.load(Ordering::Relaxed), 0);
+        assert_eq!(corruption_denials.load(Ordering::Relaxed), 0);
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn corrupt_reservation_cancelled_while_queued_counts_zero() {
+        let (runtime, handle, legacy) = DbRuntime::open_test().unwrap();
+        seed_api_counter_for_today(&legacy, "garbage");
+        let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let corruption_denials = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker_handle = handle.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_handle
+                .hold_writer_until(blocked_tx, release_rx)
+                .await
+        });
+        blocked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer blocker must start");
+
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let reserve_handle = handle.clone();
+        let reserve_failures = Arc::clone(&failures);
+        let reserve_corruption_denials = Arc::clone(&corruption_denials);
+        let reservation = tokio::spawn(async move {
+            reserve_handle
+                .reserve_api_call_with_hooks(
+                    100,
+                    reserve_failures,
+                    reserve_corruption_denials,
+                    ReservationTestHooks {
+                        queued: Some(queued_tx),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        queued_rx.await.unwrap();
+        reservation.abort();
+        assert!(matches!(reservation.await, Err(error) if error.is_cancelled()));
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        handle.writer_barrier().await.unwrap();
+
+        assert_eq!(corruption_denials.load(Ordering::Relaxed), 0);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            handle
+                .get_metadata("api_calls_today")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("garbage")
+        );
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn corrupt_reservation_waiter_cancelled_after_actor_decision_counts_once() {
+        let (runtime, handle, legacy) = DbRuntime::open_test().unwrap();
+        seed_api_counter_for_today(&legacy, "garbage");
+        let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let corruption_denials = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reserve_handle = handle.clone();
+        let reserve_failures = Arc::clone(&failures);
+        let reserve_corruption_denials = Arc::clone(&corruption_denials);
+        let reservation = tokio::spawn(async move {
+            reserve_handle
+                .reserve_api_call_with_hooks(
+                    100,
+                    reserve_failures,
+                    reserve_corruption_denials,
+                    ReservationTestHooks {
+                        decision: Some(decision_tx),
+                        release_after_decision: Some(release_rx),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        assert_eq!(decision_rx.await.unwrap(), QuotaDecision::CounterCorrupt);
+        assert_eq!(
+            corruption_denials.load(Ordering::Relaxed),
+            1,
+            "actor must count before publishing the decision boundary"
+        );
+        reservation.abort();
+        assert!(matches!(reservation.await, Err(error) if error.is_cancelled()));
+        release_tx.send(()).unwrap();
+        handle.writer_barrier().await.unwrap();
+
+        assert_eq!(corruption_denials.load(Ordering::Relaxed), 1);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            handle
+                .get_metadata("api_calls_today")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("garbage")
+        );
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actor_quota_decisions_count_only_counter_corruption() {
+        let (runtime, handle, legacy) = DbRuntime::open_test().unwrap();
+        let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let corruption_denials = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        seed_api_counter_for_today(&legacy, "1");
+
+        let exhausted = handle
+            .reserve_api_call(1, Arc::clone(&failures), Arc::clone(&corruption_denials))
+            .await
+            .unwrap();
+        assert!(matches!(exhausted, QuotaReservation::Exhausted));
+        assert_eq!(corruption_denials.load(Ordering::Relaxed), 0);
+
+        legacy.set_metadata("api_calls_today", "garbage").unwrap();
+        let corrupt = handle
+            .reserve_api_call(100, Arc::clone(&failures), Arc::clone(&corruption_denials))
+            .await
+            .unwrap();
+        assert!(matches!(corrupt, QuotaReservation::CounterCorrupt));
+        assert_eq!(corruption_denials.load(Ordering::Relaxed), 1);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            handle
+                .get_metadata("api_calls_today")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("garbage")
+        );
+
         drop(handle);
         runtime.shutdown().await.unwrap();
     }
@@ -3836,7 +4230,7 @@ mod tests {
         assert_eq!(
             outcomes
                 .into_iter()
-                .filter(|outcome| *outcome.as_ref().unwrap())
+                .filter(|outcome| outcome.as_ref().unwrap() == &QuotaDecision::Reserved)
                 .count(),
             1,
             "IMMEDIATE reservation must grant exactly one slot without SQLITE_BUSY"
@@ -4295,16 +4689,22 @@ mod tests {
         assert_eq!(db.api_calls_today().unwrap(), 0);
 
         // First reservation under generous limit succeeds.
-        assert!(db.try_reserve_api_call(100).unwrap());
+        assert_eq!(
+            db.try_reserve_api_call(100).unwrap(),
+            QuotaDecision::Reserved
+        );
         assert_eq!(db.api_calls_today().unwrap(), 1);
 
         // Limit-of-1 path: already at 1, so further reservation denied.
-        assert!(!db.try_reserve_api_call(1).unwrap());
+        assert_eq!(
+            db.try_reserve_api_call(1).unwrap(),
+            QuotaDecision::Exhausted
+        );
         // Counter unchanged after a denied reservation.
         assert_eq!(db.api_calls_today().unwrap(), 1);
 
         // Limit-of-2 path: still room for one more.
-        assert!(db.try_reserve_api_call(2).unwrap());
+        assert_eq!(db.try_reserve_api_call(2).unwrap(), QuotaDecision::Reserved);
         assert_eq!(db.api_calls_today().unwrap(), 2);
 
         // Refund returns the slot.
@@ -4341,8 +4741,12 @@ mod tests {
             .unwrap();
 
         // Fail closed: deny the reservation despite a generous limit.
-        let reserved = db.try_reserve_api_call(100).unwrap();
-        assert!(!reserved, "corrupt counter must deny the reservation");
+        let decision = db.try_reserve_api_call(100).unwrap();
+        assert_eq!(
+            decision,
+            QuotaDecision::CounterCorrupt,
+            "corrupt counter must be distinct from normal exhaustion"
+        );
 
         // The corrupt row must NOT be healed/overwritten by the denied call.
         let raw: String = db
@@ -4354,6 +4758,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(raw, "garbage", "corrupt counter row must be left untouched");
+    }
+
+    #[test]
+    fn corrupt_api_counter_warnings_are_escaped_and_context_specific() {
+        let raw = "bad\n\u{1b}";
+        let escaped = format!("{raw:?}");
+
+        let (_, parse_events) = capture_events(|| parse_api_calls_value(Some(raw.to_owned())));
+        assert!(
+            parse_events.is_empty(),
+            "the parser must remain side-effect-free"
+        );
+
+        let mut reservation_db = Database::open_memory().unwrap();
+        seed_api_counter_for_today(&reservation_db, raw);
+        let (decision, reservation_events) =
+            capture_events(|| reservation_db.try_reserve_api_call(100).unwrap());
+        assert_eq!(decision, QuotaDecision::CounterCorrupt);
+        let reservation_warnings = warning_messages(&reservation_events);
+        assert_eq!(reservation_warnings.len(), 1);
+        assert!(reservation_warnings[0].contains("quota reservation denied"));
+        assert!(reservation_warnings[0].contains(&escaped));
+        assert!(!reservation_warnings[0].contains("refund"));
+        assert!(!reservation_warnings[0].contains("stats reports"));
+
+        let mut refund_db = Database::open_memory().unwrap();
+        seed_api_counter_for_today(&refund_db, raw);
+        let (refund_result, refund_events) = capture_events(|| refund_db.refund_api_call());
+        assert!(refund_result.is_err());
+        let refund_warnings = warning_messages(&refund_events);
+        assert_eq!(refund_warnings.len(), 1);
+        assert!(refund_warnings[0].contains("quota refund skipped"));
+        assert!(refund_warnings[0].contains(&escaped));
+        assert!(!refund_warnings[0].contains("reservation denied"));
+        assert!(!refund_warnings[0].contains("stats reports"));
+
+        let stats_db = Database::open_memory().unwrap();
+        stats_db.set_metadata("api_calls_today", raw).unwrap();
+        let (stats_count, stats_events) =
+            capture_events(|| stats_db.api_calls_today_for_stats().unwrap());
+        assert_eq!(stats_count, 0);
+        let stats_warnings = warning_messages(&stats_events);
+        assert_eq!(stats_warnings.len(), 1);
+        assert!(stats_warnings[0].contains("stats reports api_calls_today fallback 0"));
+        assert!(stats_warnings[0].contains(&escaped));
+        assert!(!stats_warnings[0].contains("reservation denied"));
+        assert!(!stats_warnings[0].contains("refund skipped"));
+
+        for warning in reservation_warnings
+            .into_iter()
+            .chain(refund_warnings)
+            .chain(stats_warnings)
+        {
+            assert!(!warning.contains('\n'));
+            assert!(!warning.contains('\u{1b}'));
+        }
     }
 
     /// Exercise repeated reservations from many caller threads against one
@@ -4379,7 +4839,7 @@ mod tests {
                     let mut g = db.lock().unwrap();
                     g.try_reserve_api_call(limit).unwrap()
                 };
-                if ok {
+                if ok == QuotaDecision::Reserved {
                     reserved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }));
@@ -4461,7 +4921,7 @@ mod tests {
 
     /// task-0100: set_last_fix is monotonic by at_rfc3339. A write carrying an
     /// OLDER timestamp than the stored row (e.g. after the clock steps
-    /// backwards) must be silently dropped, leaving the newer fix intact. A
+    /// backwards) must be rejected with a warning, leaving the newer fix intact. A
     /// subsequent newer write must still apply (the guard is `>=`, not `==`).
     #[test]
     fn set_last_fix_drops_older_timestamp() {
@@ -4485,7 +4945,18 @@ mod tests {
             at_rfc3339: "2026-05-09T00:00:00+00:00".to_string(),
             sources: 1,
         };
-        db.set_last_fix(&t1).unwrap();
+        let captured = CapturedEvents::default();
+        let older_events = captured.clone();
+        install_commit_marker(&db, &captured);
+        subscriber::with_default(captured, || db.set_last_fix(&t1).unwrap());
+        db.conn.commit_hook(None::<fn() -> bool>);
+        let older_events = older_events
+            .0
+            .lock()
+            .expect("capture lock poisoned")
+            .clone();
+        assert_one_last_fix_drop_warning(&older_events, &t1.at_rfc3339, &t2.at_rfc3339);
+        assert_commit_precedes_last_fix_warning(&older_events);
 
         let got = db.get_last_fix().unwrap().unwrap();
         assert_eq!(
@@ -4508,7 +4979,8 @@ mod tests {
             at_rfc3339: "2026-05-11T00:00:00+00:00".to_string(),
             sources: 9,
         };
-        db.set_last_fix(&t3).unwrap();
+        let (_, newer_events) = capture_events(|| db.set_last_fix(&t3).unwrap());
+        assert!(warning_messages(&newer_events).is_empty());
         let got = db.get_last_fix().unwrap().unwrap();
         assert_eq!(got.at_rfc3339, "2026-05-11T00:00:00+00:00");
         assert!((got.lat - 10.0).abs() < 1e-9);
@@ -4521,13 +4993,100 @@ mod tests {
             address: Some("backfilled".to_string()),
             ..t3.clone()
         };
-        db.set_last_fix(&t3_backfill).unwrap();
+        let (_, equal_events) = capture_events(|| db.set_last_fix(&t3_backfill).unwrap());
+        assert!(warning_messages(&equal_events).is_empty());
         let got = db.get_last_fix().unwrap().unwrap();
         assert_eq!(
             got.address,
             Some("backfilled".to_string()),
             "equal-timestamp write must apply (address backfill depends on >=)"
         );
+    }
+
+    #[test]
+    fn combined_older_fix_keeps_last_fix_appends_history_and_warns_after_commit() {
+        let mut db = Database::open_memory().unwrap();
+        let stored = LastFixRow {
+            lat: 55.0,
+            lon: 12.0,
+            accuracy_m: 10.0,
+            address: Some("stored".to_owned()),
+            at_rfc3339: "2026-05-10T00:00:00+00:00".to_owned(),
+            sources: 5,
+        };
+        db.set_last_fix(&stored).unwrap();
+        let incoming = LastFixRow {
+            lat: 48.0,
+            lon: 2.0,
+            accuracy_m: 99.0,
+            address: Some("incoming".to_owned()),
+            at_rfc3339: "2026-05-09T00:00:00+00:00".to_owned(),
+            sources: 1,
+        };
+
+        let captured = CapturedEvents::default();
+        let events = captured.clone();
+        install_commit_marker(&db, &captured);
+        subscriber::with_default(captured, || db.persist_fix_and_history(&incoming).unwrap());
+        db.conn.commit_hook(None::<fn() -> bool>);
+        let events = events.0.lock().expect("capture lock poisoned").clone();
+        assert_one_last_fix_drop_warning(&events, &incoming.at_rfc3339, &stored.at_rfc3339);
+        assert_commit_precedes_last_fix_warning(&events);
+        let retained = db.get_last_fix().unwrap().unwrap();
+        assert_eq!(retained.at_rfc3339, stored.at_rfc3339);
+        assert_eq!(retained.address, stored.address);
+        let history = db
+            .get_fixes_in_range("2026-05-08T00:00:00+00:00", "2026-05-11T00:00:00+00:00")
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].at_rfc3339, incoming.at_rfc3339);
+    }
+
+    #[test]
+    fn combined_older_fix_history_failure_rolls_back_without_warning() {
+        let mut db = Database::open_memory().unwrap();
+        let stored = LastFixRow {
+            lat: 55.0,
+            lon: 12.0,
+            accuracy_m: 10.0,
+            address: Some("stored".to_owned()),
+            at_rfc3339: "2026-05-10T00:00:00+00:00".to_owned(),
+            sources: 5,
+        };
+        db.set_last_fix(&stored).unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_fix_history
+                 BEFORE INSERT ON fixes
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected history failure');
+                 END;",
+            )
+            .unwrap();
+        let incoming = LastFixRow {
+            lat: 48.0,
+            lon: 2.0,
+            accuracy_m: 99.0,
+            address: Some("incoming".to_owned()),
+            at_rfc3339: "2026-05-09T00:00:00+00:00".to_owned(),
+            sources: 1,
+        };
+
+        let (result, events) = capture_events(|| db.persist_fix_and_history(&incoming));
+        assert!(result.is_err());
+        assert!(
+            warning_messages(&events)
+                .into_iter()
+                .all(|message| !message.contains("persisted last_fix update rejected")),
+            "rolled-back operation must emit no drop warning: {events:?}"
+        );
+        let retained = db.get_last_fix().unwrap().unwrap();
+        assert_eq!(retained.at_rfc3339, stored.at_rfc3339);
+        let history_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM fixes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(history_count, 0);
     }
 
     /// task-0047: a migration body that returns Err must roll back the

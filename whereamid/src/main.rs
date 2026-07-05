@@ -176,6 +176,7 @@ async fn main() -> Result<()> {
         last_fix: tokio::sync::Mutex::new(initial_last_fix),
         inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
         db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        api_counter_corruption_denials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
         history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1092,15 +1093,20 @@ mod shutdown_drain_tests {
     #[tokio::test(start_paused = true)]
     async fn named_abort_enqueues_quota_refund_before_drain_returns() {
         let state = crate::server::test_state();
-        let lease = state
+        let reservation = state
             .db
             .reserve_api_call(
                 state.args.daily_limit,
                 std::sync::Arc::clone(&state.db_write_failures),
+                std::sync::Arc::clone(&state.api_counter_corruption_denials),
             )
             .await
-            .unwrap()
-            .expect("quota lease");
+            .unwrap();
+        let lease = match reservation {
+            crate::db::QuotaReservation::Reserved(lease) => lease,
+            crate::db::QuotaReservation::Exhausted
+            | crate::db::QuotaReservation::CounterCorrupt => panic!("quota lease"),
+        };
         assert_eq!(state.db.api_calls_today().await.unwrap(), 1);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let named = vec![tokio::spawn(async move {

@@ -211,12 +211,12 @@ pub async fn resolve_chain(
     //                      NotFound for this BSSID. This is the load-bearing
     //                      positive evidence that grants an end-of-chain mark.
     //
-    // A `Skipped` provider (creds unconfigured / daily quota exhausted) is a
-    // deterministic *abstention*: it is neither transient evidence that blocks
-    // a mark nor authoritative evidence that grants one, so it feeds neither
-    // set. An all-Skipped BSSID therefore has an empty authoritative_nf and is
-    // left pending — never marked. That is what stops credential-free mode
-    // from livelocking: before this, Skipped fed transient_error and
+    // A `Skipped` provider (creds unconfigured / daily quota exhausted or
+    // corrupt) is a deterministic *abstention*: it is neither transient
+    // evidence that blocks a mark nor authoritative evidence that grants one,
+    // so it feeds neither set. An all-Skipped BSSID therefore has an empty
+    // authoritative_nf and is left pending — never marked. That is what stops
+    // credential-free mode from livelocking: before this, Skipped fed transient_error and
     // permanently suppressed every mark, so an Apple-definitive NotFound with
     // WiGLE unconfigured was re-queried on every scan forever.
     //
@@ -354,8 +354,8 @@ pub async fn resolve_chain(
                 }
                 ProviderOutcome::Skipped => {
                     // task-0189: a Skipped provider is a deterministic
-                    // abstention (unconfigured creds / exhausted quota), not
-                    // transient evidence and not authoritative evidence. It
+                    // abstention (unconfigured creds / exhausted or corrupt
+                    // quota), not transient or authoritative evidence. It
                     // feeds neither set; it only drives the per-policy action.
                     match policy.on_skipped {
                         SkipAction::NextProvider => {}
@@ -588,6 +588,7 @@ mod tests {
             inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
             db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            api_counter_corruption_denials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             shutdown,

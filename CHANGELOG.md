@@ -42,6 +42,17 @@ and the project follows semver.
   permission expectations, exact data-retention lifecycles, and deployment-
   specific socket-pinned wipe commands.
 
+### Fixed — quota and clock-skew observability
+
+- Stats and the typed client now distinguish normal WiGLE quota exhaustion from
+  executed reservation attempts denied by a malformed persisted same-day API
+  counter. The additive v1 counter is cumulative since daemon start and resets
+  on restart; genuine reservation database failures now hard-stop that provider
+  pass instead of becoming a deterministic skip.
+- A persisted `last_fix` update rejected as older now warns after commit with
+  both escaped timestamps. The combined persistence path still records the
+  incoming history observation, and rolled-back operations emit no drop warning.
+
 ### Security / Changed — BREAKING: control channel is now a Unix domain socket
 
 The daemon's control channel moved from unauthenticated loopback TCP to a **Unix

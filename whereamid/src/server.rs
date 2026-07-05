@@ -158,6 +158,9 @@ pub struct DaemonState {
     /// sites). Surfaced via the stats endpoint (task-0076) so silent
     /// corruption is visible without scraping the journal.
     pub db_write_failures: Arc<std::sync::atomic::AtomicU64>,
+    /// Executed WiGLE reservation attempts denied since daemon start because
+    /// the same-day persisted API counter was malformed. Reset on restart.
+    pub api_counter_corruption_denials: Arc<std::sync::atomic::AtomicU64>,
     /// Shared admission cap for unix and TCP connections. A permit is acquired
     /// before accept, so no Tokio task is spawned merely to wait for capacity.
     pub connection_slots: Arc<tokio::sync::Semaphore>,
@@ -514,9 +517,9 @@ enum Provenance {
     /// task-0194: the daemon could not consult a provider for this BSSID this
     /// call, so absence is NOT established — the lookup was deferred to an
     /// in-flight resolution, the only provider was skipped (missing creds /
-    /// exhausted quota), or a transient failure occurred. Distinct from
-    /// NotFound so clients that cache not_found don't blacklist a BSSID that
-    /// is still resolvable; the client should retry later.
+    /// exhausted or corrupt quota), or a transient failure occurred. Distinct
+    /// from NotFound so clients that cache not_found don't blacklist a BSSID
+    /// that is still resolvable; the client should retry later.
     Unresolved,
 }
 
@@ -560,6 +563,9 @@ struct StatsResponse {
     not_found_aps: i64,
     db_size_bytes: i64,
     api_calls_today: u32,
+    /// Executed reservation attempts denied since daemon start because the
+    /// same-day persisted API counter was malformed. Reset on restart.
+    api_counter_corruption_denials: u64,
     /// Number of BSSIDs currently undergoing remote provider lookup
     /// (size of state.inflight). task-0074.
     inflight: usize,
@@ -1504,9 +1510,9 @@ async fn handle_resolve(
                     // established *authoritative* absence for this call (a provider
                     // said NotFound, or the not_found table did within TTL).
                     // Everything else — deferred to an in-flight resolution, a
-                    // provider skipped for missing creds / exhausted quota, or a
-                    // transient failure — is `unresolved`: absence is NOT
-                    // established, so a client must retry rather than blacklist it.
+                    // provider skipped for missing creds / exhausted or corrupt
+                    // quota, or a transient failure — is `unresolved`: absence
+                    // is NOT established, so a client must retry rather than blacklist it.
                     let provenance = if result.not_found.contains(bssid) {
                         Provenance::NotFound
                     } else {
@@ -2092,6 +2098,9 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
     let db_write_failures = state
         .db_write_failures
         .load(std::sync::atomic::Ordering::Relaxed);
+    let api_counter_corruption_denials = state
+        .api_counter_corruption_denials
+        .load(std::sync::atomic::Ordering::Relaxed);
     let orphan_tasks_aborted = state
         .orphan_tasks_aborted
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -2104,6 +2113,7 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
         not_found_aps: stats.not_found_aps,
         db_size_bytes: stats.db_size_bytes,
         api_calls_today: stats.api_calls_today,
+        api_counter_corruption_denials,
         inflight,
         db_write_failures,
         orphan_tasks_aborted,
@@ -2156,6 +2166,7 @@ fn test_state_with_db(
         inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
         address_cache: std::sync::Mutex::new(AddressCache::new()),
         db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        api_counter_corruption_denials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
         history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -2165,6 +2176,48 @@ fn test_state_with_db(
         orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
         args,
     })
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn protocol_documents_api_counter_corruption_denial_semantics() {
+        let protocol = include_str!("../../docs/protocol.md");
+        for marker in [
+            "\"api_counter_corruption_denials\": 0",
+            "cumulative executed WiGLE reservation",
+            "distinct from normal quota",
+            "resets on restart",
+            "api_calls_today` can render its fallback `0`",
+            "does not change protocol version `v: 1`",
+        ] {
+            assert!(
+                protocol.contains(marker),
+                "protocol is missing semantic marker {marker:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stats_wire_reports_corruption_denials_while_counter_falls_back_to_zero() {
+        let state = test_state();
+        {
+            let db = lock_db(&state);
+            db.set_metadata("api_calls_today", "malformed").unwrap();
+        }
+        state
+            .api_counter_corruption_denials
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+
+        let response: serde_json::Value =
+            serde_json::from_str(&handle_stats(&state).await).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["v"], 1);
+        assert_eq!(response["api_calls_today"], 0);
+        assert_eq!(response["api_counter_corruption_denials"], 3);
+    }
 }
 
 #[cfg(test)]

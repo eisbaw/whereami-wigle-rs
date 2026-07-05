@@ -189,8 +189,9 @@ Presence rules:
   this call, so absence is **not** established. Causes: the lookup was deferred
   to an in-flight background resolution of the same BSSID; the only provider
   was skipped because WiGLE credentials are unconfigured or the daily quota is
-  exhausted; or a transient network / rate-limit failure. Retry later — do
-  **not** cache this as absent.
+  exhausted; the persisted same-day WiGLE quota counter is malformed; or a
+  transient network / rate-limit failure. Retry later — do **not** cache this as
+  absent.
 
 (This is distinct from the `aps.source` column in the SQLite cache, which
 records *which provider* originally supplied the position: `apple`, `wigle`,
@@ -209,6 +210,7 @@ Maximum **256 BSSIDs** per `resolve` request.
     "not_found_aps": 3,
     "db_size_bytes": 49152,
     "api_calls_today": 5,
+    "api_counter_corruption_denials": 0,
     "inflight": 0,
     "db_write_failures": 0,
     "orphan_tasks_aborted": 0
@@ -216,6 +218,12 @@ Maximum **256 BSSIDs** per `resolve` request.
 ```
 
 - `inflight` — provider lookups currently in-flight (the dedup set).
+- `api_counter_corruption_denials` — cumulative executed WiGLE reservation
+  attempts denied since daemon start because the same-day persisted
+  `api_calls_today` value was malformed. This is distinct from normal quota
+  exhaustion and resets on restart. When the counter row is corrupt,
+  `api_calls_today` can render its fallback `0` while this denial count is
+  non-zero. This additive field does not change protocol version `v: 1`.
 - `db_write_failures` — cumulative best-effort DB write failures since
   daemon start. Non-zero values indicate silent corruption is being logged
   but not fatal.

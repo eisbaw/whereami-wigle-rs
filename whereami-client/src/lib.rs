@@ -207,8 +207,8 @@ pub enum Provenance {
     NotFound,
     /// task-0194: the daemon could not consult a provider for this BSSID this
     /// call (deferred to an in-flight resolution, provider skipped for missing
-    /// creds / exhausted quota, or a transient failure), so absence is NOT
-    /// established. Retry later rather than caching it as absent.
+    /// creds / exhausted or corrupt quota, or a transient failure), so absence
+    /// is NOT established. Retry later rather than caching it as absent.
     Unresolved,
     /// A value the daemon emitted that this client version does not
     /// recognise. Forward-compat escape hatch (`#[serde(other)]`).
@@ -415,6 +415,11 @@ pub struct StatsResponse {
     pub db_size_bytes: i64,
     #[serde(default)]
     pub api_calls_today: u32,
+    /// Executed WiGLE reservations denied since daemon start because the
+    /// same-day persisted API counter was malformed. Distinct from normal
+    /// quota exhaustion and defaults to 0 for older daemons.
+    #[serde(default)]
+    pub api_counter_corruption_denials: u64,
     /// In-flight provider lookups currently coalescing concurrent requests.
     /// task-0074. Defaults to 0 for older daemons that don't emit it.
     #[serde(default)]
@@ -723,7 +728,7 @@ mod stats_wire_tests {
 
     #[test]
     fn current_daemon_stats_shape_deserializes_every_typed_field() {
-        let json = r#"{"ok":true,"v":1,"cached_aps":41,"pending_aps":2,"not_found_aps":3,"db_size_bytes":49152,"api_calls_today":4,"inflight":5,"db_write_failures":6,"orphan_tasks_aborted":7}"#;
+        let json = r#"{"ok":true,"v":1,"cached_aps":41,"pending_aps":2,"not_found_aps":3,"db_size_bytes":49152,"api_calls_today":4,"api_counter_corruption_denials":8,"inflight":5,"db_write_failures":6,"orphan_tasks_aborted":7}"#;
         let stats: StatsResponse = WhereAmIClient::parse_response_line(json).unwrap();
 
         assert!(stats.ok);
@@ -733,6 +738,7 @@ mod stats_wire_tests {
         assert_eq!(stats.not_found_aps, 3);
         assert_eq!(stats.db_size_bytes, 49_152);
         assert_eq!(stats.api_calls_today, 4);
+        assert_eq!(stats.api_counter_corruption_denials, 8);
         assert_eq!(stats.inflight, 5);
         assert_eq!(stats.db_write_failures, 6);
         assert_eq!(stats.orphan_tasks_aborted, 7);
@@ -751,6 +757,7 @@ mod stats_wire_tests {
         assert_eq!(stats.not_found_aps, 103);
         assert_eq!(stats.db_size_bytes, 104);
         assert_eq!(stats.api_calls_today, 105);
+        assert_eq!(stats.api_counter_corruption_denials, 0);
         assert_eq!(stats.inflight, 106);
         assert_eq!(stats.db_write_failures, 107);
         assert_eq!(stats.orphan_tasks_aborted, 0);
