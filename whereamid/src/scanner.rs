@@ -311,7 +311,8 @@ pub fn normalize_bssid(bssid: &str) -> String {
 ///
 /// Covers 2.4 GHz (channels 1-14), 5 GHz (channels ~36-177), and Wi-Fi 6E /
 /// 6 GHz (channels 1-233 starting at 5955 MHz). Per IEEE 802.11ax/be the 6 GHz
-/// channels use formula `(freq - 5950) / 5` over `5955..=7115` MHz.
+/// channels use formula `(freq - 5950) / 5` over `5955..=7115` MHz, except for
+/// channel 2 at 5935 MHz, which is the single special case.
 fn freq_to_channel(freq: i32) -> Option<i32> {
     match freq {
         2412 => Some(1),
@@ -330,9 +331,11 @@ fn freq_to_channel(freq: i32) -> Option<i32> {
         2484 => Some(14),
         // 6 GHz (Wi-Fi 6E / 7) — checked BEFORE the 5 GHz formula so that
         // any future widening of the 5 GHz range cannot silently shadow it.
+        5935 => Some(2),
         f if (5955..=7115).contains(&f) => Some((f - 5950) / 5),
         // 5 GHz: channel = (freq - 5000) / 5. Range 5180-5885 covers UNII-1/2/3.
-        // The gap 5895-5945 (UNII-4 / DSRC) intentionally stays None.
+        // The gap 5895-5945 (UNII-4 / DSRC) stays None except for 5935 MHz
+        // above, the isolated 6 GHz channel-2 special case.
         f if (5180..=5885).contains(&f) => Some((f - 5000) / 5),
         _ => None,
     }
@@ -484,7 +487,11 @@ BSS 11:22:33:44:55:66(on wlan0)
             (5886, None, "immediately above 5 GHz"),
             (5890, None, "above 5 GHz"),
             (5905, None, "UNII-4 gap"),
-            // 6 GHz / Wi-Fi 6E.
+            // 6 GHz / Wi-Fi 6E. Channel 2 at 5935 MHz is isolated from the
+            // formula-based range that starts with channel 1 at 5955 MHz.
+            (5934, None, "immediately below special-case channel 2"),
+            (5935, Some(2), "special-case 6 GHz channel 2"),
+            (5936, None, "immediately above special-case channel 2"),
             (5950, None, "below 6 GHz"),
             (5954, None, "immediately below 6 GHz"),
             (5955, Some(1), "first 6 GHz channel"),
