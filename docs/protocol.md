@@ -15,9 +15,15 @@ localhost has no peer authentication.
 
 - One-shot connection: connect, send one JSON object as a UTF-8 line terminated
   by `\n`, read one JSON response as a UTF-8 line, close.
-- Maximum request size: **64 KiB**. Larger payloads are rejected with
-  `invalid request: EOF while parsing a value`.
-- Read timeout: **5 s** (server gives up if the request line doesn't arrive).
+- Request read cap: **64 KiB**. The line reader gives `serde_json` at most the
+  first 65,536 bytes; this is not a separate physical-payload length check. If
+  the JSON or terminating newline crosses the cap, the daemon parses the capped
+  prefix, which normally produces `invalid request: <parser detail>`. The exact
+  detail and line/column are input- and parser-version-dependent. Clients must
+  keep the complete request line within the cap.
+- Read timeout: **5 s**. If a complete request line has not arrived, the server
+  writes exactly `{"ok":false,"v":1,"error":"read timeout"}\n` and closes the
+  connection.
 - Write timeout: **5 s** (server gives up if the client reads slowly).
 - Active connection cap: **32** by default, configurable with
   `--max-connections` in the range **1–4096**. Unix and optional TCP connections
@@ -114,14 +120,22 @@ Every response includes:
     "ok": true, "v": 1,
     "lat": 55.707250, "lon": 12.585598, "accuracy_m": 11.95,
     "sources": 6, "cached": 6, "fetched": 0, "pending": 0,
-    "visible": 12, "stable": 11,
-    "address": "Magstræde 5, …",     // present iff --address-approx
-    "stale": false                    // true when returning the previous
-                                      //   known fix because no current
-                                      //   trilateration was possible
-                                      // "age_s": <secs> (only when stale)
+    "visible": 12, "stable": 11
 }
 ```
+
+The three conditional fields use omission, not `null` or a false sentinel:
+
+- `address` is omitted when unavailable. `--address-approx` enables rounded-cell
+  cache lookup and background geocoding, but does not guarantee this field: a
+  cache miss schedules work for later and the current response still omits it.
+  A stale fix includes `address` whenever that saved fix has one, regardless of
+  the daemon's current `--address-approx` setting.
+- `stale` is present with value `true` only when current trilateration failed and
+  the daemon returned its previous fix. It is omitted from a fresh fix; the
+  daemon never emits `"stale": false`.
+- `age_s` is present only with a stale fix and is its non-negative age in
+  seconds. It is omitted from a fresh fix.
 
 ### `scan` — currently visible Wi-Fi networks
 
@@ -136,6 +150,14 @@ Every response includes:
     "scanned_at": "2026-05-10T09:04:38+00:00"
 }
 ```
+
+Presence rules:
+
+- Each network always contains `ssid` and `channel`; either value is `null` when
+  the scanner did not supply it.
+- `scan_age_ms` is always present and is `null` before the first completed scan.
+- `scanned_at` is omitted before the first completed scan; afterward it is an
+  RFC3339 string.
 
 ### `resolve` — look up specific BSSIDs (cache-only + WiGLE fallback)
 
@@ -220,7 +242,8 @@ Maximum **256 BSSIDs** per `resolve` request.
 ```
 
 - `signal_dbm` is `null` when the BSSID is debounce-stable but absent
-  from the most recent scan.
+  from the most recent scan; the key itself is not omitted.
+- `scan_age_ms` is always present and is `null` before the first completed scan.
 - `db_status` ∈ `{cached, pending, not_found, new}`.
 
 ### `version` — daemon version + git revision
@@ -277,16 +300,102 @@ and response. The concurrency cap is not an absolute history-row or memory cap.
 
 Common errors:
 
-- `unknown command: <cmd>` — the request used a `cmd` value not in the
-  list above.
-- `invalid request: …` — JSON parsing failed (malformed body, exceeded
-  64 KiB limit, etc.).
+- Unknown and missing commands are `invalid request` parser errors; there is no
+  separate `unknown command: …` error. For the exact compact request
+  `{"cmd":"bogus"}`, the current daemon emits this exact response line (plus
+  its framing newline):
+
+  ```json
+  {"ok":false,"v":1,"error":"invalid request: unknown variant `bogus`, expected one of `locate`, `resolve`, `scan`, `stats`, `debug`, `version`, `history` at line 1 column 14"}
+  ```
+
+  For `{"range":"7d"}` (no `cmd`), it emits:
+
+  ```json
+  {"ok":false,"v":1,"error":"invalid request: missing field `cmd` at line 1 column 14"}
+  ```
+
+  These details come from the current `serde_json` parser. The accepted-variant
+  list changes when commands are added, and line/column values depend on the
+  exact input.
+- `invalid request: <parser detail>` — other JSON/deserialization failures,
+  including malformed or truncated request bodies. The prefix is stable; parser
+  detail and its line/column suffix depend on the input and parser version.
+- `read timeout` — a complete request line did not arrive within 5 seconds. The
+  exact response is `{"ok":false,"v":1,"error":"read timeout"}`.
 - `resolve requires non-empty bssids array`
 - `resolve accepts at most 256 BSSIDs per request (got N)`
 - `history: 'range' and 'from'/'to' are mutually exclusive`
-- `history: invalid range: …` (parse failure)
+- `history: invalid range: <parser detail>`
+- `history: invalid 'from' timestamp: <parser detail>`
+- `history: invalid 'to' timestamp: <parser detail>`
 - `history: 'from' must be before 'to'`
+- `history: provide either 'range' or both 'from' and 'to'`
 - `history: busy; retry later` — another history query/response is in flight
+- `history: cancelled` — shutdown cancelled admitted history work
+- `history: processing failed` — the blocking history worker failed
+- `history: db error: <detail>` — the history database query failed
+
+The six constant history strings (mutual exclusion, ordering, missing pair,
+busy, cancelled, and processing failed) are exact. The four dynamic forms are
+the three `invalid` prefixes and `history: db error:`; their suffixes come from
+the range parser, Chrono's RFC3339 parser, or the database stack and can vary
+with the failing value and dependency version.
+
+Concrete current parser examples:
+
+- `{"cmd":"history","range":"bogus"}` produces
+  `history: invalid range: invalid range 'bogus': expected '<number><unit>' (e.g. '7d')`.
+- `{"cmd":"history","from":"not-a-time","to":"2026-07-05T01:00:00Z"}`
+  produces `history: invalid 'from' timestamp: premature end of input`.
+- `{"cmd":"history","from":"2026-07-05T00:00:00Z","to":"not-a-time"}`
+  produces `history: invalid 'to' timestamp: premature end of input`.
+
+Those complete strings are exact for the current inputs and dependency
+versions, not stable parser codes; in particular, the parser-generated suffixes
+may change after a dependency update.
+
+All `error` values are human-readable diagnostics, not machine-stable error
+codes. The exact strings and prefixes above describe and regression-test the
+current daemon; clients should branch on `ok`, not parse error prose.
+
+## Official CLI `--json` behavior
+
+The client transport removes the framing newline and trims surrounding
+whitespace from the daemon response. For any syntactically valid JSON body that
+remains, `whereami --json …` writes that body byte-for-byte and adds one output
+newline. It does not deserialize and re-serialize the command-specific response,
+so unknown fields and the distinction between omitted fields and `null` survive.
+The exit status is 0 if and only if the top-level `ok` field is the JSON boolean
+`true`; every other value, a missing `ok`, or `ok: false` exits 1.
+
+This deliberately creates an asymmetry with human output. JSON mode checks only
+that the body is valid JSON and that `ok` is boolean `true`; it does not validate
+`v` or the command-specific schema. An otherwise schema-invalid response with
+`ok: true` can therefore pass through and exit 0. Human mode uses the typed
+response for that command and can reject the same line during deserialization.
+
+If no daemon line is available because transport failed, or if the daemon line
+is not valid JSON, the CLI emits its own valid JSON error object and exits 1:
+
+```json
+{"error":"description","ok":false}
+```
+
+This CLI-only envelope intentionally has no protocol `v` field and is not a
+daemon response. JSON object key order is not a contract. Clap parse errors
+(such as an unknown flag) occur before target resolution: even under `--json`,
+they write to stderr, leave stdout empty, and exit 1. The history `--from`/`--to`
+pair check occurs after target resolution. With a resolved target it likewise
+writes to stderr with empty stdout and exits 1, but if no target can be resolved,
+the earlier target-resolution failure instead produces the synthesized JSON
+envelope on stdout and exits 1. This precedence is tracked for a future decision
+in TASK-0228.
+
+The 0/1 rules above apply when I/O completes. On Unix, an early-closed stdout
+pipe (or a daemon connection that closes during a request write) can instead
+terminate the CLI via `SIGPIPE`; shells conventionally report status **141**
+(`128 + SIGPIPE(13)`).
 
 ## Minimal client examples
 

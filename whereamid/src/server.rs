@@ -2113,6 +2113,12 @@ mod dispatch_tests {
         assert_eq!(json["ok"], true, "locate failed: {response}");
         assert_eq!(json["cached"], 10);
         assert_eq!(json["sources"], 10);
+        for field in ["address", "stale", "age_s"] {
+            assert!(
+                json.get(field).is_none(),
+                "fresh locate must omit {field:?} on the production wire path: {response}"
+            );
+        }
 
         state.db.writer_barrier().await.unwrap();
         assert_eq!(
@@ -2130,6 +2136,68 @@ mod dispatch_tests {
             .await
             .unwrap();
         assert_eq!(history.len(), 1, "locate must append one history row");
+    }
+
+    #[tokio::test]
+    async fn scan_and_debug_option_fields_pin_null_vs_omitted_wire_shape() {
+        let state = test_state();
+
+        let empty_scan = dispatch_command(&Request::Scan, &state).await;
+        let empty_scan: serde_json::Value = serde_json::from_str(&empty_scan).unwrap();
+        assert_eq!(
+            empty_scan.get("scan_age_ms"),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(
+            empty_scan.get("scanned_at").is_none(),
+            "scanned_at is omitted until a scan exists: {empty_scan}"
+        );
+
+        let empty_debug = dispatch_command(&Request::Debug, &state).await;
+        let empty_debug: serde_json::Value = serde_json::from_str(&empty_debug).unwrap();
+        assert_eq!(
+            empty_debug.get("scan_age_ms"),
+            Some(&serde_json::Value::Null)
+        );
+
+        let bssid = "02:00:00:00:20:01";
+        let mut sample = crate::debounce::ScanSample::new();
+        sample.insert(
+            bssid.to_string(),
+            crate::debounce::ScanEntry {
+                signal_dbm: -52,
+                ssid: None,
+                channel: None,
+            },
+        );
+        {
+            let mut debouncer = state.debouncer.lock().await;
+            for _ in 0..state.args.debounce_threshold {
+                debouncer.push_scan(sample.clone());
+            }
+            // Keep the BSSID stable in the ring while making it absent from the
+            // latest scan, which is the production source of signal_dbm:null.
+            debouncer.push_scan(crate::debounce::ScanSample::new());
+        }
+
+        let missing_signal = dispatch_command(&Request::Debug, &state).await;
+        let missing_signal: serde_json::Value = serde_json::from_str(&missing_signal).unwrap();
+        let row = missing_signal["bssids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["bssid"] == bssid)
+            .expect("stable BSSID must remain in debug output");
+        assert_eq!(row.get("signal_dbm"), Some(&serde_json::Value::Null));
+
+        state.debouncer.lock().await.push_scan(sample);
+        let populated_scan = dispatch_command(&Request::Scan, &state).await;
+        let populated_scan: serde_json::Value = serde_json::from_str(&populated_scan).unwrap();
+        let network = &populated_scan["networks"][0];
+        assert_eq!(network.get("ssid"), Some(&serde_json::Value::Null));
+        assert_eq!(network.get("channel"), Some(&serde_json::Value::Null));
+        assert!(populated_scan["scan_age_ms"].is_u64());
+        assert!(populated_scan["scanned_at"].is_string());
     }
 
     /// task-0184: a history request whose range overflows chrono must return
@@ -2796,6 +2864,37 @@ mod transport_tests {
 
     fn mode_bits(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Exercise the real one-shot connection handler without binding a host
+    /// socket. The returned string includes the protocol framing newline.
+    async fn duplex_round_trip(request: &str) -> String {
+        let (client, server) = tokio::io::duplex(4096);
+        let handler = tokio::spawn(handle_connection(server, test_state()));
+        let (mut reader, mut writer) = tokio::io::split(client);
+        writer.write_all(request.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut response = String::new();
+        reader.read_to_string(&mut response).await.unwrap();
+        handler.await.unwrap().unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn invalid_request_wire_errors_pin_unknown_and_missing_command_details() {
+        let unknown = duplex_round_trip(r#"{"cmd":"bogus"}"#).await;
+        assert_eq!(
+            unknown,
+            "{\"ok\":false,\"v\":1,\"error\":\"invalid request: unknown variant `bogus`, expected one of `locate`, `resolve`, `scan`, `stats`, `debug`, `version`, `history` at line 1 column 14\"}\n"
+        );
+
+        let missing = duplex_round_trip(r#"{"range":"7d"}"#).await;
+        assert_eq!(
+            missing,
+            "{\"ok\":false,\"v\":1,\"error\":\"invalid request: missing field `cmd` at line 1 column 14\"}\n"
+        );
     }
 
     #[test]
