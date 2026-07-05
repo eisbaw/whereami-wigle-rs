@@ -7,6 +7,8 @@
 wigle-wifi-wardriving/
 apple_bssid_locator/
 geowifi/
+# Policy: the detached cargo-fuzz workspace regenerates Cargo.lock; keep it untracked.
+whereamid/fuzz/Cargo.lock
 whereamid/fuzz/target/
 whereamid/fuzz/corpus/
 whereamid/fuzz/artifacts/
