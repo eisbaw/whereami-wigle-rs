@@ -2780,8 +2780,10 @@ mod transport_tests {
     use std::path::PathBuf;
 
     fn unique_tempdir(tag: &str) -> PathBuf {
+        // Filesystem Unix sockets have a short fixed path limit. Keep the test
+        // component compact even when nix-shell supplies a longer TMPDIR.
         let dir = std::env::temp_dir().join(format!(
-            "whereamid-xport-{tag}-{}-{}",
+            "wx-{tag}-{}-{:x}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

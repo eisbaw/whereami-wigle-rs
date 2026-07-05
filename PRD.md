@@ -436,11 +436,19 @@ whereami/
 
 ## NixOS Deployment
 
-The project includes a `shell.nix` for development and a NixOS module for deployment.
+The project includes a flake development shell, a `shell.nix` compatibility
+entry point, and a NixOS module for deployment.
 
 ### Development shell (`shell.nix`)
 
-Provides: `rustc`, `cargo`, `pkg-config`, `openssl`, `sqlite`, `iw`. No flake — plain `shell.nix` to keep it simple.
+`shell.nix` selects the local flake's `devShells.<system>.default` rather than
+duplicating the environment. Both `nix-shell` and `nix develop` therefore
+provide the same nightly Rust toolchain, `cargo-fuzz`, `just`, `pkg-config`,
+`openssl`, `sqlite`, `iw`, and NetworkManager tools.
+
+This development workflow requires a Git checkout and flakes-enabled Nix.
+The `shell.nix` `git+file`/`getFlake` compatibility path intentionally does
+not support source tarballs, Nix store paths, or older flakes-disabled Nix.
 
 ### NixOS module
 

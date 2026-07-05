@@ -21,7 +21,7 @@ Apple WPS on demand without an API key, and the cache lives on your disk.
 ## Quick start
 
 ```bash
-nix develop                                   # or: nix-shell
+nix-shell                                     # or: nix develop (same dev shell)
 just build                                    # cargo build via Justfile
 cargo run --bin whereamid -- --interface $(ip -o link | awk -F': ' '/state UP/ && /wl/ {print $2; exit}')
 # in another terminal:
@@ -142,19 +142,27 @@ locate` answers immediately while the next scan-and-resolve cycle runs.
 ## Development
 
 ```bash
+nix-shell            # or: nix develop; both select the flake's default dev shell
 just build           # cargo build
 just test            # cargo test --workspace
 just lint            # cargo clippy --all-targets -- -D warnings
 just fmt             # cargo fmt --check
-just e2e             # test + lint (pre-commit gate)
+just e2e             # shell.nix evaluation + test + lint (pre-commit gate)
 just qa              # e2e + fmt + 15s fuzz on every target
 just fuzz            # quick smoke (15s/target)
 just fuzz-all        # long smoke (60s/target)
 just fuzz-apple-encode   # focused: Apple WPS encoder fuzz
 ```
 
-The dev shell exposes `just`, the nightly Rust toolchain, `cargo-fuzz`, and
-all native deps. `RUST_LOG=whereamid=debug` enables verbose logging.
+`shell.nix` is a compatibility entry point for tools that expect `nix-shell`;
+it selects the same flake `devShells.<system>.default` used by `nix develop`,
+so the dependency list has one source of truth. The dev shell exposes `just`,
+the nightly Rust toolchain, `cargo-fuzz`, and all native deps.
+`RUST_LOG=whereamid=debug` enables verbose logging.
+
+The documented development workflow requires a Git checkout and a
+flakes-enabled Nix for both entry points. The `git+file`/`getFlake` shim does
+not support source tarballs, Nix store paths, or older flakes-disabled Nix.
 
 ### Formal verification (Kani)
 

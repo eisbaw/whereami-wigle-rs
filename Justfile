@@ -1,6 +1,6 @@
 # Justfile for whereami project.
-# Recipes assume you are inside the dev shell:  nix develop
-# (or run a single recipe with:  nix develop -c just <recipe>)
+# Recipes assume you are inside the dev shell: nix-shell or nix develop.
+# For one recipe: nix-shell --run 'just <recipe>' or nix develop -c just <recipe>.
 
 # Build the workspace
 build:
@@ -30,8 +30,9 @@ fmt-fix:
 clean:
     cargo clean
 
-# Pre-commit gate: tests + strict clippy
+# Pre-commit gate: shell.nix evaluation, tests, and strict clippy
 e2e:
+    nix-instantiate shell.nix >/dev/null
     cargo test
     cargo clippy --all-targets -- -D warnings
 
