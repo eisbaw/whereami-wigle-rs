@@ -544,3 +544,19 @@ in existing string fields such as `source`) keep `v=1`. Clients should treat
 an unrecognised `source` value like `unresolved` (absence not established, so
 retry) rather than erroring. The `source: "unresolved"` value was added this
 way (task-0194).
+
+A typed client must read the required integer `v` before interpreting
+command-specific fields, especially fields whose decoder supplies defaults
+when they are absent. If `v` is greater than the highest version the client
+understands, it must reject the response instead of rendering a partially
+decoded result. The error should identify the daemon endpoint, the received
+and supported versions, and tell the operator to upgrade the client or choose
+a compatible daemon. Missing or malformed `v` remains a schema error.
+
+The official typed Rust client and human-readable CLI apply that check. They
+accept `v=1` additive fields and map unknown values of extensible enums to an
+unknown variant. The official CLI's daemon-backed `--json` mode is the
+intentional exception: as documented above, it validates only JSON syntax and
+the top-level `ok` boolean, then passes the raw response through unchanged.
+Consequently, an `ok: true, v: 2` response is rejected in human mode but is
+preserved byte-for-byte and exits 0 in `--json` mode.

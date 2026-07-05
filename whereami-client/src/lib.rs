@@ -23,6 +23,16 @@ pub enum ConnectTarget {
     Tcp(String),
 }
 
+impl ConnectTarget {
+    /// Human-readable endpoint description for transport and protocol errors.
+    fn description(&self) -> String {
+        match self {
+            Self::Unix(path) => format!("unix socket {}", path.display()),
+            Self::Tcp(addr) => format!("TCP endpoint {addr}"),
+        }
+    }
+}
+
 /// Environment override naming an explicit unix socket path (highest priority).
 const ENV_SOCKET: &str = "WHEREAMI_SOCKET";
 /// Environment override naming a TCP `host:port` (old TCP daemons / custom
@@ -148,6 +158,22 @@ impl Transport for UnixStream {
 pub trait DaemonResponse {
     fn is_ok(&self) -> bool;
     fn error(&self) -> Option<&str>;
+}
+
+/// Highest daemon protocol version understood by this typed client.
+const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+
+/// Required prefix shared by every daemon response. Decode this before a
+/// command-specific response so a newer protocol cannot be mistaken for a
+/// valid response whose defaultable fields happen to be absent.
+#[derive(Deserialize)]
+struct ResponseVersion {
+    v: u32,
+}
+
+/// Private typed-response contract used by the common version gate.
+trait ProtocolResponse {
+    fn protocol_version(&self) -> u32;
 }
 
 // --- Request types ---
@@ -621,16 +647,34 @@ impl WhereAmIClient {
     /// the `--json` passthrough on a single source of truth for both the
     /// request bytes and the transport (task-0183): they can no longer
     /// drift because there is exactly one place each request is built.
-    fn parse_response_line<T: for<'de> Deserialize<'de>>(line: &str) -> Result<T> {
+    fn parse_response_line<T>(&self, line: &str) -> Result<T>
+    where
+        T: for<'de> Deserialize<'de> + ProtocolResponse,
+    {
         if line.is_empty() {
             bail!("empty response from daemon");
         }
-        serde_json::from_str(line).context("parsing response JSON")
+        let version: ResponseVersion =
+            serde_json::from_str(line).context("parsing response JSON")?;
+        if version.v > SUPPORTED_PROTOCOL_VERSION {
+            bail!(
+                "whereamid at {} uses unsupported protocol v{}; this client supports through v{}; \
+                 upgrade the whereami client or connect to a daemon using supported protocol v{}",
+                self.target.description(),
+                version.v,
+                SUPPORTED_PROTOCOL_VERSION,
+                SUPPORTED_PROTOCOL_VERSION,
+            );
+        }
+
+        let response: T = serde_json::from_str(line).context("parsing response JSON")?;
+        debug_assert_eq!(response.protocol_version(), version.v);
+        Ok(response)
     }
 
     /// Ask "where am I?" based on current stable APs.
     pub fn locate(&self) -> Result<LocateResponse> {
-        Self::parse_response_line(&self.locate_raw()?)
+        self.parse_response_line(&self.locate_raw()?)
     }
 
     /// Raw `locate`: daemon JSON response body after transport framing and
@@ -641,7 +685,7 @@ impl WhereAmIClient {
 
     /// Look up specific BSSIDs (ephemeral, does not write to cache).
     pub fn resolve(&self, bssids: Vec<String>) -> Result<ResolveResponse> {
-        Self::parse_response_line(&self.resolve_raw(bssids)?)
+        self.parse_response_line(&self.resolve_raw(bssids)?)
     }
 
     /// Raw `resolve`: daemon JSON response body after transport framing and
@@ -655,7 +699,7 @@ impl WhereAmIClient {
 
     /// Get current visible Wi-Fi networks.
     pub fn scan(&self) -> Result<ScanResponse> {
-        Self::parse_response_line(&self.scan_raw()?)
+        self.parse_response_line(&self.scan_raw()?)
     }
 
     /// Raw `scan`: daemon JSON response body after transport framing and
@@ -666,7 +710,7 @@ impl WhereAmIClient {
 
     /// Get cache and API statistics.
     pub fn stats(&self) -> Result<StatsResponse> {
-        Self::parse_response_line(&self.stats_raw()?)
+        self.parse_response_line(&self.stats_raw()?)
     }
 
     /// Raw `stats`: daemon JSON response body after transport framing and
@@ -678,7 +722,7 @@ impl WhereAmIClient {
     /// Get the daemon's debug snapshot: scan buffer state, per-BSSID
     /// debounce counters, DB classification.
     pub fn debug(&self) -> Result<DebugResponse> {
-        Self::parse_response_line(&self.debug_raw()?)
+        self.parse_response_line(&self.debug_raw()?)
     }
 
     /// Raw `debug`: daemon JSON response body after transport framing and
@@ -689,7 +733,7 @@ impl WhereAmIClient {
 
     /// Get the daemon's version string and git revision.
     pub fn version(&self) -> Result<VersionResponse> {
-        Self::parse_response_line(&self.version_raw()?)
+        self.parse_response_line(&self.version_raw()?)
     }
 
     /// Raw `version`: daemon JSON response body after transport framing and
@@ -706,7 +750,7 @@ impl WhereAmIClient {
         from: Option<String>,
         to: Option<String>,
     ) -> Result<HistoryResponse> {
-        Self::parse_response_line(&self.history_raw(range, from, to)?)
+        self.parse_response_line(&self.history_raw(range, from, to)?)
     }
 
     /// Raw `history`: daemon JSON response body after transport framing and
@@ -728,7 +772,7 @@ impl WhereAmIClient {
     /// Delete the daemon's persisted and managed in-memory location/AP state.
     /// The explicit enum makes destructive intent visible at every call site.
     pub fn wipe(&self, confirmation: WipeConfirmation) -> Result<WipeResponse> {
-        Self::parse_response_line(&self.wipe_raw(confirmation)?)
+        self.parse_response_line(&self.wipe_raw(confirmation)?)
     }
 
     /// Raw confirmed `wipe`; feeds the CLI's byte-preserving `--json` mode.
@@ -952,6 +996,12 @@ macro_rules! impl_daemon_response {
                 self.error.as_deref()
             }
         }
+
+        impl ProtocolResponse for $t {
+            fn protocol_version(&self) -> u32 {
+                self.v
+            }
+        }
     };
 }
 impl_daemon_response!(LocateResponse);
@@ -966,6 +1016,10 @@ impl_daemon_response!(WipeResponse);
 #[cfg(test)]
 mod wipe_wire_tests {
     use super::*;
+
+    fn client() -> WhereAmIClient {
+        WhereAmIClient::unix("/test/whereamid.sock")
+    }
 
     #[test]
     fn confirmed_wipe_request_is_exact() {
@@ -983,7 +1037,7 @@ mod wipe_wire_tests {
 
     #[test]
     fn wipe_success_and_error_shapes_parse_typed() {
-        let success: WipeResponse = WhereAmIClient::parse_response_line(
+        let success: WipeResponse = client().parse_response_line(
             r#"{"ok":true,"v":1,"aps_deleted":5,"pending_deleted":4,"not_found_deleted":3,"fixes_deleted":2,"last_fix_deleted":1}"#,
         )
         .unwrap();
@@ -991,9 +1045,9 @@ mod wipe_wire_tests {
         assert_eq!(success.aps_deleted, 5);
         assert_eq!(success.last_fix_deleted, 1);
 
-        let error: WipeResponse =
-            WhereAmIClient::parse_response_line(r#"{"ok":false,"v":1,"error":"wipe refused"}"#)
-                .unwrap();
+        let error: WipeResponse = client()
+            .parse_response_line(r#"{"ok":false,"v":1,"error":"wipe refused"}"#)
+            .unwrap();
         assert!(!error.ok);
         assert_eq!(error.error.as_deref(), Some("wipe refused"));
         assert_eq!(error.fixes_deleted, 0);
@@ -1006,10 +1060,14 @@ mod stats_wire_tests {
     //! daemon success shape while remaining compatible with older daemons.
     use super::*;
 
+    fn client() -> WhereAmIClient {
+        WhereAmIClient::unix("/test/whereamid.sock")
+    }
+
     #[test]
     fn current_daemon_stats_shape_deserializes_every_typed_field() {
         let json = r#"{"ok":true,"v":1,"cached_aps":41,"pending_aps":2,"not_found_aps":3,"db_size_bytes":49152,"api_calls_today":4,"api_counter_corruption_denials":8,"inflight":5,"db_write_failures":6,"orphan_tasks_aborted":7}"#;
-        let stats: StatsResponse = WhereAmIClient::parse_response_line(json).unwrap();
+        let stats: StatsResponse = client().parse_response_line(json).unwrap();
 
         assert!(stats.ok);
         assert_eq!(stats.v, 1);
@@ -1028,7 +1086,7 @@ mod stats_wire_tests {
     #[test]
     fn legacy_stats_shape_defaults_missing_last_shutdown_aborts_to_zero() {
         let json = r#"{"ok":true,"v":1,"cached_aps":101,"pending_aps":102,"not_found_aps":103,"db_size_bytes":104,"api_calls_today":105,"inflight":106,"db_write_failures":107}"#;
-        let stats: StatsResponse = WhereAmIClient::parse_response_line(json).unwrap();
+        let stats: StatsResponse = client().parse_response_line(json).unwrap();
 
         assert!(stats.ok);
         assert_eq!(stats.v, 1);
@@ -1042,6 +1100,68 @@ mod stats_wire_tests {
         assert_eq!(stats.db_write_failures, 107);
         assert_eq!(stats.orphan_tasks_aborted, 0);
         assert!(stats.error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod protocol_version_tests {
+    use super::*;
+
+    #[test]
+    fn supported_v1_response_parses_normally() {
+        let client = WhereAmIClient::tcp("127.0.0.1:4747");
+        let response: LocateResponse = client
+            .parse_response_line(
+                r#"{"ok":true,"v":1,"lat":55.6761,"lon":12.5683,"accuracy_m":12.0,"sources":3}"#,
+            )
+            .unwrap();
+
+        assert!(response.ok);
+        assert_eq!(response.v, 1);
+        assert_eq!(response.lat, 55.6761);
+        assert_eq!(response.lon, 12.5683);
+    }
+
+    #[test]
+    fn newer_protocol_is_rejected_before_defaultable_locate_fields_escape() {
+        let client = WhereAmIClient::unix("/run/user/1000/whereamid.sock");
+        let error = client
+            .parse_response_line::<LocateResponse>(r#"{"ok":true,"v":2}"#)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "whereamid at unix socket /run/user/1000/whereamid.sock uses unsupported protocol v2; \
+             this client supports through v1; upgrade the whereami client or connect to a daemon \
+             using supported protocol v1"
+        );
+    }
+
+    #[test]
+    fn newer_protocol_error_names_the_exact_tcp_endpoint() {
+        let client = WhereAmIClient::tcp("192.0.2.17:8474");
+        let error = client
+            .parse_response_line::<LocateResponse>(r#"{"ok":true,"v":9}"#)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("TCP endpoint 192.0.2.17:8474"), "{error}");
+        assert!(error.contains("unsupported protocol v9"), "{error}");
+        assert!(error.contains("supports through v1"), "{error}");
+        assert!(error.contains("upgrade the whereami client"), "{error}");
+    }
+
+    #[test]
+    fn additive_unknown_enum_value_remains_compatible_at_v1() {
+        let client = WhereAmIClient::tcp("127.0.0.1:4747");
+        let response: ResolveResponse = client
+            .parse_response_line(
+                r#"{"ok":true,"v":1,"results":[{"bssid":"aa:bb:cc:dd:ee:ff","lat":null,"lon":null,"ssid":null,"source":"future_source"}]}"#,
+            )
+            .unwrap();
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].provenance, Provenance::Unknown);
     }
 }
 
