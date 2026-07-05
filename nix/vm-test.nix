@@ -17,6 +17,124 @@
 # wires `hostPkgs`/defaults for us and takes the test as a plain module.
 { self, pkgs, gitRev }:
 
+let
+  # A byte-for-byte copy at a distinct store path. The scan-node mount namespace
+  # overlays the packaged nmcli destination, so invoking that path recursively
+  # would only call the shim again. This copy genuinely connects to the system
+  # bus and NetworkManager before any deterministic fixture is emitted.
+  realNmcliProbe = pkgs.runCommand "whereami-real-nmcli-probe" { } ''
+    install -Dm755 ${pkgs.networkmanager}/bin/nmcli $out/bin/nmcli-real
+  '';
+
+  # Hardware-independent kernel-path proof for the iw fallback. Opening a
+  # NETLINK_GENERIC socket exercises both RestrictAddressFamilies=AF_NETLINK and
+  # the active SystemCallFilter without needing a Wi-Fi device in the VM.
+  netlinkProbe = pkgs.runCommandCC "whereami-netlink-generic-probe" { } ''
+    mkdir -p "$out/bin"
+    cat > probe.c <<'EOF'
+#include <errno.h>
+#include <linux/netlink.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+  int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
+  if (fd < 0) {
+    perror("socket(AF_NETLINK, NETLINK_GENERIC)");
+    return errno == 0 ? 1 : errno;
+  }
+  return close(fd) == 0 ? 0 : 1;
+}
+EOF
+    $CC -O2 -Wall -Wextra -Werror probe.c -o "$out/bin/netlink-generic-probe"
+  '';
+
+  # Test-only command overlays. The daemon still runs its production scan loop,
+  # spawns the packaged nmcli/iw paths, parses their real wire output, and
+  # publishes through the real control socket. BindReadOnlyPaths below replaces
+  # only those external binaries inside whereamid.service's mount namespace.
+  mockNmcli = pkgs.writeShellScriptBin "nmcli" ''
+    set -euo pipefail
+    mode="$(${pkgs.coreutils}/bin/cat /run/whereami-scan-mode)"
+
+    if (( $# == 5 )) \
+      && [[ "$1" == "device" && "$2" == "wifi" && "$3" == "rescan" \
+            && "$4" == "ifname" && "$5" == "vmwifi0" ]]; then
+      [[ "$mode" == "nmcli" ]] || exit 1
+      exit 0
+    fi
+    if (( $# == 8 )) \
+      && [[ "$1" == "-t" && "$2" == "-f" \
+            && "$3" == "BSSID,SSID,SIGNAL,CHAN,FREQ" \
+            && "$4" == "device" && "$5" == "wifi" && "$6" == "list" \
+            && "$7" == "ifname" && "$8" == "vmwifi0" ]]; then
+      [[ "$mode" == "nmcli" ]] || {
+        echo "VM test forcing nmcli failure for iw fallback" >&2
+        exit 1
+      }
+      ${realNmcliProbe}/bin/nmcli-real --terse general status >/dev/null
+      printf '%s\n' ok > /var/lib/whereami/nmcli-dbus-probe-ok
+      printf '%s\n' '02\:00\:00\:00\:21\:10:VM-nmcli:80:6:2437'
+      exit 0
+    fi
+
+    echo "unexpected nmcli arguments: $*" >&2
+    exit 64
+  '';
+
+  mockIw = pkgs.writeShellScriptBin "iw" ''
+    set -euo pipefail
+    mode="$(${pkgs.coreutils}/bin/cat /run/whereami-scan-mode)"
+    if [[ "$mode" != "iw" ]]; then
+      echo "poisoned iw invoked during $mode phase" >&2
+      exit 90
+    fi
+    if (( $# != 4 )) \
+      || [[ "$1" != "dev" || "$2" != "vmwifi0" || "$3" != "scan" ]] \
+      || [[ "$4" != "trigger" && "$4" != "dump" ]]; then
+      echo "unexpected iw arguments: $*" >&2
+      exit 64
+    fi
+
+    # Read the child PID explicitly (not /proc/self) and fail unless the only
+    # effective capability is CAP_NET_ADMIN (bit 12, exactly 0x1000).
+    cap_hex="$(${pkgs.gawk}/bin/awk '$1 == "CapEff:" { print $2 }' /proc/$$/status)"
+    if [[ "''${cap_hex,,}" != "0000000000001000" ]]; then
+      echo "CAP_NET_ADMIN is not the exact effective set (CapEff=$cap_hex)" >&2
+      exit 77
+    fi
+    ${netlinkProbe}/bin/netlink-generic-probe
+    printf '%s %s\n' "$4" "''${cap_hex,,}" >> /var/lib/whereami/iw-capeff.log
+
+    case "$4" in
+      trigger)
+        exit 0
+        ;;
+      dump)
+        ${pkgs.coreutils}/bin/cat <<'EOF'
+BSS 02:00:00:00:21:20(on vmwifi0)
+        freq: 5180
+        signal: -61.00 dBm
+        SSID: VM-iw
+        DS Parameter set: channel 36
+EOF
+        exit 0
+        ;;
+    esac
+
+  '';
+
+  pre0210RemovedSettings = [
+    "PrivateDevices"
+    "RestrictSUIDSGID"
+    "ProtectProc"
+    "ProcSubset"
+    "ProtectHostname"
+    "ProtectClock"
+    "SystemCallArchitectures"
+  ];
+in
 pkgs.testers.runNixOSTest {
   name = "whereami-module";
 
@@ -57,6 +175,43 @@ pkgs.testers.runNixOSTest {
       environment.systemPackages = [ config.services.whereami.package ];
       users.users.alice = { isNormalUser = true; };
       users.users.mallory = { isNormalUser = true; };
+
+      # Measured pre-0210 control: clone the evaluated production service
+      # configuration and remove only this task's seven new directives. It is
+      # loaded but never started; systemd-analyze compares like-for-like units.
+      systemd.services."whereamid-pre0210" = {
+        description = "whereami pre-TASK-0210 security baseline (VM test only)";
+        serviceConfig = builtins.removeAttrs
+          config.systemd.services.whereamid.serviceConfig
+          pre0210RemovedSettings;
+      };
+    };
+
+    # Dedicated scanner node: test overlays cannot improve or otherwise alter
+    # the production-shaped main node's systemd-analyze score.
+    scan = { config, pkgs, ... }: {
+      imports = [ self.nixosModules.default ];
+      networking.networkmanager.enable = true;
+      services.whereami = {
+        enable = true;
+        wifiInterface = "vmwifi0";
+        scanIntervalFast = 1;
+        scanFastDuration = 3600;
+        scanIntervalSlow = 1;
+        debounceWindow = 1;
+        debounceThreshold = 1;
+      };
+      environment.systemPackages = [ config.services.whereami.package ];
+      systemd.tmpfiles.rules = [
+        "f /run/whereami-scan-mode 0644 root root - nmcli"
+      ];
+      systemd.services.whereamid = {
+        after = [ "systemd-tmpfiles-setup.service" ];
+        serviceConfig.BindReadOnlyPaths = [
+          "${mockNmcli}/bin/nmcli:${pkgs.networkmanager}/bin/nmcli"
+          "${mockIw}/bin/iw:${pkgs.iw}/bin/iw"
+        ];
+      };
     };
 
     # Second node: a non-loopback bind WITHOUT the opt-in flag. There is no
@@ -77,6 +232,80 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    import json
+
+    hardening_properties = [
+        "PrivateDevices",
+        "RestrictSUIDSGID",
+        "ProtectProc",
+        "ProcSubset",
+        "ProtectHostname",
+        "ProtectClock",
+        "SystemCallArchitectures",
+        "SystemCallFilter",
+        "RestrictAddressFamilies",
+        "AmbientCapabilities",
+        "CapabilityBoundingSet",
+    ]
+
+    def effective_properties(node, unit="whereamid.service"):
+        flags = " ".join(f"--property={name}" for name in hardening_properties)
+        output = node.succeed(f"systemctl show {unit} {flags}")
+        return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+
+    def assert_effective_hardening(node, label):
+        props = effective_properties(node)
+        evidence = dict(props)
+        filter_count = len(props.get("SystemCallFilter", "").split())
+        evidence["SystemCallFilter"] = f"{filter_count} allowed syscalls"
+        print(
+            f"TASK-0210 {label} effective hardening: "
+            f"{json.dumps(evidence, sort_keys=True)}"
+        )
+        expected = {
+            "PrivateDevices": "yes",
+            "RestrictSUIDSGID": "yes",
+            "ProtectProc": "invisible",
+            "ProcSubset": "pid",
+            "ProtectHostname": "yes",
+            "ProtectClock": "yes",
+            # The unit text below proves the declarative value; systemd exposes
+            # the same canonical spelling through the runtime D-Bus property.
+            "SystemCallArchitectures": "native",
+        }
+        for name, value in expected.items():
+            assert props.get(name) == value, \
+                f"{label}: {name}={props.get(name)!r}, expected {value!r}"
+        assert props.get("SystemCallFilter"), f"{label}: SystemCallFilter is empty"
+        assert set(props.get("RestrictAddressFamilies", "").split()) == {
+            "AF_INET", "AF_INET6", "AF_NETLINK", "AF_UNIX"
+        }, f"{label}: unexpected address families {props.get('RestrictAddressFamilies')!r}"
+        assert props.get("AmbientCapabilities") == "cap_net_admin", \
+            f"{label}: ambient capabilities drifted: {props.get('AmbientCapabilities')!r}"
+        assert props.get("CapabilityBoundingSet") == "cap_net_admin", \
+            f"{label}: capability bounding set drifted: {props.get('CapabilityBoundingSet')!r}"
+        node.succeed(
+            "systemctl cat whereamid.service | grep -F 'SystemCallArchitectures=native'"
+        )
+        node.succeed(
+            "systemctl cat whereamid.service | grep -Fx 'RestrictSUIDSGID=true'"
+        )
+        node.succeed(
+            "systemctl cat whereamid.service | grep -Fx 'SystemCallFilter=@system-service'"
+        )
+        node.succeed(
+            "systemctl cat whereamid.service | grep -Fx 'SystemCallFilter=@network-io'"
+        )
+        return props
+
+    def security_rows(node, unit):
+        return json.loads(node.succeed(
+            f"systemd-analyze security --json=short {unit}"
+        ))
+
+    def summed_exposure(rows):
+        return sum(float(row["exposure"]) for row in rows if row["exposure"] is not None)
+
     start_all()
 
     # The socket unit is ordered before the service (module: requires=/after=
@@ -93,6 +322,134 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds(
             "journalctl -u whereamid.service --no-pager | "
             "grep -F 'control channel: unix socket ready'"
+        )
+
+    with subtest("(e) non-loopback bind without allowNonlocalBind refuses to start"):
+        # Check this intentionally failing node before its preserved restart
+        # policy exhausts StartLimitBurst and propagates failure to the socket.
+        # The daemon must reject the bind during validate(), before adopting fd 3.
+        nonloopback.wait_for_unit("whereamid.socket")
+        nonloopback.wait_until_succeeds("systemctl is-failed --quiet whereamid.service")
+        nonloopback.succeed(
+            "journalctl -u whereamid.service --no-pager | grep -F -- '--allow-nonlocal-bind'"
+        )
+
+    with subtest("task-0210: effective hardening and measured exposure improve"):
+        main_hardening = assert_effective_hardening(machine, "main node")
+        baseline_hardening = effective_properties(machine, "whereamid-pre0210.service")
+        assert main_hardening["SystemCallFilter"] == baseline_hardening["SystemCallFilter"], \
+            "TASK-0210 unexpectedly changed the effective syscall allowlist"
+        hardened_rows = security_rows(machine, "whereamid.service")
+        baseline_rows = security_rows(machine, "whereamid-pre0210.service")
+        hardened_exposure = summed_exposure(hardened_rows)
+        baseline_exposure = summed_exposure(baseline_rows)
+        print(
+            f"TASK-0210 systemd-analyze summed exposure: "
+            f"{hardened_exposure:.3f} (hardened) vs {baseline_exposure:.3f} (pre-0210)"
+        )
+        assert hardened_exposure < baseline_exposure, \
+            f"hardening did not improve exposure: {hardened_exposure} >= {baseline_exposure}"
+        assert hardened_exposure < 3.0, \
+            f"hardened summed exposure {hardened_exposure} exceeds ceiling 3.0"
+        hardened_by_field = {row["json_field"]: row for row in hardened_rows}
+        for field in [
+            "PrivateDevices", "RestrictSUIDSGID", "ProtectProc", "ProcSubset",
+            "ProtectHostname", "ProtectClock", "SystemCallArchitectures",
+        ]:
+            assert hardened_by_field[field]["set"] is True, \
+                f"systemd-analyze does not recognize {field} as hardened"
+
+    with subtest("task-0210: scan node has identical effective hardening"):
+        scan.wait_for_unit("NetworkManager.service")
+        scan.wait_for_unit("whereamid.socket")
+        scan.wait_for_unit("whereamid.service")
+        scan.wait_until_succeeds(
+            "journalctl -u whereamid.service --no-pager | "
+            "grep -F 'control channel: unix socket ready'",
+            timeout=30,
+        )
+        scan.succeed("test \"$(cat /run/whereami-scan-mode)\" = nmcli")
+        scan_hardening = assert_effective_hardening(scan, "scan node")
+        assert scan_hardening["SystemCallFilter"] == main_hardening["SystemCallFilter"], \
+            "scan overlay changed the effective syscall allowlist"
+        scan_pid = scan.succeed(
+            "systemctl show -p MainPID --value whereamid.service"
+        ).strip()
+        scan_restarts = int(scan.succeed(
+            "systemctl show -p NRestarts --value whereamid.service"
+        ).strip())
+        assert scan_pid != "0", "scan daemon has no live MainPID"
+        assert scan_restarts == 0, f"scan daemon already restarted {scan_restarts} times"
+
+    with subtest("task-0210: real nmcli DBus path and parser succeed under sandbox"):
+        scan_query = (
+            "env WHEREAMI_SOCKET=/run/whereami/whereamid.sock whereami scan --json"
+        )
+        scan.wait_until_succeeds(
+            f"{scan_query} | grep -F '02:00:00:00:21:10'",
+            timeout=30,
+        )
+        nmcli_scan = json.loads(scan.succeed(scan_query))
+        nmcli_networks = nmcli_scan["networks"]
+        assert len(nmcli_networks) == 1, f"unexpected nmcli scan: {nmcli_scan!r}"
+        assert nmcli_networks[0] == {
+            "bssid": "02:00:00:00:21:10",
+            "ssid": "VM-nmcli",
+            "signal_dbm": -42,
+            "channel": 6,
+        }, f"nmcli parser/wire response drifted: {nmcli_scan!r}"
+        scan.succeed("test -f /var/lib/whereami/nmcli-dbus-probe-ok")
+        scan.succeed("test ! -e /var/lib/whereami/iw-capeff.log")
+        scan.fail(
+            "journalctl -u whereamid.service --no-pager | "
+            "grep -F 'poisoned iw invoked'"
+        )
+        assert scan.succeed(
+            "systemctl show -p MainPID --value whereamid.service"
+        ).strip() == scan_pid, "nmcli scan restarted the daemon"
+        assert int(scan.succeed(
+            "systemctl show -p NRestarts --value whereamid.service"
+        ).strip()) == 0, "nmcli scan incremented NRestarts"
+
+    with subtest("task-0210: iw capability, netlink path and parser succeed under sandbox"):
+        # Atomic, deterministic phase transition. nmcli now fails closed and
+        # the next production scan-loop iteration must take the iw fallback.
+        scan.succeed(
+            "printf '%s\\n' iw > /run/whereami-scan-mode.next && "
+            "mv /run/whereami-scan-mode.next /run/whereami-scan-mode"
+        )
+        scan.wait_until_succeeds(
+            f"{scan_query} | grep -F '02:00:00:00:21:20'",
+            timeout=30,
+        )
+        iw_scan = json.loads(scan.succeed(scan_query))
+        iw_networks = iw_scan["networks"]
+        assert len(iw_networks) == 1, f"unexpected iw scan: {iw_scan!r}"
+        assert iw_networks[0] == {
+            "bssid": "02:00:00:00:21:20",
+            "ssid": "VM-iw",
+            "signal_dbm": -61,
+            "channel": 36,
+        }, f"iw parser/wire response drifted: {iw_scan!r}"
+        assert all(n["bssid"] != "02:00:00:00:21:10" for n in iw_networks), \
+            f"stale nmcli result survived deterministic switch: {iw_scan!r}"
+        scan.succeed(
+            "grep -Fx 'trigger 0000000000001000' /var/lib/whereami/iw-capeff.log"
+        )
+        scan.succeed(
+            "grep -Fx 'dump 0000000000001000' /var/lib/whereami/iw-capeff.log"
+        )
+        assert scan.succeed(
+            "systemctl show -p MainPID --value whereamid.service"
+        ).strip() == scan_pid, "iw scan restarted the daemon"
+        assert int(scan.succeed(
+            "systemctl show -p NRestarts --value whereamid.service"
+        ).strip()) == 0, "iw scan incremented NRestarts"
+        scan.fail(
+            "journalctl -u whereamid.service --no-pager | "
+            "grep -E 'poisoned iw|unexpected (nmcli|iw) arguments|"
+            "CAP_NET_ADMIN is not the exact|Operation not permitted|"
+            "Permission denied|Bad system call|NETLINK_GENERIC'"
         )
 
     with subtest("(a) control socket is 0660 root:whereami under /run/whereami"):
@@ -227,13 +584,5 @@ pkgs.testers.runNixOSTest {
         assert '"ok":true' in out.replace(" ", ""), \
             f"restarted daemon must answer alice, got: {out!r}"
 
-    with subtest("(e) non-loopback bind without allowNonlocalBind refuses to start"):
-        nonloopback.wait_for_unit("whereamid.socket")
-        # The service fails at validate() before adopting the fd; a plain
-        # wait_for_unit would hang, so poll is-failed instead.
-        nonloopback.wait_until_succeeds("systemctl is-failed --quiet whereamid.service")
-        nonloopback.succeed(
-            "journalctl -u whereamid.service --no-pager | grep -F -- '--allow-nonlocal-bind'"
-        )
   '';
 }

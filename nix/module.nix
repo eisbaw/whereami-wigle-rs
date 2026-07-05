@@ -104,14 +104,21 @@ in {
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
+        PrivateDevices = true;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
         ProtectControlGroups = true;
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
+        ProtectHostname = true;
+        ProtectClock = true;
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_NETLINK" "AF_UNIX" ];
         RestrictNamespaces = true;
+        RestrictSUIDSGID = true;
         LockPersonality = true;
         MemoryDenyWriteExecute = true;
         RestrictRealtime = true;
+        SystemCallArchitectures = "native";
         SystemCallFilter = [ "@system-service" "@network-io" ];
       } // lib.optionalAttrs (cfg.credentialsFile != null) {
         # task-0205: deliver the WiGLE secrets to the DynamicUser via systemd
