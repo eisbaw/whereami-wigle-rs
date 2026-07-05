@@ -1960,6 +1960,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "nu-ansi-term",
  "serde",
  "serde_json",
 ]

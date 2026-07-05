@@ -1,5 +1,5 @@
-//! Shared geographic helpers. Currently exposes `haversine_m`, the
-//! great-circle distance in meters between two (lat, lon) points.
+//! Shared geographic helpers. Exposes great-circle distance and implied
+//! travel speed between two (lat, lon) points.
 //!
 //! Previously each consumer (trilaterate.rs, history.rs, the proptest
 //! suite) had its own private copy. task-0081 consolidated them here so
@@ -25,6 +25,19 @@ pub fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     R * c
 }
 
+/// Implied great-circle travel speed in kilometers per hour.
+///
+/// A non-positive elapsed time has no meaningful direction and deliberately
+/// returns zero. Besides avoiding division by zero, this makes future-dated
+/// persisted fixes fail closed at the caller's explicit clock-skew warning
+/// boundary instead of fabricating an infinite speed.
+pub fn haversine_kmh(lat1: f64, lon1: f64, lat2: f64, lon2: f64, dt_secs: f64) -> f64 {
+    if dt_secs <= 0.0 {
+        return 0.0;
+    }
+    haversine_m(lat1, lon1, lat2, lon2) / 1000.0 / (dt_secs / 3600.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,6 +57,27 @@ mod tests {
     #[test]
     fn haversine_zero_at_identity() {
         assert!(haversine_m(55.0, 12.0, 55.0, 12.0) < 1e-6);
+    }
+
+    #[test]
+    fn haversine_speed_copenhagen_to_malmoe_in_one_hour() {
+        let speed = haversine_kmh(55.6761, 12.5683, 55.6050, 13.0038, 3600.0);
+        assert!((speed - 28.0).abs() < 2.0, "expected ~28 km/h, got {speed}");
+    }
+
+    #[test]
+    fn haversine_speed_same_point_is_zero() {
+        assert!(haversine_kmh(55.6761, 12.5683, 55.6761, 12.5683, 60.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn haversine_speed_zero_elapsed_time_is_zero() {
+        assert_eq!(haversine_kmh(55.6761, 12.5683, 55.6050, 13.0038, 0.0), 0.0);
+    }
+
+    #[test]
+    fn haversine_speed_negative_elapsed_time_is_zero() {
+        assert_eq!(haversine_kmh(55.6761, 12.5683, 55.6050, 13.0038, -1.0), 0.0);
     }
 
     /// task-0185: near-antipodal points pushed the haversine `a` term a few

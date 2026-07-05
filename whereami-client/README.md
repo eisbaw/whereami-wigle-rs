@@ -25,7 +25,10 @@ let client = WhereAmIClient::from_env()?;
 
 // Where am I?
 let resp = client.locate()?;
-println!("{:.6}, {:.6}  ±{}m", resp.lat, resp.lon, resp.accuracy_m as i64);
+println!(
+    "{:.6}, {:.6}  ±{}m ({})",
+    resp.lat, resp.lon, resp.accuracy_m as i64, resp.confidence
+);
 
 // History over the last 24 hours.
 let h = client.history(Some("24h".into()), None, None)?;
@@ -64,6 +67,14 @@ the end of the last clean daemon shutdown. It is one persisted shutdown
 snapshot, neither a current count nor a cumulative total. The daemon loads it on
 startup; a crash or `SIGKILL` leaves the previous clean-shutdown value unchanged.
 Older daemons omit the field, which the typed client reads as `0`.
+
+`LocateResponse` exposes the daemon's additive uncertainty fields:
+`implied_speed_kmh`, `last_fix_age_secs`, `inlier_ratio`, `confidence`, and
+`suspect_reason`. Missing fields from an older daemon deserialize as `None` and
+`Confidence::High`, preserving the behavior clients saw before explicit
+plausibility reporting. The human CLI appends confidence to the coordinate
+line and only emits confidence colors when stdout is a terminal; `--json`,
+pipes, redirects, and the optional address line are never colored.
 
 All typed response structs expose an `ok: bool` flag and an
 `error: Option<String>` field so callers have one uniform model. Successful

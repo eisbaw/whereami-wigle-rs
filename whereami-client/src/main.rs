@@ -19,10 +19,11 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use std::{process, time::Duration};
+use nu_ansi_term::{Color, Style};
+use std::{io::IsTerminal, process, time::Duration};
 use whereami_client::{
-    DaemonResponse, LocateResponse, ScanResponse, StatsResponse, WhereAmIClient, WipeConfirmation,
-    WipeResponse, DEFAULT_SOCKET_IO_TIMEOUT,
+    Confidence, DaemonResponse, LocateResponse, ScanResponse, StatsResponse, WhereAmIClient,
+    WipeConfirmation, WipeResponse, DEFAULT_SOCKET_IO_TIMEOUT,
 };
 
 /// `whereami` — Wi-Fi geolocation CLI.
@@ -279,7 +280,7 @@ fn render_scan(resp: &ScanResponse, no_scan_time: bool) -> String {
 /// the coordinate line). The daemon-sourced address is sanitized against
 /// terminal-escape injection (task-0198); the stale banner is written to
 /// stderr by the caller. Pure, so it is directly unit-testable.
-fn render_locate(resp: &LocateResponse) -> String {
+fn render_locate(resp: &LocateResponse, color: bool) -> String {
     let mut out = String::new();
     if let Some(addr) = resp.address.as_deref() {
         if !addr.is_empty() {
@@ -287,10 +288,22 @@ fn render_locate(resp: &LocateResponse) -> String {
             out.push('\n');
         }
     }
-    out.push_str(&format!(
-        "{:.6}, {:.6}  ±{}m  ({} sources)\n",
-        resp.lat, resp.lon, resp.accuracy_m as i64, resp.sources
-    ));
+    let coordinate_line = format!(
+        "{:.6}, {:.6}  ±{}m  ({} sources, {})",
+        resp.lat, resp.lon, resp.accuracy_m as i64, resp.sources, resp.confidence
+    );
+    if color {
+        let style = match resp.confidence {
+            Confidence::Suspect => Style::new().fg(Color::Red).bold(),
+            Confidence::Low => Style::new().fg(Color::Yellow),
+            Confidence::Medium => Style::new(),
+            Confidence::High => Style::new().fg(Color::Green).dimmed(),
+        };
+        out.push_str(&style.paint(coordinate_line).to_string());
+    } else {
+        out.push_str(&coordinate_line);
+    }
+    out.push('\n');
     out
 }
 
@@ -447,7 +460,7 @@ fn run_locate(client: &WhereAmIClient, json: bool) {
                 };
                 eprint!("[last known, {age_str} ago] ");
             }
-            print!("{}", render_locate(resp));
+            print!("{}", render_locate(resp, std::io::stdout().is_terminal()));
         });
     }
 }
@@ -1065,11 +1078,16 @@ mod tests {
             address: Some("Rådhuspladsen 1, København".to_string()),
             stale: false,
             age_s: None,
+            implied_speed_kmh: Some(42.0),
+            last_fix_age_secs: Some(60),
+            inlier_ratio: Some(0.75),
+            confidence: Confidence::High,
+            suspect_reason: None,
             error: None,
         };
         assert_eq!(
-            render_locate(&resp),
-            "Rådhuspladsen 1, København\n55.676098, 12.568337  ±42m  (4 sources)\n"
+            render_locate(&resp, false),
+            "Rådhuspladsen 1, København\n55.676098, 12.568337  ±42m  (4 sources, High)\n"
         );
     }
 
@@ -1091,15 +1109,89 @@ mod tests {
             address: Some("Evil St \u{1b}]0;pwned\u{07}".to_string()),
             stale: false,
             age_s: None,
+            implied_speed_kmh: None,
+            last_fix_age_secs: None,
+            inlier_ratio: None,
+            confidence: Confidence::Low,
+            suspect_reason: None,
             error: None,
         };
-        let out = render_locate(&resp);
+        let out = render_locate(&resp, false);
         assert_no_raw_control_bytes(&out);
         assert!(
             out.contains("\\u{1b}"),
             "ESC should be escaped, got: {out:?}"
         );
         assert!(out.contains("Evil St"));
+    }
+
+    fn locate_for_confidence(confidence: Confidence) -> LocateResponse {
+        LocateResponse {
+            ok: true,
+            v: 1,
+            lat: 55.676098,
+            lon: 12.568337,
+            accuracy_m: 12.0,
+            sources: 3,
+            cached: 3,
+            fetched: 0,
+            pending: 0,
+            visible: 3,
+            stable: 3,
+            address: Some("plain address".to_string()),
+            stale: false,
+            age_s: None,
+            implied_speed_kmh: None,
+            last_fix_age_secs: None,
+            inlier_ratio: Some(1.0),
+            confidence,
+            suspect_reason: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn locate_non_tty_never_emits_ansi_for_any_confidence() {
+        for confidence in [
+            Confidence::High,
+            Confidence::Medium,
+            Confidence::Low,
+            Confidence::Suspect,
+        ] {
+            let out = render_locate(&locate_for_confidence(confidence), false);
+            assert!(
+                !out.contains('\u{1b}'),
+                "non-TTY output contained ANSI: {out:?}"
+            );
+            assert!(out.ends_with(&format!("(3 sources, {confidence})\n")));
+        }
+    }
+
+    #[test]
+    fn locate_tty_styles_only_the_coordinate_line_by_confidence() {
+        let cases = [
+            (Confidence::Suspect, "\u{1b}[1;31m"),
+            (Confidence::Low, "\u{1b}[33m"),
+            (Confidence::High, "\u{1b}[2;32m"),
+        ];
+        for (confidence, prefix) in cases {
+            let out = render_locate(&locate_for_confidence(confidence), true);
+            assert!(
+                out.starts_with("plain address\n"),
+                "address was colored: {out:?}"
+            );
+            assert!(out.contains(prefix), "missing style {prefix:?}: {out:?}");
+            assert!(
+                out.ends_with("\u{1b}[0m\n"),
+                "coordinate style not reset: {out:?}"
+            );
+        }
+
+        let medium = render_locate(&locate_for_confidence(Confidence::Medium), true);
+        assert!(
+            !medium.contains('\u{1b}'),
+            "Medium must remain plain: {medium:?}"
+        );
     }
 
     #[test]

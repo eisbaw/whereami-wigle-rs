@@ -87,6 +87,11 @@ pub struct Args {
     #[arg(long, default_value_t = 10)]
     pub top_n: usize,
 
+    /// Maximum plausible travel speed between the previous accepted fix and
+    /// the current trilateration result, in kilometers per hour.
+    #[arg(long, default_value_t = 250.0)]
+    pub max_travel_speed_kmh: f64,
+
     /// Comma-separated anchored `*`/`?` globs for scanner-observed SSIDs that
     /// identify mobile access points. Matching uses locale-independent Unicode
     /// lowercase comparison. An empty value disables the heuristic;
@@ -227,6 +232,9 @@ impl Args {
         }
         if self.top_n == 0 {
             anyhow::bail!("--top-n must be > 0");
+        }
+        if !self.max_travel_speed_kmh.is_finite() || self.max_travel_speed_kmh <= 0.0 {
+            anyhow::bail!("--max-travel-speed-kmh must be a finite value > 0");
         }
         if self
             .mobile_ssid_denylist
@@ -1004,6 +1012,36 @@ mod tests {
     #[test]
     fn zero_top_n_rejected() {
         assert!(parse(&["--top-n", "0"]).validate().is_err());
+    }
+
+    #[test]
+    fn max_travel_speed_defaults_to_250() {
+        let args = parse(&[]);
+        assert_eq!(args.max_travel_speed_kmh, 250.0);
+        args.validate().unwrap();
+    }
+
+    #[test]
+    fn max_travel_speed_accepts_positive_fraction() {
+        let args = parse(&["--max-travel-speed-kmh", "0.5"]);
+        assert_eq!(args.max_travel_speed_kmh, 0.5);
+        args.validate().unwrap();
+    }
+
+    #[test]
+    fn max_travel_speed_rejects_non_positive_and_non_finite_values() {
+        for argument in [
+            "--max-travel-speed-kmh=0",
+            "--max-travel-speed-kmh=-1",
+            "--max-travel-speed-kmh=NaN",
+            "--max-travel-speed-kmh=inf",
+            "--max-travel-speed-kmh=-inf",
+        ] {
+            let error = parse(&[argument])
+                .validate()
+                .expect_err("invalid speed limit must fail validation");
+            assert!(error.to_string().contains("--max-travel-speed-kmh"));
+        }
     }
 
     #[test]

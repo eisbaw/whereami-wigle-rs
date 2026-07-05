@@ -37,6 +37,7 @@ let
     debounceWindow = 1;
     debounceThreshold = 1;
     topN = 1;
+    maxTravelSpeedKmh = 123.5;
     mobileSsidDenylist = [
       "--adversarial"
       "Bus WiFi"
@@ -92,6 +93,9 @@ let
     modules = [ { options.services.whereami = sharedOptions; } ];
   }).config.services.whereami.mobileSsidDenylist;
   moduleMobileDefaultJoined = lib.concatStringsSep "," moduleMobileDefault;
+  moduleSpeedDefault = (lib.evalModules {
+    modules = [ { options.services.whereami = sharedOptions; } ];
+  }).config.services.whereami.maxTravelSpeedKmh;
 
   # Split the space-joined ExecStart and keep the tokens that begin with a flag
   # after removing escapeSystemdExecArg's opening quote. For canonical
@@ -106,11 +110,12 @@ let
 in
 assert lib.hasInfix expectedAdversarialMobileArg execStart;
 assert lib.hasInfix expectedEmptyMobileArg emptyMobileExecStart;
+assert lib.hasInfix "--max-travel-speed-kmh 123.5" execStart;
 pkgs.runCommand "whereami-flag-parity"
 {
   nativeBuildInputs = [ package ];
   emitted = lib.concatStringsSep "\n" (lib.sort (a: b: a < b) emittedFlags);
-  inherit moduleMobileDefaultJoined;
+  inherit moduleMobileDefaultJoined moduleSpeedDefault;
 } ''
   set -euo pipefail
   printf '%s\n' "$emitted" | sort -u > emitted-flags
@@ -145,7 +150,15 @@ pkgs.runCommand "whereami-flag-parity"
     exit 1
   fi
 
+  help_speed_default="$(${package}/bin/whereamid --help \
+    | sed -n '/--max-travel-speed-kmh/,/--mobile-ssid-denylist/ s/.*\[default: \([^]]*\)\].*/\1/p')"
+  if [[ -z "$help_speed_default" || "$help_speed_default" != "$moduleSpeedDefault" ]]; then
+    echo "max travel speed default drift: Rust help='$help_speed_default' Nix module='$moduleSpeedDefault'" >&2
+    exit 1
+  fi
+
   echo "flag parity OK: $(wc -l < help-flags) flags match between --help and exec-start.nix"
   echo "mobile SSID default parity OK"
+  echo "max travel speed default parity OK"
   touch $out
 ''

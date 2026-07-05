@@ -11,6 +11,8 @@
 #     validate() has NO check for it (scanFastDuration, dailyLimit) or because 0
 #     is the documented "disabled" value (addressCacheTtlDays and retention
 #     windows).
+#   - addCheck number (> 0): finite positive floating-point tuning values such
+#     as maxTravelSpeedKmh.
 # Upper bounds are intentionally omitted for the other tuning options, so
 # clap's numeric range remains their runtime guard. `maxConnections` and both
 # retention windows have shared explicit Rust/Nix policy ranges.
@@ -173,6 +175,16 @@ in {
     type = lib.types.ints.positive;
     default = 10;
     description = "Number of strongest APs to use for trilateration.";
+  };
+
+  maxTravelSpeedKmh = lib.mkOption {
+    type = lib.types.addCheck lib.types.number (value: value > 0);
+    default = 250;
+    description = ''
+      Maximum plausible travel speed in kilometers per hour between the
+      previous accepted fix and current trilateration. A faster result is
+      marked Suspect and resolved by visible cached-AP consensus.
+    '';
   };
 
   mobileSsidDenylist = lib.mkOption {

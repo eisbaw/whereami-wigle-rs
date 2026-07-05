@@ -49,6 +49,7 @@ lib.concatStringsSep " " ([
   "--debounce-window" (toString cfg.debounceWindow)
   "--debounce-threshold" (toString cfg.debounceThreshold)
   "--top-n" (toString cfg.topN)
+  "--max-travel-speed-kmh" (toString cfg.maxTravelSpeedKmh)
   mobileSsidDenylistArg
   "--pending-interval" (toString cfg.pendingInterval)
   "--pending-max-attempts" (toString cfg.pendingMaxAttempts)

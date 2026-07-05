@@ -19,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+nu-ansi-term = "0.50"
 # Used only to reset the SIGPIPE disposition to SIG_DFL at startup so the
 # CLI behaves like a Unix filter under `| head` (task-0199).
 libc = "0.2"

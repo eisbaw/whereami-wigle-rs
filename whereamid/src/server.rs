@@ -242,6 +242,9 @@ impl TryFrom<crate::db::LastFixRow> for LastFix {
                 row.lon
             );
         }
+        if !row.accuracy_m.is_finite() || row.accuracy_m < 0.0 {
+            anyhow::bail!("invalid last_fix accuracy_m: {}", row.accuracy_m);
+        }
         let at = chrono::DateTime::parse_from_rfc3339(&row.at_rfc3339)
             .map_err(|e| {
                 anyhow::anyhow!("unparseable last_fix timestamp {:?}: {e}", row.at_rfc3339)
@@ -306,50 +309,37 @@ where
     Ok(true)
 }
 
-/// Persist a newly computed fix to both the in-memory and SQLite last-fix
-/// stores (plus history) under the same `last_fix -> durable writer` ordering
-/// used by address backfill. This is the handle_locate-side operation raced by the
-/// task-0046 regression.
-async fn persist_last_fix_and_history(
+/// Publish a current winner without address lookup. The caller owns the
+/// privacy read guard and `last_fix` mutex across this complete operation.
+/// Keeping this as the single locked implementation lets policy dispatch and
+/// the concurrency regressions exercise identical memory/SQLite semantics.
+async fn persist_last_fix_and_history_locked(
     state: &Arc<DaemonState>,
-    ticket: crate::privacy::PrivacyTicket,
+    last: &mut Option<LastFix>,
     new_fix: LastFix,
 ) {
-    let Some(_privacy) = state.privacy.read(ticket).await else {
-        return;
-    };
     let row: crate::db::LastFixRow = (&new_fix).into();
-    let mut last = state.last_fix.lock().await;
     *last = Some(new_fix);
 
     if let Err(e) = state.db.persist_fix_and_history(row).await {
         warn!("failed to persist last_fix and history: {e}");
         state.record_db_failure();
     }
-    drop(last);
 }
 
-/// Persist a newly computed locate and atomically publish its address-cache
-/// observation to the geocode scheduler.
-///
-/// The `last_fix -> address_cache -> scheduler` critical section is
-/// load-bearing. A newer locate cannot supersede generation A until its own
-/// last_fix B is installed, so an A worker that races for backfill either
-/// completes before supersession or sees B's mismatching rounded key. The
-/// cache guard also makes miss publication atomic with worker insertion, then
-/// is released before the potentially contended SQLite section. `last_fix`
-/// remains held through DB persistence to preserve task-0046 ordering.
-async fn persist_locate_fix_and_schedule(
+/// Publish a current winner with the existing address-cache/geocode behavior.
+/// The caller owns the privacy read guard and `last_fix` mutex. The address
+/// cache remains synchronous and is released before the durable writer await.
+async fn persist_locate_fix_and_schedule_locked(
     state: &Arc<DaemonState>,
     ticket: crate::privacy::PrivacyTicket,
+    last: &mut Option<LastFix>,
     mut new_fix: LastFix,
 ) -> Option<String> {
-    let _privacy = state.privacy.read(ticket).await?;
-    let mut last = state.last_fix.lock().await;
     let (address, row) = {
-        let cache = state.address_cache.lock().unwrap_or_else(|e| {
+        let cache = state.address_cache.lock().unwrap_or_else(|error| {
             warn!("address cache mutex poisoned — recovering");
-            e.into_inner()
+            error.into_inner()
         });
         let address = cache.get(new_fix.lat, new_fix.lon);
         new_fix.address = address.clone();
@@ -361,12 +351,39 @@ async fn persist_locate_fix_and_schedule(
         (address, row)
     };
 
-    if let Err(e) = state.db.persist_fix_and_history(row).await {
-        warn!("failed to persist last_fix and history: {e}");
+    if let Err(error) = state.db.persist_fix_and_history(row).await {
+        warn!("failed to persist last_fix and history: {error}");
         state.record_db_failure();
     }
-    drop(last);
     address
+}
+
+/// Test seam for the privacy/last_fix acquisition boundary. Persistence is
+/// delegated to the production locked implementation above.
+#[cfg(test)]
+async fn persist_last_fix_and_history(
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+    new_fix: LastFix,
+) {
+    let Some(_privacy) = state.privacy.read(ticket).await else {
+        return;
+    };
+    let mut last = state.last_fix.lock().await;
+    persist_last_fix_and_history_locked(state, &mut last, new_fix).await;
+}
+
+/// Test seam used by geocode scheduler concurrency tests. All publication
+/// behavior lives in the production locked helper above.
+#[cfg(test)]
+async fn persist_locate_fix_and_schedule(
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+    new_fix: LastFix,
+) -> Option<String> {
+    let _privacy = state.privacy.read(ticket).await?;
+    let mut last = state.last_fix.lock().await;
+    persist_locate_fix_and_schedule_locked(state, ticket, &mut last, new_fix).await
 }
 
 #[cfg(test)]
@@ -420,6 +437,25 @@ mod last_fix_rehydration_tests {
         assert_eq!(finite.lat, 55.6);
         assert_eq!(finite.lon, 12.5);
     }
+
+    #[test]
+    fn last_fix_rehydration_rejects_invalid_accuracy() {
+        for accuracy_m in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01] {
+            let mut persisted = row(55.6, 12.5);
+            persisted.accuracy_m = accuracy_m;
+            let error = LastFix::try_from(persisted)
+                .err()
+                .expect("non-finite or negative accuracy must be rejected");
+            assert!(error.to_string().contains("invalid last_fix accuracy_m"));
+        }
+
+        let mut zero = row(55.6, 12.5);
+        zero.accuracy_m = 0.0;
+        assert!(
+            LastFix::try_from(zero).is_ok(),
+            "zero accuracy remains valid"
+        );
+    }
 }
 
 // --- Protocol types ---
@@ -465,6 +501,26 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum Confidence {
+    High,
+    Medium,
+    Low,
+    Suspect,
+}
+
+impl std::fmt::Display for Confidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Confidence::High => "High",
+            Confidence::Medium => "Medium",
+            Confidence::Low => "Low",
+            Confidence::Suspect => "Suspect",
+        })
+    }
+}
+
 #[derive(Serialize)]
 struct LocateResponse {
     ok: bool,
@@ -486,6 +542,15 @@ struct LocateResponse {
     /// Age of the last-known position in seconds (only set when stale)
     #[serde(skip_serializing_if = "Option::is_none")]
     age_s: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    implied_speed_kmh: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_fix_age_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inlier_ratio: Option<f64>,
+    confidence: Confidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suspect_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1242,6 +1307,137 @@ fn bounded_uncached_observations(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlausibilityWinner {
+    CurrentTrilat,
+    LastFix,
+}
+
+#[derive(Debug)]
+struct PlausibilityDecision {
+    winner: PlausibilityWinner,
+    implied_speed_kmh: Option<f64>,
+    last_fix_age_secs: Option<i64>,
+    inlier_ratio: Option<f64>,
+    confidence: Confidence,
+    suspect_reason: Option<String>,
+    distance_m: f64,
+    current_score: Option<f64>,
+    last_fix_score: Option<f64>,
+}
+
+fn confidence_from_score(score: Option<f64>) -> Confidence {
+    match score {
+        Some(value) if value >= 0.7 => Confidence::High,
+        Some(value) if value >= 0.4 => Confidence::Medium,
+        _ => Confidence::Low,
+    }
+}
+
+fn signed_elapsed_seconds(
+    now: chrono::DateTime<chrono::Utc>,
+    previous: chrono::DateTime<chrono::Utc>,
+) -> f64 {
+    (now - previous).as_seconds_f64()
+}
+
+fn format_score(score: Option<f64>) -> String {
+    score
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn evaluate_plausibility(
+    previous: Option<&LastFix>,
+    current: (f64, f64),
+    visible_cached: &[(f64, f64)],
+    now: chrono::DateTime<chrono::Utc>,
+    max_travel_speed_kmh: f64,
+) -> PlausibilityDecision {
+    let current_score = crate::trilaterate::ap_consensus_score(visible_cached, current);
+    let Some(previous) = previous else {
+        return PlausibilityDecision {
+            winner: PlausibilityWinner::CurrentTrilat,
+            implied_speed_kmh: None,
+            last_fix_age_secs: None,
+            inlier_ratio: current_score,
+            confidence: confidence_from_score(current_score),
+            suspect_reason: None,
+            distance_m: 0.0,
+            current_score,
+            last_fix_score: None,
+        };
+    };
+
+    let elapsed_seconds = signed_elapsed_seconds(now, previous.at);
+    if elapsed_seconds < 0.0 {
+        warn!(
+            previous_at = %previous.at,
+            now = %now,
+            "last_fix timestamp is in the future; clamping reported age and implied speed to zero"
+        );
+    }
+    let age_secs = (now - previous.at).num_seconds().max(0);
+    let distance_m = crate::geo::haversine_m(previous.lat, previous.lon, current.0, current.1);
+    let speed = crate::geo::haversine_kmh(
+        previous.lat,
+        previous.lon,
+        current.0,
+        current.1,
+        elapsed_seconds,
+    );
+
+    if speed <= max_travel_speed_kmh {
+        return PlausibilityDecision {
+            winner: PlausibilityWinner::CurrentTrilat,
+            implied_speed_kmh: Some(speed),
+            last_fix_age_secs: Some(age_secs),
+            inlier_ratio: current_score,
+            confidence: confidence_from_score(current_score),
+            suspect_reason: None,
+            distance_m,
+            current_score,
+            last_fix_score: None,
+        };
+    }
+
+    let previous_score =
+        crate::trilaterate::ap_consensus_score(visible_cached, (previous.lat, previous.lon));
+    // Both scores are defined over the same denominator, so they are either
+    // both Some or both None. Any tie (including undefined) deliberately keeps
+    // current_trilat, the daemon's best current estimate.
+    let winner = match (previous_score, current_score) {
+        (Some(previous), Some(current)) if previous > current => PlausibilityWinner::LastFix,
+        _ => PlausibilityWinner::CurrentTrilat,
+    };
+    let (winner_name, winner_score, loser_name, loser_score) = match winner {
+        PlausibilityWinner::CurrentTrilat => {
+            ("current_trilat", current_score, "last_fix", previous_score)
+        }
+        PlausibilityWinner::LastFix => {
+            ("last_fix", previous_score, "current_trilat", current_score)
+        }
+    };
+    let suspect_reason = format!(
+        "implied {speed:.1} km/h exceeds max {max_travel_speed_kmh}; tie-break favored \
+         {winner_name} (score {winner_name} {} vs {loser_name} {})",
+        format_score(winner_score),
+        format_score(loser_score),
+    );
+
+    PlausibilityDecision {
+        winner,
+        implied_speed_kmh: Some(speed),
+        last_fix_age_secs: Some(age_secs),
+        inlier_ratio: winner_score,
+        confidence: Confidence::Suspect,
+        suspect_reason: Some(suspect_reason),
+        distance_m,
+        current_score,
+        last_fix_score: previous_score,
+    }
+}
+
 async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::PrivacyTicket) -> String {
     use crate::resolver;
     use crate::trilaterate::{trilaterate, PositionedAp};
@@ -1253,67 +1449,43 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
     let stable = debouncer.stable_bssids();
     let visible = debouncer.latest_scan().map(|s| s.len()).unwrap_or(0);
 
-    // Build candidate list: stable APs with a CURRENT signal, sorted by
-    // RSSI, top-N. Stable BSSIDs that fell out of the most recent scan
-    // (no current signal) are filtered out rather than fed a fake -90 dBm
-    // (task-0051) — fake readings poison trilateration weights, which is
-    // exactly the bug task-0043 fixed in the nmcli parser.
+    // Snapshot every scanner-eligible AP in the latest scan exactly once.
+    // This full set is the consensus universe; solver membership is derived
+    // separately below so stability and top-N never shrink the denominator.
     let stable_count = stable.len();
-    let mut candidates: Vec<(String, i32, Option<String>)> = stable
-        .iter()
-        .filter_map(|bssid| {
-            debouncer
-                .latest_entry(bssid)
-                // Current scanner evidence takes effect immediately. Do this
-                // before sorting/truncating so stronger train/bus hotspots
-                // cannot consume every top-N slot and starve fixed APs.
-                .filter(|entry| {
+    let mut visible_candidates: Vec<(String, i32, Option<String>)> = debouncer
+        .latest_scan()
+        .map(|scan| {
+            scan.iter()
+                .filter(|(_, entry)| {
                     !crate::scanner::is_mobile_ssid(
                         entry.ssid.as_deref(),
                         &state.args.mobile_ssid_denylist,
                     )
                 })
-                .map(|entry| (bssid.clone(), entry.signal_dbm, entry.ssid.clone()))
+                .map(|(bssid, entry)| (bssid.clone(), entry.signal_dbm, entry.ssid.clone()))
+                .collect()
         })
-        .collect();
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
+        .unwrap_or_default();
+    visible_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
 
-    // Cold-start fallback: if no scanner-eligible stable APs exist, use all
-    // scanner-eligible APs from the latest scan (bypass debounce for the
-    // query). Do not truncate either list yet: persisted-mobile and poisoned
-    // non-finite cache rows are not known until after the cache lookup, and an
-    // ineligible stronger row must not consume a top-N positioning slot.
-    let fallback_candidates: Vec<(String, i32, Option<String>)> = if candidates.is_empty() {
-        debouncer
-            .latest_scan()
-            .map(|scan| {
-                let mut v: Vec<(String, i32, Option<String>)> = scan
-                    .iter()
-                    .filter(|(_, entry)| {
-                        !crate::scanner::is_mobile_ssid(
-                            entry.ssid.as_deref(),
-                            &state.args.mobile_ssid_denylist,
-                        )
-                    })
-                    .map(|(b, e)| (b.clone(), e.signal_dbm, e.ssid.clone()))
-                    .collect();
-                v.sort_by_key(|c| std::cmp::Reverse(c.1));
-                v
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    // Stable BSSIDs that fell out of the current scan are absent from this
+    // list instead of receiving a fabricated -90 dBm signal (task-0051).
+    let stable_candidates: Vec<(String, i32, Option<String>)> = visible_candidates
+        .iter()
+        .filter(|(bssid, _, _)| stable.contains(bssid))
+        .cloned()
+        .collect();
 
     drop(debouncer);
     drop(privacy);
 
     // Try stable candidates first, fall back to raw visible APs
-    let using_fallback = candidates.is_empty() && !fallback_candidates.is_empty();
-    let active_candidates = if candidates.is_empty() {
-        &fallback_candidates
+    let using_fallback = stable_candidates.is_empty() && !visible_candidates.is_empty();
+    let active_candidates = if stable_candidates.is_empty() {
+        &visible_candidates
     } else {
-        &candidates
+        &stable_candidates
     };
 
     if active_candidates.is_empty() {
@@ -1325,7 +1497,7 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
         return return_last_fix_or_error(state, ticket, error, visible, stable_count).await;
     }
 
-    let bssids: Vec<String> = active_candidates
+    let bssids: Vec<String> = visible_candidates
         .iter()
         .map(|(bssid, _, _)| bssid.clone())
         .collect();
@@ -1335,8 +1507,8 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
         .collect();
 
     // Cache-only lookup — never blocks on WiGLE. Instant response.
-    // lookup_cached_touch preserves input order, so the returned hits remain
-    // RSSI ordered even though absent BSSIDs are omitted.
+    // This is the sole cache lookup for locate. lookup_cached_touch preserves
+    // full-snapshot RSSI order even though absent BSSIDs are omitted.
     let cached_aps = resolver::lookup_cached(&bssids, state, ticket).await;
 
     // Build trilateration input.
@@ -1352,29 +1524,37 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
     // both run before take(top_n). Otherwise stronger ineligible cache rows can
     // fill every slot and starve weaker fixed rows. trilaterate() independently
     // re-applies these guards for callers that bypass this server path.
-    let positioned_aps: Vec<PositionedAp> = cached_aps
+    let active_bssids: std::collections::HashSet<&str> = active_candidates
         .iter()
-        .filter_map(|ap| {
-            let finite = ap.lat.is_finite() && ap.lon.is_finite();
-            if !finite {
-                warn!(
-                    "skipping AP {}: non-finite cached position ({}, {})",
-                    ap.bssid, ap.lat, ap.lon
-                );
-                return None;
-            }
-            if ap.is_mobile {
-                return None;
-            }
-            Some(PositionedAp {
+        .map(|(bssid, _, _)| bssid.as_str())
+        .collect();
+    let mut visible_cached = Vec::new();
+    let mut positioned_aps = Vec::new();
+    for ap in &cached_aps {
+        if !ap.lat.is_finite() || !ap.lon.is_finite() {
+            warn!(
+                "skipping AP {}: non-finite cached position ({}, {})",
+                ap.bssid, ap.lat, ap.lon
+            );
+            continue;
+        }
+        if ap.is_mobile {
+            continue;
+        }
+
+        // Consensus deliberately ignores stability, RSSI, top-N and eventual
+        // outlier-filter survival. Every eligible unique BSSID in the latest
+        // scanner snapshot contributes exactly one denominator entry.
+        visible_cached.push((ap.lat, ap.lon));
+        if active_bssids.contains(ap.bssid.as_str()) && positioned_aps.len() < state.args.top_n {
+            positioned_aps.push(PositionedAp {
                 lat: ap.lat,
                 lon: ap.lon,
                 signal_dbm: signal_map.get(&ap.bssid).copied(),
                 is_mobile: ap.is_mobile,
-            })
-        })
-        .take(state.args.top_n)
-        .collect();
+            });
+        }
+    }
     // `cached` counts only finite fixed cache hits admitted to this solve, not
     // every row examined while filling top-N. `sources` is the number handed
     // to trilateration; locate is cache-only, so they coincide for fresh fixes.
@@ -1415,44 +1595,94 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
 
     match trilaterate(&positioned_aps) {
         Ok(pos) => {
-            // Save as last-known fix: in-memory + SQLite, both under the
-            // last_fix mutex (task-0046).
-            //
-            // Holding the last_fix mutex across the DB write closes the race
-            // where two concurrent handle_locate calls could otherwise have
-            // their in-memory writes interleave with their DB writes:
-            //   T1 in-mem X, T1 drops, T2 in-mem Y, T2 drops + persists Y,
-            //   T1 persists X => disk diverges from in-memory.
-            //
-            // The last_fix guard intentionally spans the durable writer-actor
-            // await. This serializes memory publication with DB FIFO ordering;
-            // the address-backfill path uses the same order. last_fix and
-            // history are committed together in one actor transaction.
-            let new_fix = LastFix {
-                lat: pos.lat,
-                lon: pos.lon,
-                accuracy_m: pos.accuracy_m,
-                address: None,
-                at: chrono::Utc::now(),
-                sources: source_count,
+            // The complete policy boundary is serialized in the established
+            // privacy -> last_fix -> database order. Read the previous row
+            // literally from SQLite while holding last_fix, then capture one
+            // high-resolution wall clock for age, speed, decision and any
+            // current-winner persistence. Concurrent locate/backfill calls
+            // cannot change the previous row between these phases.
+            let Some(_privacy) = state.privacy.read(ticket).await else {
+                return error_json(STALE_AFTER_WIPE_ERROR);
             };
-            // Address resolution remains off the response-critical network
-            // path. An address-enabled locate atomically persists its fix and
-            // observes the rounded cache cell; misses replace one bounded
-            // scheduler slot and hits supersede stale rate-waiting work.
-            let address = if state.args.address_approx {
-                persist_locate_fix_and_schedule(state, ticket, new_fix).await
-            } else {
-                persist_last_fix_and_history(state, ticket, new_fix).await;
-                None
+            let mut last = state.last_fix.lock().await;
+            let previous_row = match state.db.get_last_fix().await {
+                Ok(row) => row,
+                Err(error) => {
+                    return error_json(&format!("failed to read last_fix: {error}"));
+                }
             };
+            let previous = previous_row.and_then(|row| match LastFix::try_from(row) {
+                Ok(fix) => Some(fix),
+                Err(error) => {
+                    warn!("ignoring invalid persisted last_fix during locate: {error}");
+                    None
+                }
+            });
+            let now = chrono::Utc::now();
+            let decision = evaluate_plausibility(
+                previous.as_ref(),
+                (pos.lat, pos.lon),
+                &visible_cached,
+                now,
+                state.args.max_travel_speed_kmh,
+            );
+
+            if decision.confidence == Confidence::Suspect {
+                let (winner, loser) = match decision.winner {
+                    PlausibilityWinner::CurrentTrilat => ("current_trilat", "last_fix"),
+                    PlausibilityWinner::LastFix => ("last_fix", "current_trilat"),
+                };
+                warn!(
+                    current_trilat_score = ?decision.current_score,
+                    last_fix_score = ?decision.last_fix_score,
+                    "plausibility tie-break rejected {loser}; favored {winner}"
+                );
+            }
+
+            let (lat, lon, accuracy_m, address) = match decision.winner {
+                PlausibilityWinner::CurrentTrilat => {
+                    let new_fix = LastFix {
+                        lat: pos.lat,
+                        lon: pos.lon,
+                        accuracy_m: pos.accuracy_m,
+                        address: None,
+                        at: now,
+                        sources: source_count,
+                    };
+
+                    let address = if state.args.address_approx {
+                        persist_locate_fix_and_schedule_locked(state, ticket, &mut last, new_fix)
+                            .await
+                    } else {
+                        persist_last_fix_and_history_locked(state, &mut last, new_fix).await;
+                        None
+                    };
+                    (pos.lat, pos.lon, pos.accuracy_m, address)
+                }
+                PlausibilityWinner::LastFix => {
+                    let previous = previous
+                        .as_ref()
+                        .expect("a last_fix winner requires a validated previous row");
+                    // Do not rewrite last_fix/history here. The prior row is
+                    // already the literal winning observation; refreshing its
+                    // timestamp would invent motion evidence, and persisting
+                    // the drift-bound accuracy would compound it on every call.
+                    (
+                        previous.lat,
+                        previous.lon,
+                        previous.accuracy_m + decision.distance_m,
+                        previous.address.clone(),
+                    )
+                }
+            };
+            drop(last);
 
             let resp = LocateResponse {
                 ok: true,
                 v: 1,
-                lat: pos.lat,
-                lon: pos.lon,
-                accuracy_m: pos.accuracy_m,
+                lat,
+                lon,
+                accuracy_m,
                 sources: source_count,
                 cached: cached_count,
                 fetched: 0,
@@ -1462,6 +1692,11 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
                 address,
                 stale: false,
                 age_s: None,
+                implied_speed_kmh: decision.implied_speed_kmh,
+                last_fix_age_secs: decision.last_fix_age_secs,
+                inlier_ratio: decision.inlier_ratio,
+                confidence: decision.confidence,
+                suspect_reason: decision.suspect_reason,
             };
             ok_json(&resp)
         }
@@ -1491,8 +1726,18 @@ async fn return_last_fix_or_error(
     };
     let last = state.last_fix.lock().await;
     if let Some(fix) = last.as_ref() {
-        // Wall-clock age. Negative ages (clock skew) clamp to zero.
-        let age_s = (chrono::Utc::now() - fix.at).num_seconds().max(0) as u64;
+        // Wall-clock age. Negative ages (clock skew) clamp to zero and remain
+        // observable instead of silently masquerading as a fresh timestamp.
+        let now = chrono::Utc::now();
+        if now < fix.at {
+            warn!(
+                previous_at = %fix.at,
+                now = %now,
+                "stale last_fix timestamp is in the future; clamping reported age to zero"
+            );
+        }
+        let age = (now - fix.at).num_seconds().max(0);
+        let age_s = age as u64;
         let resp = LocateResponse {
             ok: true,
             v: 1,
@@ -1508,6 +1753,11 @@ async fn return_last_fix_or_error(
             address: fix.address.clone(),
             stale: true,
             age_s: Some(age_s),
+            implied_speed_kmh: None,
+            last_fix_age_secs: Some(age),
+            inlier_ratio: None,
+            confidence: Confidence::Low,
+            suspect_reason: None,
         };
         ok_json(&resp)
     } else {
@@ -2736,6 +2986,547 @@ mod dispatch_tests {
         assert_eq!(json["sources"], 3, "only fixed finite rows are sources");
         assert!((json["lat"].as_f64().unwrap() - 55.6760).abs() < 0.001);
         assert!((json["lon"].as_f64().unwrap() - 12.5681).abs() < 0.001);
+    }
+
+    async fn push_stable_scan(state: &Arc<DaemonState>, sample: crate::debounce::ScanSample) {
+        let mut debouncer = state.debouncer.lock().await;
+        for _ in 0..state.args.debounce_threshold {
+            debouncer.push_scan(sample.clone());
+        }
+    }
+
+    fn add_cached_scan_ap(
+        state: &Arc<DaemonState>,
+        sample: &mut crate::debounce::ScanSample,
+        bssid: &str,
+        lat: f64,
+        lon: f64,
+        signal_dbm: i32,
+        ssid: Option<&str>,
+    ) {
+        cache_ap(state, bssid, lat, lon);
+        sample.insert(
+            bssid.to_string(),
+            crate::debounce::ScanEntry {
+                signal_dbm,
+                ssid: ssid.map(str::to_owned),
+                channel: Some(1),
+            },
+        );
+    }
+
+    fn previous_row(lat: f64, lon: f64, age: chrono::Duration) -> crate::db::LastFixRow {
+        crate::db::LastFixRow {
+            lat,
+            lon,
+            accuracy_m: 20.0,
+            address: Some("previous address".to_string()),
+            at_rfc3339: (chrono::Utc::now() - age).to_rfc3339(),
+            sources: 7,
+        }
+    }
+
+    #[test]
+    fn confidence_thresholds_and_display_are_pinned() {
+        for (score, expected) in [
+            (Some(1.0), Confidence::High),
+            (Some(0.7), Confidence::High),
+            (Some(0.699_999), Confidence::Medium),
+            (Some(0.4), Confidence::Medium),
+            (Some(0.399_999), Confidence::Low),
+            (None, Confidence::Low),
+        ] {
+            assert_eq!(confidence_from_score(score), expected);
+        }
+        assert_eq!(Confidence::High.to_string(), "High");
+        assert_eq!(Confidence::Medium.to_string(), "Medium");
+        assert_eq!(Confidence::Low.to_string(), "Low");
+        assert_eq!(Confidence::Suspect.to_string(), "Suspect");
+        assert_eq!(
+            serde_json::to_string(&Confidence::Suspect).unwrap(),
+            "\"suspect\""
+        );
+    }
+
+    #[test]
+    fn speed_limit_equality_is_not_suspect_and_undefined_tie_favors_current() {
+        let now = chrono::Utc::now();
+        let previous = LastFix {
+            lat: 55.6050,
+            lon: 13.0038,
+            accuracy_m: 10.0,
+            address: None,
+            at: now - chrono::Duration::hours(1),
+            sources: 3,
+        };
+        let current = (55.6761, 12.5683);
+        let exact_speed =
+            crate::geo::haversine_kmh(previous.lat, previous.lon, current.0, current.1, 3600.0);
+        let at_limit = evaluate_plausibility(
+            Some(&previous),
+            current,
+            &[current, current, current],
+            now,
+            exact_speed,
+        );
+        assert_eq!(at_limit.winner, PlausibilityWinner::CurrentTrilat);
+        assert_eq!(at_limit.confidence, Confidence::High);
+        assert!(at_limit.suspect_reason.is_none());
+
+        let undefined_tie = evaluate_plausibility(
+            Some(&previous),
+            current,
+            &[current, current],
+            now,
+            exact_speed - 0.001,
+        );
+        assert_eq!(undefined_tie.winner, PlausibilityWinner::CurrentTrilat);
+        assert_eq!(undefined_tie.confidence, Confidence::Suspect);
+        assert_eq!(undefined_tie.inlier_ratio, None);
+        let reason = undefined_tie.suspect_reason.unwrap();
+        assert!(reason.contains("favored current_trilat"), "{reason}");
+        assert!(
+            reason.contains("score current_trilat n/a vs last_fix n/a"),
+            "{reason}"
+        );
+
+        let defined_tie = evaluate_plausibility(
+            Some(&previous),
+            current,
+            &[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)],
+            now,
+            exact_speed - 0.001,
+        );
+        assert_eq!(defined_tie.winner, PlausibilityWinner::CurrentTrilat);
+        assert_eq!(defined_tie.inlier_ratio, Some(0.0));
+        assert!(defined_tie
+            .suspect_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("score current_trilat 0.00 vs last_fix 0.00")));
+    }
+
+    #[test]
+    fn signed_elapsed_seconds_preserves_sub_microsecond_sign_and_policy() {
+        let now = chrono::Utc::now();
+        let past = now - chrono::Duration::nanoseconds(500);
+        let future = now + chrono::Duration::nanoseconds(500);
+        let past_elapsed = signed_elapsed_seconds(now, past);
+        let future_elapsed = signed_elapsed_seconds(now, future);
+        assert!((past_elapsed - 5e-7).abs() < 1e-15, "got {past_elapsed}");
+        assert!(
+            (future_elapsed + 5e-7).abs() < 1e-15,
+            "got {future_elapsed}"
+        );
+
+        let previous = LastFix {
+            lat: 55.6050,
+            lon: 13.0038,
+            accuracy_m: 10.0,
+            address: None,
+            at: past,
+            sources: 3,
+        };
+        let current = (55.6761, 12.5683);
+        let positive_duration = evaluate_plausibility(
+            Some(&previous),
+            current,
+            &[current, current, current],
+            now,
+            250.0,
+        );
+        assert_eq!(positive_duration.confidence, Confidence::Suspect);
+        assert!(positive_duration.implied_speed_kmh.unwrap() > 1_000_000_000.0);
+
+        let future_previous = LastFix {
+            at: future,
+            ..previous
+        };
+        let future_clock = evaluate_plausibility(
+            Some(&future_previous),
+            current,
+            &[current, current, current],
+            now,
+            1.0,
+        );
+        assert_eq!(future_clock.implied_speed_kmh, Some(0.0));
+        assert_eq!(future_clock.last_fix_age_secs, Some(0));
+        assert_eq!(future_clock.confidence, Confidence::High);
+        assert_eq!(future_clock.winner, PlausibilityWinner::CurrentTrilat);
+    }
+
+    #[tokio::test]
+    async fn locate_cold_boot_reports_consensus_without_speed_fields() {
+        let state = test_state();
+        let mut sample = crate::debounce::ScanSample::new();
+        for (index, (lat, lon)) in [(55.6760, 12.5680), (55.6761, 12.5682), (55.6759, 12.5681)]
+            .into_iter()
+            .enumerate()
+        {
+            add_cached_scan_ap(
+                &state,
+                &mut sample,
+                &format!("02:00:00:00:60:{index:02x}"),
+                lat,
+                lon,
+                -50 - index as i32,
+                Some("fixed-home"),
+            );
+        }
+        push_stable_scan(&state, sample).await;
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], true, "{response}");
+        assert_eq!(json["confidence"], "high");
+        assert_eq!(json["inlier_ratio"], 1.0);
+        for field in ["implied_speed_kmh", "last_fix_age_secs", "suspect_reason"] {
+            assert!(
+                json.get(field).is_none(),
+                "cold boot must omit {field}: {response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn speed_alarm_uses_full_visible_consensus_and_keeps_previous_row_literal() {
+        const PREVIOUS: (f64, f64) = (55.7047, 12.5900);
+        const BRAZIL: (f64, f64) = (-12.8940, -38.2920);
+
+        let mut state = test_state();
+        Arc::get_mut(&mut state)
+            .expect("state must be uniquely owned before test configuration")
+            .args
+            .top_n = 1;
+        let previous = previous_row(PREVIOUS.0, PREVIOUS.1, chrono::Duration::minutes(5));
+        state.db.set_last_fix(previous.clone()).await.unwrap();
+
+        let mut sample = crate::debounce::ScanSample::new();
+        add_cached_scan_ap(
+            &state,
+            &mut sample,
+            "02:00:00:00:61:ff",
+            BRAZIL.0,
+            BRAZIL.1,
+            -20,
+            Some("strong-outlier"),
+        );
+        for index in 0..4 {
+            add_cached_scan_ap(
+                &state,
+                &mut sample,
+                &format!("02:00:00:00:61:{index:02x}"),
+                PREVIOUS.0 + index as f64 / 100_000.0,
+                PREVIOUS.1 + index as f64 / 100_000.0,
+                -60 - index,
+                Some("fixed-near-previous"),
+            );
+        }
+        push_stable_scan(&state, sample).await;
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], true, "{response}");
+        assert_eq!(json["confidence"], "suspect");
+        assert_eq!(
+            json["cached"], 1,
+            "top_n=1 must still govern solver metadata"
+        );
+        assert_eq!(json["sources"], 1);
+        assert_eq!(json["visible"], 5);
+        assert_eq!(json["stable"], 5);
+        assert_eq!(
+            json["inlier_ratio"], 0.8,
+            "consensus denominator must include all five visible cached APs"
+        );
+        assert!((json["lat"].as_f64().unwrap() - PREVIOUS.0).abs() < 1e-12);
+        assert!((json["lon"].as_f64().unwrap() - PREVIOUS.1).abs() < 1e-12);
+        assert_eq!(json["address"], "previous address");
+        assert!(json["implied_speed_kmh"].as_f64().unwrap() > 250.0);
+        let expected_accuracy = previous.accuracy_m
+            + crate::geo::haversine_m(PREVIOUS.0, PREVIOUS.1, BRAZIL.0, BRAZIL.1);
+        assert!(
+            (json["accuracy_m"].as_f64().unwrap() - expected_accuracy).abs() < 1e-6,
+            "previous winner must add current-candidate distance to saved accuracy"
+        );
+        let reason = json["suspect_reason"].as_str().unwrap();
+        assert!(reason.contains("tie-break favored last_fix"), "{reason}");
+        assert!(
+            reason.contains("score last_fix 0.80 vs current_trilat 0.20"),
+            "{reason}"
+        );
+        assert!(json.get("stale").is_none() && json.get("age_s").is_none());
+
+        let stored = state.db.get_last_fix().await.unwrap().unwrap();
+        assert_eq!(
+            stored.at_rfc3339, previous.at_rfc3339,
+            "policy reuse must not refresh the observation timestamp"
+        );
+        assert_eq!(
+            stored.accuracy_m, previous.accuracy_m,
+            "drift bound must not compound on disk"
+        );
+        assert!(
+            state
+                .db
+                .get_fixes_in_range("0000", "9999")
+                .await
+                .unwrap()
+                .is_empty(),
+            "last_fix winner must not append synthetic history"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspect_current_winner_preserves_address_last_fix_and_history_semantics() {
+        const CURRENT: (f64, f64) = (55.6761, 12.5683);
+        const PREVIOUS: (f64, f64) = (-12.8940, -38.2920);
+        let mut state = test_state();
+        Arc::get_mut(&mut state)
+            .expect("state must be uniquely owned before test configuration")
+            .args
+            .address_approx = true;
+        state
+            .db
+            .set_last_fix(previous_row(
+                PREVIOUS.0,
+                PREVIOUS.1,
+                chrono::Duration::minutes(5),
+            ))
+            .await
+            .unwrap();
+        state.address_cache.lock().unwrap().insert(
+            CURRENT.0,
+            CURRENT.1,
+            "current address".to_string(),
+        );
+
+        let mut sample = crate::debounce::ScanSample::new();
+        for index in 0..4 {
+            add_cached_scan_ap(
+                &state,
+                &mut sample,
+                &format!("02:00:00:00:65:{index:02x}"),
+                CURRENT.0,
+                CURRENT.1,
+                -40 - index,
+                Some("fixed-current"),
+            );
+        }
+        add_cached_scan_ap(
+            &state,
+            &mut sample,
+            "02:00:00:00:65:ff",
+            PREVIOUS.0,
+            PREVIOUS.1,
+            -80,
+            Some("fixed-previous"),
+        );
+        push_stable_scan(&state, sample).await;
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["confidence"], "suspect", "{response}");
+        assert_eq!(json["inlier_ratio"], 0.8);
+        assert!((json["lat"].as_f64().unwrap() - CURRENT.0).abs() < 1e-12);
+        assert!((json["lon"].as_f64().unwrap() - CURRENT.1).abs() < 1e-12);
+        assert_eq!(json["address"], "current address");
+        assert!(json["suspect_reason"]
+            .as_str()
+            .unwrap()
+            .contains("score current_trilat 0.80 vs last_fix 0.20"));
+
+        let stored = state.db.get_last_fix().await.unwrap().unwrap();
+        assert!((stored.lat - CURRENT.0).abs() < 1e-12);
+        assert!((stored.lon - CURRENT.1).abs() < 1e-12);
+        assert_eq!(stored.address.as_deref(), Some("current address"));
+        assert_eq!(
+            state
+                .db
+                .get_fixes_in_range("0000", "9999")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let memory = state.last_fix.lock().await;
+        let memory = memory
+            .as_ref()
+            .expect("current winner must publish in memory");
+        assert!((memory.lat - CURRENT.0).abs() < 1e-12);
+        assert_eq!(memory.address.as_deref(), Some("current address"));
+    }
+
+    #[tokio::test]
+    async fn legitimate_drive_keeps_current_high_confidence_fix() {
+        const MALMOE: (f64, f64) = (55.6050, 13.0038);
+        const COPENHAGEN: (f64, f64) = (55.6761, 12.5683);
+        let state = test_state();
+        state
+            .db
+            .set_last_fix(previous_row(
+                MALMOE.0,
+                MALMOE.1,
+                chrono::Duration::minutes(30),
+            ))
+            .await
+            .unwrap();
+        let mut sample = crate::debounce::ScanSample::new();
+        for index in 0..3 {
+            add_cached_scan_ap(
+                &state,
+                &mut sample,
+                &format!("02:00:00:00:62:{index:02x}"),
+                COPENHAGEN.0 + index as f64 / 100_000.0,
+                COPENHAGEN.1 + index as f64 / 100_000.0,
+                -50 - index,
+                Some("fixed-current"),
+            );
+        }
+        push_stable_scan(&state, sample).await;
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["confidence"], "high", "{response}");
+        assert_eq!(json["inlier_ratio"], 1.0);
+        assert!((50.0..65.0).contains(&json["implied_speed_kmh"].as_f64().unwrap()));
+        assert!((1_790..=1_810).contains(&json["last_fix_age_secs"].as_i64().unwrap()));
+        assert!(json.get("suspect_reason").is_none());
+        assert!((json["lat"].as_f64().unwrap() - COPENHAGEN.0).abs() < 0.001);
+        assert_eq!(
+            state
+                .db
+                .get_fixes_in_range("0000", "9999")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn locate_with_two_visible_cached_aps_forces_low_confidence() {
+        let state = test_state();
+        let mut sample = crate::debounce::ScanSample::new();
+        for index in 0..2 {
+            add_cached_scan_ap(
+                &state,
+                &mut sample,
+                &format!("02:00:00:00:63:{index:02x}"),
+                55.6761 + index as f64 / 100_000.0,
+                12.5683 + index as f64 / 100_000.0,
+                -50 - index,
+                Some("fixed-current"),
+            );
+        }
+        push_stable_scan(&state, sample).await;
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], true, "{response}");
+        assert_eq!(json["confidence"], "low");
+        assert!(json.get("inlier_ratio").is_none());
+    }
+
+    /// A plausible speed is necessary but not sufficient: mobile hardware can
+    /// evade the coarse SSID taxonomy when the train hides its SSID or uses an
+    /// unrecognized name. A coherent moved cluster then earns high consensus,
+    /// and a slow enough apparent displacement is intentionally not flagged.
+    /// A consensus-only mode that can challenge plausible-speed clusters is a
+    /// follow-up, not behavior implemented by this speed-gated policy.
+    #[tokio::test]
+    async fn undocumented_train_ssids_can_still_produce_wrong_high_confidence_fix() {
+        const STRANDBOULEVARDEN: (f64, f64) = (55.7047, 12.5900);
+        const MAGLEVAENGET: (f64, f64) = (55.7390, 12.5500);
+        let state = test_state();
+        state
+            .db
+            .set_last_fix(previous_row(
+                STRANDBOULEVARDEN.0,
+                STRANDBOULEVARDEN.1,
+                chrono::Duration::minutes(30),
+            ))
+            .await
+            .unwrap();
+        let endpoint_delta_lat = (175.0_f64 / 6_371_000.0).to_degrees();
+        let train_coords = [
+            (MAGLEVAENGET.0 - endpoint_delta_lat, MAGLEVAENGET.1),
+            MAGLEVAENGET,
+            (MAGLEVAENGET.0 + endpoint_delta_lat, MAGLEVAENGET.1),
+        ];
+        let endpoint_span = crate::geo::haversine_m(
+            train_coords[0].0,
+            train_coords[0].1,
+            train_coords[2].0,
+            train_coords[2].1,
+        );
+        assert!(
+            (349.0..=351.0).contains(&endpoint_span),
+            "train AP fixture must span about 350m, got {endpoint_span}m"
+        );
+        let mut sample = crate::debounce::ScanSample::new();
+        for (index, ssid) in [None, Some("RailNet"), Some("")].into_iter().enumerate() {
+            add_cached_scan_ap(
+                &state,
+                &mut sample,
+                &format!("02:00:00:00:64:{index:02x}"),
+                train_coords[index].0,
+                train_coords[index].1,
+                -50,
+                ssid,
+            );
+        }
+        push_stable_scan(&state, sample).await;
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            json["confidence"], "high",
+            "documented limitation changed: {response}"
+        );
+        assert_eq!(json["inlier_ratio"], 1.0);
+        let speed = json["implied_speed_kmh"].as_f64().unwrap();
+        assert!(
+            (speed - 9.1).abs() < 1.0,
+            "fixture must remain a plausible train displacement: {speed}"
+        );
+        let candidate = (json["lat"].as_f64().unwrap(), json["lon"].as_f64().unwrap());
+        assert!((candidate.0 - MAGLEVAENGET.0).abs() < 0.001);
+        assert!((candidate.1 - MAGLEVAENGET.1).abs() < 0.001);
+        for ap in train_coords {
+            let distance = crate::geo::haversine_m(candidate.0, candidate.1, ap.0, ap.1);
+            assert!(
+                distance <= 200.0,
+                "every train AP must be an inclusive-200m consensus inlier; got {distance}m"
+            );
+        }
+        assert!(json.get("suspect_reason").is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_fallback_reports_low_uncertainty_and_clamps_future_age() {
+        let state = test_state();
+        *state.last_fix.lock().await = Some(LastFix {
+            lat: 55.6761,
+            lon: 12.5683,
+            accuracy_m: 20.0,
+            address: None,
+            at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            sources: 3,
+        });
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], true, "{response}");
+        assert_eq!(json["stale"], true);
+        assert_eq!(json["age_s"], 0);
+        assert_eq!(json["last_fix_age_secs"], 0);
+        assert_eq!(json["confidence"], "low");
+        for field in ["implied_speed_kmh", "inlier_ratio", "suspect_reason"] {
+            assert!(
+                json.get(field).is_none(),
+                "stale fallback must omit {field}: {response}"
+            );
+        }
     }
 
     #[test]

@@ -212,6 +212,30 @@ struct WipeRequest {
 
 // --- Response types ---
 
+/// Plausibility confidence attached to every successful locate response.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    /// Backward-compatible default for responses from older daemons, which
+    /// predate explicit uncertainty reporting.
+    #[default]
+    High,
+    Medium,
+    Low,
+    Suspect,
+}
+
+impl std::fmt::Display for Confidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Confidence::High => "High",
+            Confidence::Medium => "Medium",
+            Confidence::Low => "Low",
+            Confidence::Suspect => "Suspect",
+        })
+    }
+}
+
 /// Response from the `locate` command.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LocateResponse {
@@ -244,6 +268,23 @@ pub struct LocateResponse {
     /// Age of the stale fix, in seconds. Only meaningful when `stale`.
     #[serde(default)]
     pub age_s: Option<u64>,
+    /// Implied speed from the previous accepted fix, absent on cold boot or
+    /// when returning the generic stale fallback.
+    #[serde(default)]
+    pub implied_speed_kmh: Option<f64>,
+    /// Age of the previous accepted fix used by the plausibility check.
+    #[serde(default)]
+    pub last_fix_age_secs: Option<i64>,
+    /// Consensus fraction for the selected winner, absent with fewer than
+    /// three eligible visible cached APs.
+    #[serde(default)]
+    pub inlier_ratio: Option<f64>,
+    /// Older daemons omit confidence; preserve their historic optimistic
+    /// behavior by interpreting that omission as High.
+    #[serde(default)]
+    pub confidence: Confidence,
+    #[serde(default)]
+    pub suspect_reason: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -1106,6 +1147,59 @@ mod stats_wire_tests {
 #[cfg(test)]
 mod protocol_version_tests {
     use super::*;
+
+    #[test]
+    fn old_daemon_locate_defaults_new_uncertainty_fields() {
+        let response: LocateResponse = WhereAmIClient::tcp("127.0.0.1:4747")
+            .parse_response_line(
+                r#"{"ok":true,"v":1,"lat":55.6761,"lon":12.5683,"accuracy_m":12.0,"sources":3}"#,
+            )
+            .unwrap();
+
+        assert_eq!(response.implied_speed_kmh, None);
+        assert_eq!(response.last_fix_age_secs, None);
+        assert_eq!(response.inlier_ratio, None);
+        assert_eq!(response.confidence, Confidence::High);
+        assert_eq!(response.suspect_reason, None);
+    }
+
+    #[test]
+    fn legacy_client_shape_ignores_new_daemon_uncertainty_fields() {
+        #[derive(Deserialize)]
+        struct LegacyLocate {
+            ok: bool,
+            v: u32,
+            lat: f64,
+            lon: f64,
+            sources: usize,
+        }
+
+        let response: LegacyLocate = serde_json::from_str(
+            r#"{"ok":true,"v":1,"lat":55.6761,"lon":12.5683,"sources":3,"implied_speed_kmh":312.5,"last_fix_age_secs":42,"inlier_ratio":0.8,"confidence":"suspect","suspect_reason":"test"}"#,
+        )
+        .unwrap();
+        assert!(response.ok);
+        assert_eq!(response.v, 1);
+        assert_eq!((response.lat, response.lon), (55.6761, 12.5683));
+        assert_eq!(response.sources, 3);
+    }
+
+    #[test]
+    fn confidence_wire_vocabulary_and_display_are_pinned() {
+        for (confidence, wire, display) in [
+            (Confidence::High, "\"high\"", "High"),
+            (Confidence::Medium, "\"medium\"", "Medium"),
+            (Confidence::Low, "\"low\"", "Low"),
+            (Confidence::Suspect, "\"suspect\"", "Suspect"),
+        ] {
+            assert_eq!(serde_json::to_string(&confidence).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<Confidence>(wire).unwrap(),
+                confidence
+            );
+            assert_eq!(confidence.to_string(), display);
+        }
+    }
 
     #[test]
     fn supported_v1_response_parses_normally() {

@@ -8,7 +8,7 @@ Unix socket.
 ```
 $ whereami locate
 Magstræde 5, 1204 København K, Denmark
-55.707250, 12.585598  ±12m  (6 sources)
+55.707250, 12.585598  ±12m  (6 sources, High)
 ```
 
 ## Why
@@ -96,6 +96,7 @@ Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
 --debounce-window <N>               Ring buffer size [10]
 --debounce-threshold <N>            Min appearances to be stable [5]
 --top-n <N>                         Strongest APs for trilateration [10]
+--max-travel-speed-kmh <KM/H>       Plausibility speed ceiling [250]
 --mobile-ssid-denylist <GLOBS>      Comma-separated mobile-SSID globs [built-in list]
 --pending-interval <S>              Pending queue drain interval [300]
 --pending-max-attempts <N>          Give up after N failures [20]
@@ -129,9 +130,18 @@ Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
 3. Positions resolve via Apple WPS first, then WiGLE; results cache locally.
 4. Outlier rejection drops APs with stale/wrong positions.
 5. Spherical-mean trilateration computes your location (antimeridian-safe).
-6. Optional reverse geocoding via OSM Nominatim adds a street address.
-7. Every successful fix is recorded in a `fixes` timeseries; the `history`
+6. The result is checked against the previous fix's implied travel speed. A
+   result above the configured ceiling is marked Suspect and visible cached-AP
+   consensus chooses between current trilateration and the previous fix.
+7. Optional reverse geocoding via OSM Nominatim adds a street address.
+8. Every accepted current fix is recorded in a `fixes` timeseries; the `history`
    command groups them into stay-point segments.
+
+Human `locate` output appends the confidence. On a terminal, High is dim green,
+Low is yellow, and Suspect is bold red; Medium and all redirected/piped output
+remain uncolored. The speed check is deliberately necessary-but-not-sufficient:
+a train or hotspot that evades the SSID denylist and moves at a plausible speed
+can still form a coherent, high-confidence but wrong AP cluster.
 
 ## Accuracy
 
@@ -276,6 +286,7 @@ on the deployment's normal `PATH` after activation. A custom
     allowedUsers = [ "alice" ];
     credentialsFile = "/etc/whereami/secrets.toml";
     addressApprox = true;
+    maxTravelSpeedKmh = 250;
     rustLog = "whereamid=debug"; # temporary troubleshooting only; normally null
   };
 }

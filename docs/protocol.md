@@ -125,11 +125,13 @@ Every response includes:
     "ok": true, "v": 1,
     "lat": 55.707250, "lon": 12.585598, "accuracy_m": 11.95,
     "sources": 6, "cached": 6, "fetched": 0, "pending": 0,
-    "visible": 12, "stable": 11
+    "visible": 12, "stable": 11,
+    "implied_speed_kmh": 18.4, "last_fix_age_secs": 42,
+    "inlier_ratio": 0.83, "confidence": "high"
 }
 ```
 
-The three conditional fields use omission, not `null` or a false sentinel:
+Conditional fields use omission, not `null` or a false sentinel:
 
 - `address` is omitted when unavailable. `--address-approx` enables rounded-cell
   cache lookup and background geocoding, but does not guarantee this field: a
@@ -141,6 +143,36 @@ The three conditional fields use omission, not `null` or a false sentinel:
   daemon never emits `"stale": false`.
 - `age_s` is present only with a stale fix and is its non-negative age in
   seconds. It is omitted from a fresh fix.
+- `implied_speed_kmh` and `last_fix_age_secs` are omitted on cold boot, when
+  no previous `last_fix` row exists. A future-dated previous timestamp is
+  warned about and both its reported age and implied speed clamp to zero.
+- `inlier_ratio` is omitted when fewer than three eligible visible cached APs
+  exist. Otherwise it is the selected winner's consensus fraction.
+- `confidence` is always present on a successful response and is one of
+  `"high"`, `"medium"`, `"low"`, or `"suspect"`.
+- `suspect_reason` is present exactly when `confidence` is `"suspect"`.
+
+The daemon compares a current trilateration result to the literal persisted
+`last_fix` row. Implied great-circle speed above
+`--max-travel-speed-kmh` (default 250) is Suspect; equality is allowed. On a
+speed alarm, visible cached-AP consensus chooses between `current_trilat` and
+`last_fix`, with ties (including undefined consensus) favoring current. A
+previous-row winner returns its saved coordinates/address and a conservative
+accuracy of saved accuracy plus the distance to current trilateration, but is
+not rewritten as a new observation or appended to history.
+
+Consensus is the fraction of eligible coordinates within an inclusive 200m of
+the candidate and requires at least three coordinates. Its denominator is each
+unique BSSID in the latest scanner snapshot that is not currently SSID-
+denylisted and has a finite, persisted-fixed cache row. It deliberately ignores
+debounce stability, RSSI, top-N solver selection, and trilateration outlier
+survival. Below the speed threshold (and on cold boot), scores at least 0.7 are
+High, scores at least 0.4 are Medium, and lower or undefined scores are Low.
+
+A generic stale fallback (current positioning failed) remains distinct from a
+policy-selected `last_fix` winner: it emits `stale:true`, `age_s`, and
+`last_fix_age_secs`, with Low confidence; speed, ratio, and suspect reason are
+omitted.
 
 For a fresh fix, `cached` is the number of scanner-eligible, finite, persisted-
 fixed cache rows admitted after the top-N limit; rows examined and rejected as
@@ -149,6 +181,14 @@ submitted to trilateration. `locate` never fetches synchronously, so these two
 counts are equal for a fresh response; they remain separate wire fields for
 compatibility. `visible` and `stable` are raw scanner/debouncer counts before
 the positioning eligibility policy.
+
+These fields are additive within protocol `v: 1`. Older clients ignore them;
+new typed clients default fields omitted by older daemons to `None` and High
+confidence. The official CLI's raw `--json` path preserves the daemon line
+unchanged rather than inserting defaults.
+The four confidence strings are closed vocabulary in v1; adding another value
+requires a protocol-version bump so mirrored server/client enums fail loudly
+rather than silently misclassifying a future confidence level.
 
 ### `scan` — currently visible Wi-Fi networks
 
