@@ -187,6 +187,26 @@ pub async fn lookup_cached(
     }
 }
 
+/// Cache-only lookup without the interactive locate path's `last_seen` touch.
+/// Autonomous locate uses this read-only variant so a dedup/skip outcome has
+/// no persistent side effects.
+pub async fn lookup_cached_readonly(
+    bssids: &[String],
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+) -> Vec<ApInfo> {
+    let Some(_privacy) = state.privacy.read(ticket).await else {
+        return Vec::new();
+    };
+    match state.db.lookup_cached_readonly(bssids.to_vec()).await {
+        Ok(result) => result,
+        Err(error) => {
+            warn!("read-only cached AP lookup failed: {error}");
+            Vec::new()
+        }
+    }
+}
+
 /// Generic provider-chain orchestrator.
 ///
 /// For each input BSSID:
@@ -650,6 +670,7 @@ mod tests {
             inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
             db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            autolocate_fixes_written: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             api_counter_corruption_denials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),

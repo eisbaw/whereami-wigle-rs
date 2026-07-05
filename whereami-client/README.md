@@ -74,6 +74,10 @@ snapshot, neither a current count nor a cumulative total. The daemon loads it on
 startup; a crash or `SIGKILL` leaves the previous clean-shutdown value unchanged.
 Older daemons omit the field, which the typed client reads as `0`.
 
+`StatsResponse::autolocate_fixes_written` counts autonomous history rows
+successfully committed since daemon start; manual `locate` writes are excluded.
+It resets on restart and defaults to `0` when an older daemon omits the field.
+
 `LocateResponse` exposes the daemon's additive uncertainty fields:
 `implied_speed_kmh`, `last_fix_age_secs`, `inlier_ratio`, `confidence`, and
 `suspect_reason`. Missing fields from an older daemon deserialize as `None` and

@@ -842,6 +842,13 @@ impl DbHandle {
         self.write(move |db| db.lookup_cached_touch(&bssids)).await
     }
 
+    /// Read cached APs in input order without refreshing `last_seen`.
+    /// Autonomous locate uses this so every skip outcome is write-free.
+    pub async fn lookup_cached_readonly(&self, bssids: Vec<String>) -> Result<Vec<ApInfo>> {
+        self.read(move |db| db.lookup_cached_readonly(&bssids))
+            .await
+    }
+
     pub async fn cache_resolved_ap(&self, ap: ApInfo, delete_pending: bool) -> Result<()> {
         self.write(move |db| db.cache_resolved_ap(&ap, delete_pending))
             .await
@@ -1285,6 +1292,19 @@ impl DbHandle {
     pub async fn persist_fix_and_history(&self, fix: LastFixRow) -> Result<()> {
         self.write_durable(move |db| db.persist_fix_and_history(&fix))
             .await
+    }
+
+    /// Persist an autonomous observation and report whether the monotonic
+    /// `last_fix` UPSERT accepted its timestamp. The history row commits in
+    /// either case; `false` means a newer wall-clock fix remained authoritative.
+    pub async fn persist_autolocate_fix_and_history(&self, fix: LastFixRow) -> Result<bool> {
+        self.write_durable(move |db| {
+            let outcome = db.persist_fix_and_history_outcome(&fix)?;
+            let applied = matches!(outcome, LastFixUpdate::Applied);
+            warn_if_last_fix_dropped(outcome);
+            Ok(applied)
+        })
+        .await
     }
 
     /// Delete every persisted privacy-bearing row in one durable transaction.
@@ -2467,6 +2487,45 @@ impl Database {
         Ok(result)
     }
 
+    /// Return every cached AP in input order under one read snapshot, without
+    /// updating observation metadata.
+    fn lookup_cached_readonly(&mut self, bssids: &[String]) -> Result<Vec<ApInfo>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let mut result = Vec::new();
+        for bssid in bssids {
+            let ap = tx
+                .query_row(
+                    "SELECT bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, is_mobile
+                     FROM aps WHERE bssid = ?1",
+                    params![bssid],
+                    |row| {
+                        let source_str: String = row.get(9)?;
+                        Ok(ApInfo {
+                            bssid: row.get(0)?,
+                            ssid: row.get(1)?,
+                            lat: row.get(2)?,
+                            lon: row.get(3)?,
+                            encryption: row.get(4)?,
+                            channel: row.get(5)?,
+                            frequency: row.get(6)?,
+                            city: row.get(7)?,
+                            country: row.get(8)?,
+                            is_mobile: row.get::<_, i64>(10)? != 0,
+                            source: Source::from_db_str(&source_str),
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(ap) = ap {
+                result.push(ap);
+            }
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+
     // --- not_found table ---
 
     /// Check if a BSSID is in the not_found table and not expired.
@@ -2964,6 +3023,12 @@ impl Database {
     /// Persist the current fix and its history observation in one transaction.
     /// The monotonic guard in `set_last_fix` remains in force.
     fn persist_fix_and_history(&mut self, fix: &LastFixRow) -> Result<()> {
+        let outcome = self.persist_fix_and_history_outcome(fix)?;
+        warn_if_last_fix_dropped(outcome);
+        Ok(())
+    }
+
+    fn persist_fix_and_history_outcome(&mut self, fix: &LastFixRow) -> Result<LastFixUpdate> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2980,8 +3045,7 @@ impl Database {
             ],
         )?;
         tx.commit()?;
-        warn_if_last_fix_dropped(outcome);
-        Ok(())
+        Ok(outcome)
     }
 
     /// Remove all persisted location and observed-network state atomically.

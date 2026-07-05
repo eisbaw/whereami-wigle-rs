@@ -216,6 +216,7 @@ mod tests {
             inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
             db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            autolocate_fixes_written: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             api_counter_corruption_denials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),

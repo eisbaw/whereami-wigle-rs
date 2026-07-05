@@ -19,6 +19,8 @@
 let
   # Must match whereamid::db::MAX_RETENTION_DAYS.
   maxRetentionDays = 365000;
+  # Must match whereamid::config::MAX_AUTOLOCATE_INTERVAL_SECS.
+  maxAutolocateIntervalSecs = 31536000;
 in {
   enable = lib.mkEnableOption "whereami Wi-Fi geolocation daemon";
 
@@ -156,6 +158,16 @@ in {
     type = lib.types.ints.positive;
     default = 60;
     description = "Scan interval during steady phase (seconds).";
+  };
+
+  autolocateIntervalSecs = lib.mkOption {
+    type = lib.types.ints.between 0 maxAutolocateIntervalSecs;
+    default = 120;
+    description = ''
+      Seconds between autonomous cache-only location fixes. The first pass is
+      delayed by one interval. Valid range: 0..31536000 (365 days). 0 disables
+      autonomous location history.
+    '';
   };
 
   debounceWindow = lib.mkOption {

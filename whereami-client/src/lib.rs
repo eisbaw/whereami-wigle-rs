@@ -662,6 +662,10 @@ pub struct StatsResponse {
     /// start. task-0076. Defaults to 0 for older daemons.
     #[serde(default)]
     pub db_write_failures: u64,
+    /// Successfully committed autonomous history rows since daemon start.
+    /// Defaults to 0 for older daemons.
+    #[serde(default)]
+    pub autolocate_fixes_written: u64,
     /// Number of tasks force-aborted at the end of the last clean daemon
     /// shutdown. This is one persisted shutdown snapshot, neither a current
     /// count nor a cumulative total. The daemon reloads it on startup; a crash
@@ -1460,7 +1464,7 @@ mod stats_wire_tests {
 
     #[test]
     fn current_daemon_stats_shape_deserializes_every_typed_field() {
-        let json = r#"{"ok":true,"v":1,"cached_aps":41,"pending_aps":2,"not_found_aps":3,"db_size_bytes":49152,"api_calls_today":4,"api_counter_corruption_denials":8,"inflight":5,"db_write_failures":6,"orphan_tasks_aborted":7}"#;
+        let json = r#"{"ok":true,"v":1,"cached_aps":41,"pending_aps":2,"not_found_aps":3,"db_size_bytes":49152,"api_calls_today":4,"api_counter_corruption_denials":8,"inflight":5,"db_write_failures":6,"autolocate_fixes_written":9,"orphan_tasks_aborted":7}"#;
         let stats: StatsResponse = client().parse_response_line(json).unwrap();
 
         assert!(stats.ok);
@@ -1473,6 +1477,7 @@ mod stats_wire_tests {
         assert_eq!(stats.api_counter_corruption_denials, 8);
         assert_eq!(stats.inflight, 5);
         assert_eq!(stats.db_write_failures, 6);
+        assert_eq!(stats.autolocate_fixes_written, 9);
         assert_eq!(stats.orphan_tasks_aborted, 7);
         assert!(stats.error.is_none());
     }
@@ -1492,6 +1497,7 @@ mod stats_wire_tests {
         assert_eq!(stats.api_counter_corruption_denials, 0);
         assert_eq!(stats.inflight, 106);
         assert_eq!(stats.db_write_failures, 107);
+        assert_eq!(stats.autolocate_fixes_written, 0);
         assert_eq!(stats.orphan_tasks_aborted, 0);
         assert!(stats.error.is_none());
     }

@@ -261,6 +261,7 @@ Maximum **256 BSSIDs** per `resolve` request.
     "api_counter_corruption_denials": 0,
     "inflight": 0,
     "db_write_failures": 0,
+    "autolocate_fixes_written": 0,
     "orphan_tasks_aborted": 0
 }
 ```
@@ -275,8 +276,12 @@ Maximum **256 BSSIDs** per `resolve` request.
 - `db_write_failures` — cumulative best-effort DB write failures since
   daemon start. Non-zero values indicate silent corruption is being logged
   but not fatal.
+- `autolocate_fixes_written` — cumulative autonomous history rows successfully
+  committed since daemon start. Manual `locate` writes are excluded; the value
+  resets on restart. Older v1 daemons omit this additive field, so typed clients
+  default it to zero; protocol version remains `v: 1`.
 - `orphan_tasks_aborted` — number of background tasks (proactive resolve /
-  address backfill spawns and the daemon's scan/drain/prune/server loops)
+  address backfill spawns and the daemon's scan/drain/prune/autolocate/server loops)
   force-aborted at the end of the **last clean shutdown** because they did
   not finish within the drain budget. Non-zero means that shutdown killed
   in-flight work. The value is persisted at shutdown and reloaded at

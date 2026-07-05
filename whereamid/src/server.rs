@@ -160,6 +160,9 @@ pub struct DaemonState {
     /// sites). Surfaced via the stats endpoint (task-0076) so silent
     /// corruption is visible without scraping the journal.
     pub db_write_failures: Arc<std::sync::atomic::AtomicU64>,
+    /// Successfully committed autonomous history rows since daemon start.
+    /// Manual locate writes are deliberately excluded. Reset on restart.
+    pub autolocate_fixes_written: Arc<std::sync::atomic::AtomicU64>,
     /// Executed WiGLE reservation attempts denied since daemon start because
     /// the same-day persisted API counter was malformed. Reset on restart.
     pub api_counter_corruption_denials: Arc<std::sync::atomic::AtomicU64>,
@@ -205,6 +208,7 @@ pub struct DaemonState {
 /// `at` is `chrono::DateTime<Utc>` rather than `std::time::Instant` so that
 /// the value can be persisted to SQLite (`last_fix` table) and rehydrated
 /// across daemon restarts. Wall-clock age is what users want anyway.
+#[derive(Clone)]
 pub struct LastFix {
     pub lat: f64,
     pub lon: f64,
@@ -646,8 +650,11 @@ struct StatsResponse {
     /// warned-only. Helps spot silent corruption (full disk, missing
     /// write permissions, etc.). Reset on daemon restart. task-0076.
     db_write_failures: u64,
+    /// Successfully committed autonomous history rows since daemon start.
+    autolocate_fixes_written: u64,
     /// Number of background tasks (tracked resolve/backfill spawns and the
-    /// named scan/pending/geocode/prune/server loops) force-aborted at the end
+    /// named scan/pending/geocode/prune/autolocate/server loops) force-aborted
+    /// at the end
     /// of the LAST clean shutdown because they did not finish within the
     /// drain budget. Persisted at shutdown and reloaded at startup — the count is
     /// produced after the server socket closes, so the previous run's value
@@ -1454,12 +1461,161 @@ fn evaluate_plausibility(
     }
 }
 
+fn autolocate_is_duplicate(
+    previous: &LastFix,
+    current: (f64, f64),
+    now: chrono::DateTime<chrono::Utc>,
+    distance_threshold_m: u64,
+    interval_secs: u64,
+) -> bool {
+    let signed_age = now.signed_duration_since(previous.at);
+    let age = if signed_age < chrono::TimeDelta::zero() {
+        warn!(
+            previous_at = %previous.at,
+            now = %now,
+            "autolocate last_fix timestamp is in the future; using zero age for dedup"
+        );
+        chrono::TimeDelta::zero()
+    } else {
+        signed_age
+    };
+
+    let distance_m = crate::geo::haversine_m(previous.lat, previous.lon, current.0, current.1);
+    autolocate_metrics_are_duplicate(distance_m, age, distance_threshold_m, interval_secs)
+}
+
+fn autolocate_metrics_are_duplicate(
+    distance_m: f64,
+    age: chrono::TimeDelta,
+    distance_threshold_m: u64,
+    interval_secs: u64,
+) -> bool {
+    // DateTime's representable span is much smaller than u64::MAX seconds.
+    // An interval outside TimeDelta's range therefore necessarily exceeds
+    // every nonnegative age. This avoids lossy integer/f64 boundary checks.
+    let age_inside_interval = i64::try_from(interval_secs)
+        .ok()
+        .and_then(chrono::TimeDelta::try_seconds)
+        .is_none_or(|interval| age < interval);
+    distance_m < distance_threshold_m as f64 && age_inside_interval
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocatePurpose {
+    Interactive,
+    Autolocate,
+}
+
+/// Structured result of one autonomous pass. The loop logs/skips these
+/// outcomes; unlike interactive locate, it has no control connection and no
+/// wire response to publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutolocateOutcome {
+    Written,
+    NoStableCandidates,
+    NoCachedPositions,
+    Deduplicated,
+    LastFixPreferred,
+    Invalidated,
+    Failed,
+}
+
+enum LocateOutcome {
+    Interactive(String),
+    Autolocate(AutolocateOutcome),
+}
+
+enum LocateClock {
+    System,
+    #[cfg(test)]
+    Fixed(chrono::DateTime<chrono::Utc>),
+}
+
+impl LocateClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        match self {
+            Self::System => chrono::Utc::now(),
+            #[cfg(test)]
+            Self::Fixed(now) => *now,
+        }
+    }
+}
+
+fn locate_early_outcome(
+    purpose: LocatePurpose,
+    interactive: impl FnOnce() -> String,
+    autonomous: AutolocateOutcome,
+) -> LocateOutcome {
+    match purpose {
+        LocatePurpose::Interactive => LocateOutcome::Interactive(interactive()),
+        LocatePurpose::Autolocate => LocateOutcome::Autolocate(autonomous),
+    }
+}
+
 async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::PrivacyTicket) -> String {
+    match compute_locate(state, ticket, LocatePurpose::Interactive).await {
+        LocateOutcome::Interactive(response) => response,
+        LocateOutcome::Autolocate(_) => unreachable!("interactive locate returned auto outcome"),
+    }
+}
+
+pub(crate) async fn run_autolocate_pass(
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+) -> AutolocateOutcome {
+    match compute_locate(state, ticket, LocatePurpose::Autolocate).await {
+        LocateOutcome::Autolocate(outcome) => outcome,
+        LocateOutcome::Interactive(_) => unreachable!("autolocate returned interactive outcome"),
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn run_autolocate_pass_at(
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+    now: chrono::DateTime<chrono::Utc>,
+) -> AutolocateOutcome {
+    match compute_locate_at(state, ticket, LocatePurpose::Autolocate, now).await {
+        LocateOutcome::Autolocate(outcome) => outcome,
+        LocateOutcome::Interactive(_) => unreachable!("autolocate returned interactive outcome"),
+    }
+}
+
+async fn compute_locate(
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+    purpose: LocatePurpose,
+) -> LocateOutcome {
+    compute_locate_with_clock(state, ticket, purpose, LocateClock::System).await
+}
+
+/// Shared locate pipeline. `now` is injected for deterministic cadence and
+/// dedup tests; production callers pass one high-resolution UTC wall clock.
+#[cfg(test)]
+async fn compute_locate_at(
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+    purpose: LocatePurpose,
+    now: chrono::DateTime<chrono::Utc>,
+) -> LocateOutcome {
+    compute_locate_with_clock(state, ticket, purpose, LocateClock::Fixed(now)).await
+}
+
+async fn compute_locate_with_clock(
+    state: &Arc<DaemonState>,
+    ticket: crate::privacy::PrivacyTicket,
+    purpose: LocatePurpose,
+    clock: LocateClock,
+) -> LocateOutcome {
     use crate::resolver;
     use crate::trilaterate::{trilaterate, PositionedAp};
 
     let Some(privacy) = state.privacy.read(ticket).await else {
-        return error_json(STALE_AFTER_WIPE_ERROR);
+        return locate_early_outcome(
+            purpose,
+            || error_json(STALE_AFTER_WIPE_ERROR),
+            AutolocateOutcome::Invalidated,
+        );
     };
     let debouncer = state.debouncer.lock().await;
     let stable = debouncer.stable_bssids();
@@ -1496,7 +1652,13 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
     drop(debouncer);
     drop(privacy);
 
-    // Try stable candidates first, fall back to raw visible APs
+    // Interactive locate retains its cold-start fallback to unstable visible
+    // APs. Autonomous history is deliberately stable-only: it consumes the
+    // scanner-owned Debouncer snapshot and never initiates a scan or provider
+    // lookup itself.
+    if purpose == LocatePurpose::Autolocate && stable_candidates.is_empty() {
+        return LocateOutcome::Autolocate(AutolocateOutcome::NoStableCandidates);
+    }
     let using_fallback = stable_candidates.is_empty() && !visible_candidates.is_empty();
     let active_candidates = if stable_candidates.is_empty() {
         &visible_candidates
@@ -1510,9 +1672,19 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
         } else {
             "no eligible fixed APs detected"
         };
-        return return_last_fix_or_error(state, ticket, error, visible, stable_count).await;
+        return match purpose {
+            LocatePurpose::Interactive => LocateOutcome::Interactive(
+                return_last_fix_or_error(state, ticket, error, visible, stable_count).await,
+            ),
+            LocatePurpose::Autolocate => {
+                LocateOutcome::Autolocate(AutolocateOutcome::NoStableCandidates)
+            }
+        };
     }
 
+    // Both purposes read every scanner-eligible AP in the latest snapshot so
+    // TASK-0094 consensus keeps its full-visible denominator. Autonomous
+    // solver membership remains stable-only through `active_bssids` below.
     let bssids: Vec<String> = visible_candidates
         .iter()
         .map(|(bssid, _, _)| bssid.clone())
@@ -1522,10 +1694,14 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
         .map(|(bssid, signal, _)| (bssid.clone(), *signal))
         .collect();
 
-    // Cache-only lookup — never blocks on WiGLE. Instant response.
-    // This is the sole cache lookup for locate. lookup_cached_touch preserves
-    // full-snapshot RSSI order even though absent BSSIDs are omitted.
-    let cached_aps = resolver::lookup_cached(&bssids, state, ticket).await;
+    // Cache-only lookup — never blocks on WiGLE. This is the sole cache lookup
+    // for locate and preserves full-snapshot RSSI order even when absent
+    // BSSIDs are omitted. Interactive locate refreshes AP observation age;
+    // autonomous locate is read-only unless it later commits a fix.
+    let cached_aps = match purpose {
+        LocatePurpose::Interactive => resolver::lookup_cached(&bssids, state, ticket).await,
+        LocatePurpose::Autolocate => resolver::lookup_cached_readonly(&bssids, state, ticket).await,
+    };
 
     // Build trilateration input.
     //
@@ -1578,6 +1754,9 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
     let source_count = positioned_aps.len();
 
     if positioned_aps.is_empty() {
+        if purpose == LocatePurpose::Autolocate {
+            return LocateOutcome::Autolocate(AutolocateOutcome::NoCachedPositions);
+        }
         // Cold-start provider work must stay bounded even though cache lookup
         // examines every scanner-eligible candidate to backfill top-N around
         // persisted-mobile/non-finite rows. Cached rows cannot benefit from the
@@ -1606,7 +1785,9 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
         } else {
             "no eligible cached positions for visible APs"
         };
-        return return_last_fix_or_error(state, ticket, error, visible, stable_count).await;
+        return LocateOutcome::Interactive(
+            return_last_fix_or_error(state, ticket, error, visible, stable_count).await,
+        );
     }
 
     match trilaterate(&positioned_aps) {
@@ -1618,13 +1799,24 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
             // current-winner persistence. Concurrent locate/backfill calls
             // cannot change the previous row between these phases.
             let Some(_privacy) = state.privacy.read(ticket).await else {
-                return error_json(STALE_AFTER_WIPE_ERROR);
+                return locate_early_outcome(
+                    purpose,
+                    || error_json(STALE_AFTER_WIPE_ERROR),
+                    AutolocateOutcome::Invalidated,
+                );
             };
             let mut last = state.last_fix.lock().await;
             let previous_row = match state.db.get_last_fix().await {
                 Ok(row) => row,
                 Err(error) => {
-                    return error_json(&format!("failed to read last_fix: {error}"));
+                    if purpose == LocatePurpose::Autolocate {
+                        warn!("autolocate failed to read persisted last_fix: {error}");
+                    }
+                    return locate_early_outcome(
+                        purpose,
+                        || error_json(&format!("failed to read last_fix: {error}")),
+                        AutolocateOutcome::Failed,
+                    );
                 }
             };
             let previous = previous_row.and_then(|row| match LastFix::try_from(row) {
@@ -1634,7 +1826,20 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
                     None
                 }
             });
-            let now = chrono::Utc::now();
+            let now = clock.now();
+            if purpose == LocatePurpose::Autolocate
+                && previous.as_ref().is_some_and(|previous| {
+                    autolocate_is_duplicate(
+                        previous,
+                        (pos.lat, pos.lon),
+                        now,
+                        state.args.history_segment_distance_m,
+                        state.args.autolocate_interval_secs,
+                    )
+                })
+            {
+                return LocateOutcome::Autolocate(AutolocateOutcome::Deduplicated);
+            }
             let decision = evaluate_plausibility(
                 previous.as_ref(),
                 (pos.lat, pos.lon),
@@ -1657,7 +1862,7 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
 
             let (lat, lon, accuracy_m, address) = match decision.winner {
                 PlausibilityWinner::CurrentTrilat => {
-                    let new_fix = LastFix {
+                    let mut new_fix = LastFix {
                         lat: pos.lat,
                         lon: pos.lon,
                         accuracy_m: pos.accuracy_m,
@@ -1665,6 +1870,45 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
                         at: now,
                         sources: source_count,
                     };
+
+                    if purpose == LocatePurpose::Autolocate {
+                        if state.args.address_approx {
+                            let cache = state.address_cache.lock().unwrap_or_else(|error| {
+                                warn!("address cache mutex poisoned — recovering");
+                                error.into_inner()
+                            });
+                            new_fix.address = cache.get(new_fix.lat, new_fix.lon);
+                        }
+                        let row: crate::db::LastFixRow = (&new_fix).into();
+                        let last_fix_applied = match state
+                            .db
+                            .persist_autolocate_fix_and_history(row)
+                            .await
+                        {
+                            Ok(applied) => applied,
+                            Err(error) => {
+                                warn!("failed to persist autonomous last_fix and history: {error}");
+                                state.record_db_failure();
+                                return LocateOutcome::Autolocate(AutolocateOutcome::Failed);
+                            }
+                        };
+                        // Commit is the publication boundary for autonomous
+                        // work. A backwards wall-clock observation still
+                        // appends history, but SQLite retains the newer
+                        // authoritative last_fix and memory must not regress.
+                        if last_fix_applied {
+                            *last = Some(new_fix);
+                        } else {
+                            // SQLite kept a newer wall-clock row. Re-align
+                            // memory to that validated persisted authority
+                            // instead of publishing the older observation.
+                            *last = previous.clone();
+                        }
+                        state
+                            .autolocate_fixes_written
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return LocateOutcome::Autolocate(AutolocateOutcome::Written);
+                    }
 
                     let address = if state.args.address_approx {
                         persist_locate_fix_and_schedule_locked(state, ticket, &mut last, new_fix)
@@ -1676,6 +1920,9 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
                     (pos.lat, pos.lon, pos.accuracy_m, address)
                 }
                 PlausibilityWinner::LastFix => {
+                    if purpose == LocatePurpose::Autolocate {
+                        return LocateOutcome::Autolocate(AutolocateOutcome::LastFixPreferred);
+                    }
                     let previous = previous
                         .as_ref()
                         .expect("a last_fix winner requires a validated previous row");
@@ -1714,18 +1961,24 @@ async fn handle_locate(state: &Arc<DaemonState>, ticket: crate::privacy::Privacy
                 confidence: decision.confidence,
                 suspect_reason: decision.suspect_reason,
             };
-            ok_json(&resp)
+            LocateOutcome::Interactive(ok_json(&resp))
         }
-        Err(e) => {
-            return_last_fix_or_error(
-                state,
-                ticket,
-                &format!("trilateration failed: {e}"),
-                visible,
-                stable_count,
-            )
-            .await
-        }
+        Err(e) => match purpose {
+            LocatePurpose::Interactive => LocateOutcome::Interactive(
+                return_last_fix_or_error(
+                    state,
+                    ticket,
+                    &format!("trilateration failed: {e}"),
+                    visible,
+                    stable_count,
+                )
+                .await,
+            ),
+            LocatePurpose::Autolocate => {
+                warn!("autolocate trilateration failed: {e}");
+                LocateOutcome::Autolocate(AutolocateOutcome::Failed)
+            }
+        },
     }
 }
 
@@ -2556,6 +2809,9 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
     let api_counter_corruption_denials = state
         .api_counter_corruption_denials
         .load(std::sync::atomic::Ordering::Relaxed);
+    let autolocate_fixes_written = state
+        .autolocate_fixes_written
+        .load(std::sync::atomic::Ordering::Relaxed);
     let orphan_tasks_aborted = state
         .orphan_tasks_aborted
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -2571,6 +2827,7 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
         api_counter_corruption_denials,
         inflight,
         db_write_failures,
+        autolocate_fixes_written,
         orphan_tasks_aborted,
     };
     ok_json(&resp)
@@ -2621,6 +2878,7 @@ fn test_state_with_db(
         inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
         address_cache: std::sync::Mutex::new(AddressCache::new()),
         db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        autolocate_fixes_written: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         api_counter_corruption_denials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
         history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -2655,6 +2913,23 @@ mod stats_tests {
         }
     }
 
+    #[test]
+    fn protocol_documents_autolocate_counter_semantics() {
+        let protocol = include_str!("../../docs/protocol.md");
+        for marker in [
+            "\"autolocate_fixes_written\": 0",
+            "autonomous history rows successfully",
+            "Manual `locate` writes are excluded",
+            "resets on restart",
+            "protocol version remains `v: 1`",
+        ] {
+            assert!(
+                protocol.contains(marker),
+                "protocol is missing autolocate marker {marker:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn stats_wire_reports_corruption_denials_while_counter_falls_back_to_zero() {
         let state = test_state();
@@ -2665,6 +2940,9 @@ mod stats_tests {
         state
             .api_counter_corruption_denials
             .store(3, std::sync::atomic::Ordering::Relaxed);
+        state
+            .autolocate_fixes_written
+            .store(4, std::sync::atomic::Ordering::Relaxed);
 
         let response: serde_json::Value =
             serde_json::from_str(&handle_stats(&state).await).unwrap();
@@ -2672,6 +2950,7 @@ mod stats_tests {
         assert_eq!(response["v"], 1);
         assert_eq!(response["api_calls_today"], 0);
         assert_eq!(response["api_counter_corruption_denials"], 3);
+        assert_eq!(response["autolocate_fixes_written"], 4);
     }
 }
 
@@ -2944,6 +3223,52 @@ mod dispatch_tests {
     const WIPE_FAIL_STOP_CHILD_TEST: &str =
         "server::dispatch_tests::wipe_post_commit_panic_fail_stop_child";
 
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<std::sync::Mutex<Vec<(tracing::Level, String, String)>>>);
+
+    struct MessageVisitor(String);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0 = value.to_owned();
+            }
+        }
+    }
+
+    impl tracing::Subscriber for CapturedEvents {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().expect("capture lock poisoned").push((
+                *event.metadata().level(),
+                event.metadata().target().to_owned(),
+                visitor.0,
+            ));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
     fn wait_for_child_marker(
         child: &mut std::process::Child,
         path: &std::path::Path,
@@ -3162,6 +3487,516 @@ mod dispatch_tests {
             at_rfc3339: (chrono::Utc::now() - age).to_rfc3339(),
             sources: 7,
         }
+    }
+
+    fn fixed_autolocate_time() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-07-05T12:00:00.123456789+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    async fn seed_autolocate_cluster(state: &Arc<DaemonState>, prefix: u8, lat: f64, lon: f64) {
+        let mut sample = crate::debounce::ScanSample::new();
+        for index in 0..3 {
+            add_cached_scan_ap(
+                state,
+                &mut sample,
+                &format!("02:00:00:00:{prefix:02x}:{index:02x}"),
+                lat,
+                lon,
+                -40 - index,
+                Some("fixed-autolocate-test"),
+            );
+        }
+        push_stable_scan(state, sample).await;
+    }
+
+    async fn history_len(state: &Arc<DaemonState>) -> usize {
+        state
+            .db
+            .get_fixes_in_range("0000", "9999")
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn autolocate_dedup_boundaries_are_strict_and_high_resolution() {
+        let just_inside =
+            chrono::TimeDelta::seconds(119) + chrono::TimeDelta::nanoseconds(999_999_999);
+        assert!(autolocate_metrics_are_duplicate(
+            99.999_999,
+            just_inside,
+            100,
+            120
+        ));
+        assert!(
+            !autolocate_metrics_are_duplicate(100.0, just_inside, 100, 120),
+            "distance equality must write"
+        );
+        assert!(
+            !autolocate_metrics_are_duplicate(99.0, chrono::TimeDelta::seconds(120), 100, 120),
+            "age equality must write"
+        );
+    }
+
+    #[tokio::test]
+    async fn autolocate_first_fix_commits_history_memory_counter_and_cached_address() {
+        let mut state = test_state();
+        Arc::get_mut(&mut state)
+            .expect("state must be uniquely owned")
+            .args
+            .address_approx = true;
+        let location = (55.6761, 12.5683);
+        seed_autolocate_cluster(&state, 0x70, location.0, location.1).await;
+        state.address_cache.lock().unwrap().insert(
+            location.0,
+            location.1,
+            "cached street".to_string(),
+        );
+
+        let now = fixed_autolocate_time();
+        let outcome = run_autolocate_pass_at(&state, state.privacy.ticket(), now).await;
+        assert_eq!(outcome, AutolocateOutcome::Written);
+        assert_eq!(history_len(&state).await, 1);
+        assert_eq!(
+            state
+                .autolocate_fixes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let persisted = state.db.get_last_fix().await.unwrap().unwrap();
+        assert_eq!(persisted.at_rfc3339, now.to_rfc3339());
+        assert_eq!(persisted.address.as_deref(), Some("cached street"));
+        let memory = state.last_fix.lock().await;
+        assert_eq!(memory.as_ref().unwrap().at, now);
+        assert_eq!(
+            memory.as_ref().unwrap().address.as_deref(),
+            Some("cached street")
+        );
+        assert_eq!(
+            state.geocode.snapshot().pending,
+            0,
+            "autolocate must not schedule Nominatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn autolocate_identical_second_pass_deduplicates() {
+        let state = test_state();
+        seed_autolocate_cluster(&state, 0x71, 55.6761, 12.5683).await;
+        let bssids: Vec<String> = (0..3)
+            .map(|index| format!("02:00:00:00:71:{index:02x}"))
+            .collect();
+        const OLD_LAST_SEEN: &str = "2000-01-01T00:00:00+00:00";
+        state
+            .db
+            .set_cached_last_seen_for_test(bssids.clone(), OLD_LAST_SEEN.to_string())
+            .await
+            .unwrap();
+        let now = fixed_autolocate_time();
+        assert_eq!(
+            run_autolocate_pass_at(&state, state.privacy.ticket(), now).await,
+            AutolocateOutcome::Written
+        );
+        assert_eq!(
+            run_autolocate_pass_at(
+                &state,
+                state.privacy.ticket(),
+                now + chrono::TimeDelta::nanoseconds(1),
+            )
+            .await,
+            AutolocateOutcome::Deduplicated
+        );
+        assert_eq!(history_len(&state).await, 1);
+        assert!(state
+            .db
+            .cached_last_seen_for_test(bssids)
+            .await
+            .unwrap()
+            .iter()
+            .all(|last_seen| last_seen == OLD_LAST_SEEN));
+        assert_eq!(
+            state
+                .autolocate_fixes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn autolocate_age_equality_writes_the_retained_snapshot_again() {
+        let state = test_state();
+        seed_autolocate_cluster(&state, 0x72, 55.6761, 12.5683).await;
+        let now = fixed_autolocate_time();
+        assert_eq!(
+            run_autolocate_pass_at(&state, state.privacy.ticket(), now).await,
+            AutolocateOutcome::Written
+        );
+        assert_eq!(
+            run_autolocate_pass_at(
+                &state,
+                state.privacy.ticket(),
+                now + chrono::TimeDelta::seconds(state.args.autolocate_interval_secs as i64),
+            )
+            .await,
+            AutolocateOutcome::Written,
+            "age equality must not deduplicate"
+        );
+        assert_eq!(history_len(&state).await, 2);
+        assert_eq!(
+            state
+                .autolocate_fixes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn autolocate_future_last_fix_uses_zero_age_and_deduplicates() {
+        let state = test_state();
+        let location = (55.6761, 12.5683);
+        seed_autolocate_cluster(&state, 0x73, location.0, location.1).await;
+        let now = fixed_autolocate_time();
+        state
+            .db
+            .set_last_fix(crate::db::LastFixRow {
+                lat: location.0,
+                lon: location.1,
+                accuracy_m: 5.0,
+                address: None,
+                at_rfc3339: (now + chrono::TimeDelta::seconds(1)).to_rfc3339(),
+                sources: 3,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            run_autolocate_pass_at(&state, state.privacy.ticket(), now).await,
+            AutolocateOutcome::Deduplicated
+        );
+        assert_eq!(history_len(&state).await, 0);
+        assert_eq!(
+            state
+                .autolocate_fixes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn autolocate_clock_backward_appends_history_without_regressing_last_fix() {
+        let state = test_state();
+        let now = fixed_autolocate_time();
+        let future = now + chrono::TimeDelta::seconds(1);
+        let previous = LastFix {
+            lat: 55.6761,
+            lon: 12.5683,
+            accuracy_m: 5.0,
+            address: Some("future authority".to_string()),
+            at: future,
+            sources: 3,
+        };
+        state
+            .db
+            .set_last_fix(crate::db::LastFixRow::from(&previous))
+            .await
+            .unwrap();
+        *state.last_fix.lock().await = Some(previous);
+        // Far enough to bypass distance dedup. A non-positive elapsed time has
+        // zero implied speed, so TASK-0094 accepts the current observation;
+        // SQLite's monotonic guard must still retain the future last_fix.
+        seed_autolocate_cluster(&state, 0x7a, -12.8940, -38.2920).await;
+
+        assert_eq!(
+            run_autolocate_pass_at(&state, state.privacy.ticket(), now).await,
+            AutolocateOutcome::Written
+        );
+        assert_eq!(history_len(&state).await, 1);
+        assert_eq!(
+            state
+                .autolocate_fixes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            state.db.get_last_fix().await.unwrap().unwrap().at_rfc3339,
+            future.to_rfc3339()
+        );
+        assert_eq!(state.last_fix.lock().await.as_ref().unwrap().at, future);
+    }
+
+    #[tokio::test]
+    async fn autolocate_skip_order_has_no_provider_pending_or_geocode_effects() {
+        let state = test_state();
+        let bssid = "02:00:00:00:74:00";
+        let mut sample = crate::debounce::ScanSample::new();
+        sample.insert(
+            bssid.to_string(),
+            crate::debounce::ScanEntry {
+                signal_dbm: -45,
+                ssid: Some("uncached-fixed".to_string()),
+                channel: Some(1),
+            },
+        );
+        state.debouncer.lock().await.push_scan(sample.clone());
+        let now = fixed_autolocate_time();
+        assert_eq!(
+            run_autolocate_pass_at(&state, state.privacy.ticket(), now).await,
+            AutolocateOutcome::NoStableCandidates
+        );
+        {
+            let mut debouncer = state.debouncer.lock().await;
+            for _ in 1..state.args.debounce_threshold {
+                debouncer.push_scan(sample.clone());
+            }
+        }
+        assert_eq!(
+            run_autolocate_pass_at(&state, state.privacy.ticket(), now).await,
+            AutolocateOutcome::NoCachedPositions
+        );
+        assert_eq!(lock_db(&state).pending_ap_count().unwrap(), 0);
+        assert!(state.inflight.lock().unwrap().is_empty());
+        assert_eq!(state.tasks.lock().unwrap().len(), 0);
+        assert_eq!(state.geocode.snapshot().pending, 0);
+        assert_eq!(history_len(&state).await, 0);
+        assert_eq!(
+            state
+                .autolocate_fixes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn autolocate_db_failure_leaves_memory_and_counter_unchanged() {
+        let state = test_state();
+        let now = fixed_autolocate_time();
+        let previous = LastFix {
+            lat: 55.6761,
+            lon: 12.5683,
+            accuracy_m: 5.0,
+            address: Some("unchanged on failure".to_string()),
+            at: now + chrono::TimeDelta::seconds(1),
+            sources: 3,
+        };
+        state
+            .db
+            .set_last_fix(crate::db::LastFixRow::from(&previous))
+            .await
+            .unwrap();
+        *state.last_fix.lock().await = Some(previous.clone());
+        seed_autolocate_cluster(&state, 0x75, -12.8940, -38.2920).await;
+        lock_db(&state)
+            .execute_batch_for_test(
+                "CREATE TRIGGER fail_autolocate_fix
+                 BEFORE INSERT ON fixes
+                 BEGIN SELECT RAISE(FAIL, 'forced autolocate failure'); END;",
+            )
+            .unwrap();
+
+        assert_eq!(
+            run_autolocate_pass_at(&state, state.privacy.ticket(), now).await,
+            AutolocateOutcome::Failed
+        );
+        assert_eq!(
+            state.last_fix.lock().await.as_ref().unwrap().at,
+            previous.at
+        );
+        assert_eq!(
+            state.db.get_last_fix().await.unwrap().unwrap().at_rfc3339,
+            previous.at.to_rfc3339()
+        );
+        assert_eq!(history_len(&state).await, 0);
+        assert_eq!(
+            state
+                .autolocate_fixes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            state
+                .db_write_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn autolocate_last_fix_read_failure_warns_root_cause_and_interactive_json_stays_actionable(
+    ) {
+        use tracing::instrument::WithSubscriber as _;
+
+        let state = test_state();
+        seed_autolocate_cluster(&state, 0x7b, 55.6761, 12.5683).await;
+        lock_db(&state)
+            .execute_batch_for_test("DROP TABLE last_fix;")
+            .unwrap();
+
+        let captured = CapturedEvents::default();
+        let events = captured.clone();
+        let outcome =
+            run_autolocate_pass_at(&state, state.privacy.ticket(), fixed_autolocate_time())
+                .with_subscriber(captured)
+                .await;
+        assert_eq!(outcome, AutolocateOutcome::Failed);
+        let warnings: Vec<String> = events
+            .0
+            .lock()
+            .expect("capture lock poisoned")
+            .iter()
+            .filter(|(level, _, _)| *level == tracing::Level::WARN)
+            .map(|(_, _, message)| message.clone())
+            .collect();
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("autolocate failed to read persisted last_fix")
+                    && message.contains("no such table: last_fix")
+            }),
+            "missing actionable root cause in warnings: {warnings:?}"
+        );
+
+        let interactive = dispatch_command(&Request::Locate, &state).await;
+        let interactive: serde_json::Value = serde_json::from_str(&interactive).unwrap();
+        assert_eq!(interactive["ok"], false);
+        assert!(interactive["error"].as_str().is_some_and(
+            |error| error.contains("failed to read last_fix: no such table: last_fix")
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_autolocate_passes_serialize_without_duplicate_history() {
+        let state = test_state();
+        seed_autolocate_cluster(&state, 0x76, 55.6761, 12.5683).await;
+        let now = fixed_autolocate_time();
+        let first_state = Arc::clone(&state);
+        let second_state = Arc::clone(&state);
+        let (first, second) = tokio::join!(
+            async move { run_autolocate_pass_at(&first_state, first_state.privacy.ticket(), now).await },
+            async move {
+                run_autolocate_pass_at(&second_state, second_state.privacy.ticket(), now).await
+            }
+        );
+        assert!(
+            matches!(
+                (first, second),
+                (AutolocateOutcome::Written, AutolocateOutcome::Deduplicated)
+                    | (AutolocateOutcome::Deduplicated, AutolocateOutcome::Written)
+            ),
+            "unexpected outcomes: {first:?}, {second:?}"
+        );
+        assert_eq!(history_len(&state).await, 1);
+        assert_eq!(
+            state
+                .autolocate_fixes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_autolocate_ticket_cannot_publish_but_fresh_pass_can() {
+        let state = test_state();
+        seed_autolocate_cluster(&state, 0x77, 55.6761, 12.5683).await;
+        let stale = state.privacy.ticket();
+        let response = dispatch_command(
+            &Request::Wipe {
+                confirm: Some(WIPE_CONFIRMATION.to_string()),
+            },
+            &state,
+        )
+        .await;
+        drop(response);
+        assert_eq!(
+            run_autolocate_pass_at(&state, stale, fixed_autolocate_time()).await,
+            AutolocateOutcome::Invalidated
+        );
+        assert_eq!(history_len(&state).await, 0);
+
+        seed_autolocate_cluster(&state, 0x78, 55.6761, 12.5683).await;
+        assert_eq!(
+            run_autolocate_pass_at(&state, state.privacy.ticket(), fixed_autolocate_time(),).await,
+            AutolocateOutcome::Written
+        );
+        assert_eq!(history_len(&state).await, 1);
+    }
+
+    #[tokio::test]
+    async fn autolocate_task0094_previous_winner_writes_nothing() {
+        const PREVIOUS: (f64, f64) = (55.7047, 12.5900);
+        const BRAZIL: (f64, f64) = (-12.8940, -38.2920);
+        const OUTLIER: &str = "02:00:00:00:79:ff";
+        let mut state = test_state();
+        Arc::get_mut(&mut state)
+            .expect("state must be uniquely owned")
+            .args
+            .top_n = 1;
+        let now = fixed_autolocate_time();
+        state
+            .db
+            .set_last_fix(crate::db::LastFixRow {
+                lat: PREVIOUS.0,
+                lon: PREVIOUS.1,
+                accuracy_m: 20.0,
+                address: Some("previous address".to_string()),
+                at_rfc3339: (now - chrono::TimeDelta::minutes(5)).to_rfc3339(),
+                sources: 7,
+            })
+            .await
+            .unwrap();
+        let mut sample = crate::debounce::ScanSample::new();
+        add_cached_scan_ap(
+            &state,
+            &mut sample,
+            OUTLIER,
+            BRAZIL.0,
+            BRAZIL.1,
+            -20,
+            Some("strong-outlier"),
+        );
+        for index in 0..4 {
+            add_cached_scan_ap(
+                &state,
+                &mut sample,
+                &format!("02:00:00:00:79:{index:02x}"),
+                PREVIOUS.0 + index as f64 / 100_000.0,
+                PREVIOUS.1 + index as f64 / 100_000.0,
+                -60 - index,
+                Some("near-previous"),
+            );
+        }
+        // Only the strong Brazil outlier is stable enough to enter the solver.
+        // The four currently visible but unstable cached APs near PREVIOUS
+        // still belong to TASK-0094's consensus denominator. Looking up only
+        // stable BSSIDs changes this decision to current and must fail here.
+        assert!(state.args.debounce_threshold > 1);
+        let mut outlier_only = crate::debounce::ScanSample::new();
+        outlier_only.insert(OUTLIER.to_string(), sample[OUTLIER].clone());
+        {
+            let mut debouncer = state.debouncer.lock().await;
+            for _ in 1..state.args.debounce_threshold {
+                debouncer.push_scan(outlier_only.clone());
+            }
+            debouncer.push_scan(sample);
+            assert_eq!(debouncer.latest_scan().unwrap().len(), 5);
+            assert_eq!(debouncer.stable_bssids(), [OUTLIER.to_string()].into());
+        }
+
+        assert_eq!(
+            run_autolocate_pass_at(&state, state.privacy.ticket(), now).await,
+            AutolocateOutcome::LastFixPreferred
+        );
+        assert_eq!(history_len(&state).await, 0);
+        assert_eq!(
+            state
+                .autolocate_fixes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            state.db.get_last_fix().await.unwrap().unwrap().at_rfc3339,
+            (now - chrono::TimeDelta::minutes(5)).to_rfc3339()
+        );
     }
 
     #[test]
@@ -4623,57 +5458,7 @@ mod dispatch_tests {
 
     #[tokio::test]
     async fn locate_skips_non_finite_cached_ap_and_warns_with_bssid() {
-        use std::sync::{Arc, Mutex};
-        use tracing::{
-            field::{Field, Visit},
-            instrument::WithSubscriber as _,
-            span, Event, Metadata, Subscriber,
-        };
-
-        #[derive(Clone, Default)]
-        struct CapturedEvents(Arc<Mutex<Vec<(tracing::Level, String, String)>>>);
-
-        struct MessageVisitor(String);
-
-        impl Visit for MessageVisitor {
-            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{value:?}");
-                }
-            }
-
-            fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "message" {
-                    self.0 = value.to_owned();
-                }
-            }
-        }
-
-        impl Subscriber for CapturedEvents {
-            fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-                true
-            }
-
-            fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
-                span::Id::from_u64(1)
-            }
-
-            fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
-            fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
-
-            fn event(&self, event: &Event<'_>) {
-                let mut visitor = MessageVisitor(String::new());
-                event.record(&mut visitor);
-                self.0.lock().expect("capture lock poisoned").push((
-                    *event.metadata().level(),
-                    event.metadata().target().to_owned(),
-                    visitor.0,
-                ));
-            }
-
-            fn enter(&self, _span: &span::Id) {}
-            fn exit(&self, _span: &span::Id) {}
-        }
+        use tracing::instrument::WithSubscriber as _;
 
         const POISONED_BSSID: &str = "02:00:00:00:52:ff";
         let state = test_state();

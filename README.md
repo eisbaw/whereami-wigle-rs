@@ -95,6 +95,7 @@ Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
 --scan-interval-fast <S>            Fast-phase scan interval [10]
 --scan-fast-duration <S>            Fast phase duration [60]
 --scan-interval-slow <S>            Steady-state scan interval [60]
+--autolocate-interval-secs <S>      Autonomous interval, 0..31536000; 0 disables [120]
 --debounce-window <N>               Ring buffer size [10]
 --debounce-threshold <N>            Min appearances to be stable [5]
 --top-n <N>                         Strongest APs for trilateration [10]
@@ -165,6 +166,23 @@ opportunistically.
 After a daemon restart, the most recent fix is rehydrated from disk — `whereami
 locate` answers immediately while the next scan-and-resolve cycle runs.
 
+By default, the daemon also records a cache-only autonomous fix every 120
+seconds. It reuses the scanner's latest stable Debouncer snapshot and already
+cached AP positions; it never scans, calls Apple/WiGLE, queues pending work, or
+schedules reverse geocoding on its own. This makes `history --raw` useful even
+when no client repeatedly calls `locate`, at the cost of more SQLite writes.
+Set `--autolocate-interval-secs=0` (or the shared NixOS/Home Manager option
+`autolocateIntervalSecs = 0`) to turn it off. Enabled intervals are capped at
+31,536,000 seconds (365 days).
+
+The autonomous loop currently has no independent scan-age cutoff: if scanning
+starts failing, the Debouncer's retained stable snapshot may be reused on later
+ticks. Distance/time dedup limits identical near-term rows, but an interval
+boundary can still append the retained position. This favors continuity during
+brief scanner outages over freshness; disable autonomous fixes when that
+trade-off is unsuitable. A dedicated stale-snapshot policy is tracked
+separately from this collection loop.
+
 ## Privacy, retention, and wiping
 
 By default, the daemon removes location-history fixes older than 30 days and
@@ -198,8 +216,9 @@ authority.
 A wipe does not disable collection. Its exclusive boundary ends when the
 server's response-write attempt terminates, whether by success, write failure,
 timeout, or disconnect; later scans and queries may then repopulate the
-database. If no complete response arrives, completion is unknown: verify the
-state or retry the idempotent wipe. Stop or disable the daemon as well if
+database, and the autonomous locate loop may record new fixes without any
+client query. If no complete response arrives, completion is unknown: verify
+the state or retry the idempotent wipe. Stop or disable the daemon as well if
 collection must remain off. This is logical live-state deletion, not forensic
 erasure: SQLite free pages or WAL remnants, allocator/process-memory remnants
 outside the managed structures above, filesystem snapshots, backups, storage
@@ -442,7 +461,8 @@ If the response is missing or truncated, the result is unknown; verify state or
 retry, because wipe is idempotent. TCP requests are always refused. Socket
 filesystem access is the authority—confirmation prevents accidents but creates
 no read-only role. Collection remains enabled and can repopulate state after
-the response attempt ends. Wipe is logical, not forensic: database/WAL free
+the response attempt ends; the autonomous locate loop can record fixes without
+a client query. Wipe is logical, not forensic: database/WAL free
 space, journals and other logs, snapshots, backups, storage media, and provider
 traffic already sent remain outside its scope. See
 [Privacy, retention, and wiping](#privacy-retention-and-wiping) for the full
@@ -489,6 +509,9 @@ major design choices. Highlights:
   later WiGLE fetches for the same BSSID.
 - In-flight dedup so concurrent `locate` + scan-loop spawns coalesce to one
   Apple/WiGLE call per BSSID.
+- A delayed fixed-cadence autonomous locate loop records stable cache-only
+  positions without a client connection; it shares the interactive
+  plausibility/persistence policy but has no provider or geocode side effects.
 - Atomic daily-quota reservation (single SQL transaction).
 - CLI args for operations, TOML file for secrets only.
 

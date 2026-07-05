@@ -16,6 +16,11 @@ use crate::scanner::DEFAULT_MOBILE_SSID_DENYLIST;
 pub const MAX_CONNECTIONS: usize = 4096;
 const _: () = assert!(MAX_CONNECTIONS <= tokio::sync::Semaphore::MAX_PERMITS);
 
+/// Operational ceiling for autonomous collection cadence: one year. This
+/// keeps Tokio deadline construction comfortably representable while still
+/// allowing an effectively dormant enabled loop. Zero remains the off-switch.
+pub const MAX_AUTOLOCATE_INTERVAL_SECS: u64 = 31_536_000;
+
 /// whereamid: Wi-Fi geolocation daemon
 #[derive(Parser, Debug, Clone)]
 #[command(name = "whereamid", version, about)]
@@ -74,6 +79,16 @@ pub struct Args {
     /// Scan interval during steady phase (seconds)
     #[arg(long, default_value_t = 60)]
     pub scan_interval_slow: u64,
+
+    /// Seconds between autonomous cache-only location fixes
+    /// (0..=31536000). The first fix is delayed by one interval. 0 disables
+    /// autonomous location history.
+    #[arg(
+        long,
+        default_value_t = 120,
+        value_parser = clap::value_parser!(u64).range(0..=MAX_AUTOLOCATE_INTERVAL_SECS)
+    )]
+    pub autolocate_interval_secs: u64,
 
     /// Number of scan samples in debounce ring buffer
     #[arg(long, default_value_t = 10)]
@@ -229,6 +244,12 @@ impl Args {
         }
         if self.scan_interval_slow == 0 {
             anyhow::bail!("--scan-interval-slow must be > 0");
+        }
+        if self.autolocate_interval_secs > MAX_AUTOLOCATE_INTERVAL_SECS {
+            anyhow::bail!(
+                "--autolocate-interval-secs must be in 0..={} (0 disables autonomous location history)",
+                MAX_AUTOLOCATE_INTERVAL_SECS
+            );
         }
         if self.top_n == 0 {
             anyhow::bail!("--top-n must be > 0");
@@ -1047,6 +1068,61 @@ mod tests {
     #[test]
     fn zero_scan_interval_fast_rejected() {
         assert!(parse(&["--scan-interval-fast", "0"]).validate().is_err());
+    }
+
+    #[test]
+    fn autolocate_interval_defaults_and_zero_off_switch() {
+        let defaults = parse(&[]);
+        assert_eq!(defaults.autolocate_interval_secs, 120);
+        defaults.validate().unwrap();
+
+        let disabled = parse(&["--autolocate-interval-secs", "0"]);
+        assert_eq!(disabled.autolocate_interval_secs, 0);
+        disabled.validate().expect("zero must disable autolocate");
+
+        let custom = parse(&["--autolocate-interval-secs", "7"]);
+        assert_eq!(custom.autolocate_interval_secs, 7);
+        custom.validate().unwrap();
+        let maximum = parse(&["--autolocate-interval-secs", "31536000"]);
+        assert_eq!(
+            maximum.autolocate_interval_secs,
+            MAX_AUTOLOCATE_INTERVAL_SECS
+        );
+        maximum
+            .validate()
+            .expect("documented upper bound must validate");
+        assert!(Args::try_parse_from(["whereamid", "--autolocate-interval-secs", "-1"]).is_err());
+        assert!(
+            Args::try_parse_from(["whereamid", "--autolocate-interval-secs", "31536001",]).is_err()
+        );
+        assert!(Args::try_parse_from([
+            "whereamid",
+            "--autolocate-interval-secs",
+            "18446744073709551615",
+        ])
+        .is_err());
+
+        let mut bypassing_clap = parse(&[]);
+        bypassing_clap.autolocate_interval_secs = u64::MAX;
+        let error = bypassing_clap
+            .validate()
+            .expect_err("validate must defensively reject direct invalid Args");
+        assert!(error.to_string().contains("--autolocate-interval-secs"));
+    }
+
+    #[test]
+    fn autolocate_help_names_default_and_off_switch() {
+        use clap::CommandFactory as _;
+        let mut help = Vec::new();
+        Args::command().write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        let section = help
+            .split("--autolocate-interval-secs")
+            .nth(1)
+            .expect("autolocate flag missing from help");
+        assert!(section.contains("[default: 120]"));
+        assert!(section.contains("0..=31536000"));
+        assert!(section.contains("0 disables autonomous location history"));
     }
 
     // --- task-0196: --bind opt-in TCP + non-loopback guard ---

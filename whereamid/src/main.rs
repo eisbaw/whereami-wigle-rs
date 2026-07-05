@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::signal;
 use tokio::time::{sleep, Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use config::{load_config_file, Args};
 #[cfg(test)]
@@ -177,6 +177,7 @@ async fn main() -> Result<()> {
         last_fix: tokio::sync::Mutex::new(initial_last_fix),
         inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
         db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        autolocate_fixes_written: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         api_counter_corruption_denials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
         history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -218,6 +219,17 @@ async fn main() -> Result<()> {
     let retention_handle = tokio::spawn(async move {
         run_retention_loop(retention_state, Duration::from_secs(24 * 60 * 60)).await;
     });
+
+    // Zero is a true off-switch: do not even spawn a task. Otherwise the first
+    // cache-only fix is delayed by one complete interval.
+    let autolocate_handle = if args.autolocate_interval_secs == 0 {
+        None
+    } else {
+        let autolocate_state = Arc::clone(&state);
+        Some(tokio::spawn(async move {
+            run_autolocate_loop(autolocate_state).await;
+        }))
+    };
 
     let server_state = Arc::clone(&state);
     let mut server_handle =
@@ -269,12 +281,13 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let named = vec![
+    let mut named = vec![
         scan_handle,
         pending_handle,
         geocode_handle,
         retention_handle,
     ];
+    named.extend(autolocate_handle);
 
     // Take the tracked-spawn JoinSet out of shared state so we can drive it to
     // completion here (a std::sync::Mutex guard cannot be held across await).
@@ -674,6 +687,62 @@ async fn run_privacy_wipe_shutdown_drain(
     aborted
 }
 
+/// Run the delayed, fixed-cadence autonomous locate loop. A zero interval is a
+/// direct-call off-switch as well as a startup spawn off-switch.
+async fn run_autolocate_loop(state: Arc<DaemonState>) {
+    let interval = Duration::from_secs(state.args.autolocate_interval_secs);
+    if interval.is_zero() {
+        return;
+    }
+    run_autolocate_loop_with_pass(state, interval, |pass_state, ticket| async move {
+        server::run_autolocate_pass(&pass_state, ticket).await
+    })
+    .await;
+}
+
+/// Injectable one-pass seam for paused Tokio-time tests. Production supplies
+/// the real shared locate core above; tests can couple each tick to a wall
+/// clock derived from the same paused Tokio `Instant` without a real sleep.
+async fn run_autolocate_loop_with_pass<F, Fut>(
+    state: Arc<DaemonState>,
+    interval: Duration,
+    mut pass: F,
+) where
+    F: FnMut(Arc<DaemonState>, crate::privacy::PrivacyTicket) -> Fut,
+    Fut: std::future::Future<Output = server::AutolocateOutcome>,
+{
+    if interval.is_zero() {
+        return;
+    }
+    let Some(first_tick) = Instant::now().checked_add(interval) else {
+        warn!(
+            ?interval,
+            "autolocate interval cannot be represented as a Tokio deadline; loop disabled"
+        );
+        return;
+    };
+    let mut ticker = tokio::time::interval_at(first_tick, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => break,
+            _ = ticker.tick() => {}
+        }
+        // Cancellation wins while sleeping and again immediately before a
+        // fresh privacy ticket admits the next pass. Once admitted, the pass
+        // is awaited to completion so a durable SQLite write is never dropped
+        // between commit and its memory/counter continuation.
+        if state.shutdown.is_cancelled() {
+            break;
+        }
+        let ticket = state.privacy.ticket();
+        let outcome = pass(Arc::clone(&state), ticket).await;
+        debug!(?outcome, "autolocate pass completed");
+    }
+}
+
 /// Run immediate and periodic retention sweeps until shutdown. The interval is
 /// injected so paused-clock tests can prove cadence without a 24-hour wait.
 async fn run_retention_loop(state: Arc<DaemonState>, interval: Duration) {
@@ -879,6 +948,294 @@ async fn run_scan_loop(state: Arc<DaemonState>) {
             _ = state.shutdown.cancelled() => break,
             _ = sleep(interval) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod autolocate_loop_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn configure_state(interval_secs: u64) -> Arc<DaemonState> {
+        let mut state = crate::server::test_state();
+        Arc::get_mut(&mut state)
+            .expect("state must be uniquely owned before loop configuration")
+            .args
+            .autolocate_interval_secs = interval_secs;
+        state
+    }
+
+    async fn seed_stable_cached_cluster(state: &Arc<DaemonState>) {
+        let mut sample = crate::debounce::ScanSample::new();
+        for index in 0..3 {
+            let bssid = format!("02:00:00:00:96:{index:02x}");
+            crate::server::lock_db(state)
+                .upsert_ap(&crate::db::ApInfo {
+                    bssid: bssid.clone(),
+                    ssid: Some("loop-fixed-ap".to_string()),
+                    lat: 55.6761,
+                    lon: 12.5683,
+                    encryption: None,
+                    channel: None,
+                    frequency: None,
+                    city: None,
+                    country: None,
+                    is_mobile: false,
+                    source: crate::db::Source::Manual,
+                })
+                .unwrap();
+            sample.insert(
+                bssid,
+                crate::debounce::ScanEntry {
+                    signal_dbm: -40 - index,
+                    ssid: Some("loop-fixed-ap".to_string()),
+                    channel: Some(1),
+                },
+            );
+        }
+        let mut debouncer = state.debouncer.lock().await;
+        for _ in 0..state.args.debounce_threshold {
+            debouncer.push_scan(sample.clone());
+        }
+    }
+
+    async fn history_len(state: &Arc<DaemonState>) -> usize {
+        state
+            .db
+            .get_fixes_in_range("0000", "9999")
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn autolocate_loop_delays_first_tick_and_writes_on_fixed_cadence() {
+        let state = configure_state(1);
+        seed_stable_cached_cluster(&state).await;
+        let monotonic_start = Instant::now();
+        let wall_start =
+            chrono::DateTime::parse_from_rfc3339("2026-07-05T12:00:00.123456789+00:00")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_autolocate_loop_with_pass(
+                loop_state,
+                Duration::from_secs(1),
+                move |pass_state, ticket| {
+                    let elapsed = monotonic_start.elapsed();
+                    let now = wall_start
+                        + chrono::TimeDelta::from_std(elapsed)
+                            .expect("paused Tokio elapsed must fit chrono");
+                    let completed_tx = completed_tx.clone();
+                    async move {
+                        let outcome =
+                            server::run_autolocate_pass_at(&pass_state, ticket, now).await;
+                        completed_tx.send(outcome).unwrap();
+                        outcome
+                    }
+                },
+            )
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(history_len(&state).await, 0, "first pass must be delayed");
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(history_len(&state).await, 0);
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(
+            completed_rx.recv().await,
+            Some(server::AutolocateOutcome::Written)
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            completed_rx.recv().await,
+            Some(server::AutolocateOutcome::Written)
+        );
+        assert_eq!(history_len(&state).await, 2);
+        assert_eq!(state.autolocate_fixes_written.load(Ordering::Relaxed), 2);
+
+        state.shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_interval_returns_without_invoking_a_pass() {
+        let state = configure_state(0);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        run_autolocate_loop_with_pass(
+            Arc::clone(&state),
+            Duration::ZERO,
+            move |_state, _ticket| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                async { server::AutolocateOutcome::Failed }
+            },
+        )
+        .await;
+        run_autolocate_loop(Arc::clone(&state)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(history_len(&state).await, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrepresentable_direct_interval_warns_and_returns_without_panicking() {
+        let state = configure_state(0);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let loop_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_autolocate_loop_with_pass(
+                loop_state,
+                Duration::from_secs(u64::MAX),
+                move |_state, _ticket| {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    async { server::AutolocateOutcome::Failed }
+                },
+            )
+            .await;
+        });
+        handle
+            .await
+            .expect("invalid direct interval must not panic or silently detach");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_while_sleeping_prevents_admission() {
+        let state = configure_state(60);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let loop_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_autolocate_loop_with_pass(
+                loop_state,
+                Duration::from_secs(60),
+                move |_state, _ticket| {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    async { server::AutolocateOutcome::Failed }
+                },
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        state.shutdown.cancel();
+        handle.await.unwrap();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_does_not_drop_an_admitted_pass_or_catch_up() {
+        let state = configure_state(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut started_tx = Some(started_tx);
+        let mut release_rx = Some(release_rx);
+        let loop_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_autolocate_loop_with_pass(
+                loop_state,
+                Duration::from_secs(1),
+                move |_state, _ticket| {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    let started = started_tx.take().expect("only one pass may start");
+                    let release = release_rx.take().expect("only one pass may start");
+                    async move {
+                        started.send(()).unwrap();
+                        release.await.unwrap();
+                        server::AutolocateOutcome::Failed
+                    }
+                },
+            )
+            .await;
+        });
+        tokio::time::advance(Duration::from_secs(1)).await;
+        started_rx.await.unwrap();
+        state.shutdown.cancel();
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "admitted pass must be awaited after cancellation"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        release_tx.send(()).unwrap();
+        handle.await.unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "no catch-up pass may start"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skip_cadence_runs_one_missed_pass_then_resumes_fixed_phase() {
+        let state = configure_state(1);
+        let origin = Instant::now();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut first_release = Some(release_rx);
+        let loop_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_autolocate_loop_with_pass(
+                loop_state,
+                Duration::from_secs(1),
+                move |_state, _ticket| {
+                    started_tx.send(origin.elapsed()).unwrap();
+                    let release = first_release.take();
+                    async move {
+                        if let Some(release) = release {
+                            release.await.unwrap();
+                        }
+                        server::AutolocateOutcome::Failed
+                    }
+                },
+            )
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(started_rx.recv().await, Some(Duration::from_secs(1)));
+
+        // The first pass spans scheduled ticks at t=2, t=3 and t=4.
+        tokio::time::advance(Duration::from_millis(3_500)).await;
+        release_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            started_rx.try_recv(),
+            Ok(Duration::from_millis(4_500)),
+            "Skip permits exactly one immediately-ready missed pass"
+        );
+        assert_eq!(
+            started_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "Burst would replay more than one missed tick"
+        );
+
+        tokio::time::advance(Duration::from_millis(499)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            started_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            started_rx.try_recv(),
+            Ok(Duration::from_secs(5)),
+            "Skip must resume the original fixed phase; Delay would fire at t=5.5"
+        );
+
+        state.shutdown.cancel();
+        handle.await.unwrap();
     }
 }
 

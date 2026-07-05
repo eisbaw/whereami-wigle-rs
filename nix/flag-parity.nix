@@ -34,6 +34,7 @@ let
     scanIntervalFast = 1;
     scanFastDuration = 1;
     scanIntervalSlow = 1;
+    autolocateIntervalSecs = 1;
     debounceWindow = 1;
     debounceThreshold = 1;
     topN = 1;
@@ -96,6 +97,9 @@ let
   moduleSpeedDefault = (lib.evalModules {
     modules = [ { options.services.whereami = sharedOptions; } ];
   }).config.services.whereami.maxTravelSpeedKmh;
+  moduleAutolocateDefault = (lib.evalModules {
+    modules = [ { options.services.whereami = sharedOptions; } ];
+  }).config.services.whereami.autolocateIntervalSecs;
 
   # Split the space-joined ExecStart and keep the tokens that begin with a flag
   # after removing escapeSystemdExecArg's opening quote. For canonical
@@ -116,6 +120,7 @@ pkgs.runCommand "whereami-flag-parity"
   nativeBuildInputs = [ package ];
   emitted = lib.concatStringsSep "\n" (lib.sort (a: b: a < b) emittedFlags);
   inherit moduleMobileDefaultJoined moduleSpeedDefault;
+  inherit moduleAutolocateDefault;
 } ''
   set -euo pipefail
   printf '%s\n' "$emitted" | sort -u > emitted-flags
@@ -150,6 +155,13 @@ pkgs.runCommand "whereami-flag-parity"
     exit 1
   fi
 
+  help_autolocate_default="$(${package}/bin/whereamid --help \
+    | sed -n '/--autolocate-interval-secs/,/--debounce-window/ s/.*\[default: \([0-9][0-9]*\)\].*/\1/p')"
+  if [[ "$help_autolocate_default" != "$moduleAutolocateDefault" ]]; then
+    echo "autolocate default drift: Rust help='$help_autolocate_default' Nix module='$moduleAutolocateDefault'" >&2
+    exit 1
+  fi
+
   help_speed_default="$(${package}/bin/whereamid --help \
     | sed -n '/--max-travel-speed-kmh/,/--mobile-ssid-denylist/ s/.*\[default: \([^]]*\)\].*/\1/p')"
   if [[ -z "$help_speed_default" || "$help_speed_default" != "$moduleSpeedDefault" ]]; then
@@ -160,5 +172,6 @@ pkgs.runCommand "whereami-flag-parity"
   echo "flag parity OK: $(wc -l < help-flags) flags match between --help and exec-start.nix"
   echo "mobile SSID default parity OK"
   echo "max travel speed default parity OK"
+  echo "autolocate interval default parity OK"
   touch $out
 ''

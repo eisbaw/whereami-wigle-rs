@@ -46,6 +46,7 @@ lib.concatStringsSep " " ([
   "--scan-interval-fast" (toString cfg.scanIntervalFast)
   "--scan-fast-duration" (toString cfg.scanFastDuration)
   "--scan-interval-slow" (toString cfg.scanIntervalSlow)
+  "--autolocate-interval-secs" (toString cfg.autolocateIntervalSecs)
   "--debounce-window" (toString cfg.debounceWindow)
   "--debounce-threshold" (toString cfg.debounceThreshold)
   "--top-n" (toString cfg.topN)
