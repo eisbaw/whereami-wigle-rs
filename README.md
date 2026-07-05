@@ -48,6 +48,8 @@ whereami scan                # currently visible Wi-Fi networks
 whereami stats               # cache size, API quota, in-flight count
 whereami debug               # per-BSSID debounce + DB classification
 whereami history 24h         # stay-point segments over the last 24 hours
+whereami history 24h --raw   # every fix (newest 1000 by default), no segmentation
+whereami history 7d --raw --max-fixes 5000
 whereami history 7d          # last 7 days; supports s/m/h/d/w
 whereami history --from 2026-05-01T00:00:00+00:00 --to 2026-05-08T00:00:00+00:00
 WHEREAMI_SOCKET=/path/to/whereamid.sock whereami wipe --yes # destructive; pin the daemon
@@ -134,8 +136,9 @@ Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
    result above the configured ceiling is marked Suspect and visible cached-AP
    consensus chooses between current trilateration and the previous fix.
 7. Optional reverse geocoding via OSM Nominatim adds a street address.
-8. Every accepted current fix is recorded in a `fixes` timeseries; the `history`
-   command groups them into stay-point segments.
+8. Every accepted current fix is recorded in a `fixes` timeseries. `history`
+   normally groups them into stay-point segments (100 m distance, 300 s minimum
+   duration); `history --raw` bypasses segmentation and exposes the observations.
 
 Human `locate` output appends the confidence. On a terminal, High is dim green,
 Low is yellow, and Suspect is bold red; Medium and all redirected/piped output

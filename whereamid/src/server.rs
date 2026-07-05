@@ -35,6 +35,8 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024; // 64 KiB max request size
 /// so an unbounded count would let one hostile request starve the rest
 /// of the daemon. task-0053.
 const MAX_RESOLVE_BSSIDS: usize = 256;
+const DEFAULT_RAW_HISTORY_MAX_FIXES: u64 = 1_000;
+const MAX_RAW_HISTORY_FIXES: u64 = 10_000;
 const WIPE_CONFIRMATION: &str = "delete-all-location-data";
 const WIPE_CONFIRMATION_ERROR: &str = "wipe: confirmation must equal 'delete-all-location-data'";
 const WIPE_TCP_ERROR: &str =
@@ -487,6 +489,12 @@ enum Request {
         /// Absolute end (RFC3339).
         #[serde(default)]
         to: Option<String>,
+        /// Return raw fixes instead of stay-point segments.
+        #[serde(default)]
+        raw: bool,
+        /// Optional raw-fix cap. Invalid unless `raw` is true.
+        #[serde(default)]
+        max_fixes: Option<u64>,
     },
     Wipe {
         #[serde(default)]
@@ -1273,11 +1281,19 @@ async fn dispatch_command_for_transport(
         Request::Stats => CommandResponse::privacy(handle_stats(state).await, ticket),
         Request::Debug => CommandResponse::privacy(handle_debug(state).await, ticket),
         Request::Version => handle_version().into(),
-        Request::History { range, from, to } => {
+        Request::History {
+            range,
+            from,
+            to,
+            raw,
+            max_fixes,
+        } => {
             handle_history(
                 range.as_deref(),
                 from.as_deref(),
                 to.as_deref(),
+                *raw,
+                *max_fixes,
                 state,
                 ticket,
             )
@@ -2040,6 +2056,43 @@ struct HistoryResponse {
     segments: Vec<crate::history::Segment>,
 }
 
+#[derive(Serialize)]
+struct RawHistoryRange {
+    from_rfc3339: String,
+    to_rfc3339: String,
+}
+
+#[derive(Serialize)]
+struct RawHistoryFix {
+    at_rfc3339: String,
+    lat: f64,
+    lon: f64,
+    accuracy_m: f64,
+    n_sources: i64,
+}
+
+impl From<crate::db::FixRow> for RawHistoryFix {
+    fn from(row: crate::db::FixRow) -> Self {
+        Self {
+            at_rfc3339: row.at_rfc3339,
+            lat: row.lat,
+            lon: row.lon,
+            accuracy_m: row.accuracy_m,
+            n_sources: row.n_sources,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RawHistoryResponse {
+    ok: bool,
+    v: u32,
+    range: RawHistoryRange,
+    fixes: Vec<RawHistoryFix>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elided: Option<i64>,
+}
+
 /// Async-side cancellation bridge for blocking history work. Dropping an
 /// async request cannot abort `spawn_blocking`; it sets this flag instead, and
 /// TASK-0087's cancellable O(N) segmentation checks it cooperatively.
@@ -2078,10 +2131,19 @@ struct HistoryWork {
     fixes: Vec<crate::db::FixRow>,
     from: String,
     to: String,
-    dist_threshold_m: f64,
-    min_duration_secs: i64,
+    output: HistoryOutput,
     shutdown: tokio_util::sync::CancellationToken,
     lease: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
+enum HistoryOutput {
+    Segmented {
+        dist_threshold_m: f64,
+        min_duration_secs: i64,
+    },
+    Raw {
+        elided: Option<i64>,
+    },
 }
 
 fn spawn_history_work<B>(
@@ -2095,8 +2157,7 @@ where
         fixes,
         from,
         to,
-        dist_threshold_m,
-        min_duration_secs,
+        output,
         shutdown,
         lease,
     } = work;
@@ -2115,37 +2176,71 @@ where
         }
         before_work(&is_cancelled);
 
-        let segments = match crate::history::segment_fixes_cancellable(
-            &fixes,
-            dist_threshold_m,
-            min_duration_secs,
-            is_cancelled,
-        ) {
-            crate::history::SegmentFixesOutcome::Complete(segments) => segments,
-            crate::history::SegmentFixesOutcome::Cancelled => {
-                return error_json("history: cancelled");
+        let body = match output {
+            HistoryOutput::Segmented {
+                dist_threshold_m,
+                min_duration_secs,
+            } => {
+                let segments = match crate::history::segment_fixes_cancellable(
+                    &fixes,
+                    dist_threshold_m,
+                    min_duration_secs,
+                    is_cancelled,
+                ) {
+                    crate::history::SegmentFixesOutcome::Complete(segments) => segments,
+                    crate::history::SegmentFixesOutcome::Cancelled => {
+                        return error_json("history: cancelled");
+                    }
+                };
+                HistoryBody::Segmented(segments)
             }
+            HistoryOutput::Raw { elided } => HistoryBody::Raw {
+                fixes: fixes.into_iter().map(RawHistoryFix::from).collect(),
+                elided,
+            },
         };
         if blocking_cancelled.load(std::sync::atomic::Ordering::Acquire) || shutdown.is_cancelled()
         {
             return error_json("history: cancelled");
         }
 
-        ok_json(&HistoryResponse {
-            ok: true,
-            v: 1,
-            from,
-            to,
-            segments,
-        })
+        match body {
+            HistoryBody::Segmented(segments) => ok_json(&HistoryResponse {
+                ok: true,
+                v: 1,
+                from,
+                to,
+                segments,
+            }),
+            HistoryBody::Raw { fixes, elided } => ok_json(&RawHistoryResponse {
+                ok: true,
+                v: 1,
+                range: RawHistoryRange {
+                    from_rfc3339: from,
+                    to_rfc3339: to,
+                },
+                fixes,
+                elided,
+            }),
+        }
     });
     (join, guard)
+}
+
+enum HistoryBody {
+    Segmented(Vec<crate::history::Segment>),
+    Raw {
+        fixes: Vec<RawHistoryFix>,
+        elided: Option<i64>,
+    },
 }
 
 async fn handle_history(
     range: Option<&str>,
     from: Option<&str>,
     to: Option<&str>,
+    raw: bool,
+    max_fixes: Option<u64>,
     state: &Arc<DaemonState>,
     ticket: crate::privacy::PrivacyTicket,
 ) -> CommandResponse {
@@ -2185,6 +2280,23 @@ async fn handle_history(
         }
     };
 
+    let raw_limit = match (raw, max_fixes) {
+        (false, Some(_)) => {
+            return error_json("history: 'max_fixes' requires 'raw': true").into();
+        }
+        (true, limit) => {
+            let limit = limit.unwrap_or(DEFAULT_RAW_HISTORY_MAX_FIXES);
+            if !(1..=MAX_RAW_HISTORY_FIXES).contains(&limit) {
+                return error_json(&format!(
+                    "history: 'max_fixes' must be in 1..={MAX_RAW_HISTORY_FIXES}"
+                ))
+                .into();
+            }
+            Some(limit)
+        }
+        (false, None) => None,
+    };
+
     // Never queue history waiters behind the expensive request: they would
     // consume connection slots and let a burst starve cheap commands.
     let lease = match Arc::clone(&state.history_slot).try_acquire_owned() {
@@ -2192,30 +2304,56 @@ async fn handle_history(
         Err(_) => return error_json("history: busy; retry later").into(),
     };
 
-    let fixes = match state
-        .db
-        .get_fixes_in_range_guarded(from.to_rfc3339(), to.to_rfc3339(), Arc::clone(&lease))
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            return CommandResponse::history(
-                error_json(&format!("history: db error: {e}")),
-                lease,
-                ticket,
-            );
-        }
-    };
-
     let from = from.to_rfc3339();
     let to = to.to_rfc3339();
+    let (fixes, output) = if let Some(limit) = raw_limit {
+        match state
+            .db
+            .get_capped_fixes_in_range_guarded(from.clone(), to.clone(), limit, Arc::clone(&lease))
+            .await
+        {
+            Ok(page) => (
+                page.fixes,
+                HistoryOutput::Raw {
+                    elided: page.elided,
+                },
+            ),
+            Err(error) => {
+                return CommandResponse::history(
+                    error_json(&format!("history: db error: {error}")),
+                    lease,
+                    ticket,
+                );
+            }
+        }
+    } else {
+        match state
+            .db
+            .get_fixes_in_range_guarded(from.clone(), to.clone(), Arc::clone(&lease))
+            .await
+        {
+            Ok(fixes) => (
+                fixes,
+                HistoryOutput::Segmented {
+                    dist_threshold_m: state.args.history_segment_distance_m as f64,
+                    min_duration_secs: state.args.history_segment_min_duration_secs as i64,
+                },
+            ),
+            Err(error) => {
+                return CommandResponse::history(
+                    error_json(&format!("history: db error: {error}")),
+                    lease,
+                    ticket,
+                );
+            }
+        }
+    };
     let (join, mut cancellation) = spawn_history_work(
         HistoryWork {
             fixes,
             from,
             to,
-            dist_threshold_m: state.args.history_segment_distance_m as f64,
-            min_duration_secs: state.args.history_segment_min_duration_secs as i64,
+            output,
             shutdown: state.shutdown.clone(),
             lease: Arc::clone(&lease),
         },
@@ -4842,6 +4980,8 @@ mod dispatch_tests {
             range: Some("100000000d".to_string()),
             from: None,
             to: None,
+            raw: false,
+            max_fixes: None,
         };
         // Returning normally at all is the "connection survives" property:
         // before task-0184 this call panicked inside parse_range.
@@ -4861,12 +5001,222 @@ mod dispatch_tests {
         );
     }
 
+    fn raw_history_request(from: &str, to: &str, max_fixes: Option<u64>) -> Request {
+        Request::History {
+            range: None,
+            from: Some(from.to_string()),
+            to: Some(to.to_string()),
+            raw: true,
+            max_fixes,
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_history_returns_short_visit_that_segmentation_discards() {
+        let state = test_state();
+        let base = chrono::DateTime::parse_from_rfc3339("2026-05-19T06:40:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for (index, seconds) in [0, 40, 80, 120].into_iter().enumerate() {
+            lock_db(&state)
+                .insert_fix(
+                    &(base + chrono::Duration::seconds(seconds)).to_rfc3339(),
+                    55.74391,
+                    12.57933,
+                    90.0 - index as f64,
+                    8 - index as i64,
+                )
+                .unwrap();
+        }
+
+        let raw = dispatch_command(
+            &raw_history_request(
+                "2026-05-19T06:40:00+00:00",
+                "2026-05-19T06:42:00+00:00",
+                Some(1_000),
+            ),
+            &state,
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["ok"], true, "raw history failed: {raw}");
+        assert_eq!(
+            value.as_object().unwrap().len(),
+            4,
+            "uncapped raw response must be exactly ok/v/range/fixes: {raw}"
+        );
+        assert_eq!(
+            value["range"],
+            serde_json::json!({
+                "from_rfc3339": "2026-05-19T06:40:00+00:00",
+                "to_rfc3339": "2026-05-19T06:42:00+00:00"
+            })
+        );
+        let fixes = value["fixes"].as_array().unwrap();
+        assert_eq!(fixes.len(), 4);
+        assert!(value.get("elided").is_none());
+        for (index, fix) in fixes.iter().enumerate() {
+            assert_eq!(
+                fix.as_object().unwrap().len(),
+                5,
+                "raw fix must expose no database id or internal fields"
+            );
+            assert_eq!(fix["lat"], 55.74391);
+            assert_eq!(fix["lon"], 12.57933);
+            assert_eq!(fix["accuracy_m"], 90.0 - index as f64);
+            assert_eq!(fix["n_sources"], 8 - index as i64);
+            assert_eq!(
+                fix["at_rfc3339"],
+                (base + chrono::Duration::seconds(index as i64 * 40)).to_rfc3339()
+            );
+        }
+        assert!(value.get("from").is_none());
+        assert!(value.get("to").is_none());
+        assert!(value.get("segments").is_none());
+        drop(raw);
+
+        let segmented = dispatch_command(
+            &Request::History {
+                range: None,
+                from: Some("2026-05-19T06:40:00+00:00".to_string()),
+                to: Some("2026-05-19T06:42:00+00:00".to_string()),
+                raw: false,
+                max_fixes: None,
+            },
+            &state,
+        )
+        .await;
+        let segmented_value: serde_json::Value = serde_json::from_str(&segmented).unwrap();
+        assert_eq!(segmented_value["ok"], true);
+        assert_eq!(
+            segmented_value.as_object().unwrap().len(),
+            5,
+            "legacy response must remain exactly ok/v/from/to/segments"
+        );
+        assert_eq!(segmented_value["segments"].as_array().unwrap().len(), 0);
+        assert!(segmented_value.get("range").is_none());
+        assert!(segmented_value.get("fixes").is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_history_default_cap_returns_newest_thousand_and_exact_elision() {
+        let state = test_state();
+        let base = chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for index in 0..1_500 {
+            lock_db(&state)
+                .insert_fix(
+                    &(base + chrono::Duration::seconds(index)).to_rfc3339(),
+                    55.0 + index as f64 / 100_000.0,
+                    12.0,
+                    5.0,
+                    index,
+                )
+                .unwrap();
+        }
+        let from = base.to_rfc3339();
+        let to = (base + chrono::Duration::seconds(1_499)).to_rfc3339();
+
+        let default_page = dispatch_command(&raw_history_request(&from, &to, None), &state).await;
+        let value: serde_json::Value = serde_json::from_str(&default_page).unwrap();
+        assert_eq!(value["ok"], true, "raw history failed: {default_page}");
+        assert_eq!(value.as_object().unwrap().len(), 5);
+        let fixes = value["fixes"].as_array().unwrap();
+        assert_eq!(fixes.len(), 1_000);
+        assert_eq!(fixes[0]["n_sources"], 500);
+        assert_eq!(fixes[999]["n_sources"], 1_499);
+        assert_eq!(value["elided"], 500);
+        for (offset, fix) in fixes.iter().enumerate() {
+            assert_eq!(fix["n_sources"], offset + 500);
+        }
+        drop(default_page);
+
+        let exact_page =
+            dispatch_command(&raw_history_request(&from, &to, Some(1_500)), &state).await;
+        let exact: serde_json::Value = serde_json::from_str(&exact_page).unwrap();
+        assert_eq!(exact.as_object().unwrap().len(), 4);
+        assert_eq!(exact["fixes"].as_array().unwrap().len(), 1_500);
+        assert!(exact.get("elided").is_none());
+    }
+
+    #[tokio::test]
+    async fn history_raw_cap_validation_is_explicit() {
+        let state = test_state();
+        for request in [
+            Request::History {
+                range: Some("1h".to_string()),
+                from: None,
+                to: None,
+                raw: false,
+                max_fixes: Some(100),
+            },
+            Request::History {
+                range: Some("1h".to_string()),
+                from: None,
+                to: None,
+                raw: true,
+                max_fixes: Some(0),
+            },
+            Request::History {
+                range: Some("1h".to_string()),
+                from: None,
+                to: None,
+                raw: true,
+                max_fixes: Some(MAX_RAW_HISTORY_FIXES + 1),
+            },
+        ] {
+            let response = dispatch_command(&request, &state).await;
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(value["ok"], false, "invalid cap succeeded: {response}");
+            assert!(
+                value["error"].as_str().unwrap().contains("max_fixes"),
+                "{response}"
+            );
+        }
+    }
+
     fn one_hour_history_request() -> Request {
         Request::History {
             range: Some("1h".to_string()),
             from: None,
             to: None,
+            raw: false,
+            max_fixes: None,
         }
+    }
+
+    fn one_hour_raw_history_request() -> Request {
+        Request::History {
+            range: Some("1h".to_string()),
+            from: None,
+            to: None,
+            raw: true,
+            max_fixes: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_and_segmented_history_share_single_flight_admission() {
+        let state = test_state();
+        let segmented = dispatch_command(&one_hour_history_request(), &state).await;
+        let raw_busy = dispatch_command(&one_hour_raw_history_request(), &state).await;
+        assert!(
+            raw_busy.contains("history: busy; retry later"),
+            "{raw_busy}"
+        );
+        drop(raw_busy);
+        drop(segmented);
+
+        let raw = dispatch_command(&one_hour_raw_history_request(), &state).await;
+        let segmented_busy = dispatch_command(&one_hour_history_request(), &state).await;
+        assert!(
+            segmented_busy.contains("history: busy; retry later"),
+            "{segmented_busy}"
+        );
+        drop(segmented_busy);
+        drop(raw);
+        assert_eq!(state.history_slot.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -5020,8 +5370,10 @@ mod dispatch_tests {
                 fixes: Vec::new(),
                 from: "2026-07-05T00:00:00+00:00".to_string(),
                 to: "2026-07-05T01:00:00+00:00".to_string(),
-                dist_threshold_m: 100.0,
-                min_duration_secs: 300,
+                output: HistoryOutput::Segmented {
+                    dist_threshold_m: 100.0,
+                    min_duration_secs: 300,
+                },
                 shutdown: state.shutdown.clone(),
                 lease: Arc::clone(&lease),
             },
@@ -5102,8 +5454,10 @@ mod dispatch_tests {
                 fixes: Vec::new(),
                 from: "2026-07-05T00:00:00+00:00".to_string(),
                 to: "2026-07-05T01:00:00+00:00".to_string(),
-                dist_threshold_m: 100.0,
-                min_duration_secs: 300,
+                output: HistoryOutput::Segmented {
+                    dist_threshold_m: 100.0,
+                    min_duration_secs: 300,
+                },
                 shutdown: state.shutdown.clone(),
                 lease: Arc::clone(&lease),
             },
@@ -5183,8 +5537,10 @@ mod dispatch_tests {
                 fixes: Vec::new(),
                 from: "2026-07-05T00:00:00+00:00".to_string(),
                 to: "2026-07-05T01:00:00+00:00".to_string(),
-                dist_threshold_m: 100.0,
-                min_duration_secs: 300,
+                output: HistoryOutput::Segmented {
+                    dist_threshold_m: 100.0,
+                    min_duration_secs: 300,
+                },
                 // Keep daemon cancellation false: this test must observe the
                 // async Drop guard's local cancellation specifically.
                 shutdown: tokio_util::sync::CancellationToken::new(),

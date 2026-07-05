@@ -22,9 +22,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use nu_ansi_term::{Color, Style};
 use std::{io::IsTerminal, process, time::Duration};
 use whereami_client::{
-    Confidence, DaemonResponse, LocateResponse, ScanResponse, StatsResponse, WhereAmIClient,
-    WipeConfirmation, WipeResponse, DEFAULT_SOCKET_IO_TIMEOUT,
+    Confidence, DaemonResponse, HistoryFixesResponse, LocateResponse, ScanResponse, StatsResponse,
+    WhereAmIClient, WipeConfirmation, WipeResponse, DEFAULT_SOCKET_IO_TIMEOUT,
 };
+
+const DEFAULT_RAW_HISTORY_MAX_FIXES: u64 = 1_000;
+const MAX_RAW_HISTORY_FIXES: u64 = 10_000;
 
 /// `whereami` — Wi-Fi geolocation CLI.
 ///
@@ -97,11 +100,13 @@ enum Command {
     #[command(alias = "d")]
     Debug,
 
-    /// Stay-point segments from the location-history timeseries.
+    /// Stay-point segments or raw fixes from location history.
     ///
     /// Defaults to the last 7 days. Pass either a relative range
     /// (`24h`, `7d`, `1w`) OR both `--from` and `--to` as RFC3339
     /// timestamps; the two forms are mutually exclusive.
+    /// By default the daemon groups fixes within 100m and emits only groups
+    /// lasting at least 300s. --raw bypasses both segmentation thresholds.
     #[command(alias = "h")]
     History {
         /// Relative range: `24h`, `7d`, `1w`. Mutually exclusive with
@@ -113,6 +118,19 @@ enum Command {
         /// RFC3339 inclusive end. Requires --from.
         #[arg(long, conflicts_with = "range")]
         to: Option<String>,
+        /// Return every retained fix instead of stay-point segments. Raw mode
+        /// bypasses the daemon's default 100m/300s segmentation thresholds.
+        #[arg(long)]
+        raw: bool,
+        /// Maximum newest raw fixes to return (default: 1000; hard maximum:
+        /// 10000). Requires --raw.
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "raw",
+            value_parser = clap::value_parser!(u64).range(1..=MAX_RAW_HISTORY_FIXES)
+        )]
+        max_fixes: Option<u64>,
     },
 
     /// Delete all stored location, history, and observed Wi-Fi data.
@@ -437,7 +455,13 @@ fn main() {
         Command::Scan { scan_time } => run_scan(&client, json, scan_time == YesNo::No),
         Command::Stats => run_stats(&client, json),
         Command::Debug => run_debug(&client, json),
-        Command::History { range, from, to } => run_history(&client, json, range, from, to),
+        Command::History {
+            range,
+            from,
+            to,
+            raw,
+            max_fixes,
+        } => run_history(&client, json, range, from, to, raw, max_fixes),
         Command::Wipe { yes: true } => run_wipe(&client, json),
         Command::Wipe { yes: false } => unreachable!("clap requires --yes"),
         Command::Version => run_daemon_version(&client, json),
@@ -531,6 +555,8 @@ fn run_history(
     range: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    raw: bool,
+    max_fixes: Option<u64>,
 ) {
     // clap enforces --from/--to are mutually exclusive with `range`.
     // We additionally check that --from and --to come as a pair: passing
@@ -552,7 +578,17 @@ fn run_history(
     // synthesized transport error — is what reaches stdout under --json.
     // Whether these CLI-side usage errors should instead emit synthesized
     // JSON under --json is tracked in TASK-0228 (deliberate for now).
-    if json {
+    if raw {
+        let max_fixes = Some(max_fixes.unwrap_or(DEFAULT_RAW_HISTORY_MAX_FIXES));
+        if json {
+            emit_json(client.history_fixes_raw(range, from, to, max_fixes));
+        } else {
+            dispatch(
+                client.history_fixes(range, from, to, max_fixes),
+                |response| print!("{}", render_history_fixes(response)),
+            );
+        }
+    } else if json {
         emit_json(client.history_raw(range, from, to));
     } else {
         dispatch(client.history(range, from, to), |resp| {
@@ -575,6 +611,86 @@ fn run_history(
             }
         });
     }
+}
+
+/// Great-circle distance between two coordinates, with the intermediate
+/// haversine value clamped against floating-point drift before `asin`.
+fn history_haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let lat1 = lat1.to_radians();
+    let lat2 = lat2.to_radians();
+    let dlat = lat2 - lat1;
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * 6_371_000.0 * a.clamp(0.0, 1.0).sqrt().asin()
+}
+
+fn format_history_distance(metres: f64) -> String {
+    if metres < 1_000.0 {
+        format!("+{metres:.1}m")
+    } else {
+        format!("+{:.1}km", metres / 1_000.0)
+    }
+}
+
+fn format_history_elapsed(previous: &str, current: &str) -> String {
+    let Ok(previous) = chrono::DateTime::parse_from_rfc3339(previous) else {
+        return "?".to_string();
+    };
+    let Ok(current) = chrono::DateTime::parse_from_rfc3339(current) else {
+        return "?".to_string();
+    };
+    let elapsed = current.signed_duration_since(previous);
+    // Check the signed duration before reducing it to whole seconds. Chrono's
+    // num_seconds truncates toward zero, so -0.2s would otherwise become 0
+    // and be mislabeled as a valid duplicate timestamp.
+    if elapsed < chrono::TimeDelta::zero() {
+        return "?".to_string();
+    }
+    let seconds = elapsed.num_seconds();
+    if seconds < 60 {
+        format!("+{seconds}s")
+    } else if seconds < 3_600 {
+        format!("+{}m", seconds / 60)
+    } else {
+        format!("+{}h", seconds / 3_600)
+    }
+}
+
+/// Render raw history as data rows only. The first shown row is the movement
+/// baseline even when earlier rows were capped, so it never implies a jump
+/// from a hidden fix.
+fn render_history_fixes(response: &HistoryFixesResponse) -> String {
+    let mut output = String::new();
+    if let Some(elided) = response.elided {
+        output.push_str(&format!(
+            "... {elided} earlier fixes elided; pass --max-fixes <N> or narrow the range\n"
+        ));
+    }
+    for (index, fix) in response.fixes.iter().enumerate() {
+        let (distance, elapsed) = if index == 0 {
+            ("+0.0m".to_string(), "-".to_string())
+        } else {
+            let previous = &response.fixes[index - 1];
+            (
+                format_history_distance(history_haversine_m(
+                    previous.lat,
+                    previous.lon,
+                    fix.lat,
+                    fix.lon,
+                )),
+                format_history_elapsed(&previous.at_rfc3339, &fix.at_rfc3339),
+            )
+        };
+        output.push_str(&format!(
+            "{}  {:.6}, {:.6}  ±{}m  {}src  {distance} / {elapsed}\n",
+            sanitize(&fix.at_rfc3339),
+            fix.lat,
+            fix.lon,
+            fix.accuracy_m as i64,
+            fix.n_sources,
+        ));
+    }
+    output
 }
 
 fn run_wipe(client: &WhereAmIClient, json: bool) {
@@ -730,10 +846,18 @@ mod tests {
     fn history_range_positional_parses() {
         let cli = Cli::try_parse_from(["whereami", "history", "24h"]).unwrap();
         match cli.command {
-            Some(Command::History { range, from, to }) => {
+            Some(Command::History {
+                range,
+                from,
+                to,
+                raw,
+                max_fixes,
+            }) => {
                 assert_eq!(range.as_deref(), Some("24h"));
                 assert!(from.is_none());
                 assert!(to.is_none());
+                assert!(!raw);
+                assert!(max_fixes.is_none());
             }
             other => panic!("expected History, got {other:?}"),
         }
@@ -751,10 +875,18 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Some(Command::History { range, from, to }) => {
+            Some(Command::History {
+                range,
+                from,
+                to,
+                raw,
+                max_fixes,
+            }) => {
                 assert!(range.is_none());
                 assert_eq!(from.as_deref(), Some("2026-01-01T00:00:00Z"));
                 assert_eq!(to.as_deref(), Some("2026-01-02T00:00:00Z"));
+                assert!(!raw);
+                assert!(max_fixes.is_none());
             }
             other => panic!("expected History, got {other:?}"),
         }
@@ -771,6 +903,75 @@ mod tests {
             "2026-01-01T00:00:00Z",
         ]);
         assert!(res.is_err(), "range + --from must conflict");
+    }
+
+    #[test]
+    fn history_raw_and_cap_parse_with_relative_or_absolute_ranges() {
+        let relative =
+            Cli::try_parse_from(["whereami", "history", "24h", "--raw", "--max-fixes", "4321"])
+                .unwrap();
+        assert!(matches!(
+            relative.command,
+            Some(Command::History {
+                raw: true,
+                max_fixes: Some(4321),
+                ..
+            })
+        ));
+
+        let absolute = Cli::try_parse_from([
+            "whereami",
+            "history",
+            "--raw",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-01-02T00:00:00Z",
+        ])
+        .unwrap();
+        assert!(matches!(
+            absolute.command,
+            Some(Command::History {
+                raw: true,
+                max_fixes: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn history_cap_requires_raw_and_enforces_protocol_ceiling() {
+        assert!(Cli::try_parse_from(["whereami", "history", "--max-fixes", "1000"]).is_err());
+        for invalid in ["0", "10001"] {
+            assert!(
+                Cli::try_parse_from(["whereami", "history", "--raw", "--max-fixes", invalid,])
+                    .is_err(),
+                "invalid cap {invalid} must fail at clap"
+            );
+        }
+    }
+
+    #[test]
+    fn history_help_documents_raw_cap_and_segment_defaults() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("history")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for marker in [
+            "--raw",
+            "--max-fixes <N>",
+            "default: 1000",
+            "100m",
+            "300s",
+            "bypasses",
+        ] {
+            assert!(
+                help.contains(marker),
+                "history help missing {marker:?}: {help}"
+            );
+        }
     }
 
     #[test]
@@ -1025,6 +1226,175 @@ mod tests {
             render_scan(&resp, true),
             "aa:bb:cc:dd:ee:ff   -55 dBm  ch11   HomeNet\n"
         );
+    }
+
+    fn raw_history_response(
+        fixes: Vec<whereami_client::HistoryFix>,
+        elided: Option<i64>,
+    ) -> HistoryFixesResponse {
+        HistoryFixesResponse {
+            ok: true,
+            v: 1,
+            range: whereami_client::HistoryRange {
+                from_rfc3339: "2026-05-19T06:40:00+00:00".to_string(),
+                to_rfc3339: "2026-05-19T08:00:00+00:00".to_string(),
+            },
+            fixes,
+            elided,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn raw_history_renderer_is_rows_only_and_pins_elapsed_boundaries() {
+        let response = raw_history_response(
+            vec![
+                whereami_client::HistoryFix {
+                    at_rfc3339: "2026-05-19T06:42:36+00:00".to_string(),
+                    lat: 55.74391,
+                    lon: 12.57933,
+                    accuracy_m: 90.4,
+                    n_sources: 8,
+                },
+                whereami_client::HistoryFix {
+                    at_rfc3339: "2026-05-19T06:43:36+00:00".to_string(),
+                    lat: 55.74391,
+                    lon: 12.57933,
+                    accuracy_m: 10.0,
+                    n_sources: 3,
+                },
+                whereami_client::HistoryFix {
+                    at_rfc3339: "2026-05-19T07:43:36+00:00".to_string(),
+                    lat: 55.74391,
+                    lon: 12.57933,
+                    accuracy_m: 11.0,
+                    n_sources: 4,
+                },
+            ],
+            None,
+        );
+        assert_eq!(
+            render_history_fixes(&response),
+            "2026-05-19T06:42:36+00:00  55.743910, 12.579330  ±90m  8src  +0.0m / -\n\
+             2026-05-19T06:43:36+00:00  55.743910, 12.579330  ±10m  3src  +0.0m / +1m\n\
+             2026-05-19T07:43:36+00:00  55.743910, 12.579330  ±11m  4src  +0.0m / +1h\n"
+        );
+    }
+
+    #[test]
+    fn raw_history_renderer_shows_all_four_fixes_from_two_minute_incident() {
+        let response = raw_history_response(
+            [
+                "2026-05-19T06:40:00+00:00",
+                "2026-05-19T06:40:40+00:00",
+                "2026-05-19T06:41:20+00:00",
+                "2026-05-19T06:42:00+00:00",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, timestamp)| whereami_client::HistoryFix {
+                at_rfc3339: timestamp.to_string(),
+                lat: 55.74391,
+                lon: 12.57933,
+                accuracy_m: 90.0 - index as f64,
+                n_sources: 8 - index as i64,
+            })
+            .collect(),
+            None,
+        );
+
+        let output = render_history_fixes(&response);
+        assert_eq!(output.lines().count(), 4, "every raw fix must be shown");
+        assert_eq!(
+            output,
+            "2026-05-19T06:40:00+00:00  55.743910, 12.579330  ±90m  8src  +0.0m / -\n\
+             2026-05-19T06:40:40+00:00  55.743910, 12.579330  ±89m  7src  +0.0m / +40s\n\
+             2026-05-19T06:41:20+00:00  55.743910, 12.579330  ±88m  6src  +0.0m / +40s\n\
+             2026-05-19T06:42:00+00:00  55.743910, 12.579330  ±87m  5src  +0.0m / +40s\n"
+        );
+    }
+
+    #[test]
+    fn raw_history_renderer_cap_banner_is_ascii_and_first_row_has_no_hidden_delta() {
+        let response = raw_history_response(
+            vec![whereami_client::HistoryFix {
+                at_rfc3339: "2026-05-19T06:42:36+00:00".to_string(),
+                lat: 55.74391,
+                lon: 12.57933,
+                accuracy_m: 90.0,
+                n_sources: 8,
+            }],
+            Some(500),
+        );
+        let output = render_history_fixes(&response);
+        assert_eq!(
+            output.lines().next().unwrap(),
+            "... 500 earlier fixes elided; pass --max-fixes <N> or narrow the range"
+        );
+        assert!(!output.contains('…'));
+        assert!(output.lines().nth(1).unwrap().ends_with("+0.0m / -"));
+    }
+
+    #[test]
+    fn raw_history_distance_elapsed_and_invalid_timestamp_formats_are_total() {
+        assert_eq!(format_history_distance(999.94), "+999.9m");
+        assert_eq!(format_history_distance(1_000.0), "+1.0km");
+        assert!(history_haversine_m(0.0, 0.0, 0.0, 180.0).is_finite());
+        assert_eq!(
+            format_history_elapsed("2026-05-19T06:42:36+00:00", "2026-05-19T06:42:36+00:00"),
+            "+0s"
+        );
+        assert_eq!(
+            format_history_elapsed(
+                "2026-05-19T06:42:36.900+00:00",
+                "2026-05-19T06:42:37.100+00:00"
+            ),
+            "+0s",
+            "positive fractional seconds must floor instead of round"
+        );
+        assert_eq!(
+            format_history_elapsed(
+                "2026-05-19T06:42:37.100+00:00",
+                "2026-05-19T06:42:36.900+00:00"
+            ),
+            "?",
+            "negative fractional deltas must be rejected before truncation"
+        );
+        assert_eq!(
+            format_history_elapsed("2026-05-19T06:42:36+00:00", "2026-05-19T06:43:35+00:00"),
+            "+59s"
+        );
+        assert_eq!(
+            format_history_elapsed("2026-05-19T06:42:36+00:00", "2026-05-19T06:43:36+00:00"),
+            "+1m"
+        );
+        assert_eq!(
+            format_history_elapsed("2026-05-19T06:42:36+00:00", "2026-05-19T07:42:36+00:00"),
+            "+1h"
+        );
+        assert_eq!(
+            format_history_elapsed("2026-05-19T06:42:36+00:00", "2026-05-19T07:42:35+00:00"),
+            "+59m"
+        );
+        assert_eq!(format_history_elapsed("not-a-time", "also-invalid"), "?");
+    }
+
+    #[test]
+    fn raw_history_renderer_sanitizes_displayed_timestamp() {
+        let response = raw_history_response(
+            vec![whereami_client::HistoryFix {
+                at_rfc3339: "bad\u{1b}[2Jtime".to_string(),
+                lat: 1.0,
+                lon: 2.0,
+                accuracy_m: 3.0,
+                n_sources: 4,
+            }],
+            None,
+        );
+        let output = render_history_fixes(&response);
+        assert_no_raw_control_bytes(&output);
+        assert!(output.contains(r"bad\u{1b}[2Jtime"));
+        assert!(output.ends_with("+0.0m / -\n"));
     }
 
     #[test]

@@ -36,6 +36,12 @@ for seg in &h.segments {
     println!("{} -> {}  {} fixes", seg.start_rfc3339, seg.end_rfc3339, seg.n_fixes);
 }
 
+// Opt in to unsegmented fixes, capped to the newest 1000 observations.
+let raw = client.history_fixes(Some("24h".into()), None, None, Some(1000))?;
+for fix in &raw.fixes {
+    println!("{}  {:.6}, {:.6}", fix.at_rfc3339, fix.lat, fix.lon);
+}
+
 // Pin a specific transport instead of resolving from the environment:
 let via_socket = WhereAmIClient::unix("/run/whereami/whereamid.sock");
 let via_tcp = WhereAmIClient::tcp("10.0.0.5:4747"); // opt-in, unauthenticated
@@ -96,6 +102,8 @@ whereami scan                            # currently visible Wi-Fi
 whereami stats                           # cache + observability counters
 whereami debug                           # daemon debug snapshot
 whereami history 7d                      # stay-point segments
+whereami history 7d --raw                # newest 1000 unsegmented fixes
+whereami history 7d --raw --max-fixes 5000
 whereami history --from 2026-05-01T00:00:00+00:00 --to 2026-05-08T00:00:00+00:00
 whereami wipe --yes                      # delete stored location/AP data
 whereami version                         # CLI + daemon versions

@@ -347,11 +347,43 @@ Segments group consecutive fixes within `--history-segment-distance-m`
 (default 100 m) into one stay-point and drop runs shorter than
 `--history-segment-min-duration-secs` (default 300 s).
 
+Raw fixes are an explicit alternate response shape:
+
+```json
+→ {"cmd":"history","range":"7d","raw":true,"max_fixes":1000}
+← {
+    "ok": true, "v": 1,
+    "range": {
+      "from_rfc3339": "2026-05-03T09:00:00+00:00",
+      "to_rfc3339":   "2026-05-10T09:00:00+00:00"
+    },
+    "fixes": [
+      {
+        "at_rfc3339": "2026-05-09T08:00:00+00:00",
+        "lat": 55.707250,
+        "lon": 12.585598,
+        "accuracy_m": 12.0,
+        "n_sources": 8
+      }
+    ],
+    "elided": 27
+}
+```
+
+`raw:true` bypasses both stay-point thresholds. `max_fixes` is valid only with
+raw mode and must be in `1..=10000`; omission defaults to 1000. The daemon
+counts the inclusive range and returns its newest N fixes in ascending
+`(at_rfc3339, id)` order. `elided` is the exact count of matching earlier rows
+and is omitted when no row was capped. The legacy request and
+`{from,to,segments}` response remain unchanged when `raw` is absent or false.
+
 History is single-flight. While one history request is querying, segmenting, or
 writing its response, another receives `history: busy; retry later` promptly.
-Segmentation and JSON serialization run off the async executor and are bounded
-to O(N) work, but one admitted request still allocates its O(N) database result
-and response. The concurrency cap is not an absolute history-row or memory cap.
+Segmentation and JSON serialization run off the async executor. Legacy segment
+queries still allocate their O(N) database result and response. Raw queries use
+one database snapshot for indexed count plus newest-page selection and allocate
+O(max_fixes), never the complete matching range. The concurrency cap is not an
+absolute response-size limit; the raw hard ceiling is the separate guardrail.
 
 ### `wipe` — delete logical location and observed-network state
 
@@ -444,6 +476,8 @@ Common errors:
 - `history: invalid 'to' timestamp: <parser detail>`
 - `history: 'from' must be before 'to'`
 - `history: provide either 'range' or both 'from' and 'to'`
+- `history: 'max_fixes' requires 'raw': true`
+- `history: 'max_fixes' must be in 1..=10000`
 - `history: busy; retry later` — another history query/response is in flight
 - `history: cancelled` — shutdown cancelled admitted history work
 - `history: processing failed` — the blocking history worker failed
@@ -546,6 +580,8 @@ instead terminate the CLI via `SIGPIPE`; shells conventionally report status
 whereami locate                # parsed response, friendly output
 whereami --json locate         # raw JSON
 whereami history 24h
+whereami history 24h --raw
+whereami history 7d --raw --max-fixes 5000
 whereami wipe --yes            # Unix socket only; destructive confirmation
 ```
 
@@ -555,6 +591,7 @@ whereami wipe --yes            # Unix socket only; destructive confirmation
 SOCK="${XDG_RUNTIME_DIR:-/run/whereami}/whereamid.sock"
 printf '{"cmd":"locate"}\n' | nc -q1 -U "$SOCK"
 echo '{"cmd":"history","range":"7d"}' | socat - UNIX-CONNECT:"$SOCK"
+echo '{"cmd":"history","range":"7d","raw":true}' | socat - UNIX-CONNECT:"$SOCK"
 ```
 
 ### Python (no dependencies)

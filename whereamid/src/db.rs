@@ -69,6 +69,16 @@ const PRUNE_FIXES_CHUNK_SQL: &str = "DELETE FROM fixes WHERE id IN (
          WHERE at_rfc3339 < ?1 ORDER BY at_rfc3339 LIMIT ?2
      )";
 
+const COUNT_FIXES_IN_RANGE_SQL: &str = "SELECT COUNT(*) FROM fixes INDEXED BY idx_fixes_at
+     WHERE at_rfc3339 >= ?1 AND at_rfc3339 <= ?2";
+
+const SELECT_NEWEST_FIXES_IN_RANGE_SQL: &str =
+    "SELECT id, at_rfc3339, lat, lon, accuracy_m, n_sources
+     FROM fixes INDEXED BY idx_fixes_at
+     WHERE at_rfc3339 >= ?1 AND at_rfc3339 <= ?2
+     ORDER BY at_rfc3339 DESC, id DESC
+     LIMIT ?3";
+
 const PRUNE_APS_CHUNK_SQL: &str = "DELETE FROM aps WHERE bssid IN (
          SELECT bssid FROM aps INDEXED BY idx_aps_last_seen
          WHERE last_seen < ?1 ORDER BY last_seen LIMIT ?2
@@ -1359,6 +1369,36 @@ impl DbHandle {
             .await
     }
 
+    /// Bounded raw-history variant. The admission guard is owned by the
+    /// interruptible reader command, exactly like segmented history, so an
+    /// aborted async waiter cannot release the single-flight slot before the
+    /// SQLite transaction has unwound.
+    #[allow(dead_code)]
+    pub(crate) async fn get_capped_fixes_in_range_guarded<G>(
+        &self,
+        start: impl Into<String>,
+        end: impl Into<String>,
+        max_fixes: u64,
+        guard: G,
+    ) -> Result<CappedFixRows>
+    where
+        G: Send + 'static,
+    {
+        let start = start.into();
+        let end = end.into();
+        Self::call_interruptible(
+            &self.reader,
+            move |db| {
+                let guard = guard;
+                let result = db.get_capped_fixes_in_range(&start, &end, max_fixes);
+                drop(guard);
+                result
+            },
+            None,
+        )
+        .await
+    }
+
     /// Exact guarded reader core. Test hooks are per-call values captured by
     /// the same interruptible actor command as production: `queued` fires only
     /// after channel insertion, and `before_query` runs on the reader thread
@@ -1564,6 +1604,16 @@ pub struct FixRow {
     pub accuracy_m: f64,
     /// Number of cached APs used to compute this fix.
     pub n_sources: i64,
+}
+
+/// A bounded newest-page of raw history fixes. `fixes` is returned in
+/// chronological order; `elided` is present only when earlier matching rows
+/// were omitted by the cap.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct CappedFixRows {
+    pub fixes: Vec<FixRow>,
+    pub elided: Option<i64>,
 }
 
 /// A persisted last-known position. Stored as a single row in `last_fix`
@@ -2983,6 +3033,77 @@ impl Database {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Count the inclusive range and select its newest `max_fixes` rows from
+    /// one deferred read transaction. The result is reversed after collection
+    /// so callers receive ascending `(timestamp, id)` order while SQLite never
+    /// materializes older rows outside the requested page.
+    pub(crate) fn get_capped_fixes_in_range(
+        &self,
+        start_rfc3339: &str,
+        end_rfc3339: &str,
+        max_fixes: u64,
+    ) -> Result<CappedFixRows> {
+        self.get_capped_fixes_in_range_with_hook(start_rfc3339, end_rfc3339, max_fixes, || {})
+    }
+
+    fn get_capped_fixes_in_range_with_hook<H>(
+        &self,
+        start_rfc3339: &str,
+        end_rfc3339: &str,
+        max_fixes: u64,
+        after_count: H,
+    ) -> Result<CappedFixRows>
+    where
+        H: FnOnce(),
+    {
+        if max_fixes == 0 {
+            anyhow::bail!("raw history max_fixes must be positive");
+        }
+        let limit_i64 = i64::try_from(max_fixes)
+            .context("raw history max_fixes does not fit SQLite INTEGER")?;
+        let _limit_usize = usize::try_from(max_fixes)
+            .context("raw history max_fixes does not fit this platform's address space")?;
+
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let total: i64 = tx.query_row(
+            COUNT_FIXES_IN_RANGE_SQL,
+            params![start_rfc3339, end_rfc3339],
+            |row| row.get(0),
+        )?;
+        after_count();
+
+        let mut statement = tx.prepare(SELECT_NEWEST_FIXES_IN_RANGE_SQL)?;
+        let rows = statement.query_map(params![start_rfc3339, end_rfc3339, limit_i64], |row| {
+            Ok(FixRow {
+                id: row.get(0)?,
+                at_rfc3339: row.get(1)?,
+                lat: row.get(2)?,
+                lon: row.get(3)?,
+                accuracy_m: row.get(4)?,
+                n_sources: row.get(5)?,
+            })
+        })?;
+        // Deliberately avoid with_capacity(max_fixes): even validated protocol
+        // input is not a trustworthy allocation size at this lower boundary.
+        let mut fixes = Vec::new();
+        for row in rows {
+            fixes.push(row?);
+        }
+        drop(statement);
+        tx.commit()?;
+        fixes.reverse();
+
+        let returned = i64::try_from(fixes.len())
+            .context("raw history result length does not fit SQLite INTEGER")?;
+        let omitted = total
+            .checked_sub(returned)
+            .ok_or_else(|| anyhow::anyhow!("raw history count was smaller than selected page"))?;
+        Ok(CappedFixRows {
+            fixes,
+            elided: (omitted > 0).then_some(omitted),
+        })
     }
 
     /// Delete fixes older than `retention_days`. Returns the number deleted.
@@ -5482,6 +5603,160 @@ mod tests {
             .unwrap();
         assert_eq!(mid.len(), 1);
         assert!((mid[0].lat - 55.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn capped_fixes_select_newest_then_return_ascending_with_exact_elision() {
+        let db = Database::open_memory().unwrap();
+        for index in 0..1_001 {
+            db.insert_fix(
+                &format!("2026-05-09T00:{:02}:{:02}+00:00", index / 60, index % 60),
+                55.0 + index as f64 / 100_000.0,
+                12.0,
+                5.0,
+                index,
+            )
+            .unwrap();
+        }
+
+        for (limit, expected_first, expected_elided) in
+            [(999, 2, Some(2)), (1_000, 1, Some(1)), (1_001, 0, None)]
+        {
+            let result = db
+                .get_capped_fixes_in_range(
+                    "2026-05-09T00:00:00+00:00",
+                    "2026-05-09T23:59:59+00:00",
+                    limit,
+                )
+                .unwrap();
+            assert_eq!(result.fixes.len(), limit as usize);
+            assert_eq!(result.fixes[0].n_sources, expected_first);
+            assert_eq!(result.fixes.last().unwrap().n_sources, 1_000);
+            assert_eq!(result.elided, expected_elided);
+        }
+    }
+
+    #[test]
+    fn capped_fixes_bounds_and_duplicate_timestamps_use_id_tie_break() {
+        let db = Database::open_memory().unwrap();
+        db.insert_fix("2026-05-09T00:00:00+00:00", 0.0, 0.0, 1.0, 1)
+            .unwrap();
+        for lat in [1.0, 2.0, 3.0] {
+            db.insert_fix("2026-05-09T12:00:00+00:00", lat, 0.0, 1.0, 1)
+                .unwrap();
+        }
+        db.insert_fix("2026-05-10T00:00:00+00:00", 4.0, 0.0, 1.0, 1)
+            .unwrap();
+
+        let inclusive = db
+            .get_capped_fixes_in_range("2026-05-09T00:00:00+00:00", "2026-05-10T00:00:00+00:00", 5)
+            .unwrap();
+        assert_eq!(
+            inclusive
+                .fixes
+                .iter()
+                .map(|row| row.lat)
+                .collect::<Vec<_>>(),
+            vec![0.0, 1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(inclusive.elided, None);
+
+        let newest_duplicates = db
+            .get_capped_fixes_in_range("2026-05-09T12:00:00+00:00", "2026-05-09T12:00:00+00:00", 2)
+            .unwrap();
+        assert_eq!(
+            newest_duplicates
+                .fixes
+                .iter()
+                .map(|row| row.lat)
+                .collect::<Vec<_>>(),
+            vec![2.0, 3.0],
+            "newest duplicate ids must be retained, then returned id-ascending"
+        );
+        assert_eq!(newest_duplicates.elided, Some(1));
+    }
+
+    #[test]
+    fn capped_fixes_count_and_page_are_indexed() {
+        let db = Database::open_memory().unwrap();
+        for (sql, parameters) in [
+            (
+                COUNT_FIXES_IN_RANGE_SQL,
+                vec!["2026-01-01T00:00:00+00:00", "2026-12-31T23:59:59+00:00"],
+            ),
+            (
+                SELECT_NEWEST_FIXES_IN_RANGE_SQL,
+                vec![
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-12-31T23:59:59+00:00",
+                    "1000",
+                ],
+            ),
+        ] {
+            let mut statement = db
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let details = statement
+                .query_map(rusqlite::params_from_iter(parameters), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                details.iter().any(|detail| {
+                    detail.contains("SEARCH fixes") && detail.contains("idx_fixes_at")
+                }),
+                "raw history query must search idx_fixes_at: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capped_fixes_count_and_page_share_one_read_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "whereamid_raw_history_snapshot_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let reader = Database::open(&path).unwrap();
+        let writer = Database::open(&path).unwrap();
+        reader
+            .insert_fix("2026-05-09T00:00:00+00:00", 1.0, 2.0, 3.0, 1)
+            .unwrap();
+
+        let result = reader
+            .get_capped_fixes_in_range_with_hook(
+                "2026-05-09T00:00:00+00:00",
+                "2026-05-09T23:59:59+00:00",
+                10,
+                || {
+                    writer
+                        .insert_fix("2026-05-09T01:00:00+00:00", 4.0, 5.0, 6.0, 1)
+                        .unwrap();
+                },
+            )
+            .unwrap();
+        assert_eq!(result.fixes.len(), 1);
+        assert_eq!(result.elided, None);
+        assert_eq!(
+            reader
+                .get_fixes_in_range("2026-05-09T00:00:00+00:00", "2026-05-09T23:59:59+00:00")
+                .unwrap()
+                .len(),
+            2,
+            "writer row must exist after the snapshot transaction ends"
+        );
+
+        drop(writer);
+        drop(reader);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]

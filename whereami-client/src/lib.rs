@@ -501,6 +501,139 @@ struct HistoryRequest {
     to: Option<String>,
 }
 
+#[derive(Serialize)]
+struct HistoryFixesRequest {
+    cmd: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    range: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to: Option<String>,
+    raw: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_fixes: Option<u64>,
+}
+
+/// Normalized inclusive bounds returned by raw history.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
+pub struct HistoryRange {
+    pub from_rfc3339: String,
+    pub to_rfc3339: String,
+}
+
+/// One unsegmented location-history observation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct HistoryFix {
+    pub at_rfc3339: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub accuracy_m: f64,
+    pub n_sources: i64,
+}
+
+/// Response from an opt-in raw-fix `history` request.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct HistoryFixesResponse {
+    pub ok: bool,
+    pub v: u32,
+    /// Empty only on an `ok:false` error envelope.
+    #[serde(default)]
+    pub range: HistoryRange,
+    /// Empty only when the successful range contains no fixes, or on error.
+    #[serde(default)]
+    pub fixes: Vec<HistoryFix>,
+    /// Exact number of matching earlier rows omitted by the requested cap.
+    #[serde(default)]
+    pub elided: Option<i64>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Presence-checking wire view. Public response fields remain defaultable so
+/// normal `ok:false` envelopes parse like every other client API; successful
+/// raw history must explicitly contain both shape-defining containers. The
+/// marker visitors walk their contents through `IgnoredAny`: JSON raw mode
+/// validates object/array type and non-null presence without allocating a
+/// second fix vector, while the typed API subsequently performs full field
+/// deserialization into `HistoryFixesResponse`.
+#[derive(Deserialize)]
+struct HistoryFixesShape {
+    ok: bool,
+    v: u32,
+    #[serde(default)]
+    range: Option<JsonObjectPresence>,
+    #[serde(default)]
+    fixes: Option<JsonArrayPresence>,
+}
+
+struct JsonObjectPresence;
+
+impl<'de> Deserialize<'de> for JsonObjectPresence {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ObjectVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ObjectVisitor {
+            type Value = JsonObjectPresence;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a non-null JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(JsonObjectPresence)
+            }
+        }
+
+        deserializer.deserialize_map(ObjectVisitor)
+    }
+}
+
+struct JsonArrayPresence;
+
+impl<'de> Deserialize<'de> for JsonArrayPresence {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ArrayVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ArrayVisitor {
+            type Value = JsonArrayPresence;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a non-null JSON array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(JsonArrayPresence)
+            }
+        }
+
+        deserializer.deserialize_seq(ArrayVisitor)
+    }
+}
+
+impl ProtocolResponse for HistoryFixesShape {
+    fn protocol_version(&self) -> u32 {
+        self.v
+    }
+}
+
 /// Response from the `stats` command.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct StatsResponse {
@@ -810,6 +943,53 @@ impl WhereAmIClient {
         })?)
     }
 
+    /// Query the unsegmented location fixes for a range. `max_fixes` is an
+    /// optional daemon-enforced newest-row cap; omission uses the daemon's
+    /// default (currently 1000).
+    pub fn history_fixes(
+        &self,
+        range: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+        max_fixes: Option<u64>,
+    ) -> Result<HistoryFixesResponse> {
+        self.parse_response_line(&self.history_fixes_raw(range, from, to, max_fixes)?)
+    }
+
+    /// Byte-preserving JSON raw-fix history response. Unlike legacy raw
+    /// accessors, this opt-in API validates the new success shape so an old
+    /// daemon that silently ignores `raw` cannot masquerade as an empty fix
+    /// result. A valid line is returned without re-serialization.
+    pub fn history_fixes_raw(
+        &self,
+        range: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+        max_fixes: Option<u64>,
+    ) -> Result<String> {
+        let line = self.raw_command(&serde_json::to_string(&HistoryFixesRequest {
+            cmd: "history",
+            range,
+            from,
+            to,
+            raw: true,
+            max_fixes,
+        })?)?;
+        self.validate_history_fixes_response(&line)?;
+        Ok(line)
+    }
+
+    fn validate_history_fixes_response(&self, line: &str) -> Result<()> {
+        let shape: HistoryFixesShape = self.parse_response_line(line)?;
+        if shape.ok && (shape.range.is_none() || shape.fixes.is_none()) {
+            bail!(
+                "whereamid returned a successful segmented history response to a raw-fix request; \
+                 upgrade whereamid to a version that supports raw history"
+            );
+        }
+        Ok(())
+    }
+
     /// Delete the daemon's persisted and managed in-memory location/AP state.
     /// The explicit enum makes destructive intent visible at every call site.
     pub fn wipe(&self, confirmation: WipeConfirmation) -> Result<WipeResponse> {
@@ -1052,7 +1232,180 @@ impl_daemon_response!(StatsResponse);
 impl_daemon_response!(DebugResponse);
 impl_daemon_response!(VersionResponse);
 impl_daemon_response!(HistoryResponse);
+impl_daemon_response!(HistoryFixesResponse);
 impl_daemon_response!(WipeResponse);
+
+#[cfg(test)]
+mod history_fixes_wire_tests {
+    use super::*;
+
+    fn tcp_daemon_once(response: String) -> (WhereAmIClient, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            // Some shape-only tests do not inspect the captured request; a
+            // dropped observer must not prevent this one-shot daemon from
+            // writing its response.
+            let _ = request_tx.send(request);
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        (WhereAmIClient::tcp(&address.to_string()), request_rx)
+    }
+
+    fn client() -> WhereAmIClient {
+        WhereAmIClient::unix("/test/whereamid.sock")
+    }
+
+    #[test]
+    fn legacy_history_request_bytes_remain_exact() {
+        assert_eq!(
+            serde_json::to_string(&HistoryRequest {
+                cmd: "history",
+                range: Some("24h".to_string()),
+                from: None,
+                to: None,
+            })
+            .unwrap(),
+            r#"{"cmd":"history","range":"24h"}"#
+        );
+    }
+
+    #[test]
+    fn raw_history_request_is_explicit_and_carries_the_cap() {
+        assert_eq!(
+            serde_json::to_string(&HistoryFixesRequest {
+                cmd: "history",
+                range: Some("24h".to_string()),
+                from: None,
+                to: None,
+                raw: true,
+                max_fixes: Some(1_234),
+            })
+            .unwrap(),
+            r#"{"cmd":"history","range":"24h","raw":true,"max_fixes":1234}"#
+        );
+    }
+
+    #[test]
+    fn successful_raw_shape_parses_and_validation_preserves_source_line() {
+        let line = r#"{"ok":true,"v":1,"range":{"from_rfc3339":"2026-05-09T00:00:00+00:00","to_rfc3339":"2026-05-10T00:00:00+00:00"},"fixes":[{"at_rfc3339":"2026-05-09T12:00:00+00:00","lat":55.1,"lon":12.2,"accuracy_m":30.0,"n_sources":4}],"elided":2,"future":"preserve"}"#;
+        client().validate_history_fixes_response(line).unwrap();
+        let response: HistoryFixesResponse = client().parse_response_line(line).unwrap();
+        assert_eq!(response.range.from_rfc3339, "2026-05-09T00:00:00+00:00");
+        assert_eq!(response.fixes.len(), 1);
+        assert_eq!(response.elided, Some(2));
+        assert!(line.contains(r#""future":"preserve""#));
+    }
+
+    #[test]
+    fn raw_fix_json_api_preserves_valid_daemon_bytes_and_sends_opt_in_fields() {
+        let line = r#"{"v":1, "ok":true, "future":"keep", "fixes":[], "range":{"to_rfc3339":"b","from_rfc3339":"a"}}"#;
+        let (client, request_rx) = tcp_daemon_once(line.to_string());
+        let returned = client
+            .history_fixes_raw(Some("24h".to_string()), None, None, Some(1_234))
+            .unwrap();
+        assert_eq!(
+            returned, line,
+            "valid daemon JSON must not be re-serialized"
+        );
+        assert_eq!(
+            request_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "{\"cmd\":\"history\",\"range\":\"24h\",\"raw\":true,\"max_fixes\":1234}\n"
+        );
+    }
+
+    #[test]
+    fn typed_raw_fix_api_rejects_old_daemon_segment_success() {
+        let (client, _) =
+            tcp_daemon_once(r#"{"ok":true,"v":1,"from":"a","to":"b","segments":[]}"#.to_string());
+        let error = client
+            .history_fixes(Some("24h".to_string()), None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("successful segmented history response"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn raw_fix_json_api_preserves_error_envelopes_without_success_fields() {
+        let line = r#"{"v":1, "ok":false, "error":"history: busy; retry later"}"#;
+        let (client, _) = tcp_daemon_once(line.to_string());
+        assert_eq!(
+            client
+                .history_fixes_raw(Some("24h".to_string()), None, None, None)
+                .unwrap(),
+            line
+        );
+    }
+
+    #[test]
+    fn old_daemon_segment_success_is_rejected_but_error_envelope_parses() {
+        let old_success = r#"{"ok":true,"v":1,"from":"a","to":"b","segments":[]}"#;
+        let error = client()
+            .validate_history_fixes_response(old_success)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("successful segmented history response"),
+            "{error}"
+        );
+
+        let error_line = r#"{"ok":false,"v":1,"error":"history: busy; retry later"}"#;
+        client()
+            .validate_history_fixes_response(error_line)
+            .unwrap();
+        let response: HistoryFixesResponse = client().parse_response_line(error_line).unwrap();
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("history: busy; retry later")
+        );
+    }
+
+    #[test]
+    fn successful_raw_response_requires_range_and_fixes_even_when_one_is_empty() {
+        for invalid in [
+            r#"{"ok":true,"v":1,"fixes":[]}"#,
+            r#"{"ok":true,"v":1,"range":{"from_rfc3339":"a","to_rfc3339":"b"}}"#,
+            r#"{"ok":true,"v":1,"range":null,"fixes":[]}"#,
+            r#"{"ok":true,"v":1,"range":{"from_rfc3339":"a","to_rfc3339":"b"},"fixes":null}"#,
+            r#"{"ok":true,"v":1,"range":[],"fixes":[]}"#,
+            r#"{"ok":true,"v":1,"range":{"from_rfc3339":"a","to_rfc3339":"b"},"fixes":{}}"#,
+        ] {
+            assert!(client().validate_history_fixes_response(invalid).is_err());
+        }
+        client()
+            .validate_history_fixes_response(
+                r#"{"ok":true,"v":1,"range":{"from_rfc3339":"a","to_rfc3339":"b"},"fixes":[]}"#,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn presence_validation_skips_fix_payloads_but_typed_parse_remains_strict() {
+        let malformed_fix = r#"{"ok":true,"v":1,"range":{"from_rfc3339":"a","to_rfc3339":"b"},"fixes":[{"future_only":true}]}"#;
+        client()
+            .validate_history_fixes_response(malformed_fix)
+            .expect("JSON passthrough validates only the non-null object/array containers");
+        assert!(
+            client()
+                .parse_response_line::<HistoryFixesResponse>(malformed_fix)
+                .is_err(),
+            "typed history must still validate every HistoryFix field"
+        );
+    }
+}
 
 #[cfg(test)]
 mod wipe_wire_tests {
