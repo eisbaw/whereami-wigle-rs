@@ -77,8 +77,9 @@ impl DaemonState {
     /// slot when the task is joined).
     ///
     /// Per-connection handlers are tracked so database actors cannot stop
-    /// while a handler still owns/enqueues through `DbHandle`; TASK-0201 owns
-    /// the separate admission/concurrency cap.
+    /// while a handler still owns/enqueues through `DbHandle`; connection
+    /// permits are captured by these futures and are returned on refusal or
+    /// force-abort (task-0201).
     pub fn spawn_tracked<F>(&self, fut: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
@@ -144,6 +145,11 @@ pub struct DaemonState {
     /// sites). Surfaced via the stats endpoint (task-0076) so silent
     /// corruption is visible without scraping the journal.
     pub db_write_failures: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared admission cap for unix and TCP connections. A permit is acquired
+    /// before accept, so no Tokio task is spawned merely to wait for capacity.
+    pub connection_slots: Arc<tokio::sync::Semaphore>,
+    /// Single-flight admission for the O(N) history query/segmentation path.
+    pub history_slot: Arc<tokio::sync::Semaphore>,
     /// Level-triggered cooperative shutdown signal (task-0190).
     ///
     /// Replaces the previous `tokio::sync::Notify`, whose `notify_waiters()`
@@ -546,6 +552,46 @@ fn ok_json<T: Serialize>(t: &T) -> String {
     serde_json::to_string(t).unwrap_or_else(|_| error_json("serialization failed"))
 }
 
+/// A wire response plus any resource whose lifetime must extend through the
+/// socket write and shutdown. History uses this to keep its single-flight slot
+/// occupied until a slow client has received (or timed out on) the response.
+struct CommandResponse {
+    body: String,
+    _history_lease: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl CommandResponse {
+    fn history(body: String, lease: Arc<tokio::sync::OwnedSemaphorePermit>) -> Self {
+        Self {
+            body,
+            _history_lease: Some(lease),
+        }
+    }
+}
+
+impl From<String> for CommandResponse {
+    fn from(body: String) -> Self {
+        Self {
+            body,
+            _history_lease: None,
+        }
+    }
+}
+
+impl std::ops::Deref for CommandResponse {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.body
+    }
+}
+
+impl std::fmt::Display for CommandResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.body)
+    }
+}
+
 // --- Unix socket transport setup (task-0196) ---
 
 /// systemd socket-activation fd number. `sd_listen_fds(3)` hands the first
@@ -807,9 +853,49 @@ pub async fn run_server(state: Arc<DaemonState>, unix: UnixListener) -> Result<(
     };
     info!("control channel: unix socket ready");
 
+    run_server_inner(
+        Arc::clone(&state),
+        unix,
+        tcp,
+        Arc::clone(&state.connection_slots),
+    )
+    .await
+}
+
+/// Accept-loop core with injectable admission state for deterministic tests.
+/// A permit is acquired before polling either listener. Consequently excess
+/// connections remain in the kernel backlog and never become permit-waiting
+/// Tokio tasks. Unix and TCP draw from the same semaphore.
+async fn run_server_inner(
+    state: Arc<DaemonState>,
+    unix: UnixListener,
+    tcp: Option<TcpListener>,
+    connection_slots: Arc<tokio::sync::Semaphore>,
+) -> Result<()> {
+    enum Accepted {
+        Unix(std::io::Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr)>),
+        Tcp(std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>),
+    }
+
     loop {
-        tokio::select! {
-            r = unix.accept() => match r {
+        let permit = Arc::clone(&connection_slots)
+            .acquire_owned()
+            .await
+            .context("connection admission semaphore closed")?;
+        let accepted = tokio::select! {
+            r = unix.accept() => Accepted::Unix(r),
+            r = async {
+                match &tcp {
+                    Some(l) => l.accept().await,
+                    // No TCP configured: never resolve, so this branch is inert
+                    // and the unix branch drives the loop (task-0196).
+                    None => std::future::pending().await,
+                }
+            } => Accepted::Tcp(r),
+        };
+
+        match accepted {
+            Accepted::Unix(r) => match r {
                 Ok((stream, _addr)) => {
                     // SO_PEERCRED is logged for auditability only. We do NOT
                     // enforce same-UID in-process: the system-service model has
@@ -826,21 +912,14 @@ pub async fn run_server(state: Arc<DaemonState>, unix: UnixListener) -> Result<(
                         ),
                         Err(e) => debug!("unix connection (peer_cred unavailable: {e})"),
                     }
-                    spawn_handler(stream, Arc::clone(&state));
+                    spawn_handler(stream, Arc::clone(&state), permit);
                 }
                 Err(e) => error!("unix accept error: {e}"),
             },
-            r = async {
-                match &tcp {
-                    Some(l) => l.accept().await,
-                    // No TCP configured: never resolve, so this branch is inert
-                    // and the unix branch drives the loop (task-0196).
-                    None => std::future::pending().await,
-                }
-            } => match r {
+            Accepted::Tcp(r) => match r {
                 Ok((stream, addr)) => {
                     debug!("tcp connection from {addr}");
-                    spawn_handler(stream, Arc::clone(&state));
+                    spawn_handler(stream, Arc::clone(&state), permit);
                 }
                 Err(e) => error!("tcp accept error: {e}"),
             },
@@ -850,14 +929,20 @@ pub async fn run_server(state: Arc<DaemonState>, unix: UnixListener) -> Result<(
 
 /// Spawn a per-connection handler generic over the stream type. Tracking is
 /// required by the database actor lifecycle: shutdown must drain every holder
-/// of `DbHandle` before it sends the actor stop commands. TASK-0201 still owns
-/// admission/concurrency caps; this only gives existing handlers an owner.
-fn spawn_handler<S>(stream: S, state: Arc<DaemonState>)
-where
+/// of `DbHandle` before it sends the actor stop commands. Admission is already
+/// owned by the supplied permit, shared across both transports (task-0201).
+fn spawn_handler<S>(
+    stream: S,
+    state: Arc<DaemonState>,
+    connection_permit: tokio::sync::OwnedSemaphorePermit,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let task_state = Arc::clone(&state);
     state.spawn_tracked(async move {
+        // Own admission for the complete read/dispatch/write/shutdown lifetime.
+        // Refusal or abort drops the future and therefore returns capacity.
+        let _connection_permit = connection_permit;
         if let Err(e) = handle_connection(stream, task_state).await {
             warn!("connection error: {e}");
         }
@@ -901,7 +986,7 @@ where
 
     let response = match serde_json::from_str::<Request>(line.trim()) {
         Ok(req) => dispatch_command(&req, &state).await,
-        Err(e) => error_json(&format!("invalid request: {e}")),
+        Err(e) => error_json(&format!("invalid request: {e}")).into(),
     };
 
     // Bound the write half of the connection. A slow-reading client
@@ -920,14 +1005,14 @@ where
     Ok(())
 }
 
-async fn dispatch_command(req: &Request, state: &Arc<DaemonState>) -> String {
+async fn dispatch_command(req: &Request, state: &Arc<DaemonState>) -> CommandResponse {
     match req {
-        Request::Locate => handle_locate(state).await,
-        Request::Resolve { bssids } => handle_resolve(bssids, state).await,
-        Request::Scan => handle_scan(state).await,
-        Request::Stats => handle_stats(state).await,
-        Request::Debug => handle_debug(state).await,
-        Request::Version => handle_version(),
+        Request::Locate => handle_locate(state).await.into(),
+        Request::Resolve { bssids } => handle_resolve(bssids, state).await.into(),
+        Request::Scan => handle_scan(state).await.into(),
+        Request::Stats => handle_stats(state).await.into(),
+        Request::Debug => handle_debug(state).await.into(),
+        Request::Version => handle_version().into(),
         Request::History { range, from, to } => {
             handle_history(range.as_deref(), from.as_deref(), to.as_deref(), state).await
         }
@@ -1414,65 +1499,191 @@ struct HistoryResponse {
     segments: Vec<crate::history::Segment>,
 }
 
+/// Async-side cancellation bridge for blocking history work. Dropping an
+/// async request cannot abort `spawn_blocking`; it sets this flag instead, and
+/// TASK-0087's cancellable O(N) segmentation checks it cooperatively.
+struct HistoryCancellationGuard {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    armed: bool,
+}
+
+impl HistoryCancellationGuard {
+    fn new(cancelled: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for HistoryCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// Spawn the complete CPU half of history processing. Serialization is kept
+/// in the same admitted blocking closure as segmentation so neither can stall
+/// a Tokio worker. The injected `before_work` seam is a per-call deterministic
+/// test gate; production passes an empty closure (no globals or hooks).
+struct HistoryWork {
+    fixes: Vec<crate::db::FixRow>,
+    from: String,
+    to: String,
+    dist_threshold_m: f64,
+    min_duration_secs: i64,
+    shutdown: tokio_util::sync::CancellationToken,
+    lease: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
+fn spawn_history_work<B>(
+    work: HistoryWork,
+    before_work: B,
+) -> (tokio::task::JoinHandle<String>, HistoryCancellationGuard)
+where
+    B: FnOnce(&dyn Fn() -> bool) + Send + 'static,
+{
+    let HistoryWork {
+        fixes,
+        from,
+        to,
+        dist_threshold_m,
+        min_duration_secs,
+        shutdown,
+        lease,
+    } = work;
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let blocking_cancelled = Arc::clone(&cancelled);
+    let guard = HistoryCancellationGuard::new(cancelled);
+    let join = tokio::task::spawn_blocking(move || {
+        // This clone keeps admission until the closure ACTUALLY exits, even if
+        // the async waiter is force-aborted while blocking work is detached.
+        let _blocking_lease = lease;
+        let is_cancelled = || {
+            blocking_cancelled.load(std::sync::atomic::Ordering::Acquire) || shutdown.is_cancelled()
+        };
+        if is_cancelled() {
+            return error_json("history: cancelled");
+        }
+        before_work(&is_cancelled);
+
+        let segments = match crate::history::segment_fixes_cancellable(
+            &fixes,
+            dist_threshold_m,
+            min_duration_secs,
+            is_cancelled,
+        ) {
+            crate::history::SegmentFixesOutcome::Complete(segments) => segments,
+            crate::history::SegmentFixesOutcome::Cancelled => {
+                return error_json("history: cancelled");
+            }
+        };
+        if blocking_cancelled.load(std::sync::atomic::Ordering::Acquire) || shutdown.is_cancelled()
+        {
+            return error_json("history: cancelled");
+        }
+
+        ok_json(&HistoryResponse {
+            ok: true,
+            v: 1,
+            from,
+            to,
+            segments,
+        })
+    });
+    (join, guard)
+}
+
 async fn handle_history(
     range: Option<&str>,
     from: Option<&str>,
     to: Option<&str>,
     state: &Arc<DaemonState>,
-) -> String {
+) -> CommandResponse {
     // Resolve range: either `range="7d"` shorthand OR explicit from/to RFC3339.
     // Mutually exclusive. If neither is provided, default to the last 7 days.
     let (from, to) = match (range, from, to) {
         (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
-            return error_json("history: 'range' and 'from'/'to' are mutually exclusive");
+            return error_json("history: 'range' and 'from'/'to' are mutually exclusive").into();
         }
         (Some(spec), None, None) => match crate::history::parse_range(spec) {
             Ok(r) => r,
-            Err(e) => return error_json(&format!("history: invalid range: {e}")),
+            Err(e) => return error_json(&format!("history: invalid range: {e}")).into(),
         },
         (None, Some(f), Some(t)) => {
             let f = match chrono::DateTime::parse_from_rfc3339(f) {
                 Ok(d) => d.with_timezone(&chrono::Utc),
-                Err(e) => return error_json(&format!("history: invalid 'from' timestamp: {e}")),
+                Err(e) => {
+                    return error_json(&format!("history: invalid 'from' timestamp: {e}")).into();
+                }
             };
             let t = match chrono::DateTime::parse_from_rfc3339(t) {
                 Ok(d) => d.with_timezone(&chrono::Utc),
-                Err(e) => return error_json(&format!("history: invalid 'to' timestamp: {e}")),
+                Err(e) => {
+                    return error_json(&format!("history: invalid 'to' timestamp: {e}")).into();
+                }
             };
             if f >= t {
-                return error_json("history: 'from' must be before 'to'");
+                return error_json("history: 'from' must be before 'to'").into();
             }
             (f, t)
         }
         (None, None, None) => {
             crate::history::parse_range("7d").expect("hardcoded default range '7d' must parse")
         }
-        _ => return error_json("history: provide either 'range' or both 'from' and 'to'"),
+        _ => {
+            return error_json("history: provide either 'range' or both 'from' and 'to'").into();
+        }
+    };
+
+    // Never queue history waiters behind the expensive request: they would
+    // consume connection slots and let a burst starve cheap commands.
+    let lease = match Arc::clone(&state.history_slot).try_acquire_owned() {
+        Ok(lease) => Arc::new(lease),
+        Err(_) => return error_json("history: busy; retry later").into(),
     };
 
     let fixes = match state
         .db
-        .get_fixes_in_range(from.to_rfc3339(), to.to_rfc3339())
+        .get_fixes_in_range_guarded(from.to_rfc3339(), to.to_rfc3339(), Arc::clone(&lease))
         .await
     {
         Ok(v) => v,
-        Err(e) => return error_json(&format!("history: db error: {e}")),
+        Err(e) => {
+            return CommandResponse::history(error_json(&format!("history: db error: {e}")), lease);
+        }
     };
 
-    let segments = crate::history::segment_fixes(
-        &fixes,
-        state.args.history_segment_distance_m as f64,
-        state.args.history_segment_min_duration_secs as i64,
+    let from = from.to_rfc3339();
+    let to = to.to_rfc3339();
+    let (join, mut cancellation) = spawn_history_work(
+        HistoryWork {
+            fixes,
+            from,
+            to,
+            dist_threshold_m: state.args.history_segment_distance_m as f64,
+            min_duration_secs: state.args.history_segment_min_duration_secs as i64,
+            shutdown: state.shutdown.clone(),
+            lease: Arc::clone(&lease),
+        },
+        |_| {},
     );
-
-    let resp = HistoryResponse {
-        ok: true,
-        v: 1,
-        from: from.to_rfc3339(),
-        to: to.to_rfc3339(),
-        segments,
+    let body = match join.await {
+        Ok(body) => body,
+        Err(error) => {
+            warn!("history blocking worker failed: {error}");
+            error_json("history: processing failed")
+        }
     };
-    ok_json(&resp)
+    cancellation.disarm();
+    CommandResponse::history(body, lease)
 }
 
 async fn handle_stats(state: &Arc<DaemonState>) -> String {
@@ -1537,6 +1748,8 @@ pub(crate) fn test_state_with_nominatim(
         inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         address_cache: std::sync::Mutex::new(AddressCache::new()),
         db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
+        history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         shutdown,
         tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
@@ -1949,6 +2162,390 @@ mod dispatch_tests {
         );
     }
 
+    fn one_hour_history_request() -> Request {
+        Request::History {
+            range: Some("1h".to_string()),
+            from: None,
+            to: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn history_busy_is_prompt_and_response_owns_slot_until_drop() {
+        let state = test_state();
+        let held = Arc::clone(&state.history_slot)
+            .try_acquire_owned()
+            .expect("direct history gate");
+        let busy = tokio::time::timeout(
+            Duration::from_millis(250),
+            dispatch_command(&one_hour_history_request(), &state),
+        )
+        .await
+        .expect("busy history must not wait for the gate");
+        assert!(busy.contains("history: busy; retry later"), "{busy}");
+        drop(held);
+
+        let first = dispatch_command(&one_hour_history_request(), &state).await;
+        assert!(first.contains("\"ok\":true"), "{first}");
+        assert_eq!(
+            state.history_slot.available_permits(),
+            0,
+            "completed CPU work must not release admission before socket write"
+        );
+        let second = dispatch_command(&one_hour_history_request(), &state).await;
+        assert!(second.contains("history: busy; retry later"), "{second}");
+        drop(second);
+        assert_eq!(state.history_slot.available_permits(), 0);
+
+        drop(first);
+        assert_eq!(
+            state.history_slot.available_permits(),
+            1,
+            "dropping the response envelope models completed socket write"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_admission_is_held_through_actual_stalled_socket_write() {
+        let state = test_state();
+        // One byte forces the real handle_connection write_all to stall while
+        // its CommandResponse still owns history admission.
+        let (client, server) = tokio::io::duplex(1);
+        let handler_state = Arc::clone(&state);
+        let handler = tokio::spawn(async move { handle_connection(server, handler_state).await });
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(b"{\"cmd\":\"history\",\"range\":\"1h\"}\n")
+            .await
+            .unwrap();
+        client_write.shutdown().await.unwrap();
+
+        let mut first_byte = [0_u8; 1];
+        let first_read = tokio::time::timeout(
+            Duration::from_secs(1),
+            client_read.read_exact(&mut first_byte),
+        )
+        .await;
+        let handler_stalled = !handler.is_finished();
+        let held_during_write = Arc::clone(&state.history_slot).try_acquire_owned().is_err();
+        let second = tokio::time::timeout(
+            Duration::from_millis(250),
+            dispatch_command(&one_hour_history_request(), &state),
+        )
+        .await;
+        let second_body = second.map(|response| response.to_string());
+
+        // Cleanup before assertions: drain the response so write_all and
+        // writer.shutdown finish, then reap the real connection handler.
+        let mut rest = Vec::new();
+        let drain_result =
+            tokio::time::timeout(Duration::from_secs(1), client_read.read_to_end(&mut rest)).await;
+        drop(client_read);
+        drop(client_write);
+        let handler_result = tokio::time::timeout(Duration::from_secs(1), handler).await;
+        let final_capacity = state.history_slot.available_permits();
+
+        first_read
+            .expect("history response did not begin")
+            .expect("reading first history response byte failed");
+        assert_eq!(first_byte[0], b'{');
+        assert!(
+            handler_stalled,
+            "one-byte duplex must stall the handler in its response write"
+        );
+        assert!(
+            held_during_write,
+            "history admission must remain held while the socket write stalls"
+        );
+        let second_body = second_body.expect("second history did not fail promptly");
+        assert!(
+            second_body.contains("history: busy; retry later"),
+            "second history response: {second_body}"
+        );
+        drain_result
+            .expect("history response drain exceeded watchdog")
+            .expect("history response drain failed");
+        handler_result
+            .expect("history connection handler did not finish")
+            .expect("history connection task panicked")
+            .expect("history connection handler failed");
+        let mut wire = first_byte.to_vec();
+        wire.extend(rest);
+        let response: serde_json::Value =
+            serde_json::from_slice(wire.strip_suffix(b"\n").unwrap_or(&wire)).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(final_capacity, 1);
+    }
+
+    /// The production blocking helper is gated after it starts on Tokio's
+    /// blocking pool. On a one-worker runtime, a real locate and timer still
+    /// complete while burst history calls fail fast instead of queueing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_history_does_not_starve_runtime_and_burst_is_busy() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let state = test_state();
+        *state.last_fix.lock().await = Some(LastFix {
+            lat: 55.6761,
+            lon: 12.5683,
+            accuracy_m: 20.0,
+            address: None,
+            at: chrono::Utc::now(),
+            sources: 3,
+        });
+        let lease = Arc::new(
+            Arc::clone(&state.history_slot)
+                .try_acquire_owned()
+                .expect("history lease"),
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (watchdog_cancel_tx, watchdog_cancel_rx) = std::sync::mpsc::channel();
+        let watchdog_fired = Arc::new(AtomicBool::new(false));
+        let watchdog_flag = Arc::clone(&watchdog_fired);
+        let watchdog_release = release_tx.clone();
+        let watchdog = std::thread::spawn(move || {
+            if watchdog_cancel_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_err()
+            {
+                watchdog_flag.store(true, Ordering::SeqCst);
+                let _ = watchdog_release.send(());
+            }
+        });
+
+        let (join, mut cancellation) = spawn_history_work(
+            HistoryWork {
+                fixes: Vec::new(),
+                from: "2026-07-05T00:00:00+00:00".to_string(),
+                to: "2026-07-05T01:00:00+00:00".to_string(),
+                dist_threshold_m: 100.0,
+                min_duration_secs: 300,
+                shutdown: state.shutdown.clone(),
+                lease: Arc::clone(&lease),
+            },
+            move |_| {
+                let _ = started_tx.send(());
+                release_rx.recv().expect("history gate release");
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("history work did not enter the blocking pool")
+            .expect("history start sender dropped");
+
+        let responsiveness = tokio::time::timeout(Duration::from_millis(500), async {
+            let locate = dispatch_command(&Request::Locate, &state);
+            let timer = tokio::time::sleep(Duration::from_millis(20));
+            let (locate, ()) = tokio::join!(locate, timer);
+            locate
+        })
+        .await;
+        let burst = tokio::time::timeout(Duration::from_millis(250), async {
+            let mut responses = Vec::new();
+            for _ in 0..8 {
+                responses.push(dispatch_command(&one_hour_history_request(), &state).await);
+            }
+            responses
+        })
+        .await;
+
+        // Cleanup precedes assertions so a regression cannot strand the
+        // blocking pool during runtime teardown. The OS-thread watchdog is
+        // only a last-resort release and must remain unused on the green path.
+        let _ = release_tx.send(());
+        let worker = tokio::time::timeout(Duration::from_secs(1), join).await;
+        cancellation.disarm();
+        drop(lease);
+        let _ = watchdog_cancel_tx.send(());
+        watchdog.join().unwrap();
+
+        let locate = responsiveness.expect("locate/timer starved by history CPU work");
+        let locate_json: serde_json::Value =
+            serde_json::from_str(&locate).expect("locate must return JSON");
+        assert_eq!(
+            locate_json["ok"], true,
+            "real locate must succeed while history CPU is blocked: {locate}"
+        );
+        assert_eq!(locate_json["lat"].as_f64(), Some(55.6761));
+        let burst = burst.expect("busy history burst was not prompt");
+        assert!(
+            burst
+                .iter()
+                .all(|response| response.contains("history: busy; retry later")),
+            "every concurrent history must be rejected"
+        );
+        let body = worker
+            .expect("blocking history did not exit after release")
+            .expect("blocking history panicked");
+        assert!(body.contains("\"ok\":true"), "{body}");
+        assert!(
+            !watchdog_fired.load(Ordering::SeqCst),
+            "external cleanup watchdog was needed"
+        );
+        assert_eq!(state.history_slot.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_async_waiter_keeps_history_busy_until_blocking_exit() {
+        let state = test_state();
+        let lease = Arc::new(
+            Arc::clone(&state.history_slot)
+                .try_acquire_owned()
+                .expect("history lease"),
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (join, cancellation) = spawn_history_work(
+            HistoryWork {
+                fixes: Vec::new(),
+                from: "2026-07-05T00:00:00+00:00".to_string(),
+                to: "2026-07-05T01:00:00+00:00".to_string(),
+                dist_threshold_m: 100.0,
+                min_duration_secs: 300,
+                shutdown: state.shutdown.clone(),
+                lease: Arc::clone(&lease),
+            },
+            move |_| {
+                let _ = started_tx.send(());
+                release_rx.recv().expect("history gate release");
+            },
+        );
+        drop(lease);
+        let waiter = tokio::spawn(async move {
+            let mut cancellation = cancellation;
+            let result = join.await;
+            cancellation.disarm();
+            result
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("blocking closure did not start")
+            .unwrap();
+
+        waiter.abort();
+        let waiter_result = waiter.await;
+        let busy = tokio::time::timeout(
+            Duration::from_millis(250),
+            dispatch_command(&one_hour_history_request(), &state),
+        )
+        .await;
+
+        // Release before assertions: even if cancellation/admission regresses,
+        // the blocking closure cannot strand runtime teardown.
+        release_tx.send(()).unwrap();
+        let restored = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&state.history_slot).acquire_owned(),
+        )
+        .await
+        .expect("cancelled blocking closure did not exit")
+        .expect("history semaphore closed");
+        assert!(waiter_result.unwrap_err().is_cancelled());
+        let busy = busy.expect("second history waited instead of failing busy");
+        assert!(
+            busy.contains("history: busy; retry later"),
+            "detached closure must retain its lease: {busy}"
+        );
+        drop(busy);
+        assert_eq!(
+            state.history_slot.available_permits(),
+            0,
+            "acquiring here proves the detached closure released only on exit"
+        );
+        drop(restored);
+        assert_eq!(state.history_slot.available_permits(), 1);
+    }
+
+    /// Drive the real history blocking helper and Drop cancellation guard
+    /// through the production shutdown drain. `JoinHandle::abort` only drops
+    /// the async waiter; the blocking closure retains history admission until
+    /// it observes that real guard's predicate and exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drain_cancels_real_history_work_and_restores_both_caps() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let connections = Arc::new(tokio::sync::Semaphore::new(1));
+        let histories = Arc::new(tokio::sync::Semaphore::new(1));
+        let connection = Arc::clone(&connections).try_acquire_owned().unwrap();
+        let response_lease = Arc::new(
+            Arc::clone(&histories)
+                .try_acquire_owned()
+                .expect("history admission"),
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cancellation_observed = Arc::new(AtomicBool::new(false));
+        let blocking_observation = Arc::clone(&cancellation_observed);
+        let (join, cancellation) = spawn_history_work(
+            HistoryWork {
+                fixes: Vec::new(),
+                from: "2026-07-05T00:00:00+00:00".to_string(),
+                to: "2026-07-05T01:00:00+00:00".to_string(),
+                dist_threshold_m: 100.0,
+                min_duration_secs: 300,
+                // Keep daemon cancellation false: this test must observe the
+                // async Drop guard's local cancellation specifically.
+                shutdown: tokio_util::sync::CancellationToken::new(),
+                lease: Arc::clone(&response_lease),
+            },
+            move |is_cancelled| {
+                let _ = started_tx.send(());
+                release_rx.recv().expect("history test gate release");
+                blocking_observation.store(is_cancelled(), Ordering::SeqCst);
+            },
+        );
+
+        let mut tracked = tokio::task::JoinSet::new();
+        tracked.spawn(async move {
+            let _connection = connection;
+            let _response_lease = response_lease;
+            let mut cancellation = cancellation;
+            let result = join.await;
+            cancellation.disarm();
+            let _ = result;
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("real blocking history work did not start")
+            .unwrap();
+
+        let aborted =
+            crate::run_shutdown_drain(Duration::from_millis(25), Vec::new(), None, tracked).await;
+        let connection_capacity_after_drain = connections.available_permits();
+        let history_held_before_release = Arc::clone(&histories).try_acquire_owned().is_err();
+
+        // Cleanup before assertions. Acquiring the semaphore itself is the
+        // happens-before proof that the closure observed cancellation, exited,
+        // and dropped its final Arc<OwnedSemaphorePermit>.
+        release_tx.send(()).unwrap();
+        let restored = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&histories).acquire_owned(),
+        )
+        .await
+        .expect("real blocking history closure did not exit")
+        .expect("history admission semaphore closed");
+        let observed = cancellation_observed.load(Ordering::SeqCst);
+        drop(restored);
+        let final_history_capacity = histories.available_permits();
+
+        assert_eq!(aborted, 1, "tracked history handler must be force-aborted");
+        assert_eq!(
+            connection_capacity_after_drain, 1,
+            "reaped tracked handler must restore connection admission"
+        );
+        assert!(
+            history_held_before_release,
+            "detached blocking closure must retain history admission"
+        );
+        assert!(
+            observed,
+            "real HistoryCancellationGuard Drop must feed the blocking predicate"
+        );
+        assert_eq!(final_history_capacity, 1);
+    }
+
     /// task-0194 AC#1: an uncached BSSID resolved while WiGLE is unconfigured
     /// (test_state uses empty creds -> wigle_lookup returns Skipped) must be
     /// reported as `unresolved`, NOT `not_found` — the daemon consulted no
@@ -2120,6 +2717,10 @@ mod dispatch_tests {
         }
 
         let state = test_state();
+        let connection_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let connection_permit = Arc::clone(&connection_slots)
+            .try_acquire_owned()
+            .expect("test connection permit");
         let dropped = std::sync::Arc::new(AtomicBool::new(false));
         let captured = DropFlag(std::sync::Arc::clone(&dropped));
         let (prechecked_tx, prechecked_rx) = std::sync::mpsc::channel();
@@ -2128,6 +2729,7 @@ mod dispatch_tests {
         let contender = std::thread::spawn(move || {
             spawn_state.spawn_tracked_after_precheck(
                 async move {
+                    let _connection_permit = connection_permit;
                     let _captured = captured;
                     std::future::pending::<()>().await;
                 },
@@ -2155,6 +2757,11 @@ mod dispatch_tests {
             state.tasks.lock().unwrap().len(),
             0,
             "racing spawn must not land in the post-take replacement JoinSet"
+        );
+        assert_eq!(
+            connection_slots.available_permits(),
+            1,
+            "refusing the raced handler must return its real admission permit"
         );
     }
 }
@@ -2430,5 +3037,151 @@ mod transport_tests {
             serde_json::from_str(line.trim()).expect("response must be one JSON line");
         assert_eq!(v["ok"], serde_json::json!(true), "got {line}");
         assert_eq!(v["v"], serde_json::json!(1));
+    }
+
+    /// task-0201: admission happens before accept. Two silent clients consume
+    /// exactly two tracked handlers; a third remains in the kernel backlog and
+    /// is only accepted after one handler returns its permit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_connection_cap_keeps_excess_in_backlog_and_restores_capacity() {
+        async fn wait_for_tracked(state: &Arc<DaemonState>, expected: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if state.tasks.lock().unwrap().len() == expected {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("tracked handler count never reached {expected}"));
+        }
+
+        let dir = unique_tempdir("connection-cap");
+        let sock = dir.join("whereamid.sock");
+        let std_listener = self_bind_unix(&sock).unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let listener = UnixListener::from_std(std_listener).unwrap();
+        let state = test_state();
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let server_state = Arc::clone(&state);
+        let server_slots = Arc::clone(&slots);
+        let server = tokio::spawn(async move {
+            run_server_inner(server_state, listener, None, server_slots).await
+        });
+
+        let first = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let second = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        wait_for_tracked(&state, 2).await;
+        assert_eq!(slots.available_permits(), 0);
+
+        let mut third = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::UnixStream::connect(&sock),
+        )
+        .await
+        .expect("third connect exceeded backlog watchdog")
+        .unwrap();
+        third.write_all(b"{\"cmd\":\"version\"}\n").await.unwrap();
+        assert_eq!(
+            state.tasks.lock().unwrap().len(),
+            2,
+            "third connection must not spawn a permit-waiting task"
+        );
+
+        drop(first);
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            BufReader::new(&mut third).read_line(&mut line),
+        )
+        .await
+        .expect("third client was not admitted after capacity returned")
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(value["ok"], true, "third client response: {line}");
+
+        // The idle accept loop intentionally pre-acquires one permit. Abort it
+        // before asserting full restoration, then reap every tracked handler.
+        server.abort();
+        let _ = server.await;
+        drop(second);
+        drop(third);
+        let mut tracked = std::mem::take(&mut *state.tasks.lock().unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tracked.join_next().await.is_some() {}
+        })
+        .await
+        .expect("connection handlers did not drain");
+        assert_eq!(
+            slots.available_permits(),
+            2,
+            "accept abort and handler completion must restore every permit"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unix_and_tcp_share_one_connection_cap_and_wire_framing() {
+        let dir = unique_tempdir("shared-transport-cap");
+        let sock = dir.join("whereamid.sock");
+        let std_unix = self_bind_unix(&sock).unwrap();
+        std_unix.set_nonblocking(true).unwrap();
+        let unix = UnixListener::from_std(std_unix).unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp.local_addr().unwrap();
+        let state = test_state();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let server_state = Arc::clone(&state);
+        let server_slots = Arc::clone(&slots);
+        let server = tokio::spawn(async move {
+            run_server_inner(server_state, unix, Some(tcp), server_slots).await
+        });
+
+        let unix_client = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.tasks.lock().unwrap().len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unix handler was not admitted");
+        assert_eq!(slots.available_permits(), 0);
+
+        let mut tcp_client = tokio::net::TcpStream::connect(tcp_addr).await.unwrap();
+        tcp_client
+            .write_all(b"{\"cmd\":\"version\"}\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            state.tasks.lock().unwrap().len(),
+            1,
+            "TCP must not bypass the unix-owned shared cap"
+        );
+        drop(unix_client);
+
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            BufReader::new(&mut tcp_client).read_line(&mut line),
+        )
+        .await
+        .expect("TCP backlog client was not admitted")
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(json["ok"], true, "shared generic handler response: {line}");
+
+        server.abort();
+        let _ = server.await;
+        drop(tcp_client);
+        let mut tracked = std::mem::take(&mut *state.tasks.lock().unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tracked.join_next().await.is_some() {}
+        })
+        .await
+        .expect("shared unix/TCP handlers did not drain");
+        assert_eq!(slots.available_permits(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

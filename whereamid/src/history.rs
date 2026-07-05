@@ -151,6 +151,7 @@ fn compute_geometric_median(
 ///
 /// The fixes array MUST be sorted ascending by timestamp; the caller (DB
 /// layer) does that.
+#[cfg(test)]
 pub fn segment_fixes(
     fixes: &[FixRow],
     dist_threshold_m: f64,
@@ -164,10 +165,9 @@ pub fn segment_fixes(
     }
 }
 
-/// Cancellation-aware segmentation path prepared for TASK-0201. The current
-/// server still calls the non-cancellable `segment_fixes` wrapper and performs
-/// this CPU work synchronously; TASK-0201 will offload the work and opt into
-/// cancellation.
+/// Cancellation-aware segmentation path used by TASK-0201's blocking history
+/// worker. The async request's Drop guard and daemon shutdown token are folded
+/// into this callback so an aborted waiter never yields a partial response.
 pub(crate) fn segment_fixes_cancellable<C>(
     fixes: &[FixRow],
     dist_threshold_m: f64,

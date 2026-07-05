@@ -29,6 +29,7 @@ let
     package = "/flag-parity-dummy";
     dbPath = "/flag-parity/aps.sqlite";
     wifiInterface = "wlan-parity";
+    maxConnections = 1;
     scanIntervalFast = 1;
     scanFastDuration = 1;
     scanIntervalSlow = 1;

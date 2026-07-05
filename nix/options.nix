@@ -10,8 +10,9 @@
 #   - lib.types.ints.unsigned  (>= 0): the daemon accepts 0 — either because
 #     validate() has NO check for it (scanFastDuration, dailyLimit) or because 0
 #     is the documented "disabled" value (addressCacheTtlDays, historyRetentionDays).
-# Upper bounds are intentionally omitted: validate() has none, so the daemon's
-# clap u32/i32 range parse stays the (runtime) guard for absurdly-large values.
+# Upper bounds are intentionally omitted for the other tuning options, so
+# clap's numeric range remains their runtime guard. `maxConnections` has the
+# shared explicit Rust/Nix policy range 1..4096.
 {
   enable = lib.mkEnableOption "whereami Wi-Fi geolocation daemon";
 
@@ -91,6 +92,16 @@
 
         [beacondb]
         enabled = true
+    '';
+  };
+
+  maxConnections = lib.mkOption {
+    type = lib.types.ints.between 1 4096;
+    default = 32;
+    description = ''
+      Maximum number of active control-channel connections, shared by the unix
+      socket and optional TCP listener. Excess clients remain in the kernel
+      listen backlog until a slot is available.
     '';
   };
 

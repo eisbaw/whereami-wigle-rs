@@ -174,6 +174,8 @@ async fn main() -> Result<()> {
         last_fix: tokio::sync::Mutex::new(initial_last_fix),
         inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
+        history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         shutdown,
         tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(orphans_last_shutdown),
@@ -566,11 +568,11 @@ async fn load_orphan_count_async(db: &crate::db::DbHandle) -> u64 {
 /// bounds the graceful phase, not arbitrary non-cooperative Rust code after
 /// abort: named/tracked futures must reach a cancellation point before reap can
 /// finish. TASK-0087 reduced history segmentation to O(N * bounded Weiszfeld
-/// iterations), but production request handling remains synchronous and
-/// non-yielding until TASK-0201 offloads it. A very large history request can
-/// therefore still delay tracked-task abort. The accept-loop server remains
-/// separately bounded because a non-cooperative server JoinHandle may ignore
-/// abort (task-0241); it does not itself issue database commands.
+/// iterations), and TASK-0201 moved segmentation/serialization to cancellable
+/// blocking work whose lease survives async abort until the closure exits. The
+/// accept-loop server remains separately bounded because a non-cooperative
+/// server JoinHandle may ignore abort (task-0241); it does not itself issue
+/// database commands.
 async fn run_shutdown_drain(
     budget: Duration,
     mut named: Vec<tokio::task::JoinHandle<()>>,

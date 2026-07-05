@@ -1035,6 +1035,9 @@ impl DbHandle {
             .await
     }
 
+    // `db.rs` is compiled into both the library and daemon targets. The
+    // daemon uses the guarded variant; DB unit tests use this plain variant.
+    #[allow(dead_code)]
     pub async fn get_fixes_in_range(
         &self,
         start: impl Into<String>,
@@ -1043,6 +1046,74 @@ impl DbHandle {
         let start = start.into();
         let end = end.into();
         self.read(move |db| db.get_fixes_in_range(&start, &end))
+            .await
+    }
+
+    /// History admission variant: `guard` is captured by the reader command
+    /// itself, so cancelling the async waiter cannot release single-flight
+    /// admission while SQLite is still unwinding an interrupted query.
+    // The library target intentionally does not include server.rs, while the
+    // daemon target calls this method from its history handler.
+    #[allow(dead_code)]
+    pub(crate) async fn get_fixes_in_range_guarded<G>(
+        &self,
+        start: impl Into<String>,
+        end: impl Into<String>,
+        guard: G,
+    ) -> Result<Vec<FixRow>>
+    where
+        G: Send + 'static,
+    {
+        self.get_fixes_in_range_guarded_inner(start.into(), end.into(), guard, None, || {})
+            .await
+    }
+
+    /// Exact guarded reader core. Test hooks are per-call values captured by
+    /// the same interruptible actor command as production: `queued` fires only
+    /// after channel insertion, and `before_query` runs on the reader thread
+    /// with the admission guard already live. No process-global test state.
+    async fn get_fixes_in_range_guarded_inner<G, H>(
+        &self,
+        start: String,
+        end: String,
+        guard: G,
+        queued: Option<tokio::sync::oneshot::Sender<()>>,
+        before_query: H,
+    ) -> Result<Vec<FixRow>>
+    where
+        G: Send + 'static,
+        H: FnOnce() + Send + 'static,
+    {
+        Self::call_interruptible(
+            &self.reader,
+            move |db| {
+                let guard = guard;
+                before_query();
+                let result = db.get_fixes_in_range(&start, &end);
+                // Explicitly retain admission through query completion/error;
+                // an aborted async waiter must not admit overlapping DB work.
+                drop(guard);
+                result
+            },
+            queued,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn get_fixes_in_range_guarded_with_hooks<G, H>(
+        &self,
+        start: impl Into<String>,
+        end: impl Into<String>,
+        guard: G,
+        queued: Option<tokio::sync::oneshot::Sender<()>>,
+        before_query: H,
+    ) -> Result<Vec<FixRow>>
+    where
+        G: Send + 'static,
+        H: FnOnce() + Send + 'static,
+    {
+        self.get_fixes_in_range_guarded_inner(start.into(), end.into(), guard, queued, before_query)
             .await
     }
 
@@ -2909,6 +2980,134 @@ mod tests {
         assert_eq!(handle.stats().await.unwrap().cached_aps, 0);
         drop(handle);
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_guarded_history_cancellation_holds_admission_until_actor_skip() {
+        let (runtime, handle, _legacy) = DbRuntime::open_test().unwrap();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker_handle = handle.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_handle
+                .hold_reader_until(blocked_tx, release_rx)
+                .await
+        });
+        blocked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader blocker must start");
+
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let lease = Arc::new(
+            Arc::clone(&admission)
+                .try_acquire_owned()
+                .expect("history admission"),
+        );
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let queued_handle = handle.clone();
+        let command_lease = Arc::clone(&lease);
+        let waiter = tokio::spawn(async move {
+            queued_handle
+                .get_fixes_in_range_guarded_with_hooks(
+                    "2026-07-05T00:00:00+00:00",
+                    "2026-07-05T01:00:00+00:00",
+                    command_lease,
+                    Some(queued_tx),
+                    || {},
+                )
+                .await
+        });
+        drop(lease);
+        queued_rx.await.expect("guarded command must be queued");
+        waiter.abort();
+        let waiter_result = waiter.await;
+        let held_before_release = Arc::clone(&admission).try_acquire_owned().is_err();
+
+        // Cleanup before assertions. Releasing the occupied reader lets it
+        // process the cancelled command, whose skipped closure owns the lease.
+        release_tx.send(()).unwrap();
+        let blocker_result = blocker.await.unwrap();
+        let restored = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&admission).acquire_owned(),
+        )
+        .await
+        .expect("actor did not drop cancelled queued history command")
+        .expect("history admission semaphore closed");
+        drop(restored);
+        let final_capacity = admission.available_permits();
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+
+        assert!(waiter_result.unwrap_err().is_cancelled());
+        blocker_result.unwrap();
+        assert!(
+            held_before_release,
+            "queued actor command must retain history admission after waiter abort"
+        );
+        assert_eq!(final_capacity, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_guarded_history_cancellation_holds_admission_until_query_unwinds() {
+        let (runtime, handle, _legacy) = DbRuntime::open_test().unwrap();
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let lease = Arc::new(
+            Arc::clone(&admission)
+                .try_acquire_owned()
+                .expect("history admission"),
+        );
+        let (active_tx, active_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let active_handle = handle.clone();
+        let command_lease = Arc::clone(&lease);
+        let waiter = tokio::spawn(async move {
+            active_handle
+                .get_fixes_in_range_guarded_with_hooks(
+                    "2026-07-05T00:00:00+00:00",
+                    "2026-07-05T01:00:00+00:00",
+                    command_lease,
+                    None,
+                    move || {
+                        let _ = active_tx.send(());
+                        release_rx.recv().expect("active query release");
+                    },
+                )
+                .await
+        });
+        drop(lease);
+        active_rx
+            .await
+            .expect("guarded command must become active on reader actor");
+        waiter.abort();
+        let waiter_result = waiter.await;
+        let held_before_release = Arc::clone(&admission).try_acquire_owned().is_err();
+
+        // Cleanup before assertions. The real interruptible command observes
+        // waiter cancellation after this per-call gate and unwinds the query.
+        release_tx.send(()).unwrap();
+        let restored = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&admission).acquire_owned(),
+        )
+        .await
+        .expect("active guarded query did not unwind and release admission")
+        .expect("history admission semaphore closed");
+        drop(restored);
+        let reusable = tokio::time::timeout(Duration::from_secs(1), handle.stats()).await;
+        let final_capacity = admission.available_permits();
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+
+        assert!(waiter_result.unwrap_err().is_cancelled());
+        assert!(
+            held_before_release,
+            "active reader command must retain history admission after waiter abort"
+        );
+        reusable
+            .expect("reader actor was not reusable after guarded cancellation")
+            .expect("reader stats failed after guarded cancellation");
+        assert_eq!(final_capacity, 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

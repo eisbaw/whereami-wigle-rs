@@ -42,6 +42,15 @@
       # They share the crane cargoArtifacts (built once per system). task-0209.
       checks = forAllSystems (system:
         (whereamiFor system).checks
+        // {
+          # Force the shared module option's negative upper-bound evaluation on
+          # every supported system; unlike flag parity this does not execute a
+          # target binary and is therefore architecture-independent.
+          option-bounds = import ./nix/option-bounds.nix {
+            pkgs = pkgsFor system;
+            inherit lib;
+          };
+        }
         // lib.optionalAttrs (system == "x86_64-linux") {
           vm = import ./nix/vm-test.nix {
             inherit self gitRev;

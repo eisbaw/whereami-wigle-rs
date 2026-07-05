@@ -19,6 +19,10 @@ localhost has no peer authentication.
   `invalid request: EOF while parsing a value`.
 - Read timeout: **5 s** (server gives up if the request line doesn't arrive).
 - Write timeout: **5 s** (server gives up if the client reads slowly).
+- Active connection cap: **32** by default, configurable with
+  `--max-connections` in the range **1–4096**. Unix and optional TCP connections
+  share this cap; excess clients stay in the kernel listen backlog rather than
+  occupying Tokio tasks.
 
 ### Socket path (daemon)
 
@@ -259,6 +263,12 @@ Segments group consecutive fixes within `--history-segment-distance-m`
 (default 100 m) into one stay-point and drop runs shorter than
 `--history-segment-min-duration-secs` (default 300 s).
 
+History is single-flight. While one history request is querying, segmenting, or
+writing its response, another receives `history: busy; retry later` promptly.
+Segmentation and JSON serialization run off the async executor and are bounded
+to O(N) work, but one admitted request still allocates its O(N) database result
+and response. The concurrency cap is not an absolute history-row or memory cap.
+
 ## Error response shape
 
 ```json
@@ -276,6 +286,7 @@ Common errors:
 - `history: 'range' and 'from'/'to' are mutually exclusive`
 - `history: invalid range: …` (parse failure)
 - `history: 'from' must be before 'to'`
+- `history: busy; retry later` — another history query/response is in flight
 
 ## Minimal client examples
 

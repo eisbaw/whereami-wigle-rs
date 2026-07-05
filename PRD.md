@@ -35,7 +35,7 @@ applies to Apple WPS and WiGLE) and `--nominatim-timeout-secs` (default
 Long-running process. Listens on a Unix domain control socket gated by filesystem permissions (default `$XDG_RUNTIME_DIR/whereamid.sock`; TCP via `--bind` is opt-in and unauthenticated — see [ADR-003](docs/adr/003-unix-socket-access-control.md)). Newline-delimited JSON protocol (one JSON object per line, one JSON response per line). No HTTP overhead — just raw sockets + JSON lines.
 
 Responsibilities:
-- Accept queries over TCP
+- Accept queries over the filesystem-permission-gated Unix socket and optional TCP
 - Manage the local SQLite cache (read/write)
 - Perform Wi-Fi scans (via `nmcli` preferred, `iw dev wlan0 scan` fallback)
 - Call remote APIs on cache miss (Apple WPS first — free, no auth — then WiGLE)
@@ -54,7 +54,7 @@ Thin TCP client. Connect, send JSON, read JSON response. Exists so Rust callers 
 
 Request and response are each a single line of JSON terminated by `\n`.
 
-**Connection lifecycle**: one-shot. Client connects, sends one JSON line, reads one JSON response line, connection closes. No persistent connections, no request multiplexing. Localhost TCP setup is sub-millisecond so the overhead is negligible.
+**Connection lifecycle**: one-shot. Client connects, sends one JSON line, reads one JSON response line, connection closes. No persistent connections, no request multiplexing. At most `--max-connections` connections (range 1–4096, default 32) are active across the Unix and optional TCP listeners; excess connections remain in the kernel listen backlog. Localhost TCP setup is sub-millisecond so the overhead is negligible.
 
 All responses include a `"v": 1` field for protocol versioning.
 
@@ -368,6 +368,7 @@ whereamid \
   --db /var/lib/whereami/aps.sqlite \
   --interface wlan0 \
   --config ~/.config/whereami/config.toml \
+  --max-connections 32 \                  # shared Unix/TCP connection cap
   --scan-interval-fast 10 \              # seconds, fast phase
   --scan-fast-duration 60 \              # seconds, fast-phase length
   --scan-interval-slow 60 \              # seconds, steady state

@@ -78,6 +78,7 @@ Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
 --db <PATH>                         SQLite database [/var/lib/whereami/aps.sqlite]
 --interface <NAME>                  Wi-Fi interface [wlan0]
 --config <PATH>                     Config file [~/.config/whereami/config.toml]
+--max-connections <N>               Shared active connection cap, 1..=4096 [32]
 --scan-interval-fast <S>            Fast-phase scan interval [10]
 --scan-fast-duration <S>            Fast phase duration [60]
 --scan-interval-slow <S>            Steady-state scan interval [60]

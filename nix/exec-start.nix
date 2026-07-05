@@ -33,6 +33,7 @@ lib.concatStringsSep " " ([
   "${cfg.package}/bin/whereamid"
   "--db" cfg.dbPath
   "--interface" cfg.wifiInterface
+  "--max-connections" (toString cfg.maxConnections)
   "--scan-interval-fast" (toString cfg.scanIntervalFast)
   "--scan-fast-duration" (toString cfg.scanFastDuration)
   "--scan-interval-slow" (toString cfg.scanIntervalSlow)

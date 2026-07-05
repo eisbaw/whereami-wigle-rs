@@ -8,6 +8,12 @@ use std::io::{ErrorKind, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
+/// Portable operational ceiling for active control-channel connections.
+/// Deliberately far below Tokio's target-dependent semaphore limit on every
+/// supported target, while still allowing unusually busy local deployments.
+pub const MAX_CONNECTIONS: usize = 4096;
+const _: () = assert!(MAX_CONNECTIONS <= tokio::sync::Semaphore::MAX_PERMITS);
+
 /// whereamid: Wi-Fi geolocation daemon
 #[derive(Parser, Debug, Clone)]
 #[command(name = "whereamid", version, about)]
@@ -46,6 +52,12 @@ pub struct Args {
     /// Path to TOML WiGLE API credentials file; keep owner-only (0600)
     #[arg(long, default_value = "~/.config/whereami/config.toml")]
     pub config: String,
+
+    /// Maximum number of concurrently active control-channel connections
+    /// (1..=4096), shared by the unix socket and optional TCP listener. Excess
+    /// clients remain in the kernel listen backlog until capacity is available.
+    #[arg(long, default_value_t = 32)]
+    pub max_connections: usize,
 
     /// Scan interval during fast phase (seconds)
     #[arg(long, default_value_t = 10)]
@@ -155,6 +167,16 @@ impl Args {
             if socket.trim().is_empty() {
                 anyhow::bail!("--socket must not be empty");
             }
+        }
+        if self.max_connections == 0 {
+            anyhow::bail!("--max-connections must be > 0");
+        }
+        if self.max_connections > MAX_CONNECTIONS {
+            anyhow::bail!(
+                "--max-connections ({}) must be <= {}",
+                self.max_connections,
+                MAX_CONNECTIONS
+            );
         }
         if self.debounce_window == 0 {
             anyhow::bail!("--debounce-window must be > 0");
@@ -564,6 +586,37 @@ mod tests {
     #[test]
     fn defaults_validate_clean() {
         parse(&[]).validate().expect("default Args must validate");
+    }
+
+    #[test]
+    fn max_connections_defaults_to_32() {
+        let args = parse(&[]);
+        assert_eq!(args.max_connections, 32);
+        args.validate().unwrap();
+    }
+
+    #[test]
+    fn max_connections_zero_is_rejected() {
+        let error = parse(&["--max-connections", "0"])
+            .validate()
+            .expect_err("zero would make the daemon stop accepting forever");
+        assert!(error.to_string().contains("--max-connections"));
+    }
+
+    #[test]
+    fn max_connections_above_portable_limit_is_rejected_before_semaphore_new() {
+        let error = parse(&["--max-connections", "4097"])
+            .validate()
+            .expect_err("portable policy must reject absurd connection caps");
+        assert!(error.to_string().contains("--max-connections"));
+        assert!(error.to_string().contains("4096"));
+    }
+
+    #[test]
+    fn max_connections_portable_limit_is_accepted() {
+        parse(&["--max-connections", "4096"])
+            .validate()
+            .expect("documented upper bound must validate");
     }
 
     #[test]
