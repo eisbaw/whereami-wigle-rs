@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::apple::AppleClient;
 use crate::config::Args;
-use crate::db::Database;
+use crate::db::{DbHandle, DebugDbStatus};
 use crate::debounce::Debouncer;
 use crate::nominatim::NominatimClient;
 use crate::wigle::WigleClient;
@@ -31,7 +31,7 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024; // 64 KiB max request size
 
 /// Maximum number of BSSIDs accepted in a single `resolve` request.
 /// MAX_REQUEST_BYTES bounds the wire size, but a 64 KiB JSON of 6-byte
-/// BSSIDs is ~7000 entries; resolve_chain takes the DB lock per BSSID,
+/// BSSIDs is ~7000 entries; resolve_chain enqueues DB work per BSSID,
 /// so an unbounded count would let one hostile request starve the rest
 /// of the daemon. task-0053.
 const MAX_RESOLVE_BSSIDS: usize = 256;
@@ -44,9 +44,11 @@ use address_cache::address_cache_key;
 pub use address_cache::AddressCache;
 pub(crate) mod geocode;
 
-/// Acquire the DB lock, logging a warning if the mutex was poisoned.
+/// Direct synchronous access exists only for legacy unit-test setup and
+/// assertions. Production code has no path to a rusqlite connection.
+#[cfg(test)]
 pub fn lock_db(state: &DaemonState) -> std::sync::MutexGuard<'_, crate::db::Database> {
-    state.db.lock().unwrap_or_else(|e| {
+    state.test_db.lock().unwrap_or_else(|e| {
         tracing::error!("DB mutex was poisoned (a thread panicked while holding it) — recovering");
         e.into_inner()
     })
@@ -62,28 +64,11 @@ impl DaemonState {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Run a closure against the locked Database. Centralises the
-    /// poison-recovery + lock-scoping pattern so callers don't have to
-    /// do `let db = lock_db(state); db.foo()` every time. For
-    /// long-running access that spans multiple operations, use
-    /// `lock_db` directly to keep the guard alive across statements.
-    /// task-0078.
-    pub fn with_db<R>(&self, f: impl FnOnce(&crate::db::Database) -> R) -> R {
-        let db = self.db.lock().unwrap_or_else(|e| {
-            tracing::error!(
-                "DB mutex was poisoned (a thread panicked while holding it) — recovering"
-            );
-            e.into_inner()
-        });
-        f(&db)
-    }
-
-    /// Spawn a detached background task tracked by the shutdown drain
-    /// (task-0102). The scan loop's proactive resolve, the locate handler's
-    /// fallback resolve, and similar detached work route through here so a
-    /// SIGTERM can wait under one budget and force-abort stragglers instead of
-    /// killing them mid-API-call at process exit. Nominatim is a separate
-    /// named one-worker loop (task-0193), never a detached spawn.
+    /// Spawn work tracked by the shutdown drain (task-0102). Background
+    /// resolves and accepted connection handlers route through here so a
+    /// SIGTERM can wait under one budget and force-abort stragglers before the
+    /// DB actors stop. Nominatim is a separate named one-worker loop
+    /// (task-0193), never a tracked spawn.
     ///
     /// Refuses to spawn once shutdown has been signalled — this structurally
     /// enforces "no new work after shutdown began" (task-0190 AC#2); the future
@@ -91,27 +76,49 @@ impl DaemonState {
     /// JoinSet does not accumulate finished-task slots (a JoinSet only frees a
     /// slot when the task is joined).
     ///
-    /// Per-connection handlers are deliberately NOT tracked here — they are
-    /// bounded by READ/WRITE timeouts and owning them is task-0201's concern.
+    /// Per-connection handlers are tracked so database actors cannot stop
+    /// while a handler still owns/enqueues through `DbHandle`; TASK-0201 owns
+    /// the separate admission/concurrency cap.
     pub fn spawn_tracked<F>(&self, fut: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_tracked_after_precheck(fut, || {});
+    }
+
+    fn spawn_tracked_after_precheck<F, H>(&self, fut: F, after_precheck: H)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+        H: FnOnce(),
     {
         if self.shutdown.is_cancelled() {
             debug!("spawn_tracked refused: shutdown in progress");
             return;
         }
+        after_precheck();
         let mut set = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        // This check and main's mem::take use the same mutex. A spawn that
+        // passed the cheap check before cancellation but lost the lock race
+        // cannot insert into the replacement JoinSet after shutdown took the
+        // old one for draining.
+        if self.shutdown.is_cancelled() {
+            debug!("spawn_tracked refused: shutdown began while waiting for task ownership");
+            return;
+        }
         while set.try_join_next().is_some() {}
         set.spawn(fut);
     }
 }
 
 /// Shared daemon state, accessible from connection handlers.
-/// Database uses std::sync::Mutex because rusqlite::Connection is !Send.
-/// All DB ops are synchronous and fast, so we never hold the lock across await points.
+/// SQLite is owned by dedicated reader/writer OS threads behind `DbHandle`;
+/// Tokio workers only enqueue commands and await oneshot results.
 pub struct DaemonState {
-    pub db: std::sync::Mutex<Database>,
+    pub db: DbHandle,
+    #[cfg(test)]
+    pub _db_runtime: Option<crate::db::DbRuntime>,
+    #[cfg(test)]
+    pub test_db: std::sync::Mutex<crate::db::Database>,
     pub debouncer: tokio::sync::Mutex<Debouncer>,
     pub args: Args,
     pub wigle: WigleClient,
@@ -136,7 +143,7 @@ pub struct DaemonState {
     /// Cumulative count of best-effort DB writes that failed (warn-only
     /// sites). Surfaced via the stats endpoint (task-0076) so silent
     /// corruption is visible without scraping the journal.
-    pub db_write_failures: std::sync::atomic::AtomicU64,
+    pub db_write_failures: Arc<std::sync::atomic::AtomicU64>,
     /// Level-triggered cooperative shutdown signal (task-0190).
     ///
     /// Replaces the previous `tokio::sync::Notify`, whose `notify_waiters()`
@@ -148,10 +155,10 @@ pub struct DaemonState {
     /// their work/sleep against `cancelled()` and refuse to start new work
     /// once cancelled.
     pub shutdown: tokio_util::sync::CancellationToken,
-    /// Detached background tasks (proactive `resolve_background` from the scan
-    /// loop and the locate handler) are tracked here so the shutdown drain can
-    /// wait for them under one budget and force-abort any stragglers
-    /// (task-0102). A `std::sync::Mutex` guards
+    /// Background work and accepted connection handlers are tracked here so
+    /// the shutdown drain can wait for every `DbHandle` user under one budget
+    /// and force-abort any stragglers (task-0102/task-0192). A
+    /// `std::sync::Mutex` guards
     /// the `JoinSet` because it is not `Sync` for concurrent spawn; the guard
     /// is only ever held to spawn/reap/take, never across an await.
     pub tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
@@ -228,7 +235,7 @@ impl TryFrom<crate::db::LastFixRow> for LastFix {
 /// that same write with an exact pre-DB signal. The explicit `drop(last)`
 /// after `persist` is load-bearing — moving persistence below it recreates the
 /// stale-backfill race where a newer in-memory fix can be overwritten on disk.
-async fn backfill_last_fix_address_with<P>(
+async fn backfill_last_fix_address_with<P, F>(
     state: &Arc<DaemonState>,
     lat: f64,
     lon: f64,
@@ -236,7 +243,8 @@ async fn backfill_last_fix_address_with<P>(
     persist: P,
 ) -> Result<bool>
 where
-    P: FnOnce(&DaemonState, &crate::db::LastFixRow) -> Result<()> + Send,
+    P: FnOnce(DbHandle, crate::db::LastFixRow) -> F + Send,
+    F: std::future::Future<Output = Result<()>> + Send,
 {
     let mut last = state.last_fix.lock().await;
     let Some(fix) = last.as_mut() else {
@@ -255,7 +263,7 @@ where
 
     fix.address = Some(display.to_owned());
     let row: crate::db::LastFixRow = (&*fix).into();
-    let result = persist(state, &row);
+    let result = persist(state.db.clone(), row).await;
     // task-0046: prove the guard spans the persistence call. Do not move this
     // drop above `persist`; the concurrency regression asserts this ordering.
     drop(last);
@@ -264,30 +272,18 @@ where
 }
 
 /// Persist a newly computed fix to both the in-memory and SQLite last-fix
-/// stores (plus history) under the same `last_fix -> db` lock ordering used by
-/// address backfill. This is the handle_locate-side operation raced by the
+/// stores (plus history) under the same `last_fix -> durable writer` ordering
+/// used by address backfill. This is the handle_locate-side operation raced by the
 /// task-0046 regression.
 async fn persist_last_fix_and_history(state: &Arc<DaemonState>, new_fix: LastFix) {
     let row: crate::db::LastFixRow = (&new_fix).into();
     let mut last = state.last_fix.lock().await;
     *last = Some(new_fix);
 
-    let db = lock_db(state);
-    if let Err(e) = db.set_last_fix(&row) {
-        warn!("failed to persist last_fix: {e}");
+    if let Err(e) = state.db.persist_fix_and_history(row).await {
+        warn!("failed to persist last_fix and history: {e}");
         state.record_db_failure();
     }
-    if let Err(e) = db.insert_fix(
-        &row.at_rfc3339,
-        row.lat,
-        row.lon,
-        row.accuracy_m,
-        row.sources,
-    ) {
-        warn!("failed to record fix in history: {e}");
-        state.record_db_failure();
-    }
-    drop(db);
     drop(last);
 }
 
@@ -306,34 +302,23 @@ async fn persist_locate_fix_and_schedule(
     mut new_fix: LastFix,
 ) -> Option<String> {
     let mut last = state.last_fix.lock().await;
-    let cache = state.address_cache.lock().unwrap_or_else(|e| {
-        warn!("address cache mutex poisoned — recovering");
-        e.into_inner()
-    });
-    let address = cache.get(new_fix.lat, new_fix.lon);
-    new_fix.address = address.clone();
-    let row: crate::db::LastFixRow = (&new_fix).into();
-    *last = Some(new_fix);
+    let (address, row) = {
+        let cache = state.address_cache.lock().unwrap_or_else(|e| {
+            warn!("address cache mutex poisoned — recovering");
+            e.into_inner()
+        });
+        let address = cache.get(new_fix.lat, new_fix.lon);
+        new_fix.address = address.clone();
+        let row: crate::db::LastFixRow = (&new_fix).into();
+        *last = Some(new_fix);
+        state.geocode.observe(row.lat, row.lon, address.is_none());
+        (address, row)
+    };
 
-    state.geocode.observe(row.lat, row.lon, address.is_none());
-    drop(cache);
-
-    let db = lock_db(state);
-    if let Err(e) = db.set_last_fix(&row) {
-        warn!("failed to persist last_fix: {e}");
+    if let Err(e) = state.db.persist_fix_and_history(row).await {
+        warn!("failed to persist last_fix and history: {e}");
         state.record_db_failure();
     }
-    if let Err(e) = db.insert_fix(
-        &row.at_rfc3339,
-        row.lat,
-        row.lon,
-        row.accuracy_m,
-        row.sources,
-    ) {
-        warn!("failed to record fix in history: {e}");
-        state.record_db_failure();
-    }
-    drop(db);
     drop(last);
     address
 }
@@ -863,15 +848,17 @@ pub async fn run_server(state: Arc<DaemonState>, unix: UnixListener) -> Result<(
     }
 }
 
-/// Spawn a detached per-connection handler generic over the stream type.
-/// Detached (NOT spawn_tracked): each is bounded by READ_TIMEOUT/WRITE_TIMEOUT,
-/// and tracking them across shutdown is task-0201's scope (task-0102).
+/// Spawn a per-connection handler generic over the stream type. Tracking is
+/// required by the database actor lifecycle: shutdown must drain every holder
+/// of `DbHandle` before it sends the actor stop commands. TASK-0201 still owns
+/// admission/concurrency caps; this only gives existing handlers an owner.
 fn spawn_handler<S>(stream: S, state: Arc<DaemonState>)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
-        if let Err(e) = handle_connection(stream, state).await {
+    let task_state = Arc::clone(&state);
+    state.spawn_tracked(async move {
+        if let Err(e) = handle_connection(stream, task_state).await {
             warn!("connection error: {e}");
         }
     });
@@ -1007,7 +994,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
         active_candidates.iter().cloned().collect();
 
     // Cache-only lookup — never blocks on WiGLE. Instant response.
-    let cached_aps = resolver::lookup_cached(&bssids, state);
+    let cached_aps = resolver::lookup_cached(&bssids, state).await;
     let cached_count = cached_aps.len();
 
     if cached_aps.is_empty() {
@@ -1015,7 +1002,7 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
         if using_fallback {
             // task-0102: track so the shutdown drain waits for this resolve
             // instead of killing it mid-API-call (which would leak a WiGLE
-            // quota slot / leave partial writes).
+            // quota lease / leave partial writes).
             let resolve_state = Arc::clone(state);
             let bssids_clone = bssids.clone();
             state.spawn_tracked(async move {
@@ -1070,13 +1057,10 @@ async fn handle_locate(state: &Arc<DaemonState>) -> String {
             //   T1 in-mem X, T1 drops, T2 in-mem Y, T2 drops + persists Y,
             //   T1 persists X => disk diverges from in-memory.
             //
-            // The DB writes are sync (no .await), so holding tokio::Mutex ->
-            // std::Mutex briefly is correct. Order matches the address-
-            // backfill task to avoid deadlock.
-            //
-            // History insert (task-0031) shares the same critical section
-            // because the cost of a second SQL statement is negligible vs
-            // the cost of duplicating the lock-scoping logic.
+            // The last_fix guard intentionally spans the durable writer-actor
+            // await. This serializes memory publication with DB FIFO ordering;
+            // the address-backfill path uses the same order. last_fix and
+            // history are committed together in one actor transaction.
             let new_fix = LastFix {
                 lat: pos.lat,
                 lon: pos.lon,
@@ -1341,27 +1325,40 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
 
     let visible = debouncer.latest_scan().map(|s| s.len()).unwrap_or(0);
 
-    let mut bssids: Vec<DebugBssid> = all_bssids
+    let debug_inputs: Vec<(String, Option<i32>, usize, bool)> = all_bssids
         .iter()
         .map(|(bssid, &signal)| {
-            let seen = debouncer.count(bssid);
-            let is_stable = stable_set.contains(bssid);
-            let db = lock_db(state);
-            let db_status = if db.get_ap(bssid).ok().flatten().is_some() {
-                DbStatus::Cached
-            } else if db
-                .is_not_found(bssid, state.args.not_found_ttl_days)
-                .unwrap_or(false)
-            {
-                DbStatus::NotFound
-            } else if db.is_pending(bssid).unwrap_or(false) {
-                DbStatus::Pending
-            } else {
-                DbStatus::New
+            (
+                bssid.clone(),
+                signal,
+                debouncer.count(bssid),
+                stable_set.contains(bssid),
+            )
+        })
+        .collect();
+    drop(debouncer);
+
+    let statuses = state
+        .db
+        .debug_statuses(
+            debug_inputs.iter().map(|item| item.0.clone()).collect(),
+            state.args.not_found_ttl_days,
+        )
+        .await
+        .unwrap_or_default();
+    let statuses: std::collections::HashMap<_, _> = statuses.into_iter().collect();
+    let mut bssids: Vec<DebugBssid> = debug_inputs
+        .into_iter()
+        .map(|(bssid, signal_dbm, seen, is_stable)| {
+            let db_status = match statuses.get(&bssid).copied() {
+                Some(DebugDbStatus::Cached) => DbStatus::Cached,
+                Some(DebugDbStatus::NotFound) => DbStatus::NotFound,
+                Some(DebugDbStatus::Pending) => DbStatus::Pending,
+                Some(DebugDbStatus::New) | None => DbStatus::New,
             };
             DebugBssid {
-                bssid: bssid.clone(),
-                signal_dbm: signal,
+                bssid,
+                signal_dbm,
                 seen,
                 needed: threshold,
                 is_stable,
@@ -1372,8 +1369,6 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
     // Sort: BSSIDs with a current signal first (strongest first); BSSIDs
     // without a current signal last (None sorts after Some(_) under Reverse).
     bssids.sort_by_key(|n| std::cmp::Reverse(n.signal_dbm));
-
-    drop(debouncer);
 
     let stable_count = stable_set.len();
     let resp = DebugResponse {
@@ -1455,12 +1450,13 @@ async fn handle_history(
         _ => return error_json("history: provide either 'range' or both 'from' and 'to'"),
     };
 
-    let fixes = {
-        let db = lock_db(state);
-        match db.get_fixes_in_range(&from.to_rfc3339(), &to.to_rfc3339()) {
-            Ok(v) => v,
-            Err(e) => return error_json(&format!("history: db error: {e}")),
-        }
+    let fixes = match state
+        .db
+        .get_fixes_in_range(from.to_rfc3339(), to.to_rfc3339())
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return error_json(&format!("history: db error: {e}")),
     };
 
     let segments = crate::history::segment_fixes(
@@ -1491,21 +1487,19 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
     let orphan_tasks_aborted = state
         .orphan_tasks_aborted
         .load(std::sync::atomic::Ordering::Relaxed);
-    // task-0078: with_db scopes the lock + poison recovery. Each
-    // .unwrap_or(0) here logs nothing on failure — see db_write_failures
-    // (task-0076) for cumulative visibility on silent write failures.
-    let resp = state.with_db(|db| StatsResponse {
+    let stats = state.db.stats().await.unwrap_or_default();
+    let resp = StatsResponse {
         ok: true,
         v: 1,
-        cached_aps: db.cached_ap_count().unwrap_or(0),
-        pending_aps: db.pending_ap_count().unwrap_or(0),
-        not_found_aps: db.not_found_ap_count().unwrap_or(0),
-        db_size_bytes: db.db_size_bytes().unwrap_or(0),
-        api_calls_today: db.api_calls_today().unwrap_or(0),
+        cached_aps: stats.cached_aps,
+        pending_aps: stats.pending_aps,
+        not_found_aps: stats.not_found_aps,
+        db_size_bytes: stats.db_size_bytes,
+        api_calls_today: stats.api_calls_today,
         inflight,
         db_write_failures,
         orphan_tasks_aborted,
-    });
+    };
     ok_json(&resp)
 }
 
@@ -1526,8 +1520,11 @@ pub(crate) fn test_state_with_nominatim(
     use clap::Parser;
     let args = crate::config::Args::parse_from(["whereamid"]);
     let shutdown = tokio_util::sync::CancellationToken::new();
+    let (db_runtime, db, test_db) = crate::db::DbRuntime::open_test().unwrap();
     std::sync::Arc::new(DaemonState {
-        db: std::sync::Mutex::new(crate::db::Database::open_memory().unwrap()),
+        db,
+        _db_runtime: Some(db_runtime),
+        test_db: std::sync::Mutex::new(test_db),
         debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(
             args.debounce_window,
             args.debounce_threshold,
@@ -1539,7 +1536,7 @@ pub(crate) fn test_state_with_nominatim(
         last_fix: tokio::sync::Mutex::new(None),
         inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         address_cache: std::sync::Mutex::new(AddressCache::new()),
-        db_write_failures: std::sync::atomic::AtomicU64::new(0),
+        db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         shutdown,
         tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
@@ -1551,7 +1548,7 @@ pub(crate) fn test_state_with_nominatim(
 mod last_fix_concurrency_tests {
     //! TASK-0046 AC#3: race address backfill against a newer fix on one real
     //! DaemonState. Synchronisation is at the exact persistence boundary, not
-    //! a timing sleep, so moving the DB write outside the last_fix guard makes
+    //! a timing sleep, so moving the DB command outside the last_fix guard makes
     //! the guard-retention assertion fail deterministically.
     use super::*;
     use std::time::Duration;
@@ -1565,7 +1562,7 @@ mod last_fix_concurrency_tests {
 
         let state = test_state();
         // Equal timestamps are intentional: task-0100's monotonic UPSERT must
-        // not mask this lock-scoping regression by rejecting a stale row.
+        // not mask this guard-scoping regression by rejecting a stale row.
         let at = chrono::DateTime::parse_from_rfc3339("2026-07-05T00:00:00+00:00")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -1582,23 +1579,21 @@ mod last_fix_concurrency_tests {
             let mut last = state.last_fix.lock().await;
             *last = Some(old_fix);
         }
-        lock_db(&state).set_last_fix(&old_row).unwrap();
+        state.db.set_last_fix(old_row).await.unwrap();
 
-        // Hold the DB mutex on a plain OS thread. This avoids carrying a
-        // std::sync::MutexGuard across await while making the backfill block at
-        // its real SQLite boundary.
+        // Occupy the real writer actor with a deterministic no-op command so
+        // the backfill queues at its production persistence boundary.
         let (db_held_tx, db_held_rx) = std::sync::mpsc::channel();
         let (release_db_tx, release_db_rx) = std::sync::mpsc::channel();
-        let blocker_state = Arc::clone(&state);
-        let blocker = std::thread::spawn(move || {
-            let db = lock_db(&blocker_state);
-            let _ = db_held_tx.send(());
-            let _ = release_db_rx.recv();
-            drop(db);
+        let blocker_db = state.db.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_db
+                .hold_writer_until(db_held_tx, release_db_rx)
+                .await
         });
         db_held_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("DB blocker thread must acquire the mutex");
+            .expect("writer actor blocker must start");
 
         // Signal from the injected *real persistence closure* immediately
         // before it asks for the blocked DB. The helper contract requires the
@@ -1611,9 +1606,9 @@ mod last_fix_concurrency_tests {
                 OLD_LAT,
                 OLD_LON,
                 "old address",
-                move |state, row| {
+                move |db, row| async move {
                     let _ = persist_reached_tx.send(());
-                    lock_db(state).set_last_fix(row)
+                    db.set_last_fix(row).await
                 },
             )
             .await
@@ -1644,7 +1639,10 @@ mod last_fix_concurrency_tests {
         // Cleanup precedes every assertion: a failing discriminator must not
         // strand the blocker thread or either Tokio task.
         let _ = release_db_tx.send(());
-        blocker.join().expect("DB blocker thread panicked");
+        blocker
+            .await
+            .expect("DB blocker task panicked")
+            .expect("DB blocker failed");
         let joined = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(backfill, replacement)
         })
@@ -1669,8 +1667,10 @@ mod last_fix_concurrency_tests {
             let last = state.last_fix.lock().await;
             crate::db::LastFixRow::from(last.as_ref().expect("last_fix missing in memory"))
         };
-        let disk_row = lock_db(&state)
+        let disk_row = state
+            .db
             .get_last_fix()
+            .await
             .unwrap()
             .expect("last_fix missing on disk");
 
@@ -1837,6 +1837,86 @@ mod dispatch_tests {
             source: crate::db::Source::Manual,
         };
         lock_db(state).upsert_ap(&ap).unwrap();
+    }
+
+    #[tokio::test]
+    async fn locate_with_ten_cached_aps_commits_touch_and_fix_batches_only() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const OLD_LAST_SEEN: &str = "2000-01-01T00:00:00+00:00";
+        let state = test_state();
+        assert!(
+            !state.args.address_approx,
+            "test requires address lookup disabled"
+        );
+        assert_eq!(state.args.top_n, 10, "test requires all ten APs selected");
+        let bssids: Vec<String> = (0..10)
+            .map(|index| format!("02:00:00:00:10:{index:02x}"))
+            .collect();
+        for (index, bssid) in bssids.iter().enumerate() {
+            cache_ap(
+                &state,
+                bssid,
+                55.67 + index as f64 / 100_000.0,
+                12.56 + index as f64 / 100_000.0,
+            );
+        }
+        state
+            .db
+            .set_cached_last_seen_for_test(bssids.clone(), OLD_LAST_SEEN.to_owned())
+            .await
+            .unwrap();
+
+        let sample: crate::debounce::ScanSample = bssids
+            .iter()
+            .enumerate()
+            .map(|(index, bssid)| {
+                (
+                    bssid.clone(),
+                    crate::debounce::ScanEntry {
+                        signal_dbm: -30 - index as i32,
+                        ssid: None,
+                        channel: Some(1),
+                    },
+                )
+            })
+            .collect();
+        {
+            let mut debouncer = state.debouncer.lock().await;
+            for _ in 0..state.args.debounce_threshold {
+                debouncer.push_scan(sample.clone());
+            }
+        }
+
+        let commits = Arc::new(AtomicUsize::new(0));
+        state
+            .db
+            .install_writer_commit_counter(Arc::clone(&commits))
+            .await
+            .unwrap();
+        commits.store(0, Ordering::SeqCst);
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], true, "locate failed: {response}");
+        assert_eq!(json["cached"], 10);
+        assert_eq!(json["sources"], 10);
+
+        state.db.writer_barrier().await.unwrap();
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            2,
+            "production locate must commit one touch batch and one fix batch"
+        );
+        let last_seen = state.db.cached_last_seen_for_test(bssids).await.unwrap();
+        assert!(last_seen.iter().all(|value| value != OLD_LAST_SEEN));
+        let last_fix = state.db.get_last_fix().await.unwrap();
+        assert!(last_fix.is_some(), "locate must persist last_fix");
+        let history = state
+            .db
+            .get_fixes_in_range("2000-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "locate must append one history row");
     }
 
     /// task-0184: a history request whose range overflows chrono must return
@@ -2025,6 +2105,56 @@ mod dispatch_tests {
             state.tasks.lock().unwrap().len(),
             0,
             "nothing may be tracked after a refused spawn"
+        );
+    }
+
+    #[test]
+    fn spawn_racing_shutdown_cannot_escape_into_replacement_joinset() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let state = test_state();
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let captured = DropFlag(std::sync::Arc::clone(&dropped));
+        let (prechecked_tx, prechecked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let spawn_state = Arc::clone(&state);
+        let contender = std::thread::spawn(move || {
+            spawn_state.spawn_tracked_after_precheck(
+                async move {
+                    let _captured = captured;
+                    std::future::pending::<()>().await;
+                },
+                || {
+                    prechecked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            );
+        });
+        prechecked_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("contender must pass the cheap cancellation check");
+
+        state.shutdown.cancel();
+        let taken = std::mem::take(&mut *state.tasks.lock().unwrap());
+        assert!(taken.is_empty(), "precondition: no task was owned yet");
+        release_tx.send(()).unwrap();
+        contender.join().unwrap();
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "refused future must be destroyed"
+        );
+        assert_eq!(
+            state.tasks.lock().unwrap().len(),
+            0,
+            "racing spawn must not land in the post-take replacement JoinSet"
         );
     }
 }

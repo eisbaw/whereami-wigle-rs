@@ -152,22 +152,14 @@ pub struct ChainPolicy {
 
 /// Cache-only lookup: returns positions from the aps table, no API calls.
 /// Used by `locate` to give instant responses.
-pub fn lookup_cached(bssids: &[String], state: &Arc<DaemonState>) -> Vec<ApInfo> {
-    let db = crate::server::lock_db(state);
-    let mut result = Vec::new();
-    for bssid in bssids {
-        match db.get_ap(bssid) {
-            Ok(Some(ap)) => {
-                if let Err(e) = db.touch_ap(bssid) {
-                    warn!("failed to touch AP {bssid}: {e}");
-                }
-                result.push(ap);
-            }
-            Ok(None) => {}
-            Err(e) => warn!("db error looking up {bssid}: {e}"),
+pub async fn lookup_cached(bssids: &[String], state: &Arc<DaemonState>) -> Vec<ApInfo> {
+    match state.db.lookup_cached_touch(bssids.to_vec()).await {
+        Ok(result) => result,
+        Err(error) => {
+            warn!("cached AP lookup failed: {error}");
+            Vec::new()
         }
     }
-    result
 }
 
 /// Generic provider-chain orchestrator.
@@ -229,20 +221,11 @@ pub async fn resolve_chain(
     for bssid in bssids {
         // Short-circuit: already in aps cache.
         if policy.skip_cached {
-            let cache_hit = {
-                let db = crate::server::lock_db(state);
-                match db.get_ap(bssid) {
-                    Ok(Some(ap)) => {
-                        if let Err(e) = db.touch_ap(bssid) {
-                            warn!("failed to touch AP {bssid}: {e}");
-                        }
-                        Some(ap)
-                    }
-                    Ok(None) => None,
-                    Err(e) => {
-                        warn!("db error looking up {bssid}: {e}");
-                        None
-                    }
+            let cache_hit = match state.db.lookup_cached_touch(vec![bssid.clone()]).await {
+                Ok(mut hits) => hits.pop(),
+                Err(e) => {
+                    warn!("db error looking up {bssid}: {e}");
+                    None
                 }
             };
             if let Some(ap) = cache_hit {
@@ -255,11 +238,11 @@ pub async fn resolve_chain(
 
         // Short-circuit: in not_found cache (within TTL).
         if policy.skip_not_found {
-            let is_nf = {
-                let db = crate::server::lock_db(state);
-                db.is_not_found(bssid, state.args.not_found_ttl_days)
-                    .unwrap_or(false)
-            };
+            let is_nf = state
+                .db
+                .is_not_found(bssid.clone(), state.args.not_found_ttl_days)
+                .await
+                .unwrap_or(false);
             if is_nf {
                 debug!("{bssid} in not_found cache, skipping");
                 // task-0194: the not_found table is authoritative within TTL,
@@ -316,16 +299,13 @@ pub async fn resolve_chain(
                         ap.lon
                     );
                     if policy.write_through {
-                        let db = crate::server::lock_db(state);
-                        if let Err(e) = db.upsert_ap(&ap) {
-                            warn!("failed to cache AP {}: {e}", ap.bssid);
+                        if let Err(e) = state
+                            .db
+                            .cache_resolved_ap(ap.clone(), policy.delete_pending_on_success)
+                            .await
+                        {
+                            warn!("failed to cache AP {} and update pending: {e}", ap.bssid);
                             state.record_db_failure();
-                        }
-                        if policy.delete_pending_on_success {
-                            if let Err(e) = db.delete_pending(&ap.bssid) {
-                                warn!("failed to delete pending {}: {e}", ap.bssid);
-                                state.record_db_failure();
-                            }
                         }
                     }
                     fetched_bssids.insert(bssid.clone());
@@ -391,12 +371,9 @@ pub async fn resolve_chain(
 
     // Apply deferred pending inserts.
     if !to_pend_at_end.is_empty() {
-        let db = crate::server::lock_db(state);
-        for bssid in &to_pend_at_end {
-            if let Err(e) = db.insert_pending(bssid, None, None, None, None) {
-                warn!("failed to insert pending {bssid}: {e}");
-                state.record_db_failure();
-            }
+        if let Err(e) = state.db.insert_pending_many(to_pend_at_end.clone()).await {
+            warn!("failed to insert deferred pending BSSIDs: {e}");
+            state.record_db_failure();
         }
     }
 
@@ -422,7 +399,6 @@ pub async fn resolve_chain(
     // that falls through the `continue`s above is left out of result_not_found
     // and therefore reported as "unresolved" on the wire, not not_found.
     let persist = matches!(policy.not_found, NotFoundPolicy::AtChainEnd);
-    let db = persist.then(|| crate::server::lock_db(state));
     for bssid in bssids {
         if resolved.contains(bssid) {
             continue;
@@ -444,20 +420,20 @@ pub async fn resolve_chain(
         }
         // Definitive absence for this call.
         result_not_found.insert(bssid.clone());
-        if let Some(db) = &db {
-            if let Err(e) = db.insert_not_found(bssid) {
+        if persist {
+            if let Err(e) = state
+                .db
+                .record_not_found(bssid.clone(), policy.delete_pending_on_not_found)
+                .await
+            {
                 warn!("failed to insert not_found {bssid}: {e}");
                 state.record_db_failure();
             }
             // task-0052: collapse drain_cleanup_after_chain — when the chain
             // marks not_found, also remove the pending row so the drain loop
             // doesn't retry it every cycle. Only under delete_pending_on_not_found.
-            if policy.delete_pending_on_not_found {
-                if let Err(e) = db.delete_pending(bssid) {
-                    warn!("failed to delete pending {bssid} after not_found mark: {e}");
-                    state.record_db_failure();
-                }
-            }
+            // `record_not_found` deletes pending in the same transaction when
+            // policy requests it.
         }
     }
 
@@ -530,7 +506,7 @@ pub async fn resolve_background(bssids: &[String], state: &Arc<DaemonState>) {
 mod tests {
     use super::*;
     use crate::config::Args;
-    use crate::db::{ApInfo, Database, Source};
+    use crate::db::{ApInfo, Source};
     use crate::provider::MockProvider;
     use crate::server::{AddressCache, DaemonState};
     use clap::Parser;
@@ -539,11 +515,13 @@ mod tests {
     /// The Apple/WiGLE/Nominatim clients are real but never called when the
     /// test uses only Provider::Mock(...) as the chain providers.
     fn test_state() -> Arc<DaemonState> {
-        let db = Database::open_memory().unwrap();
+        let (db_runtime, db, test_db) = crate::db::DbRuntime::open_test().unwrap();
         let args = Args::parse_from(["whereamid"]);
         let shutdown = tokio_util::sync::CancellationToken::new();
         Arc::new(DaemonState {
-            db: std::sync::Mutex::new(db),
+            db,
+            _db_runtime: Some(db_runtime),
+            test_db: std::sync::Mutex::new(test_db),
             debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(10, 5)),
             args,
             wigle: crate::wigle::WigleClient::new("", ""),
@@ -553,7 +531,7 @@ mod tests {
             last_fix: tokio::sync::Mutex::new(None),
             inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
-            db_write_failures: std::sync::atomic::AtomicU64::new(0),
+            db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             shutdown,
             tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
             orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),

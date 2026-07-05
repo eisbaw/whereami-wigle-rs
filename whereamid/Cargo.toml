@@ -18,7 +18,7 @@ tokio = { version = "1", features = ["full"] }
 # transitive dep (reqwest/hyper), so this only promotes it to a direct dep.
 tokio-util = "0.7"
 reqwest = { version = "0.12", features = ["json"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -34,6 +34,10 @@ libc = "0.2"
 
 [dev-dependencies]
 proptest = "1.11.0"
+# Tests probe sqlite3_txn_state at the exact quota-reservation boundary. Keep
+# that bundled-bindings feature out of release builds; `hooks` remains a
+# production feature because reader cancellation uses progress_handler.
+rusqlite = { version = "0.31", features = ["modern_sqlite"] }
 # test-util enables tokio's paused clock (`#[tokio::test(start_paused = true)]`)
 # for deterministic shutdown-drain / loop-cancellation tests (task-0190). Only
 # compiled for tests, so the release binary is unaffected.

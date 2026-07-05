@@ -5,7 +5,9 @@
 //! rate waiting and HTTP work. A generation watch cancels work superseded
 //! before transport, while the exact-key active set coalesces same-cell jitter.
 
-use super::{address_cache_key, backfill_last_fix_address_with, lock_db, DaemonState};
+#[cfg(test)]
+use super::lock_db;
+use super::{address_cache_key, backfill_last_fix_address_with, DaemonState};
 use crate::nominatim::REQUEST_INTERVAL;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -354,13 +356,13 @@ pub(crate) async fn run_worker(state: Arc<DaemonState>) {
         }
 
         // Backfill only a still-current matching last_fix. The helper retains
-        // the reviewed last_fix -> DB lock order from task-0046.
+        // the reviewed last_fix -> durable writer FIFO order from task-0046.
         if let Err(error) = backfill_last_fix_address_with(
             &state,
             candidate.lat,
             candidate.lon,
             &address.display,
-            |state, row| lock_db(state).set_last_fix(row),
+            |db, row| async move { db.set_last_fix(row).await },
         )
         .await
         {

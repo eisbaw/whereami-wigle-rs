@@ -32,7 +32,9 @@ use tokio::time::{sleep, Duration, Instant};
 use tracing::{error, info, warn};
 
 use config::{load_config_file, Args};
+#[cfg(test)]
 use db::Database;
+use db::DbRuntime;
 use debounce::Debouncer;
 use server::DaemonState;
 
@@ -98,13 +100,15 @@ async fn main() -> Result<()> {
     let config_file = load_config_file(&args.config)?;
 
     // Open database
-    let db = Database::open(&args.db).context("opening database")?;
+    let (db_runtime, db) = DbRuntime::open(&args.db)
+        .await
+        .context("opening database")?;
 
     // Rehydrate last_fix from disk so the daemon can answer "where am I"
     // immediately after a restart, before the first scan-and-resolve cycle
     // completes. A malformed timestamp or non-finite coordinate is treated as
     // "no last fix" — better to discard it than serve a poisoned stale fix.
-    let initial_last_fix = match db.get_last_fix() {
+    let initial_last_fix = match db.get_last_fix().await {
         Ok(Some(row)) => match server::LastFix::try_from(row) {
             Ok(fix) => Some(fix),
             Err(e) => {
@@ -126,7 +130,7 @@ async fn main() -> Result<()> {
     // endpoint can actually report it (task-0102 review): the in-memory bump
     // happens only after the server socket has closed, so without this
     // persist/reload cycle no client could ever observe a non-zero value.
-    let orphans_last_shutdown = load_orphan_count(&db);
+    let orphans_last_shutdown = load_orphan_count_async(&db).await;
     if orphans_last_shutdown > 0 {
         info!("last shutdown force-aborted {orphans_last_shutdown} tasks (see stats)");
     }
@@ -153,7 +157,11 @@ async fn main() -> Result<()> {
 
     let shutdown = tokio_util::sync::CancellationToken::new();
     let state = Arc::new(DaemonState {
-        db: std::sync::Mutex::new(db),
+        db,
+        #[cfg(test)]
+        _db_runtime: None,
+        #[cfg(test)]
+        test_db: std::sync::Mutex::new(Database::open_memory().unwrap()),
         debouncer: tokio::sync::Mutex::new(debouncer),
         apple: apple::AppleClient::with_timeout(http_timeout),
         nominatim: nominatim::NominatimClient::with_timeout(nominatim_timeout),
@@ -165,11 +173,17 @@ async fn main() -> Result<()> {
         wigle: wigle_client,
         last_fix: tokio::sync::Mutex::new(initial_last_fix),
         inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
-        db_write_failures: std::sync::atomic::AtomicU64::new(0),
+        db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         shutdown,
         tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(orphans_last_shutdown),
     });
+
+    // Bind the mandatory control channel before starting any task that owns
+    // daemon state. On failure, explicitly close both DB actors; dropping only
+    // their JoinHandles would detach the OS threads.
+    let (db_runtime, state, (unix_listener, cleanup_socket_path)) =
+        finish_db_backed_startup(db_runtime, state, setup_unix_listener(&args)).await?;
 
     // Background tasks. Each selects its work/sleep against
     // state.shutdown.cancelled() (level-triggered, task-0190), so they exit at
@@ -205,10 +219,7 @@ async fn main() -> Result<()> {
                 _ = sleep(interval) => {}
             }
             let retention = history_state.args.history_retention_days;
-            let pruned = {
-                let db = server::lock_db(&history_state);
-                db.prune_fixes(retention)
-            };
+            let pruned = history_state.db.prune_fixes(retention).await;
             match pruned {
                 Ok(0) => {}
                 Ok(n) => info!("history prune: removed {n} fix rows older than {retention}d"),
@@ -219,16 +230,6 @@ async fn main() -> Result<()> {
             }
         }
     });
-
-    // Set up the mandatory control-channel unix listener BEFORE spawning the
-    // server task. A failure here — a live socket already owns the path, or the
-    // chmod could not be verified — must abort startup with a non-zero exit
-    // rather than run degraded (task-0196). We handle stale socket files at
-    // startup (not on run_server's exit, which is an abort at shutdown with no
-    // chance to clean up); `cleanup_socket_path` is a best-effort unlink after
-    // the drain for self-bound sockets (None when systemd owns the socket).
-    let (unix_listener, cleanup_socket_path) =
-        setup_unix_listener(&args).context("setting up the control-channel unix socket")?;
 
     let server_state = Arc::clone(&state);
     let mut server_handle =
@@ -304,8 +305,11 @@ async fn main() -> Result<()> {
     // the persisted value describes the last fully-drained shutdown even when
     // its process status is non-zero.
     {
-        let db = server::lock_db(&state);
-        if let Err(e) = db.set_metadata(ORPHANS_ABORTED_KEY, &aborted.to_string()) {
+        if let Err(e) = state
+            .db
+            .set_metadata(ORPHANS_ABORTED_KEY, aborted.to_string())
+            .await
+        {
             tracing::warn!("failed to persist {ORPHANS_ABORTED_KEY}: {e}");
             state.record_db_failure();
         }
@@ -331,6 +335,13 @@ async fn main() -> Result<()> {
         Some(_) => error!("whereamid stopped after unexpected server task failure"),
         None => info!("whereamid stopped"),
     }
+    // Every task/handler and the final metadata command is drained before the
+    // actor owner stops its FIFO threads.
+    drop(state);
+    db_runtime
+        .shutdown()
+        .await
+        .context("shutting down database actors")?;
     shutdown_result(server_failure)
 }
 
@@ -479,6 +490,28 @@ fn setup_unix_listener(args: &Args) -> Result<(tokio::net::UnixListener, Option<
     Ok((listener, Some(path)))
 }
 
+/// Keep the state owner and DB runtime together across the last fallible
+/// startup step. A setup error drops every state-held `DbHandle`, explicitly
+/// shuts/joins the actors, and only then returns the original error.
+async fn finish_db_backed_startup<T, S>(
+    db_runtime: DbRuntime,
+    state_owner: S,
+    setup: Result<T>,
+) -> Result<(DbRuntime, S, T)> {
+    match setup {
+        Ok(value) => Ok((db_runtime, state_owner, value)),
+        Err(error) => {
+            drop(state_owner);
+            match db_runtime.shutdown().await {
+                Ok(()) => Err(error.context("setting up the control-channel unix socket")),
+                Err(shutdown) => Err(anyhow::anyhow!(
+                    "setting up the control-channel unix socket failed: {error:#}; database actor cleanup also failed: {shutdown:#}"
+                )),
+            }
+        }
+    }
+}
+
 /// Metadata key holding the number of tasks force-aborted at the end of the
 /// last clean shutdown's drain. Persisted at shutdown and reloaded at startup
 /// so `stats.orphan_tasks_aborted` reports the previous run's aborts — the
@@ -489,8 +522,23 @@ const ORPHANS_ABORTED_KEY: &str = "orphans_aborted_last_shutdown";
 /// Load the persisted forced-abort count from the last clean shutdown.
 /// Missing or malformed values count as 0 — better to under-report a
 /// diagnostic than to refuse to start.
+#[cfg(test)]
 fn load_orphan_count(db: &Database) -> u64 {
     match db.get_metadata(ORPHANS_ABORTED_KEY) {
+        Ok(Some(v)) => v.parse().unwrap_or_else(|_| {
+            tracing::warn!("corrupt {ORPHANS_ABORTED_KEY} metadata value {v:?}; treating as 0");
+            0
+        }),
+        Ok(None) => 0,
+        Err(e) => {
+            tracing::warn!("failed to read {ORPHANS_ABORTED_KEY}: {e}");
+            0
+        }
+    }
+}
+
+async fn load_orphan_count_async(db: &crate::db::DbHandle) -> u64 {
+    match db.get_metadata(ORPHANS_ABORTED_KEY).await {
         Ok(Some(v)) => v.parse().unwrap_or_else(|_| {
             tracing::warn!("corrupt {ORPHANS_ABORTED_KEY} metadata value {v:?}; treating as 0");
             0
@@ -512,30 +560,34 @@ fn load_orphan_count(db: &Database) -> u64 {
 /// aborted (named loops + server + tracked spawns), which the caller records
 /// into `orphan_tasks_aborted`.
 ///
-/// Every JoinHandle is polled at most once (task-0195): the graceful future
-/// consumes the `named`/`server` handles, and the pre-extracted `AbortHandle`s
-/// are the only thing touched on the timeout path — handles are never
-/// re-awaited. The server is separate because its output is `Result<()>`,
-/// unlike the background loops' `()`.
+/// Named async loops are retained across the graceful timeout. On timeout they
+/// are aborted and then reaped, which guarantees their futures (including any
+/// quota lease) have dropped before DB actor shutdown. Therefore `budget`
+/// bounds the graceful phase, not arbitrary non-cooperative Rust code after
+/// abort: named/tracked futures must reach a cancellation point before reap can
+/// finish. History segmentation still has a known O(n²), non-yielding CPU
+/// phase (deferred to TASK-0201/TASK-0087), so this is not a generic hard wall
+/// for that separate defect. The accept-loop server remains separately bounded
+/// because a non-cooperative server JoinHandle may ignore abort (task-0241);
+/// it does not itself issue database commands.
 async fn run_shutdown_drain(
     budget: Duration,
-    named: Vec<tokio::task::JoinHandle<()>>,
-    server: Option<tokio::task::JoinHandle<Result<()>>>,
+    mut named: Vec<tokio::task::JoinHandle<()>>,
+    mut server: Option<tokio::task::JoinHandle<Result<()>>>,
     mut tracked: tokio::task::JoinSet<()>,
 ) -> u64 {
-    let named_aborts: Vec<tokio::task::AbortHandle> =
-        named.iter().map(|h| h.abort_handle()).collect();
-    let server_abort = server.as_ref().map(|h| h.abort_handle());
-
-    // Graceful phase. `named` is moved in and consumed (owned `JoinHandle`s,
-    // awaited once each); `tracked` is borrowed so it survives a timeout for
-    // the force-abort + count below.
+    // Borrow every owner so cancellation of `timeout` leaves the JoinHandles
+    // available for explicit abort + reap below.
+    let mut named_completed = 0usize;
+    let mut server_completed = false;
     let graceful = async {
-        for h in named {
-            let _ = h.await;
+        while named_completed < named.len() {
+            let _ = (&mut named[named_completed]).await;
+            named_completed += 1;
         }
-        if let Some(h) = server {
+        if let Some(h) = server.as_mut() {
             let _ = h.await;
+            server_completed = true;
         }
         while tracked.join_next().await.is_some() {}
     };
@@ -551,17 +603,27 @@ async fn run_shutdown_drain(
     );
 
     let mut aborted: u64 = 0;
-    for a in &named_aborts {
-        if !a.is_finished() {
-            a.abort();
+    for handle in named.iter().skip(named_completed) {
+        if !handle.is_finished() {
+            handle.abort();
             aborted += 1;
         }
     }
-    if let Some(a) = &server_abort {
-        if !a.is_finished() {
-            a.abort();
+    // Abort of Tokio async tasks is cooperative, but awaiting these named
+    // handles is required: only then are their futures and RAII leases known
+    // to be destroyed before the DB Stop command is sent.
+    for handle in named.into_iter().skip(named_completed) {
+        let _ = handle.await;
+    }
+
+    if let Some(handle) = server.take() {
+        if !server_completed && !handle.is_finished() {
+            handle.abort();
             aborted += 1;
         }
+        // Do not await: task-0241 proves a spawn_blocking/non-cooperative
+        // server can ignore abort. Dropping this handle preserves the budget.
+        drop(handle);
     }
     // Reap tracked tasks that completed on their own but were never joined —
     // the graceful phase drains `named` first, so a wedged named handle
@@ -759,6 +821,65 @@ mod shutdown_drain_tests {
         assert_eq!(aborted, 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn drain_drops_named_future_before_returning() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let task_dropped = std::sync::Arc::clone(&dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let named = vec![tokio::spawn(async move {
+            let _drop_flag = DropFlag(task_dropped);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        })];
+        started_rx.await.unwrap();
+
+        let aborted = run_shutdown_drain(Duration::from_secs(1), named, None, JoinSet::new()).await;
+        assert_eq!(aborted, 1);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "named future (and any quota lease it owns) must drop before drain returns"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn named_abort_enqueues_quota_refund_before_drain_returns() {
+        let state = crate::server::test_state();
+        let lease = state
+            .db
+            .reserve_api_call(
+                state.args.daily_limit,
+                std::sync::Arc::clone(&state.db_write_failures),
+            )
+            .await
+            .unwrap()
+            .expect("quota lease");
+        assert_eq!(state.db.api_calls_today().await.unwrap(), 1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let named = vec![tokio::spawn(async move {
+            let _lease = lease;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        })];
+        started_rx.await.unwrap();
+
+        let aborted = run_shutdown_drain(Duration::from_secs(1), named, None, JoinSet::new()).await;
+        assert_eq!(aborted, 1);
+        // The drain's named-handle reap must have dropped the lease and queued
+        // its conditional refund. This FIFO barrier observes that command
+        // before main is allowed to stop the DB actors.
+        state.db.writer_barrier().await.unwrap();
+        assert_eq!(state.db.api_calls_today().await.unwrap(), 0);
+    }
+
     /// task-0241 review regression: abort is cooperative. A server task in
     /// non-yielding/blocking work cannot be awaited outside the shutdown
     /// budget, or SIGTERM may hang forever before metadata/socket cleanup.
@@ -841,6 +962,38 @@ mod shutdown_drain_tests {
             aborted, 2,
             "finished-but-unjoined tracked tasks must be reaped before counting"
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_cleanup_tests {
+    use super::finish_db_backed_startup;
+    use crate::db::DbRuntime;
+
+    #[tokio::test]
+    async fn setup_error_shuts_runtime_even_with_surviving_handle() {
+        let dir = std::env::temp_dir().join(format!(
+            "whereamid-startup-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("whereami.db");
+        let (runtime, handle) = DbRuntime::open(&path).await.unwrap();
+        let survivor = handle.clone();
+        let setup: anyhow::Result<()> = Err(anyhow::anyhow!("injected socket setup failure"));
+
+        let outcome = finish_db_backed_startup(runtime, handle, setup).await;
+        assert!(outcome.is_err());
+        assert!(
+            survivor.stats().await.is_err(),
+            "socket-error cleanup must leave no serving DB actor"
+        );
+        drop(survivor);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

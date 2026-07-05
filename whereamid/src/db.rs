@@ -2,8 +2,12 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
-use std::path::Path;
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread::JoinHandle;
+use std::time::Duration;
 use tracing::{debug, info};
 
 /// Information about a resolved access point.
@@ -39,8 +43,1062 @@ pub use source::Source;
 // the projection (and reintroduce a struct) the moment a real consumer
 // appears.
 
-pub struct Database {
+pub(crate) struct Database {
     conn: Connection,
+}
+
+/// How long a database actor waits for another SQLite connection to release a
+/// lock.  This is deliberately shorter than the daemon's five-second shutdown
+/// drain, so an external writer cannot strand shutdown indefinitely.
+pub const DB_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+
+const PRUNE_FIXES_CHUNK_SQL: &str = "DELETE FROM fixes WHERE id IN (
+         SELECT id FROM fixes INDEXED BY idx_fixes_at
+         WHERE at_rfc3339 < ?1 ORDER BY at_rfc3339 LIMIT ?2
+     )";
+
+type DbJob = Box<dyn FnOnce(&mut Database) + Send + 'static>;
+
+enum DbCommand {
+    Run(DbJob),
+    Stop(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Marks an enqueued request abandoned when its async waiter is dropped. The
+/// actor checks the flag before starting queued work; reader progress handlers
+/// also check it while SQLite is executing a long query.
+struct CancelOnDrop {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Owned WiGLE quota reservation. It is created before the reservation command
+/// is enqueued, so cancellation at every await boundary has an owner that can
+/// append a conditional refund to the same writer FIFO.
+// The package's library target intentionally omits the daemon provider module
+// but compiles this shared db module, so the lease is reachable only in the
+// binary target there.
+#[allow(dead_code)]
+pub(crate) struct QuotaLease {
+    writer: mpsc::Sender<DbCommand>,
+    committed: Arc<AtomicBool>,
+    failures: Arc<std::sync::atomic::AtomicU64>,
+    active: bool,
+}
+
+#[allow(dead_code)]
+impl QuotaLease {
+    fn new(
+        writer: mpsc::Sender<DbCommand>,
+        committed: Arc<AtomicBool>,
+        failures: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            writer,
+            committed,
+            failures,
+            active: true,
+        }
+    }
+
+    /// The upstream request consumed the reservation (Found/NotFound).
+    pub(crate) fn consume(mut self) {
+        self.active = false;
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for QuotaLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let committed = Arc::clone(&self.committed);
+        let committed_on_send = Arc::clone(&self.committed);
+        let failures = Arc::clone(&self.failures);
+        let failures_on_send = Arc::clone(&failures);
+        let command = DbCommand::Run(Box::new(move |db| {
+            // FIFO ordering is the protocol: this runs after the matching
+            // reservation command, whether that command was still queued,
+            // actively committing, or had delivered its result. swap(false)
+            // makes the conditional refund exactly-once.
+            if committed.swap(false, Ordering::AcqRel) {
+                if let Err(error) = db.refund_api_call() {
+                    tracing::warn!("failed to refund WiGLE quota lease on drop: {error}");
+                    failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }));
+        if self.writer.send(command).is_err() && committed_on_send.load(Ordering::Acquire) {
+            tracing::warn!("failed to enqueue WiGLE quota refund: database actor stopped");
+            failures_on_send.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ReservationTestHooks {
+    queued: Option<tokio::sync::oneshot::Sender<()>>,
+    committed: Option<tokio::sync::oneshot::Sender<()>>,
+    release_after_commit: Option<mpsc::Receiver<()>>,
+}
+
+struct DbActor {
+    tx: mpsc::Sender<DbCommand>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl DbActor {
+    fn spawn(
+        name: &'static str,
+        open: impl FnOnce() -> Result<Database> + Send + 'static,
+    ) -> Result<Self> {
+        let (tx, rx) = mpsc::channel::<DbCommand>();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || match open() {
+                Ok(mut db) => {
+                    let _ = ready_tx.send(Ok(()));
+                    let mut stop_done = None;
+                    while let Ok(command) = rx.recv() {
+                        match command {
+                            DbCommand::Run(job) => {
+                                // A buggy command must fail its caller, not permanently kill
+                                // the database service and every later request.
+                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    job(&mut db)
+                                }))
+                                .is_err()
+                                {
+                                    tracing::error!(actor = name, "database actor job panicked");
+                                }
+                            }
+                            DbCommand::Stop(done) => {
+                                stop_done = Some(done);
+                                break;
+                            }
+                        }
+                    }
+                    // Connection::drop may checkpoint/close WAL resources. Do
+                    // it on the actor thread before acknowledging shutdown so
+                    // the Tokio caller's subsequent JoinHandle::join is truly
+                    // non-blocking and performs no SQLite work.
+                    drop(db);
+                    if let Some(done) = stop_done {
+                        let _ = done.send(());
+                    }
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                }
+            })
+            .with_context(|| format!("spawning {name} database actor"))?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                tx,
+                thread: Some(thread),
+            }),
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                anyhow::bail!("{name} database actor exited before startup completed")
+            }
+        }
+    }
+
+    fn join_thread(&mut self, errors: &mut Vec<String>) {
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                errors.push("database actor thread panicked during shutdown".to_owned());
+            }
+        }
+    }
+
+    fn finish_stop(errors: Vec<String>) -> Result<()> {
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(errors.join("; "))
+        }
+    }
+
+    fn stop_blocking(mut self) -> Result<()> {
+        self.stop_blocking_inner(None)
+    }
+
+    fn stop_blocking_with_signal(
+        mut self,
+        stop_queued: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
+        self.stop_blocking_inner(stop_queued)
+    }
+
+    fn stop_blocking_inner(
+        &mut self,
+        stop_queued: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
+        if self.thread.is_none() {
+            return Ok(());
+        }
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let mut errors = Vec::new();
+        let stop_sent = self.tx.send(DbCommand::Stop(done_tx)).is_ok();
+        if !stop_sent {
+            errors.push("database actor stopped before shutdown request".to_owned());
+        } else if let Some(stop_queued) = stop_queued {
+            // This signal is deliberately emitted after the Stop command is
+            // in the actor FIFO. It is used by the cancellation regression to
+            // prove the blocking cleanup task owns the actor before aborting
+            // the async waiter.
+            let _ = stop_queued.send(());
+        }
+        self.join_thread(&mut errors);
+        // Join proves the actor can no longer mutate the receiver. Inspect the
+        // acknowledgement without Tokio's blocking_recv (which panics when a
+        // fallback Drop happens on a runtime worker).
+        if stop_sent && done_rx.try_recv().is_err() {
+            errors.push("database actor stopped without acknowledging shutdown".to_owned());
+        }
+        Self::finish_stop(errors)
+    }
+}
+
+impl Drop for DbActor {
+    fn drop(&mut self) {
+        if self.thread.is_none() {
+            return;
+        }
+        // Exceptional ownership fallback for a fallible startup path that
+        // returns after an actor has spawned. Normal DbRuntime shutdown calls
+        // stop_blocking_inner first, takes the JoinHandle, and reaches this
+        // Drop with no thread left to stop a second time.
+        if let Err(error) = self.stop_blocking_inner(None) {
+            tracing::error!("fallback database actor shutdown failed: {error:#}");
+        }
+    }
+}
+
+/// Cloneable, asynchronous access to the database. Every closure that can
+/// touch rusqlite is constructed in this module and runs on one of the two
+/// named OS threads; no connection, statement, row, or transaction escapes.
+#[derive(Clone)]
+pub struct DbHandle {
+    writer: mpsc::Sender<DbCommand>,
+    reader: mpsc::Sender<DbCommand>,
+}
+
+/// Owns the two database threads. Main keeps this owner alive until all
+/// handlers/background tasks and final metadata writes have drained, then
+/// performs an explicit FIFO shutdown.
+pub struct DbRuntime {
+    writer: Option<DbActor>,
+    reader: Option<DbActor>,
+}
+
+#[derive(Debug, Default)]
+pub struct DbStats {
+    pub cached_aps: i64,
+    pub pending_aps: i64,
+    pub not_found_aps: i64,
+    pub db_size_bytes: i64,
+    pub api_calls_today: u32,
+}
+
+impl DbRuntime {
+    /// Open/migrate the writer, then open the independent WAL reader. Startup
+    /// coordination itself waits on Tokio's blocking pool; SQLite remains
+    /// confined to the two dedicated actors.
+    pub async fn open(path: &Path) -> Result<(Self, DbHandle)> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::open_blocking(path))
+            .await
+            .context("joining database startup coordinator")?
+    }
+
+    fn open_blocking(path: PathBuf) -> Result<(Self, DbHandle)> {
+        Self::open_blocking_with_reader(path, |reader_path| Database::open_reader(&reader_path))
+    }
+
+    fn open_blocking_with_reader<F>(path: PathBuf, open_reader: F) -> Result<(Self, DbHandle)>
+    where
+        F: FnOnce(PathBuf) -> Result<Database> + Send + 'static,
+    {
+        let writer_path = path.clone();
+        let writer = DbActor::spawn("whereamid-db-writer", move || Database::open(&writer_path))?;
+        let reader = match DbActor::spawn("whereamid-db-reader", move || open_reader(path)) {
+            Ok(reader) => reader,
+            Err(error) => {
+                return match writer.stop_blocking() {
+                    Ok(()) => Err(error.context("opening database reader")),
+                    Err(cleanup) => Err(anyhow::anyhow!(
+                        "opening database reader failed: {error:#}; writer cleanup also failed: {cleanup:#}"
+                    )),
+                };
+            }
+        };
+        let handle = DbHandle {
+            writer: writer.tx.clone(),
+            reader: reader.tx.clone(),
+        };
+        Ok((
+            Self {
+                writer: Some(writer),
+                reader: Some(reader),
+            },
+            handle,
+        ))
+    }
+
+    /// Shut down after all `DbHandle` owners have stopped enqueueing work.
+    /// Both actors are first transferred to one blocking cleanup task, so
+    /// cancelling the async waiter cannot detach either actor. Joining the OS
+    /// threads therefore never blocks a Tokio worker during normal shutdown.
+    pub async fn shutdown(mut self) -> Result<()> {
+        let cleanup = self.schedule_shutdown(None, None);
+        cleanup
+            .await
+            .context("joining database shutdown coordinator")?
+    }
+
+    fn schedule_shutdown(
+        &mut self,
+        writer_stop_queued: Option<tokio::sync::oneshot::Sender<()>>,
+        cleanup_complete: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let writer = self.writer.take().expect("DbRuntime writer already taken");
+        let reader = self.reader.take().expect("DbRuntime reader already taken");
+
+        // There must be no await between taking either actor and scheduling
+        // this closure. Dropping the returned JoinHandle detaches the blocking
+        // task but does not cancel it, so it retains both actors through join.
+        tokio::task::spawn_blocking(move || {
+            let writer = writer.stop_blocking_with_signal(writer_stop_queued);
+            let reader = reader.stop_blocking();
+            let result = Self::combine_shutdown_results(writer, reader);
+            if let Some(cleanup_complete) = cleanup_complete {
+                // Both stop_blocking calls have joined their actor threads.
+                let _ = cleanup_complete.send(());
+            }
+            result
+        })
+    }
+
+    fn combine_shutdown_results(writer: Result<()>, reader: Result<()>) -> Result<()> {
+        match (writer, reader) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(writer), Err(reader)) => Err(anyhow::anyhow!(
+                "writer shutdown failed: {writer:#}; reader shutdown failed: {reader:#}"
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    async fn shutdown_with_signals(
+        mut self,
+        writer_stop_queued: tokio::sync::oneshot::Sender<()>,
+        cleanup_complete: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<()> {
+        let cleanup = self.schedule_shutdown(Some(writer_stop_queued), Some(cleanup_complete));
+        cleanup
+            .await
+            .context("joining database shutdown coordinator")?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_test() -> Result<(Self, DbHandle, Database)> {
+        use rusqlite::OpenFlags;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let uri = format!(
+            "file:whereamid-test-{}?mode=memory&cache=shared",
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let writer_uri = uri.clone();
+        let writer = DbActor::spawn("whereamid-test-db-writer", move || {
+            Database::open_shared_memory(&writer_uri, true)
+        })?;
+        let reader_uri = uri.clone();
+        let reader = DbActor::spawn("whereamid-test-db-reader", move || {
+            Database::open_shared_memory(&reader_uri, false)
+        })?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI;
+        let conn = Connection::open_with_flags(&uri, flags)?;
+        conn.busy_timeout(DB_BUSY_TIMEOUT)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let legacy = Database { conn };
+        let handle = DbHandle {
+            writer: writer.tx.clone(),
+            reader: reader.tx.clone(),
+        };
+        Ok((
+            Self {
+                writer: Some(writer),
+                reader: Some(reader),
+            },
+            handle,
+            legacy,
+        ))
+    }
+}
+
+impl Drop for DbRuntime {
+    fn drop(&mut self) {
+        // Exceptional fallback for owners that never reach explicit shutdown.
+        // This may synchronously wait for active actor work, including when
+        // dropped on a Tokio worker. Normal callers should use `shutdown`,
+        // which transfers both actors to the blocking pool before awaiting.
+        let mut errors = Vec::new();
+        if let Some(writer) = self.writer.take() {
+            if let Err(error) = writer.stop_blocking() {
+                errors.push(format!("writer: {error:#}"));
+            }
+        }
+        if let Some(reader) = self.reader.take() {
+            if let Err(error) = reader.stop_blocking() {
+                errors.push(format!("reader: {error:#}"));
+            }
+        }
+        if !errors.is_empty() {
+            tracing::error!(
+                "fallback database actor shutdown failed: {}",
+                errors.join("; ")
+            );
+        }
+    }
+}
+
+impl DbHandle {
+    async fn call_cancellable<R, F>(
+        sender: &mpsc::Sender<DbCommand>,
+        operation: F,
+        queued: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Database) -> Result<R> + Send + 'static,
+    {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut cancel_on_drop = CancelOnDrop::new(Arc::clone(&cancelled));
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(DbCommand::Run(Box::new(move |db| {
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                let _ = result_tx.send(operation(db));
+            })))
+            .map_err(|_| anyhow::anyhow!("database actor is not running"))?;
+        if let Some(queued) = queued {
+            let _ = queued.send(());
+        }
+        let result = result_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("database actor dropped request without a result"))?;
+        cancel_on_drop.disarm();
+        result
+    }
+
+    async fn call_durable<R, F>(sender: &mpsc::Sender<DbCommand>, operation: F) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Database) -> Result<R> + Send + 'static,
+    {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(DbCommand::Run(Box::new(move |db| {
+                let _ = result_tx.send(operation(db));
+            })))
+            .map_err(|_| anyhow::anyhow!("database actor is not running"))?;
+        result_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("database actor dropped durable request"))?
+    }
+
+    async fn call_interruptible<R, F>(
+        sender: &mpsc::Sender<DbCommand>,
+        operation: F,
+        queued: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Database) -> Result<R> + Send + 'static,
+    {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut cancel_on_drop = CancelOnDrop::new(Arc::clone(&cancelled));
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(DbCommand::Run(Box::new(move |db| {
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                let progress_cancelled = Arc::clone(&cancelled);
+                db.conn.progress_handler(
+                    1_000,
+                    Some(move || progress_cancelled.load(Ordering::Acquire)),
+                );
+                // Always clear the connection-local callback, including when a
+                // buggy operation panics. The outer actor boundary logs the
+                // resumed panic and remains reusable.
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(db)));
+                db.conn.progress_handler(0, None::<fn() -> bool>);
+                match outcome {
+                    Ok(result) => {
+                        let _ = result_tx.send(result);
+                    }
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            })))
+            .map_err(|_| anyhow::anyhow!("database actor is not running"))?;
+        if let Some(queued) = queued {
+            let _ = queued.send(());
+        }
+        let result = result_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("database actor dropped read request"))?;
+        cancel_on_drop.disarm();
+        result
+    }
+
+    async fn write<R, F>(&self, operation: F) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Database) -> Result<R> + Send + 'static,
+    {
+        Self::call_cancellable(&self.writer, operation, None).await
+    }
+
+    async fn write_durable<R, F>(&self, operation: F) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Database) -> Result<R> + Send + 'static,
+    {
+        Self::call_durable(&self.writer, operation).await
+    }
+
+    async fn read<R, F>(&self, operation: F) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Database) -> Result<R> + Send + 'static,
+    {
+        Self::call_interruptible(&self.reader, operation, None).await
+    }
+
+    pub async fn lookup_cached_touch(&self, bssids: Vec<String>) -> Result<Vec<ApInfo>> {
+        self.write(move |db| db.lookup_cached_touch(&bssids)).await
+    }
+
+    pub async fn cache_resolved_ap(&self, ap: ApInfo, delete_pending: bool) -> Result<()> {
+        self.write(move |db| db.cache_resolved_ap(&ap, delete_pending))
+            .await
+    }
+
+    pub async fn is_not_found(&self, bssid: impl Into<String>, ttl_days: i64) -> Result<bool> {
+        let bssid = bssid.into();
+        self.read(move |db| db.is_not_found(&bssid, ttl_days)).await
+    }
+
+    pub async fn record_not_found(
+        &self,
+        bssid: impl Into<String>,
+        delete_pending: bool,
+    ) -> Result<()> {
+        let bssid = bssid.into();
+        self.write(move |db| db.record_not_found(&bssid, delete_pending))
+            .await
+    }
+
+    pub async fn insert_pending_many(&self, bssids: Vec<String>) -> Result<()> {
+        self.write(move |db| db.insert_pending_many(&bssids)).await
+    }
+
+    pub async fn get_pending(&self, limit: usize) -> Result<Vec<(String, i32)>> {
+        self.read(move |db| db.get_pending(limit)).await
+    }
+
+    pub async fn increment_pending_attempts(&self, bssids: Vec<String>) -> Result<()> {
+        self.write(move |db| {
+            let tx = db
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for bssid in bssids {
+                tx.execute(
+                    "UPDATE pending SET attempts = attempts + 1 WHERE bssid = ?1",
+                    params![bssid],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn delete_expired_pending(&self, max_attempts: i32) -> Result<usize> {
+        self.write(move |db| db.delete_expired_pending(max_attempts))
+            .await
+    }
+
+    pub async fn revive_expired_not_found(
+        &self,
+        ttl_days: i64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        self.write(move |db| db.revive_expired_not_found(ttl_days, limit))
+            .await
+    }
+
+    pub async fn get_metadata(&self, key: impl Into<String>) -> Result<Option<String>> {
+        let key = key.into();
+        self.read(move |db| db.get_metadata(&key)).await
+    }
+
+    pub async fn set_metadata(
+        &self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<()> {
+        let key = key.into();
+        let value = value.into();
+        self.write(move |db| db.set_metadata(&key, &value)).await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn reserve_api_call(
+        &self,
+        daily_limit: u32,
+        failures: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<Option<QuotaLease>> {
+        self.reserve_api_call_inner(daily_limit, failures, None, None, None)
+            .await
+    }
+
+    #[allow(dead_code)]
+    async fn reserve_api_call_inner(
+        &self,
+        daily_limit: u32,
+        failures: Arc<std::sync::atomic::AtomicU64>,
+        queued: Option<tokio::sync::oneshot::Sender<()>>,
+        committed_signal: Option<tokio::sync::oneshot::Sender<()>>,
+        release_after_commit: Option<mpsc::Receiver<()>>,
+    ) -> Result<Option<QuotaLease>> {
+        let committed = Arc::new(AtomicBool::new(false));
+        // Construct ownership before enqueue/await. If this future is dropped,
+        // the lease appends its conditional refund behind this command.
+        let mut lease = QuotaLease::new(self.writer.clone(), Arc::clone(&committed), failures);
+        let operation_committed = Arc::clone(&committed);
+        let reservation = Self::call_cancellable(
+            &self.writer,
+            move |db| {
+                let reserved = db.try_reserve_api_call(daily_limit)?;
+                if reserved {
+                    // The DB method returns true only after COMMIT succeeds.
+                    operation_committed.store(true, Ordering::Release);
+                    if let Some(signal) = committed_signal {
+                        let _ = signal.send(());
+                    }
+                    if let Some(release) = release_after_commit {
+                        release.recv().map_err(|_| {
+                            anyhow::anyhow!("reservation test release channel closed")
+                        })?;
+                    }
+                }
+                Ok(reserved)
+            },
+            queued,
+        )
+        .await;
+
+        match reservation {
+            Ok(true) => Ok(Some(lease)),
+            Ok(false) => {
+                lease.disarm();
+                Ok(None)
+            }
+            Err(error) => {
+                // A normal DB error occurs before a successful commit and can
+                // be defused. If a post-commit test gate failed, keep the lease
+                // armed so Drop repairs the committed reservation.
+                if !committed.load(Ordering::Acquire) {
+                    lease.disarm();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn reserve_api_call_with_hooks(
+        &self,
+        daily_limit: u32,
+        failures: Arc<std::sync::atomic::AtomicU64>,
+        hooks: ReservationTestHooks,
+    ) -> Result<Option<QuotaLease>> {
+        self.reserve_api_call_inner(
+            daily_limit,
+            failures,
+            hooks.queued,
+            hooks.committed,
+            hooks.release_after_commit,
+        )
+        .await
+    }
+
+    /// A FIFO writer round-trip used to observe preceding fire-and-forget
+    /// commands (notably quota refunds) without sleeps.
+    #[cfg(test)]
+    pub async fn writer_barrier(&self) -> Result<()> {
+        self.write_durable(|_| Ok(())).await
+    }
+
+    #[cfg(test)]
+    pub async fn hold_writer_until(
+        &self,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    ) -> Result<()> {
+        self.write_durable(move |_| {
+            let _ = entered.send(());
+            release
+                .recv()
+                .map_err(|_| anyhow::anyhow!("test writer release channel closed"))?;
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn hold_reader_until(
+        &self,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    ) -> Result<()> {
+        Self::call_durable(&self.reader, move |_| {
+            let _ = entered.send(());
+            release
+                .recv()
+                .map_err(|_| anyhow::anyhow!("test reader release channel closed"))?;
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn queued_reader_probe(
+        &self,
+        executed: Arc<AtomicBool>,
+        queued: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<()> {
+        Self::call_interruptible(
+            &self.reader,
+            move |_| {
+                executed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            Some(queued),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn actor_observations(
+        &self,
+    ) -> Result<((String, String, i64, u64), (String, String, i64, u64))> {
+        let writer = self
+            .write(|db| {
+                Ok((
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("unnamed")
+                        .to_owned(),
+                    db.conn
+                        .pragma_query_value(None, "journal_mode", |row| row.get(0))?,
+                    db.conn
+                        .pragma_query_value(None, "synchronous", |row| row.get(0))?,
+                    db.conn
+                        .pragma_query_value(None, "busy_timeout", |row| row.get(0))?,
+                ))
+            })
+            .await?;
+        let reader = self
+            .read(|db| {
+                Ok((
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("unnamed")
+                        .to_owned(),
+                    db.conn
+                        .pragma_query_value(None, "journal_mode", |row| row.get(0))?,
+                    db.conn
+                        .pragma_query_value(None, "synchronous", |row| row.get(0))?,
+                    db.conn
+                        .pragma_query_value(None, "busy_timeout", |row| row.get(0))?,
+                ))
+            })
+            .await?;
+        Ok((writer, reader))
+    }
+
+    #[cfg(test)]
+    async fn set_metadata_started(
+        &self,
+        key: String,
+        value: String,
+        started: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<()> {
+        self.write_durable(move |db| {
+            let _ = started.send(());
+            db.set_metadata(&key, &value)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn set_metadata_queued(
+        &self,
+        key: String,
+        value: String,
+        queued: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<()> {
+        Self::call_cancellable(
+            &self.writer,
+            move |db| db.set_metadata(&key, &value),
+            Some(queued),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn run_long_read(&self, started: tokio::sync::oneshot::Sender<()>) -> Result<i64> {
+        self.read(move |db| {
+            let _ = started.send(());
+            db.conn
+                .query_row(
+                    "WITH RECURSIVE counter(x) AS (
+                         VALUES(0) UNION ALL SELECT x + 1 FROM counter WHERE x < 1000000000
+                     ) SELECT sum(x) FROM counter",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) async fn install_writer_commit_counter(
+        &self,
+        commits: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<()> {
+        self.write_durable(move |db| {
+            db.conn.commit_hook(Some(move || {
+                commits.fetch_add(1, Ordering::SeqCst);
+                false
+            }));
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) async fn set_cached_last_seen_for_test(
+        &self,
+        bssids: Vec<String>,
+        value: String,
+    ) -> Result<()> {
+        self.write_durable(move |db| {
+            let tx = db
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for bssid in bssids {
+                tx.execute(
+                    "UPDATE aps SET last_seen = ?1 WHERE bssid = ?2",
+                    params![value, bssid],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) async fn cached_last_seen_for_test(
+        &self,
+        bssids: Vec<String>,
+    ) -> Result<Vec<String>> {
+        self.read(move |db| {
+            bssids
+                .into_iter()
+                .map(|bssid| {
+                    db.conn
+                        .query_row(
+                            "SELECT last_seen FROM aps WHERE bssid = ?1",
+                            params![bssid],
+                            |row| row.get(0),
+                        )
+                        .map_err(Into::into)
+                })
+                .collect()
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn hold_writer_transaction_until(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: mpsc::Receiver<()>,
+    ) -> Result<()> {
+        self.write(move |db| {
+            let tx = db
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Make the transaction a real WAL writer before publishing the
+            // deterministic test boundary.
+            tx.execute(
+                "INSERT INTO metadata (key, value) VALUES ('actor_test_lock', '1')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+            let _ = entered.send(());
+            release
+                .recv()
+                .map_err(|_| anyhow::anyhow!("test transaction release channel closed"))?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn stats(&self) -> Result<DbStats> {
+        self.read(|db| {
+            Ok(DbStats {
+                cached_aps: db.cached_ap_count()?,
+                pending_aps: db.pending_ap_count()?,
+                not_found_aps: db.not_found_ap_count()?,
+                db_size_bytes: db.db_size_bytes()?,
+                api_calls_today: db.api_calls_today().unwrap_or(0),
+            })
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub async fn api_calls_today(&self) -> Result<u32> {
+        self.read(|db| db.api_calls_today()).await
+    }
+
+    pub async fn get_last_fix(&self) -> Result<Option<LastFixRow>> {
+        self.read(|db| db.get_last_fix()).await
+    }
+
+    pub async fn set_last_fix(&self, fix: LastFixRow) -> Result<()> {
+        self.write_durable(move |db| db.set_last_fix(&fix)).await
+    }
+
+    pub async fn persist_fix_and_history(&self, fix: LastFixRow) -> Result<()> {
+        self.write_durable(move |db| db.persist_fix_and_history(&fix))
+            .await
+    }
+
+    pub async fn get_fixes_in_range(
+        &self,
+        start: impl Into<String>,
+        end: impl Into<String>,
+    ) -> Result<Vec<FixRow>> {
+        let start = start.into();
+        let end = end.into();
+        self.read(move |db| db.get_fixes_in_range(&start, &end))
+            .await
+    }
+
+    pub async fn prune_fixes(&self, retention_days: i64) -> Result<usize> {
+        if retention_days <= 0 {
+            return Ok(0);
+        }
+        let cutoff = (Utc::now() - chrono::TimeDelta::days(retention_days)).to_rfc3339();
+        let mut total = 0;
+        loop {
+            let cutoff = cutoff.clone();
+            let deleted = self
+                .write(move |db| db.prune_fixes_chunk(&cutoff, 1_000))
+                .await?;
+            total += deleted;
+            if deleted < 1_000 {
+                return Ok(total);
+            }
+            // Re-enqueue the next chunk at the tail so quota reservations and
+            // shutdown metadata already waiting on the writer get a turn.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub async fn debug_statuses(
+        &self,
+        bssids: Vec<String>,
+        ttl_days: i64,
+    ) -> Result<Vec<(String, DebugDbStatus)>> {
+        self.read(move |db| {
+            bssids
+                .into_iter()
+                .map(|bssid| {
+                    let status = if db.get_ap(&bssid)?.is_some() {
+                        DebugDbStatus::Cached
+                    } else if db.is_not_found(&bssid, ttl_days)? {
+                        DebugDbStatus::NotFound
+                    } else if db.is_pending(&bssid)? {
+                        DebugDbStatus::Pending
+                    } else {
+                        DebugDbStatus::New
+                    };
+                    Ok((bssid, status))
+                })
+                .collect()
+        })
+        .await
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DebugDbStatus {
+    Cached,
+    NotFound,
+    Pending,
+    New,
 }
 
 const SCHEMA_VERSION: i32 = 5;
@@ -182,11 +1240,56 @@ impl Database {
                 wal_mode
             );
         }
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .context("failed to set synchronous=NORMAL")?;
+        conn.busy_timeout(DB_BUSY_TIMEOUT)
+            .context("failed to set SQLite busy timeout")?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("failed to enable foreign keys")?;
 
         let db = Self { conn };
         db.migrate()?;
+        Ok(db)
+    }
+
+    /// Open the independent read actor only after the writer has completed
+    /// migrations. It is intentionally a normal WAL connection (rather than
+    /// SQLite read-only mode) because connection-local pragmas such as
+    /// `synchronous` cannot be reliably configured on every SQLite build for
+    /// a read-only handle. The actor API exposes read operations only.
+    fn open_reader(path: &Path) -> Result<Self> {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        // Deliberately omit SQLITE_OPEN_CREATE. The writer must have opened
+        // and migrated this exact file first; a typo/race must fail instead of
+        // silently creating an empty reader database.
+        let conn = Connection::open_with_flags(path, flags)
+            .with_context(|| format!("failed to open database reader at {}", path.display()))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .context("failed to enable WAL on database reader")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .context("failed to set reader synchronous=NORMAL")?;
+        conn.busy_timeout(DB_BUSY_TIMEOUT)
+            .context("failed to set reader SQLite busy timeout")?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .context("failed to enable reader foreign keys")?;
+        Ok(Self { conn })
+    }
+
+    #[cfg(test)]
+    fn open_shared_memory(uri: &str, migrate: bool) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_URI;
+        let conn = Connection::open_with_flags(uri, flags)?;
+        conn.busy_timeout(DB_BUSY_TIMEOUT)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let db = Self { conn };
+        if migrate {
+            db.migrate()?;
+        }
         Ok(db)
     }
 
@@ -650,11 +1753,16 @@ impl Database {
     ///
     /// `last_seen` is **always** advanced regardless of priority decision —
     /// observing a BSSID is independent of whose data is authoritative.
+    #[cfg(test)]
     pub fn upsert_ap(&self, ap: &ApInfo) -> Result<()> {
+        Self::upsert_ap_on(&self.conn, ap)
+    }
+
+    fn upsert_ap_on(conn: &Connection, ap: &ApInfo) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let source_str = ap.source.as_str();
         let priority = ap.source.priority();
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO aps (bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, source_priority, first_seen, last_seen, fetched_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?12)
              ON CONFLICT(bssid) DO UPDATE SET
@@ -675,14 +1783,60 @@ impl Database {
         Ok(())
     }
 
-    /// Update last_seen for an AP already in the cache.
-    pub fn touch_ap(&self, bssid: &str) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        self.conn.execute(
-            "UPDATE aps SET last_seen = ?1 WHERE bssid = ?2",
-            params![now, bssid],
-        )?;
+    fn cache_resolved_ap(&mut self, ap: &ApInfo, delete_pending: bool) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::upsert_ap_on(&tx, ap)?;
+        if delete_pending {
+            tx.execute("DELETE FROM pending WHERE bssid = ?1", params![ap.bssid])?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Return every cached AP in input order and advance all of their
+    /// `last_seen` values in one IMMEDIATE transaction. A locate with ten
+    /// cache hits therefore performs one commit instead of ten autocommits.
+    fn lookup_cached_touch(&mut self, bssids: &[String]) -> Result<Vec<ApInfo>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+        let mut result = Vec::new();
+        for bssid in bssids {
+            let ap = tx
+                .query_row(
+                    "SELECT bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source
+                     FROM aps WHERE bssid = ?1",
+                    params![bssid],
+                    |row| {
+                        let source_str: String = row.get(9)?;
+                        Ok(ApInfo {
+                            bssid: row.get(0)?,
+                            ssid: row.get(1)?,
+                            lat: row.get(2)?,
+                            lon: row.get(3)?,
+                            encryption: row.get(4)?,
+                            channel: row.get(5)?,
+                            frequency: row.get(6)?,
+                            city: row.get(7)?,
+                            country: row.get(8)?,
+                            source: Source::from_db_str(&source_str),
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(ap) = ap {
+                tx.execute(
+                    "UPDATE aps SET last_seen = ?1 WHERE bssid = ?2",
+                    params![now, bssid],
+                )?;
+                result.push(ap);
+            }
+        }
+        tx.commit()?;
+        Ok(result)
     }
 
     // --- not_found table ---
@@ -699,9 +1853,14 @@ impl Database {
     }
 
     /// Insert into not_found.
+    #[cfg(test)]
     pub fn insert_not_found(&self, bssid: &str) -> Result<()> {
+        Self::insert_not_found_on(&self.conn, bssid)
+    }
+
+    fn insert_not_found_on(conn: &Connection, bssid: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO not_found (bssid, first_seen, last_seen, checked_at)
              VALUES (?1, ?2, ?2, ?2)
              ON CONFLICT(bssid) DO UPDATE SET last_seen = excluded.last_seen, checked_at = excluded.checked_at",
@@ -710,9 +1869,22 @@ impl Database {
         Ok(())
     }
 
+    fn record_not_found(&mut self, bssid: &str, delete_pending: bool) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::insert_not_found_on(&tx, bssid)?;
+        if delete_pending {
+            tx.execute("DELETE FROM pending WHERE bssid = ?1", params![bssid])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     // --- pending table ---
 
     /// Insert a BSSID into the pending queue.
+    #[cfg(test)]
     pub fn insert_pending(
         &self,
         bssid: &str,
@@ -721,8 +1893,19 @@ impl Database {
         frequency: Option<i32>,
         signal_dbm: Option<i32>,
     ) -> Result<()> {
+        Self::insert_pending_on(&self.conn, bssid, ssid, channel, frequency, signal_dbm)
+    }
+
+    fn insert_pending_on(
+        conn: &Connection,
+        bssid: &str,
+        ssid: Option<&str>,
+        channel: Option<i32>,
+        frequency: Option<i32>,
+        signal_dbm: Option<i32>,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO pending (bssid, ssid, channel, frequency, signal_dbm, first_seen, last_seen, attempts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0)
              ON CONFLICT(bssid) DO UPDATE SET
@@ -731,6 +1914,17 @@ impl Database {
                 signal_dbm = CASE WHEN excluded.signal_dbm > pending.signal_dbm THEN excluded.signal_dbm ELSE pending.signal_dbm END",
             params![bssid, ssid, channel, frequency, signal_dbm, now],
         )?;
+        Ok(())
+    }
+
+    fn insert_pending_many(&mut self, bssids: &[String]) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for bssid in bssids {
+            Self::insert_pending_on(&tx, bssid, None, None, None, None)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -776,6 +1970,7 @@ impl Database {
     }
 
     /// Increment attempts for a pending BSSID.
+    #[cfg(test)]
     pub fn increment_pending_attempts(&self, bssid: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE pending SET attempts = attempts + 1 WHERE bssid = ?1",
@@ -785,6 +1980,7 @@ impl Database {
     }
 
     /// Delete a BSSID from the pending table.
+    #[cfg(test)]
     pub fn delete_pending(&self, bssid: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM pending WHERE bssid = ?1", params![bssid])?;
@@ -836,9 +2032,41 @@ impl Database {
     /// SHOULD call [`Database::refund_api_call`] to give the slot back.
     /// Slots that map to actual completed lookups (Found / NotFound) should
     /// not be refunded.
+    #[allow(dead_code)]
     pub fn try_reserve_api_call(&mut self, daily_limit: u32) -> Result<bool> {
+        #[cfg(test)]
+        let result = self.try_reserve_api_call_inner(daily_limit, None);
+        #[cfg(not(test))]
+        let result = self.try_reserve_api_call_inner(daily_limit);
+        result
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn try_reserve_api_call_observing<F>(
+        &mut self,
+        daily_limit: u32,
+        mut observe_transaction: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(rusqlite::TransactionState),
+    {
+        self.try_reserve_api_call_inner(daily_limit, Some(&mut observe_transaction))
+    }
+
+    fn try_reserve_api_call_inner(
+        &mut self,
+        daily_limit: u32,
+        #[cfg(test)] observe_transaction: Option<&mut dyn FnMut(rusqlite::TransactionState)>,
+    ) -> Result<bool> {
         let today = Utc::now().format("%Y-%m-%d").to_string();
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        #[cfg(test)]
+        if let Some(observe_transaction) = observe_transaction {
+            observe_transaction(tx.transaction_state(None)?);
+        }
 
         // Reset counter if the stored date is not today.
         let stored_date: Option<String> = tx
@@ -899,9 +2127,12 @@ impl Database {
     /// Refund a previously reserved API slot. Clamped at 0. Only meaningful
     /// when called on the same calendar day; if the day has rolled over the
     /// refund is silently ignored (counter has already been reset to 0).
+    #[allow(dead_code)]
     pub fn refund_api_call(&mut self) -> Result<()> {
         let today = Utc::now().format("%Y-%m-%d").to_string();
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stored_date: Option<String> = tx
             .query_row(
                 "SELECT value FROM metadata WHERE key = 'api_calls_date'",
@@ -976,25 +2207,35 @@ impl Database {
         Ok(page_count * page_size)
     }
 
-    /// Get expired not_found entries (older than ttl_days) for re-checking.
-    pub fn get_expired_not_found(&self, ttl_days: i64, limit: usize) -> Result<Vec<String>> {
+    /// Atomically move a bounded batch of expired negative-cache entries back
+    /// into pending. This replaces a read followed by two autocommits per row.
+    fn revive_expired_not_found(&mut self, ttl_days: i64, limit: usize) -> Result<Vec<String>> {
         let cutoff = (Utc::now() - chrono::TimeDelta::days(ttl_days)).to_rfc3339();
-        let mut stmt = self
+        let tx = self
             .conn
-            .prepare("SELECT bssid FROM not_found WHERE checked_at <= ?1 LIMIT ?2")?;
-        let rows = stmt.query_map(params![cutoff, limit as i64], |row| row.get(0))?;
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expired = {
+            let mut stmt =
+                tx.prepare("SELECT bssid FROM not_found WHERE checked_at <= ?1 LIMIT ?2")?;
+            let rows = stmt.query_map(params![cutoff, limit as i64], |row| row.get(0))?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row?);
+            }
+            values
+        };
+        let now = Utc::now().to_rfc3339();
+        for bssid in &expired {
+            tx.execute("DELETE FROM not_found WHERE bssid = ?1", params![bssid])?;
+            tx.execute(
+                "INSERT INTO pending (bssid, first_seen, last_seen, attempts)
+                 VALUES (?1, ?2, ?2, 0)
+                 ON CONFLICT(bssid) DO UPDATE SET last_seen = excluded.last_seen",
+                params![bssid, now],
+            )?;
         }
-        Ok(result)
-    }
-
-    /// Delete a BSSID from not_found (e.g., for re-checking).
-    pub fn delete_not_found(&self, bssid: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM not_found WHERE bssid = ?1", params![bssid])?;
-        Ok(())
+        tx.commit()?;
+        Ok(expired)
     }
 
     // --- last_fix table ---
@@ -1004,8 +2245,8 @@ impl Database {
     /// **Invariant: monotonic by `at_rfc3339` — older writes are silently
     /// dropped.** The UPSERT overwrites the existing row only when the
     /// incoming `at_rfc3339` is `>=` the stored one (see the trailing
-    /// `WHERE`). Concurrent locates are already serialized by the daemon's DB
-    /// mutex (task-0046); this guard instead defends against the wall clock
+    /// `WHERE`). Concurrent locates are serialized by the daemon's `last_fix`
+    /// guard and writer FIFO (task-0046); this guard instead defends against the wall clock
     /// moving backwards (NTP step, container time fix on restart) letting a
     /// stale fix clobber a newer one (task-0100).
     ///
@@ -1053,6 +2294,7 @@ impl Database {
     /// so an out-of-order row lands in its correct time bucket. No DB-side
     /// `CHECK` is added — it would require a schema migration and would reject
     /// legitimate skew-affected observations.
+    #[cfg(test)]
     pub fn insert_fix(
         &self,
         at_rfc3339: &str,
@@ -1066,6 +2308,44 @@ impl Database {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![at_rfc3339, lat, lon, accuracy_m, n_sources],
         )?;
+        Ok(())
+    }
+
+    /// Persist the current fix and its history observation in one transaction.
+    /// The monotonic guard in `set_last_fix` remains in force.
+    fn persist_fix_and_history(&mut self, fix: &LastFixRow) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO last_fix (id, lat, lon, accuracy_m, address, at_rfc3339, sources)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                lat = excluded.lat, lon = excluded.lon,
+                accuracy_m = excluded.accuracy_m, address = excluded.address,
+                at_rfc3339 = excluded.at_rfc3339, sources = excluded.sources
+             WHERE excluded.at_rfc3339 >= last_fix.at_rfc3339",
+            params![
+                fix.lat,
+                fix.lon,
+                fix.accuracy_m,
+                fix.address,
+                fix.at_rfc3339,
+                fix.sources
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO fixes (at_rfc3339, lat, lon, accuracy_m, n_sources)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                fix.at_rfc3339,
+                fix.lat,
+                fix.lon,
+                fix.accuracy_m,
+                fix.sources
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1110,6 +2390,7 @@ impl Database {
     /// that this `pub` DELETE fails *safe* (no-op) rather than *catastrophic*
     /// (a negative would make the cutoff a future time and wipe everything)
     /// even if some future caller bypasses `validate`.
+    #[cfg(test)]
     pub fn prune_fixes(&self, retention_days: i64) -> Result<usize> {
         if retention_days <= 0 {
             return Ok(0);
@@ -1119,6 +2400,15 @@ impl Database {
             .conn
             .execute("DELETE FROM fixes WHERE at_rfc3339 < ?1", params![cutoff])?;
         Ok(n)
+    }
+
+    fn prune_fixes_chunk(&mut self, cutoff: &str, limit: usize) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(PRUNE_FIXES_CHUNK_SQL, params![cutoff, limit as i64])?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     /// Read the persisted last-known position, if any.
@@ -1148,6 +2438,619 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_ap(index: usize) -> ApInfo {
+        ApInfo {
+            bssid: format!("02:00:00:00:00:{index:02x}"),
+            ssid: Some(format!("ap-{index}")),
+            lat: 55.67 + index as f64 / 10_000.0,
+            lon: 12.56,
+            encryption: None,
+            channel: Some(1),
+            frequency: Some(2_412),
+            city: None,
+            country: None,
+            source: Source::Apple,
+        }
+    }
+
+    #[test]
+    fn ten_cache_hits_and_fix_persistence_commit_exactly_twice() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut db = Database::open_memory().unwrap();
+        let bssids: Vec<_> = (0..10)
+            .map(|index| {
+                let ap = sample_ap(index);
+                db.upsert_ap(&ap).unwrap();
+                ap.bssid
+            })
+            .collect();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let hook_commits = Arc::clone(&commits);
+        db.conn.commit_hook(Some(move || {
+            hook_commits.fetch_add(1, Ordering::SeqCst);
+            false
+        }));
+
+        let hits = db.lookup_cached_touch(&bssids).unwrap();
+        assert_eq!(hits.len(), 10);
+        db.persist_fix_and_history(&LastFixRow {
+            lat: 55.6761,
+            lon: 12.5683,
+            accuracy_m: 8.0,
+            address: None,
+            at_rfc3339: "2026-07-05T00:00:00+00:00".to_owned(),
+            sources: 10,
+        })
+        .unwrap();
+
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            2,
+            "cache touches and last_fix+history must each use one transaction"
+        );
+    }
+
+    #[test]
+    fn prune_chunk_selection_is_index_search_not_full_scan() {
+        let db = Database::open_memory().unwrap();
+        let explain = format!("EXPLAIN QUERY PLAN {PRUNE_FIXES_CHUNK_SQL}");
+        let mut stmt = db.conn.prepare(&explain).unwrap();
+        let details: Vec<String> = stmt
+            .query_map(params!["2020-01-01T00:00:00+00:00", 1_000_i64], |row| {
+                row.get(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("SEARCH fixes") && detail.contains("idx_fixes_at")
+            }),
+            "expired-row selection must SEARCH idx_fixes_at: {details:?}"
+        );
+        assert!(
+            details.iter().all(|detail| !detail.contains("SCAN fixes")),
+            "prune plan must never full-scan fixes: {details:?}"
+        );
+    }
+
+    #[test]
+    fn prune_chunk_counts_full_partial_then_empty_batches() {
+        let mut db = Database::open_memory().unwrap();
+        let tx = db.conn.transaction().unwrap();
+        for _ in 0..2_505 {
+            tx.execute(
+                "INSERT INTO fixes (at_rfc3339, lat, lon, accuracy_m, n_sources)
+                 VALUES ('2010-01-01T00:00:00+00:00', 1.0, 2.0, 3.0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "INSERT INTO fixes (at_rfc3339, lat, lon, accuracy_m, n_sources)
+             VALUES ('2030-01-01T00:00:00+00:00', 4.0, 5.0, 6.0, 1)",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let cutoff = "2020-01-01T00:00:00+00:00";
+        assert_eq!(db.prune_fixes_chunk(cutoff, 1_000).unwrap(), 1_000);
+        assert_eq!(db.prune_fixes_chunk(cutoff, 1_000).unwrap(), 1_000);
+        assert_eq!(db.prune_fixes_chunk(cutoff, 1_000).unwrap(), 505);
+        assert_eq!(db.prune_fixes_chunk(cutoff, 1_000).unwrap(), 0);
+        assert_eq!(
+            db.get_fixes_in_range("2000-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00")
+                .unwrap()
+                .len(),
+            1,
+            "non-expired fix must remain"
+        );
+    }
+
+    #[test]
+    fn file_database_uses_wal_normal_and_named_busy_timeout() {
+        let dir = unique_tempdir("task0192-pragmas");
+        let path = dir.join("whereami.db");
+        let db = Database::open(&path).unwrap();
+        let journal: String = db
+            .conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = db
+            .conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        let busy_timeout_ms: u64 = db
+            .conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal.to_ascii_lowercase(), "wal");
+        assert_eq!(synchronous, 1, "SQLite NORMAL is numeric mode 1");
+        assert_eq!(busy_timeout_ms, DB_BUSY_TIMEOUT.as_millis() as u64);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reader_open_never_creates_a_missing_database() {
+        let dir = unique_tempdir("task0192-reader-no-create");
+        let path = dir.join("missing.db");
+        assert!(Database::open_reader(&path).is_err());
+        assert!(!path.exists(), "reader flags must omit SQLITE_OPEN_CREATE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_startup_failure_stops_writer_before_returning() {
+        let dir = unique_tempdir("task0192-reader-startup-cleanup");
+        let path = dir.join("whereami.db");
+        let failed_path = path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            DbRuntime::open_blocking_with_reader(failed_path, |_| {
+                anyhow::bail!("injected reader startup failure")
+            })
+        })
+        .await
+        .unwrap();
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("injected reader failure must fail startup"),
+        };
+        assert!(format!("{error:#}").contains("injected reader startup failure"));
+
+        // The failure helper returns only after stop_blocking joined the
+        // writer. A fresh runtime can own the same migrated DB immediately.
+        let (runtime, handle) = DbRuntime::open(&path).await.unwrap();
+        assert_eq!(handle.stats().await.unwrap().cached_aps, 0);
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn actor_drop_stops_and_joins_even_with_surviving_sender() {
+        let actor = DbActor::spawn("whereamid-test-local-drop", Database::open_memory).unwrap();
+        let sender = actor.tx.clone();
+        let (job_started_tx, job_started_rx) = mpsc::channel();
+        let (release_job_tx, release_job_rx) = mpsc::channel();
+        sender
+            .send(DbCommand::Run(Box::new(move |_| {
+                job_started_tx.send(()).unwrap();
+                release_job_rx.recv().unwrap();
+            })))
+            .unwrap();
+        job_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("actor job must start");
+
+        let (drop_started_tx, drop_started_rx) = mpsc::channel();
+        let (cleanup_complete_tx, cleanup_complete_rx) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop_started_tx.send(()).unwrap();
+            drop(actor);
+            // DbActor::drop returns only after its actor thread is joined.
+            cleanup_complete_tx.send(()).unwrap();
+        });
+        drop_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("actor drop must start");
+        release_job_tx.send(()).unwrap();
+        cleanup_complete_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("actor Drop did not complete cleanup");
+        dropper.join().unwrap();
+
+        assert!(
+            sender.send(DbCommand::Run(Box::new(|_| {}))).is_err(),
+            "surviving sender must observe the joined actor receiver as closed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actor_threads_own_sql_and_shutdown_closes_channels() {
+        let dir = unique_tempdir("task0192-actor-lifecycle");
+        let path = dir.join("whereami.db");
+        let (runtime, handle) = DbRuntime::open(&path).await.unwrap();
+        let (writer, reader) = handle.actor_observations().await.unwrap();
+        assert_eq!(writer.0, "whereamid-db-writer");
+        assert_eq!(reader.0, "whereamid-db-reader");
+        for (_, journal, synchronous, busy_timeout_ms) in [writer, reader] {
+            assert_eq!(journal.to_ascii_lowercase(), "wal");
+            assert_eq!(synchronous, 1, "SQLite NORMAL is numeric mode 1");
+            assert_eq!(busy_timeout_ms, DB_BUSY_TIMEOUT.as_millis() as u64);
+        }
+        runtime.shutdown().await.unwrap();
+        assert!(
+            handle.stats().await.is_err(),
+            "commands after lifecycle shutdown must fail, not hang"
+        );
+        drop(handle);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_explicit_shutdown_does_not_detach_actor_cleanup() {
+        let dir = unique_tempdir("task0192-cancelled-shutdown");
+        let path = dir.join("whereami.db");
+        let (runtime, handle) = DbRuntime::open(&path).await.unwrap();
+
+        let (writer_blocked_tx, writer_blocked_rx) = mpsc::channel();
+        let (release_writer_tx, release_writer_rx) = mpsc::channel();
+        let blocker_handle = handle.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_handle
+                .hold_writer_until(writer_blocked_tx, release_writer_rx)
+                .await
+        });
+        writer_blocked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer blocker must start");
+
+        let (writer_stop_queued_tx, writer_stop_queued_rx) = tokio::sync::oneshot::channel();
+        let (cleanup_complete_tx, cleanup_complete_rx) = tokio::sync::oneshot::channel();
+        let shutdown =
+            tokio::spawn(runtime.shutdown_with_signals(writer_stop_queued_tx, cleanup_complete_tx));
+
+        writer_stop_queued_rx
+            .await
+            .expect("blocking cleanup must queue writer Stop");
+        shutdown.abort();
+        assert!(
+            shutdown.await.unwrap_err().is_cancelled(),
+            "outer shutdown waiter must be cancelled for this regression"
+        );
+
+        release_writer_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cleanup_complete_rx)
+            .await
+            .expect("detached cleanup did not finish both actor joins")
+            .expect("cleanup completion signal dropped before both actor joins");
+
+        assert!(
+            handle.writer_barrier().await.is_err(),
+            "writer receiver survived cancelled explicit shutdown"
+        );
+        assert!(
+            handle.stats().await.is_err(),
+            "reader receiver survived cancelled explicit shutdown"
+        );
+        drop(handle);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_drop_stops_and_joins_actors_even_with_surviving_handle() {
+        let dir = unique_tempdir("task0192-runtime-drop");
+        let path = dir.join("whereami.db");
+        let (runtime, handle) = DbRuntime::open(&path).await.unwrap();
+        let survivor = handle.clone();
+        drop(handle);
+        drop(runtime);
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), survivor.stats())
+                .await
+                .expect("surviving handle call hung after runtime Drop")
+                .is_err(),
+            "runtime Drop must close actor receivers despite surviving senders"
+        );
+        drop(survivor);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wal_reader_and_tokio_timer_respond_while_writer_transaction_is_blocked() {
+        let dir = unique_tempdir("task0192-reader-responsive");
+        let path = dir.join("whereami.db");
+        let (runtime, handle) = DbRuntime::open(&path).await.unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker_handle = handle.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_handle
+                .hold_writer_transaction_until(entered_tx, release_rx)
+                .await
+        });
+        entered_rx.await.unwrap();
+
+        let stats = tokio::time::timeout(Duration::from_millis(250), handle.stats()).await;
+        let timer = tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::time::sleep(Duration::from_millis(1)),
+        )
+        .await;
+
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        assert!(timer.is_ok(), "blocked SQLite writer stalled Tokio timer");
+        assert!(
+            matches!(stats, Ok(Ok(_))),
+            "WAL reader did not serve stats while writer was blocked: {stats:?}"
+        );
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_writer_hits_named_busy_timeout_then_retry_succeeds() {
+        let dir = unique_tempdir("task0192-busy-timeout");
+        let path = dir.join("whereami.db");
+        let (runtime, handle) = DbRuntime::open(&path).await.unwrap();
+        let external = Connection::open(&path).unwrap();
+        external.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let write_handle = handle.clone();
+        let write = tokio::spawn(async move {
+            write_handle
+                .set_metadata_started("busy-test".to_owned(), "ok".to_owned(), started_tx)
+                .await
+        });
+        started_rx.await.unwrap();
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(DB_BUSY_TIMEOUT + Duration::from_secs(1), write)
+            .await
+            .expect("writer exceeded the named busy timeout watchdog")
+            .unwrap()
+            .expect_err("external BEGIN IMMEDIATE must hold the writer through timeout");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= DB_BUSY_TIMEOUT.saturating_sub(Duration::from_millis(250)),
+            "SQLite returned before the configured busy timeout: {elapsed:?}"
+        );
+        let sqlite = error
+            .downcast_ref::<rusqlite::Error>()
+            .expect("busy failure must preserve rusqlite root cause");
+        let code = match sqlite {
+            rusqlite::Error::SqliteFailure(error, _) => error.code,
+            other => panic!("expected SQLite busy/locked failure, got {other:?}"),
+        };
+        assert!(matches!(
+            code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        ));
+
+        external.execute_batch("ROLLBACK").unwrap();
+        handle.set_metadata("busy-test", "ok").await.unwrap();
+        assert_eq!(
+            handle.get_metadata("busy-test").await.unwrap().as_deref(),
+            Some("ok")
+        );
+
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reservation_begins_in_write_state() {
+        let mut db = Database::open_memory().unwrap();
+        let mut observed = None;
+        let reserved = db
+            .try_reserve_api_call_observing(1, |state| observed = Some(state))
+            .unwrap();
+        assert!(reserved);
+        assert_eq!(observed, Some(rusqlite::TransactionState::Write));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_queued_write_is_skipped_before_stop_or_later_work() {
+        let (runtime, handle, _legacy) = DbRuntime::open_test().unwrap();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker_handle = handle.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_handle
+                .hold_writer_until(blocked_tx, release_rx)
+                .await
+        });
+        blocked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer blocker must start");
+
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let queued_handle = handle.clone();
+        let queued = tokio::spawn(async move {
+            queued_handle
+                .set_metadata_queued("cancelled-write".to_owned(), "bad".to_owned(), queued_tx)
+                .await
+        });
+        queued_rx.await.unwrap();
+        queued.abort();
+        assert!(queued.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        handle.writer_barrier().await.unwrap();
+
+        assert_eq!(handle.get_metadata("cancelled-write").await.unwrap(), None);
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_queued_reader_is_skipped_and_reader_is_reusable() {
+        let (runtime, handle, _legacy) = DbRuntime::open_test().unwrap();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker_handle = handle.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_handle
+                .hold_reader_until(blocked_tx, release_rx)
+                .await
+        });
+        blocked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader blocker must start");
+
+        let executed = Arc::new(AtomicBool::new(false));
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let queued_handle = handle.clone();
+        let probe_executed = Arc::clone(&executed);
+        let queued = tokio::spawn(async move {
+            queued_handle
+                .queued_reader_probe(probe_executed, queued_tx)
+                .await
+        });
+        queued_rx.await.unwrap();
+        queued.abort();
+        assert!(queued.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "cancelled queued reader operation must not start"
+        );
+        assert_eq!(handle.stats().await.unwrap().cached_aps, 0);
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_active_long_read_interrupts_sql_and_reader_is_reusable() {
+        let dir = unique_tempdir("task0192-interrupt-read");
+        let path = dir.join("whereami.db");
+        let (runtime, handle) = DbRuntime::open(&path).await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let read_handle = handle.clone();
+        let read = tokio::spawn(async move { read_handle.run_long_read(started_tx).await });
+        started_rx.await.unwrap();
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+
+        let stats = tokio::time::timeout(Duration::from_secs(1), handle.stats())
+            .await
+            .expect("cancelled long read did not release reader actor")
+            .expect("reader actor was not reusable after interruption");
+        assert_eq!(stats.cached_aps, 0);
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quota_reservation_cancelled_while_queued_cannot_leak() {
+        let (runtime, handle, _legacy) = DbRuntime::open_test().unwrap();
+        let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker_handle = handle.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_handle
+                .hold_writer_until(blocked_tx, release_rx)
+                .await
+        });
+        blocked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer blocker must start");
+
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let reserve_handle = handle.clone();
+        let reserve_failures = Arc::clone(&failures);
+        let reservation = tokio::spawn(async move {
+            reserve_handle
+                .reserve_api_call_with_hooks(
+                    1,
+                    reserve_failures,
+                    ReservationTestHooks {
+                        queued: Some(queued_tx),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        queued_rx.await.unwrap();
+        reservation.abort();
+        assert!(matches!(reservation.await, Err(error) if error.is_cancelled()));
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        handle.writer_barrier().await.unwrap();
+
+        assert_eq!(handle.api_calls_today().await.unwrap(), 0);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn quota_reservation_cancelled_after_commit_is_refunded() {
+        let (runtime, handle, _legacy) = DbRuntime::open_test().unwrap();
+        let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        handle
+            .install_writer_commit_counter(Arc::clone(&commits))
+            .await
+            .unwrap();
+        commits.store(0, Ordering::SeqCst);
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reserve_handle = handle.clone();
+        let reserve_failures = Arc::clone(&failures);
+        let reservation = tokio::spawn(async move {
+            reserve_handle
+                .reserve_api_call_with_hooks(
+                    1,
+                    reserve_failures,
+                    ReservationTestHooks {
+                        committed: Some(committed_tx),
+                        release_after_commit: Some(release_rx),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        committed_rx.await.unwrap();
+        reservation.abort();
+        assert!(matches!(reservation.await, Err(error) if error.is_cancelled()));
+        release_tx.send(()).unwrap();
+        handle.writer_barrier().await.unwrap();
+
+        assert_eq!(handle.api_calls_today().await.unwrap(), 0);
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            2,
+            "one reservation COMMIT plus exactly one refund COMMIT expected"
+        );
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+        drop(handle);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn two_connections_cannot_overbook_one_quota_slot() {
+        let dir = unique_tempdir("task0192-immediate-reservation");
+        let path = dir.join("whereami.db");
+        let mut first = Database::open(&path).unwrap();
+        let mut second = Database::open(&path).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_barrier = Arc::clone(&barrier);
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.try_reserve_api_call(1)
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            second.try_reserve_api_call(1)
+        });
+        barrier.wait();
+        let outcomes = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+        assert!(outcomes.iter().all(Result::is_ok));
+        assert_eq!(
+            outcomes
+                .into_iter()
+                .filter(|outcome| *outcome.as_ref().unwrap())
+                .count(),
+            1,
+            "IMMEDIATE reservation must grant exactly one slot without SQLITE_BUSY"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn test_schema_creation() {
@@ -1661,15 +3564,10 @@ mod tests {
         assert_eq!(raw, "garbage", "corrupt counter row must be left untouched");
     }
 
-    /// Concurrent reservations must not exceed the daily limit even when
-    /// many threads race on the same Database. Database is !Send-shareable
-    /// across threads (rusqlite Connection), so we wrap it in a Mutex,
-    /// matching the daemon's runtime invariant (DaemonState::db is a Mutex).
-    /// The interesting property is: if two threads both held the lock long
-    /// enough to read the counter independently, they could both decide to
-    /// proceed. With try_reserve_api_call doing its read+increment under a
-    /// single SQL transaction (and held under the outer Mutex), that cannot
-    /// happen.
+    /// Exercise repeated reservations from many caller threads against one
+    /// synchronous Database test fixture. The mutex here only makes the
+    /// fixture shareable; production uses the writer actor, and the separate
+    /// two-connection test above proves SQLite IMMEDIATE contention semantics.
     #[test]
     fn test_rate_limiting_concurrent() {
         use std::sync::{Arc, Mutex};

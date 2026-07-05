@@ -39,9 +39,9 @@ pub async fn run_pending_drain(state: Arc<DaemonState>) {
         }
         // Run one pass, abandoning it promptly if shutdown fires mid-pass.
         // Dropping drain_once mid-flight is safe: resolve_chain never holds the
-        // DB lock across an await, each per-BSSID write is atomic, and a WiGLE
-        // quota slot reserved but not yet consumed is refunded by its RAII
-        // guard on drop (task-0190). This does not change resolve_chain
+        // SQLite resource across an await, actor-side batches are atomic, and
+        // a WiGLE quota lease is conditionally refunded by its Drop protocol
+        // even if cancellation races reservation commit (task-0190/0192). This does not change resolve_chain
         // semantics — it only cancels the in-flight pass.
         tokio::select! {
             biased;
@@ -60,8 +60,7 @@ pub async fn run_pending_drain(state: Arc<DaemonState>) {
 async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32, providers: &[Provider]) {
     // Clean up entries that exceeded max attempts
     {
-        let db = crate::server::lock_db(state);
-        match db.delete_expired_pending(max_attempts) {
+        match state.db.delete_expired_pending(max_attempts).await {
             Ok(deleted) if deleted > 0 => {
                 info!("deleted {deleted} pending entries exceeding {max_attempts} attempts");
             }
@@ -75,19 +74,14 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32, providers: &[Pr
 
     // Re-check expired not_found entries (30 day TTL)
     {
-        let db = crate::server::lock_db(state);
-        match db.get_expired_not_found(state.args.not_found_ttl_days, NOT_FOUND_REVIVAL_BATCH) {
+        match state
+            .db
+            .revive_expired_not_found(state.args.not_found_ttl_days, NOT_FOUND_REVIVAL_BATCH)
+            .await
+        {
             Ok(expired) => {
                 for bssid in expired {
                     debug!("re-checking expired not_found entry: {bssid}");
-                    if let Err(e) = db.delete_not_found(&bssid) {
-                        warn!("failed to delete not_found {bssid}: {e}");
-                        state.record_db_failure();
-                    }
-                    if let Err(e) = db.insert_pending(&bssid, None, None, None, None) {
-                        warn!("failed to insert pending {bssid}: {e}");
-                        state.record_db_failure();
-                    }
                 }
             }
             Err(e) => {
@@ -99,8 +93,7 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32, providers: &[Pr
 
     // Pick up to PENDING_DRAIN_BATCH pending MACs
     let pending = {
-        let db = crate::server::lock_db(state);
-        match db.get_pending(PENDING_DRAIN_BATCH) {
+        match state.db.get_pending(PENDING_DRAIN_BATCH).await {
             Ok(p) => p,
             Err(e) => {
                 warn!("failed to get pending entries: {e}");
@@ -157,12 +150,9 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32, providers: &[Pr
     // here and is bumped too. Harmless — that task's success/not_found deletes
     // the row well before attempts reaches the cap.
     {
-        let db = crate::server::lock_db(state);
-        for bssid in &bssids {
-            if let Err(e) = db.increment_pending_attempts(bssid) {
-                warn!("failed to increment attempts for {bssid}: {e}");
-                state.record_db_failure();
-            }
+        if let Err(e) = state.db.increment_pending_attempts(bssids.clone()).await {
+            warn!("failed to increment pending attempts: {e}");
+            state.record_db_failure();
         }
     }
 }
@@ -171,7 +161,6 @@ async fn drain_once(state: &Arc<DaemonState>, max_attempts: i32, providers: &[Pr
 mod tests {
     use super::*;
     use crate::config::Args;
-    use crate::db::Database;
     use crate::provider::{MockProvider, ProviderOutcome};
     use crate::resolver::{
         resolve_chain, ChainPolicy, HardStopAction, NetErrorAction, NotFoundPolicy, SkipAction,
@@ -180,11 +169,13 @@ mod tests {
     use clap::Parser;
 
     fn test_state() -> Arc<DaemonState> {
-        let db = Database::open_memory().unwrap();
+        let (db_runtime, db, test_db) = crate::db::DbRuntime::open_test().unwrap();
         let args = Args::parse_from(["whereamid"]);
         let shutdown = tokio_util::sync::CancellationToken::new();
         Arc::new(DaemonState {
-            db: std::sync::Mutex::new(db),
+            db,
+            _db_runtime: Some(db_runtime),
+            test_db: std::sync::Mutex::new(test_db),
             debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(10, 5)),
             args,
             wigle: crate::wigle::WigleClient::new("", ""),
@@ -194,7 +185,7 @@ mod tests {
             last_fix: tokio::sync::Mutex::new(None),
             inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             address_cache: std::sync::Mutex::new(AddressCache::new()),
-            db_write_failures: std::sync::atomic::AtomicU64::new(0),
+            db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             shutdown,
             tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
             orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
