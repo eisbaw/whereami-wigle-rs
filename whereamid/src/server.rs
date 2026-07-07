@@ -324,11 +324,12 @@ async fn persist_last_fix_and_history_locked(
     state: &Arc<DaemonState>,
     last: &mut Option<LastFix>,
     new_fix: LastFix,
+    quality: FixQuality,
 ) {
     let row: crate::db::LastFixRow = (&new_fix).into();
     *last = Some(new_fix);
 
-    if let Err(e) = state.db.persist_fix_and_history(row).await {
+    if let Err(e) = state.db.persist_fix_and_history(row, quality).await {
         warn!("failed to persist last_fix and history: {e}");
         state.record_db_failure();
     }
@@ -342,6 +343,7 @@ async fn persist_locate_fix_and_schedule_locked(
     ticket: crate::privacy::PrivacyTicket,
     last: &mut Option<LastFix>,
     mut new_fix: LastFix,
+    quality: FixQuality,
 ) -> Option<String> {
     let (address, row) = {
         let cache = state.address_cache.lock().unwrap_or_else(|error| {
@@ -358,7 +360,7 @@ async fn persist_locate_fix_and_schedule_locked(
         (address, row)
     };
 
-    if let Err(error) = state.db.persist_fix_and_history(row).await {
+    if let Err(error) = state.db.persist_fix_and_history(row, quality).await {
         warn!("failed to persist last_fix and history: {error}");
         state.record_db_failure();
     }
@@ -377,7 +379,13 @@ async fn persist_last_fix_and_history(
         return;
     };
     let mut last = state.last_fix.lock().await;
-    persist_last_fix_and_history_locked(state, &mut last, new_fix).await;
+    persist_last_fix_and_history_locked(
+        state,
+        &mut last,
+        new_fix,
+        FixQuality::new(None, None, None, Confidence::Low, None).expect("test quality is valid"),
+    )
+    .await;
 }
 
 /// Test seam used by geocode scheduler concurrency tests. All publication
@@ -390,7 +398,14 @@ async fn persist_locate_fix_and_schedule(
 ) -> Option<String> {
     let _privacy = state.privacy.read(ticket).await?;
     let mut last = state.last_fix.lock().await;
-    persist_locate_fix_and_schedule_locked(state, ticket, &mut last, new_fix).await
+    persist_locate_fix_and_schedule_locked(
+        state,
+        ticket,
+        &mut last,
+        new_fix,
+        FixQuality::new(None, None, None, Confidence::Low, None).expect("test quality is valid"),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -514,25 +529,7 @@ struct ErrorResponse {
     error: String,
 }
 
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum Confidence {
-    High,
-    Medium,
-    Low,
-    Suspect,
-}
-
-impl std::fmt::Display for Confidence {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Confidence::High => "High",
-            Confidence::Medium => "Medium",
-            Confidence::Low => "Low",
-            Confidence::Suspect => "Suspect",
-        })
-    }
-}
+use crate::quality::{Confidence, FixQuality};
 
 #[derive(Serialize)]
 struct LocateResponse {
@@ -1340,11 +1337,9 @@ enum PlausibilityWinner {
 #[derive(Debug)]
 struct PlausibilityDecision {
     winner: PlausibilityWinner,
-    implied_speed_kmh: Option<f64>,
-    last_fix_age_secs: Option<i64>,
-    inlier_ratio: Option<f64>,
-    confidence: Confidence,
-    suspect_reason: Option<String>,
+    /// The single validated bundle used by both the response and, for a
+    /// current winner, the history INSERT. It is never recomputed downstream.
+    quality: FixQuality,
     distance_m: f64,
     current_score: Option<f64>,
     last_fix_score: Option<f64>,
@@ -1378,15 +1373,25 @@ fn evaluate_plausibility(
     now: chrono::DateTime<chrono::Utc>,
     max_travel_speed_kmh: f64,
 ) -> PlausibilityDecision {
+    // INVARIANT for every FixQuality::new(...).expect(...) below: the bundle is
+    // always valid, so the expect cannot fire. ap_consensus_score returns None
+    // or inliers/len with len >= MIN_CONSENSUS_N (finite, in 0..=1); age_secs is
+    // clamped >= 0; and haversine_kmh clamps a non-positive/backward elapsed to
+    // 0.0 speed, so speed is finite and >= 0. If any of those guards is ever
+    // relaxed, an out-of-domain score/speed would abort the daemon here rather
+    // than merely mis-report a response — keep them intact.
     let current_score = crate::trilaterate::ap_consensus_score(visible_cached, current);
     let Some(previous) = previous else {
         return PlausibilityDecision {
             winner: PlausibilityWinner::CurrentTrilat,
-            implied_speed_kmh: None,
-            last_fix_age_secs: None,
-            inlier_ratio: current_score,
-            confidence: confidence_from_score(current_score),
-            suspect_reason: None,
+            quality: FixQuality::new(
+                None,
+                None,
+                current_score,
+                confidence_from_score(current_score),
+                None,
+            )
+            .expect("plausibility produces a valid cold-start quality bundle"),
             distance_m: 0.0,
             current_score,
             last_fix_score: None,
@@ -1414,11 +1419,14 @@ fn evaluate_plausibility(
     if speed <= max_travel_speed_kmh {
         return PlausibilityDecision {
             winner: PlausibilityWinner::CurrentTrilat,
-            implied_speed_kmh: Some(speed),
-            last_fix_age_secs: Some(age_secs),
-            inlier_ratio: current_score,
-            confidence: confidence_from_score(current_score),
-            suspect_reason: None,
+            quality: FixQuality::new(
+                Some(speed),
+                Some(age_secs),
+                current_score,
+                confidence_from_score(current_score),
+                None,
+            )
+            .expect("plausibility produces a valid normal quality bundle"),
             distance_m,
             current_score,
             last_fix_score: None,
@@ -1451,11 +1459,14 @@ fn evaluate_plausibility(
 
     PlausibilityDecision {
         winner,
-        implied_speed_kmh: Some(speed),
-        last_fix_age_secs: Some(age_secs),
-        inlier_ratio: winner_score,
-        confidence: Confidence::Suspect,
-        suspect_reason: Some(suspect_reason),
+        quality: FixQuality::new(
+            Some(speed),
+            Some(age_secs),
+            winner_score,
+            Confidence::Suspect,
+            Some(suspect_reason),
+        )
+        .expect("plausibility produces a valid suspect quality bundle"),
         distance_m,
         current_score,
         last_fix_score: previous_score,
@@ -2012,7 +2023,7 @@ async fn compute_locate_with_clock(
                 state.args.max_travel_speed_kmh,
             );
 
-            if decision.confidence == Confidence::Suspect {
+            if decision.quality.confidence() == Confidence::Suspect {
                 let (winner, loser) = match decision.winner {
                     PlausibilityWinner::CurrentTrilat => ("current_trilat", "last_fix"),
                     PlausibilityWinner::LastFix => ("last_fix", "current_trilat"),
@@ -2046,7 +2057,7 @@ async fn compute_locate_with_clock(
                         let row: crate::db::LastFixRow = (&new_fix).into();
                         let last_fix_applied = match state
                             .db
-                            .persist_autolocate_fix_and_history(row)
+                            .persist_autolocate_fix_and_history(row, decision.quality.clone())
                             .await
                         {
                             Ok(applied) => applied,
@@ -2075,10 +2086,22 @@ async fn compute_locate_with_clock(
                     }
 
                     let address = if state.args.address_approx {
-                        persist_locate_fix_and_schedule_locked(state, ticket, &mut last, new_fix)
-                            .await
+                        persist_locate_fix_and_schedule_locked(
+                            state,
+                            ticket,
+                            &mut last,
+                            new_fix,
+                            decision.quality.clone(),
+                        )
+                        .await
                     } else {
-                        persist_last_fix_and_history_locked(state, &mut last, new_fix).await;
+                        persist_last_fix_and_history_locked(
+                            state,
+                            &mut last,
+                            new_fix,
+                            decision.quality.clone(),
+                        )
+                        .await;
                         None
                     };
                     (pos.lat, pos.lon, pos.accuracy_m, address)
@@ -2119,11 +2142,11 @@ async fn compute_locate_with_clock(
                 address,
                 stale: false,
                 age_s: None,
-                implied_speed_kmh: decision.implied_speed_kmh,
-                last_fix_age_secs: decision.last_fix_age_secs,
-                inlier_ratio: decision.inlier_ratio,
-                confidence: decision.confidence,
-                suspect_reason: decision.suspect_reason,
+                implied_speed_kmh: decision.quality.implied_speed_kmh(),
+                last_fix_age_secs: decision.quality.last_fix_age_secs(),
+                inlier_ratio: decision.quality.inlier_ratio(),
+                confidence: decision.quality.confidence(),
+                suspect_reason: decision.quality.suspect_reason().map(str::to_owned),
             };
             LocateOutcome::Interactive(ok_json(&resp))
         }
@@ -2486,16 +2509,42 @@ struct RawHistoryFix {
     lon: f64,
     accuracy_m: f64,
     n_sources: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    implied_speed_kmh: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_fix_age_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inlier_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<Confidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suspect_reason: Option<String>,
 }
 
 impl From<crate::db::FixRow> for RawHistoryFix {
     fn from(row: crate::db::FixRow) -> Self {
+        let (implied_speed_kmh, last_fix_age_secs, inlier_ratio, confidence, suspect_reason) = row
+            .quality
+            .map_or((None, None, None, None, None), |quality| {
+                (
+                    quality.implied_speed_kmh(),
+                    quality.last_fix_age_secs(),
+                    quality.inlier_ratio(),
+                    Some(quality.confidence()),
+                    quality.suspect_reason().map(str::to_owned),
+                )
+            });
         Self {
             at_rfc3339: row.at_rfc3339,
             lat: row.lat,
             lon: row.lon,
             accuracy_m: row.accuracy_m,
             n_sources: row.n_sources,
+            implied_speed_kmh,
+            last_fix_age_secs,
+            inlier_ratio,
+            confidence,
+            suspect_reason,
         }
     }
 }
@@ -2744,6 +2793,14 @@ async fn handle_history(
             }
         }
     } else {
+        // Segmentation ignores per-fix quality, but it reads through the same
+        // quality-decoding projection, so a corrupt quality column in ANY row in
+        // range fails the whole (position-only) segmented view, not just raw
+        // history. This is a deliberate fail-loud choice: production only ever
+        // writes validated bundles (FixQuality::new), the DB is single-writer
+        // 0600, and silently serving positions from a DB with detectably-corrupt
+        // rows would violate the fail-fast contract. task-0247 tracks an optional
+        // position-only projection if this blast radius ever needs narrowing.
         match state
             .db
             .get_fixes_in_range_guarded(from.clone(), to.clone(), Arc::clone(&lease))
@@ -3705,6 +3762,28 @@ mod dispatch_tests {
             .len()
     }
 
+    async fn history_rows(state: &Arc<DaemonState>) -> Vec<crate::db::FixRow> {
+        state.db.get_fixes_in_range("0000", "9999").await.unwrap()
+    }
+
+    /// Assert a persisted quality speed equals the speed reported in a locate
+    /// JSON response. Both are the SAME in-memory f64 (`decision.quality`), but
+    /// the DB round-trip is bit-exact while reading the value back out of the
+    /// JSON here goes through serde_json's default float parser, which is not
+    /// guaranteed correctly-rounded (`float_roundtrip` is off) and can land 1
+    /// ULP away. A relative tolerance (~1e-9, ~1e6x the ULP, far below any
+    /// meaningful speed difference) expresses the real "history == response"
+    /// invariant without the ~8% exact-equality flake this used to have.
+    fn assert_speed_matches(persisted: Option<f64>, reported: Option<f64>) {
+        match (persisted, reported) {
+            (Some(persisted), Some(reported)) => assert!(
+                (persisted - reported).abs() <= 1e-9 * persisted.abs().max(1.0),
+                "persisted speed {persisted} disagrees with reported {reported}"
+            ),
+            (persisted, reported) => assert_eq!(persisted, reported),
+        }
+    }
+
     fn scan_snapshot_with_evidence(
         confirmed_refresh_started_at: Option<BootTime>,
     ) -> TimestampedScan {
@@ -3883,6 +3962,16 @@ mod dispatch_tests {
         let outcome = run_autolocate_pass_at(&state, state.privacy.ticket(), now).await;
         assert_eq!(outcome, AutolocateOutcome::Written);
         assert_eq!(history_len(&state).await, 1);
+        let rows = history_rows(&state).await;
+        let quality = rows[0]
+            .quality
+            .as_ref()
+            .expect("new autonomous rows must have quality");
+        assert_eq!(quality.confidence(), Confidence::High);
+        assert_eq!(quality.implied_speed_kmh(), None);
+        assert_eq!(quality.last_fix_age_secs(), None);
+        assert_eq!(quality.inlier_ratio(), Some(1.0));
+        assert_eq!(quality.suspect_reason(), None);
         assert_eq!(
             state
                 .autolocate_fixes_written
@@ -3902,6 +3991,72 @@ mod dispatch_tests {
             state.geocode.snapshot().pending,
             0,
             "autolocate must not schedule Nominatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn task0245_autolocate_suspect_current_persists_exact_decision_quality() {
+        const CURRENT: (f64, f64) = (55.6761, 12.5683);
+        const PREVIOUS: (f64, f64) = (-12.8940, -38.2920);
+        let state = test_state();
+        let now = fixed_autolocate_time();
+        let previous = LastFix {
+            lat: PREVIOUS.0,
+            lon: PREVIOUS.1,
+            accuracy_m: 20.0,
+            address: None,
+            at: now - chrono::TimeDelta::minutes(5),
+            sources: 5,
+        };
+        state
+            .db
+            .set_last_fix(crate::db::LastFixRow::from(&previous))
+            .await
+            .unwrap();
+        *state.last_fix.lock().await = Some(previous);
+
+        let mut sample = crate::debounce::ScanSample::new();
+        for index in 0..4 {
+            add_cached_scan_ap(
+                &state,
+                &mut sample,
+                &format!("02:00:00:00:84:{index:02x}"),
+                CURRENT.0,
+                CURRENT.1,
+                -40 - index,
+                Some("fixed-current"),
+            );
+        }
+        add_cached_scan_ap(
+            &state,
+            &mut sample,
+            "02:00:00:00:84:ff",
+            PREVIOUS.0,
+            PREVIOUS.1,
+            -80,
+            Some("fixed-previous"),
+        );
+        push_stable_scan(&state, sample).await;
+
+        assert_eq!(
+            run_autolocate_pass_at(&state, state.privacy.ticket(), now).await,
+            AutolocateOutcome::Written
+        );
+        let rows = history_rows(&state).await;
+        assert_eq!(rows.len(), 1);
+        let quality = rows[0].quality.as_ref().unwrap();
+        assert_eq!(quality.confidence(), Confidence::Suspect);
+        assert_eq!(quality.last_fix_age_secs(), Some(300));
+        assert_eq!(quality.inlier_ratio(), Some(0.8));
+        assert!(quality.implied_speed_kmh().unwrap() > 250.0);
+        let reason = quality.suspect_reason().unwrap();
+        assert!(
+            reason.contains("tie-break favored current_trilat"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("score current_trilat 0.80 vs last_fix 0.20"),
+            "{reason}"
         );
     }
 
@@ -3933,6 +4088,15 @@ mod dispatch_tests {
             AutolocateOutcome::Deduplicated
         );
         assert_eq!(history_len(&state).await, 1);
+        let rows = history_rows(&state).await;
+        let quality = rows[0]
+            .quality
+            .as_ref()
+            .expect("deduplicated pass must retain first observation quality");
+        assert_eq!(quality.confidence(), Confidence::High);
+        assert_eq!(quality.implied_speed_kmh(), None);
+        assert_eq!(quality.last_fix_age_secs(), None);
+        assert_eq!(quality.inlier_ratio(), Some(1.0));
         assert!(state
             .db
             .cached_last_seen_for_test(bssids)
@@ -4043,6 +4207,12 @@ mod dispatch_tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+        let rows = history_rows(&state).await;
+        let quality = rows[0].quality.as_ref().unwrap();
+        assert_eq!(quality.confidence(), Confidence::High);
+        assert_eq!(quality.implied_speed_kmh(), Some(0.0));
+        assert_eq!(quality.last_fix_age_secs(), Some(0));
+        assert_eq!(quality.inlier_ratio(), Some(1.0));
         assert_eq!(
             state.db.get_last_fix().await.unwrap().unwrap().at_rfc3339,
             future.to_rfc3339()
@@ -4569,8 +4739,8 @@ mod dispatch_tests {
             exact_speed,
         );
         assert_eq!(at_limit.winner, PlausibilityWinner::CurrentTrilat);
-        assert_eq!(at_limit.confidence, Confidence::High);
-        assert!(at_limit.suspect_reason.is_none());
+        assert_eq!(at_limit.quality.confidence(), Confidence::High);
+        assert!(at_limit.quality.suspect_reason().is_none());
 
         let undefined_tie = evaluate_plausibility(
             Some(&previous),
@@ -4580,9 +4750,9 @@ mod dispatch_tests {
             exact_speed - 0.001,
         );
         assert_eq!(undefined_tie.winner, PlausibilityWinner::CurrentTrilat);
-        assert_eq!(undefined_tie.confidence, Confidence::Suspect);
-        assert_eq!(undefined_tie.inlier_ratio, None);
-        let reason = undefined_tie.suspect_reason.unwrap();
+        assert_eq!(undefined_tie.quality.confidence(), Confidence::Suspect);
+        assert_eq!(undefined_tie.quality.inlier_ratio(), None);
+        let reason = undefined_tie.quality.suspect_reason().unwrap();
         assert!(reason.contains("favored current_trilat"), "{reason}");
         assert!(
             reason.contains("score current_trilat n/a vs last_fix n/a"),
@@ -4597,10 +4767,10 @@ mod dispatch_tests {
             exact_speed - 0.001,
         );
         assert_eq!(defined_tie.winner, PlausibilityWinner::CurrentTrilat);
-        assert_eq!(defined_tie.inlier_ratio, Some(0.0));
+        assert_eq!(defined_tie.quality.inlier_ratio(), Some(0.0));
         assert!(defined_tie
-            .suspect_reason
-            .as_deref()
+            .quality
+            .suspect_reason()
             .is_some_and(|reason| reason.contains("score current_trilat 0.00 vs last_fix 0.00")));
     }
 
@@ -4633,8 +4803,8 @@ mod dispatch_tests {
             now,
             250.0,
         );
-        assert_eq!(positive_duration.confidence, Confidence::Suspect);
-        assert!(positive_duration.implied_speed_kmh.unwrap() > 1_000_000_000.0);
+        assert_eq!(positive_duration.quality.confidence(), Confidence::Suspect);
+        assert!(positive_duration.quality.implied_speed_kmh().unwrap() > 1_000_000_000.0);
 
         let future_previous = LastFix {
             at: future,
@@ -4647,9 +4817,9 @@ mod dispatch_tests {
             now,
             1.0,
         );
-        assert_eq!(future_clock.implied_speed_kmh, Some(0.0));
-        assert_eq!(future_clock.last_fix_age_secs, Some(0));
-        assert_eq!(future_clock.confidence, Confidence::High);
+        assert_eq!(future_clock.quality.implied_speed_kmh(), Some(0.0));
+        assert_eq!(future_clock.quality.last_fix_age_secs(), Some(0));
+        assert_eq!(future_clock.quality.confidence(), Confidence::High);
         assert_eq!(future_clock.winner, PlausibilityWinner::CurrentTrilat);
     }
 
@@ -4847,6 +5017,28 @@ mod dispatch_tests {
                 .len(),
             1
         );
+        let rows = history_rows(&state).await;
+        let quality = rows[0]
+            .quality
+            .as_ref()
+            .expect("current winner history must include quality");
+        assert_eq!(quality.confidence(), Confidence::Suspect);
+        // Suspect speeds are large (>250 km/h), so the ULP-scale JSON re-parse
+        // error needs the same relative tolerance as the high-confidence case.
+        assert_speed_matches(
+            quality.implied_speed_kmh(),
+            json["implied_speed_kmh"].as_f64(),
+        );
+        assert_eq!(
+            quality.last_fix_age_secs(),
+            json["last_fix_age_secs"].as_i64()
+        );
+        assert_eq!(quality.inlier_ratio(), json["inlier_ratio"].as_f64());
+        assert_eq!(
+            quality.suspect_reason(),
+            json["suspect_reason"].as_str(),
+            "response and persistence must use the same decision bundle"
+        );
         let memory = state.last_fix.lock().await;
         let memory = memory
             .as_ref()
@@ -4900,6 +5092,20 @@ mod dispatch_tests {
                 .len(),
             1
         );
+        let rows = history_rows(&state).await;
+        let quality = rows[0].quality.as_ref().unwrap();
+        assert_eq!(quality.confidence(), Confidence::High);
+        // Age is i64 (exact) and inlier_ratio is pinned to 1.0 (exact under any
+        // parser); only the speed needs tolerance — see assert_speed_matches.
+        assert_speed_matches(
+            quality.implied_speed_kmh(),
+            json["implied_speed_kmh"].as_f64(),
+        );
+        assert_eq!(
+            quality.last_fix_age_secs(),
+            json["last_fix_age_secs"].as_i64()
+        );
+        assert_eq!(quality.inlier_ratio(), json["inlier_ratio"].as_f64());
     }
 
     #[tokio::test]
@@ -4924,6 +5130,12 @@ mod dispatch_tests {
         assert_eq!(json["ok"], true, "{response}");
         assert_eq!(json["confidence"], "low");
         assert!(json.get("inlier_ratio").is_none());
+        let rows = history_rows(&state).await;
+        let quality = rows[0].quality.as_ref().unwrap();
+        assert_eq!(quality.confidence(), Confidence::Low);
+        assert_eq!(quality.implied_speed_kmh(), None);
+        assert_eq!(quality.last_fix_age_secs(), None);
+        assert_eq!(quality.inlier_ratio(), None);
     }
 
     /// A plausible speed is necessary but not sufficient: mobile hardware can
@@ -6407,6 +6619,146 @@ mod dispatch_tests {
         assert_eq!(segmented_value["segments"].as_array().unwrap().len(), 0);
         assert!(segmented_value.get("range").is_none());
         assert!(segmented_value.get("fixes").is_none());
+    }
+
+    #[tokio::test]
+    async fn task0245_raw_history_emits_known_quality_and_capped_projection() {
+        let state = test_state();
+        let cold = FixQuality::new(None, None, Some(1.0), Confidence::High, None).unwrap();
+        state
+            .db
+            .persist_fix_and_history(
+                crate::db::LastFixRow {
+                    lat: 55.0,
+                    lon: 12.0,
+                    accuracy_m: 10.0,
+                    address: None,
+                    at_rfc3339: "2026-07-05T12:00:00+00:00".to_owned(),
+                    sources: 3,
+                },
+                cold,
+            )
+            .await
+            .unwrap();
+        let suspect = FixQuality::new(
+            Some(321.5),
+            Some(60),
+            Some(0.75),
+            Confidence::Suspect,
+            Some("exact reason".to_owned()),
+        )
+        .unwrap();
+        state
+            .db
+            .persist_fix_and_history(
+                crate::db::LastFixRow {
+                    lat: 56.0,
+                    lon: 13.0,
+                    accuracy_m: 20.0,
+                    address: None,
+                    at_rfc3339: "2026-07-05T12:01:00+00:00".to_owned(),
+                    sources: 4,
+                },
+                suspect,
+            )
+            .await
+            .unwrap();
+
+        let response = dispatch_command(
+            &raw_history_request(
+                "2026-07-05T12:00:00+00:00",
+                "2026-07-05T12:01:00+00:00",
+                Some(1),
+            ),
+            &state,
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["elided"], 1);
+        let fixes = value["fixes"].as_array().unwrap();
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(
+            fixes[0],
+            serde_json::json!({
+                "at_rfc3339": "2026-07-05T12:01:00+00:00",
+                "lat": 56.0,
+                "lon": 13.0,
+                "accuracy_m": 20.0,
+                "n_sources": 4,
+                "implied_speed_kmh": 321.5,
+                "last_fix_age_secs": 60,
+                "inlier_ratio": 0.75,
+                "confidence": "suspect",
+                "suspect_reason": "exact reason"
+            })
+        );
+        drop(response);
+
+        let uncapped = dispatch_command(
+            &raw_history_request(
+                "2026-07-05T12:00:00+00:00",
+                "2026-07-05T12:01:00+00:00",
+                Some(2),
+            ),
+            &state,
+        )
+        .await;
+        let uncapped: serde_json::Value = serde_json::from_str(&uncapped).unwrap();
+        let cold = &uncapped["fixes"][0];
+        assert_eq!(cold["confidence"], "high");
+        assert_eq!(cold["inlier_ratio"], 1.0);
+        for absent in ["implied_speed_kmh", "last_fix_age_secs", "suspect_reason"] {
+            assert!(cold.get(absent).is_none(), "{absent} must be omitted");
+        }
+    }
+
+    #[tokio::test]
+    async fn task0245_quality_metadata_does_not_change_segmented_history_bytes() {
+        let legacy = test_state();
+        let known = test_state();
+        for (timestamp, lat, lon) in [
+            ("2026-07-05T12:00:00+00:00", 55.0, 12.0),
+            ("2026-07-05T12:10:00+00:00", 55.00001, 12.00001),
+        ] {
+            lock_db(&legacy)
+                .insert_fix(timestamp, lat, lon, 10.0, 3)
+                .unwrap();
+            known
+                .db
+                .persist_fix_and_history(
+                    crate::db::LastFixRow {
+                        lat,
+                        lon,
+                        accuracy_m: 10.0,
+                        address: None,
+                        at_rfc3339: timestamp.to_owned(),
+                        sources: 3,
+                    },
+                    FixQuality::new(None, None, Some(1.0), Confidence::High, None).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let request = Request::History {
+            range: None,
+            from: Some("2026-07-05T12:00:00+00:00".to_owned()),
+            to: Some("2026-07-05T12:10:00+00:00".to_owned()),
+            raw: false,
+            max_fixes: None,
+        };
+        let legacy_response = dispatch_command(&request, &legacy).await;
+        let known_response = dispatch_command(&request, &known).await;
+        assert_eq!(&*known_response, &*legacy_response);
+        let value: serde_json::Value = serde_json::from_str(&known_response).unwrap();
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["from", "ok", "segments", "to", "v"]
+        );
     }
 
     #[tokio::test]

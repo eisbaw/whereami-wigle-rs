@@ -17,6 +17,7 @@ mod nominatim;
 mod pending;
 mod privacy;
 mod provider;
+mod quality;
 mod resolver;
 mod scanner;
 mod server;

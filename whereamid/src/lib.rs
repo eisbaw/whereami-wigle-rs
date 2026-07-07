@@ -6,5 +6,6 @@ pub mod db;
 pub mod debounce;
 pub mod geo;
 pub mod http;
+pub mod quality;
 pub mod scanner;
 pub mod trilaterate;

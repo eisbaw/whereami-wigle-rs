@@ -8,7 +8,7 @@
         <mxCell id="title" value="History — stay-point segmentation over the fixes timeseries" style="text;html=1;align=center;verticalAlign=middle;fontSize=18;fontStyle=1;fillColor=none;strokeColor=none;" parent="1" vertex="1">
           <mxGeometry x="200" y="30" width="1000" height="36" as="geometry" />
         </mxCell>
-        <mxCell id="subtitle" value="On-demand. history.rs::segment_fixes groups fixes within 100m into stay-points; segments shorter than 300s are dropped. Centroid via geometric_median. Periodic prune deletes fixes older than retention_days." style="text;html=1;align=center;verticalAlign=middle;fontSize=12;fontStyle=2;fontColor=#666666;fillColor=none;strokeColor=none;" parent="1" vertex="1">
+        <mxCell id="subtitle" value="On-demand. Segmented history ignores per-fix quality; raw history returns the stored optional quality bundle. segment_fixes groups within 100m, drops runs shorter than 300s, and uses geometric_median. Periodic prune applies retention_days." style="text;html=1;align=center;verticalAlign=middle;fontSize=12;fontStyle=2;fontColor=#666666;fillColor=none;strokeColor=none;" parent="1" vertex="1">
           <mxGeometry x="40" y="68" width="1320" height="40" as="geometry" />
         </mxCell>
 
@@ -19,13 +19,13 @@
         <mxCell id="server" value="server.rs&#xa;&#xa;TCP :4747&#xa;dispatch_command" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
           <mxGeometry x="340" y="220" width="200" height="100" as="geometry" />
         </mxCell>
-        <mxCell id="history" value="history.rs&#xa;&#xa;segment_fixes,&#xa;stay-points,&#xa;geometric_median centroid" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
+        <mxCell id="history" value="history.rs / server.rs&#xa;&#xa;segmented: position fields only&#xa;raw: flat optional quality fields" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontSize=13;align=left;spacingLeft=8;" parent="1" vertex="1">
           <mxGeometry x="620" y="200" width="240" height="140" as="geometry" />
         </mxCell>
 
         <!-- fixes table -->
-        <mxCell id="fixes" value="fixes&#xa;at_rfc3339, lat, lon,&#xa;accuracy_m, n_sources" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontSize=12;" parent="1" vertex="1">
-          <mxGeometry x="960" y="220" width="220" height="120" as="geometry" />
+        <mxCell id="fixes" value="fixes (schema v7)&#xa;at, lat, lon, accuracy, sources&#xa;speed + age, inlier ratio,&#xa;confidence + suspect reason&#xa;(all NULL = legacy unknown)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="950" y="200" width="250" height="160" as="geometry" />
         </mxCell>
 
         <!-- Prune loop -->
@@ -38,10 +38,10 @@
         <mxCell id="el_cli_srv" value="JSON request" style="edgeLabel;html=1;fontSize=11;" parent="e_cli_srv" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
 
         <mxCell id="e_srv_hist" style="endArrow=classic;html=1;strokeWidth=2;" parent="1" source="server" target="history" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
-        <mxCell id="el_srv_hist" value="range (from, to) → Vec&amp;lt;Segment&amp;gt;" style="edgeLabel;html=1;fontSize=11;" parent="e_srv_hist" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_srv_hist" value="range + mode" style="edgeLabel;html=1;fontSize=11;" parent="e_srv_hist" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry"><mxPoint x="0" y="-16" as="offset" /></mxGeometry></mxCell>
 
         <mxCell id="e_hist_fixes" style="endArrow=classic;html=1;dashPattern=1 3;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="history" target="fixes" edge="1"><mxGeometry relative="1" as="geometry" /></mxCell>
-        <mxCell id="el_hist_fixes" value="select range → Vec&amp;lt;FixRow&amp;gt;" style="edgeLabel;html=1;fontSize=11;" parent="e_hist_fixes" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry" /></mxCell>
+        <mxCell id="el_hist_fixes" value="select Vec&amp;lt;FixRow&amp;gt;" style="edgeLabel;html=1;fontSize=11;" parent="e_hist_fixes" vertex="1" connectable="0"><mxGeometry x="-0.2" relative="1" as="geometry"><mxPoint x="0" y="-16" as="offset" /></mxGeometry></mxCell>
 
         <mxCell id="e_srv_cli" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#888888;exitX=0;exitY=1;entryX=1;entryY=1;" parent="1" source="server" target="cli" edge="1">
           <mxGeometry relative="1" as="geometry">

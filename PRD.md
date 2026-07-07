@@ -162,7 +162,7 @@ serve split persisted/in-memory state.
 
 ## Data Model (SQLite)
 
-Schema version is **5**. All timestamps are **UTC ISO 8601 / RFC3339**.
+Schema version is **7**. All timestamps are **UTC ISO 8601 / RFC3339**.
 SQLite in **WAL mode** (set on open via `PRAGMA journal_mode=WAL`). Migrations
 run inside transactions and roll back atomically on failure.
 
@@ -189,7 +189,8 @@ CREATE TABLE aps (
                                        -- 40 apple, 30 wigle, 20 beacondb (legacy), 10 manual, 0 unknown
     first_seen      TEXT NOT NULL,
     last_seen       TEXT NOT NULL,
-    fetched_at      TEXT NOT NULL
+    fetched_at      TEXT NOT NULL,
+    is_mobile       INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX idx_aps_geo ON aps(lat, lon);
@@ -245,10 +246,20 @@ CREATE TABLE fixes (
     lat         REAL NOT NULL,
     lon         REAL NOT NULL,
     accuracy_m  REAL NOT NULL,
-    n_sources   INTEGER NOT NULL
+    n_sources   INTEGER NOT NULL,
+    implied_speed_kmh REAL,
+    last_fix_age_secs INTEGER,
+    inlier_ratio      REAL,
+    confidence        TEXT,     -- "high" | "medium" | "low" | "suspect"
+    suspect_reason    TEXT
 );
 CREATE INDEX idx_fixes_at ON fixes(at_rfc3339);
 ```
+
+The five nullable quality columns are one bundle. All five `NULL` identifies a
+pre-v7 legacy row with unknown quality. Every new daemon-written fix has a
+non-NULL `confidence`; speed and age are both absent only when no previous fix
+exists, and `suspect_reason` is present exactly for `suspect` confidence.
 
 The **pending table** acts as a work queue. The daemon drains it in the background whenever WiGLE becomes reachable:
 - On successful lookup: row moves from `pending` to `aps`, deleted from `pending`

@@ -716,6 +716,14 @@ pkgs.testers.runNixOSTest {
           INSERT INTO fixes (
             at_rfc3339, lat, lon, accuracy_m, n_sources
           ) VALUES ('2999-01-01T00:00:00+00:00', 55.123456, 12.654321, 4.0, 1);
+          INSERT INTO fixes (
+            at_rfc3339, lat, lon, accuracy_m, n_sources,
+            implied_speed_kmh, last_fix_age_secs, inlier_ratio,
+            confidence, suspect_reason
+          ) VALUES (
+            '2999-01-01T00:01:00+00:00', 55.223456, 12.754321, 5.0, 2,
+            321.5, 60, 0.75, 'suspect', 'vm quality reason'
+          );
           INSERT INTO last_fix (
             id, lat, lon, accuracy_m, address, at_rfc3339, sources
           ) VALUES (
@@ -734,7 +742,26 @@ pkgs.testers.runNixOSTest {
             "(SELECT count(*) FROM not_found) || ',' || "
             "(SELECT count(*) FROM fixes) || ',' || "
             "(SELECT count(*) FROM last_fix);"
-        ) == "1,1,1,1,1"
+        ) == "1,1,1,2,1"
+
+        expected_quality_columns = {
+            "implied_speed_kmh": "REAL",
+            "last_fix_age_secs": "INTEGER",
+            "inlier_ratio": "REAL",
+            "confidence": "TEXT",
+            "suspect_reason": "TEXT",
+        }
+        for column, declared_type in expected_quality_columns.items():
+            shape = sqlite_value(
+                "SELECT type || ',' || \"notnull\" || ',' || (dflt_value IS NULL) "
+                f"FROM pragma_table_info('fixes') WHERE name = '{column}';"
+            )
+            assert shape == f"{declared_type},0,1", (column, shape)
+        assert sqlite_value(
+            "SELECT (implied_speed_kmh IS NULL) + (last_fix_age_secs IS NULL) + "
+            "(inlier_ratio IS NULL) + (confidence IS NULL) + (suspect_reason IS NULL) "
+            "FROM fixes WHERE at_rfc3339 = '2999-01-01T00:00:00+00:00';"
+        ) == "5", "legacy fixture must remain all-NULL after v7 migration"
 
         # Restart forces last_fix through the production DB rehydration path;
         # locate then proves the sensitive value is live in managed memory.
@@ -746,6 +773,30 @@ pkgs.testers.runNixOSTest {
             timeout=30,
         )
         assert "55.123456" in locate
+
+        raw_history = json.loads(machine.succeed(
+            "runuser -u alice -- env WHEREAMI_SOCKET=/run/whereami/whereamid.sock "
+            "whereami --json history --raw "
+            "--from 2999-01-01T00:00:00+00:00 --to 2999-01-01T00:01:00+00:00"
+        ))
+        assert raw_history["ok"] is True, raw_history
+        assert len(raw_history["fixes"]) == 2, raw_history
+        legacy_fix, quality_fix = raw_history["fixes"]
+        assert set(legacy_fix) == {
+            "at_rfc3339", "lat", "lon", "accuracy_m", "n_sources"
+        }, legacy_fix
+        assert quality_fix == {
+            "at_rfc3339": "2999-01-01T00:01:00+00:00",
+            "lat": 55.223456,
+            "lon": 12.754321,
+            "accuracy_m": 5.0,
+            "n_sources": 2,
+            "implied_speed_kmh": 321.5,
+            "last_fix_age_secs": 60,
+            "inlier_ratio": 0.75,
+            "confidence": "suspect",
+            "suspect_reason": "vm quality reason",
+        }, quality_fix
 
         tcp_refusal = machine.fail(
             "env WHEREAMI_ADDR=127.0.0.1:4747 whereami --json wipe --yes"
@@ -764,7 +815,7 @@ pkgs.testers.runNixOSTest {
             "aps_deleted": 1,
             "pending_deleted": 1,
             "not_found_deleted": 1,
-            "fixes_deleted": 1,
+            "fixes_deleted": 2,
             "last_fix_deleted": 1,
         }, f"unexpected allowedUsers-member wipe response: {member_wipe!r}"
 
@@ -795,9 +846,9 @@ pkgs.testers.runNixOSTest {
             "SELECT value FROM metadata WHERE key = 'wipe-vm-retained';"
         ) == "yes", "wipe must retain operational metadata"
         # Privacy wipe retains the current operational schema marker. This
-        # fixture predates the v6 mobile-AP migration and must track the schema
+        # fixture predates the v7 quality migration and must track the schema
         # version the production daemon actually initialized above.
-        assert sqlite_value("SELECT version FROM schema_version WHERE id = 1;") == "6"
+        assert sqlite_value("SELECT version FROM schema_version WHERE id = 1;") == "7"
 
         after = machine.fail(
             "runuser -u alice -- env WHEREAMI_SOCKET=/run/whereami/whereamid.sock "

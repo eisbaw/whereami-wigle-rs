@@ -213,6 +213,15 @@ struct WipeRequest {
 // --- Response types ---
 
 /// Plausibility confidence attached to every successful locate response.
+///
+/// MIRROR: this is a hand-kept copy of `whereamid`'s `quality::Confidence`
+/// across the crate boundary (no shared protocol crate yet — task-0114). Both
+/// derive `#[serde(rename_all = "lowercase")]` over the SAME variants in the
+/// SAME order, so they MUST serialize to identical tokens. Keep them in
+/// lockstep. The `#[default] High` below is intentional and client-only: an
+/// older daemon predates confidence, so a missing locate field reads High —
+/// but history's field is `Option<Confidence>`, where absence is legacy
+/// unknown (`None`), never High.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Confidence {
@@ -530,6 +539,18 @@ pub struct HistoryFix {
     pub lon: f64,
     pub accuracy_m: f64,
     pub n_sources: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implied_speed_kmh: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fix_age_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inlier_ratio: Option<f64>,
+    /// Unlike locate responses, absent history confidence is legacy unknown
+    /// and must never default to High.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<Confidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspect_reason: Option<String>,
 }
 
 /// Response from an opt-in raw-fix `history` request.
@@ -1305,7 +1326,59 @@ mod history_fixes_wire_tests {
         assert_eq!(response.range.from_rfc3339, "2026-05-09T00:00:00+00:00");
         assert_eq!(response.fixes.len(), 1);
         assert_eq!(response.elided, Some(2));
+        let legacy = &response.fixes[0];
+        assert_eq!(legacy.confidence, None);
+        assert_eq!(legacy.implied_speed_kmh, None);
+        assert_eq!(legacy.last_fix_age_secs, None);
+        assert_eq!(legacy.inlier_ratio, None);
+        assert_eq!(legacy.suspect_reason, None);
         assert!(line.contains(r#""future":"preserve""#));
+    }
+
+    #[test]
+    fn task0245_mixed_quality_rows_are_additive_and_closed_vocabulary() {
+        let line = r#"{"ok":true,"v":1,"range":{"from_rfc3339":"a","to_rfc3339":"b"},"fixes":[{"at_rfc3339":"old","lat":1.0,"lon":2.0,"accuracy_m":3.0,"n_sources":4},{"at_rfc3339":"new","lat":5.0,"lon":6.0,"accuracy_m":7.0,"n_sources":8,"implied_speed_kmh":9.5,"last_fix_age_secs":10,"inlier_ratio":0.75,"confidence":"suspect","suspect_reason":"exact"}]}"#;
+        let response: HistoryFixesResponse = client().parse_response_line(line).unwrap();
+        assert_eq!(response.fixes[0].confidence, None);
+        assert_eq!(response.fixes[1].confidence, Some(Confidence::Suspect));
+        assert_eq!(response.fixes[1].implied_speed_kmh, Some(9.5));
+        assert_eq!(response.fixes[1].last_fix_age_secs, Some(10));
+        assert_eq!(response.fixes[1].inlier_ratio, Some(0.75));
+        assert_eq!(response.fixes[1].suspect_reason.as_deref(), Some("exact"));
+
+        #[derive(Deserialize)]
+        struct LegacyFix {
+            at_rfc3339: String,
+            lat: f64,
+            lon: f64,
+            accuracy_m: f64,
+            n_sources: i64,
+        }
+        #[derive(Deserialize)]
+        struct LegacyEnvelope {
+            fixes: Vec<LegacyFix>,
+        }
+        let old_client: LegacyEnvelope = serde_json::from_str(line).unwrap();
+        assert_eq!(old_client.fixes.len(), 2);
+        assert_eq!(old_client.fixes[1].at_rfc3339, "new");
+        assert_eq!(old_client.fixes[1].lat, 5.0);
+        assert_eq!(old_client.fixes[1].lon, 6.0);
+        assert_eq!(old_client.fixes[1].accuracy_m, 7.0);
+        assert_eq!(old_client.fixes[1].n_sources, 8);
+
+        let unknown = r#"{"ok":true,"v":1,"range":{"from_rfc3339":"a","to_rfc3339":"b"},"fixes":[{"at_rfc3339":"new","lat":1.0,"lon":2.0,"accuracy_m":3.0,"n_sources":4,"confidence":"future"}]}"#;
+        client().validate_history_fixes_response(unknown).unwrap();
+        assert!(client()
+            .parse_response_line::<HistoryFixesResponse>(unknown)
+            .is_err());
+        let (raw_client, _) = tcp_daemon_once(unknown.to_string());
+        assert_eq!(
+            raw_client
+                .history_fixes_raw(Some("24h".to_owned()), None, None, None)
+                .unwrap(),
+            unknown,
+            "raw API must preserve unknown confidence bytes"
+        );
     }
 
     #[test]

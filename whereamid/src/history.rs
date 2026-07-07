@@ -383,6 +383,7 @@ mod tests {
             lon,
             accuracy_m: acc,
             n_sources: 3,
+            quality: None,
         }
     }
 

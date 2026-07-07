@@ -10,6 +10,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tracing::{debug, info};
 
+use crate::quality::{Confidence, FixQuality};
+
 /// Information about a resolved access point.
 #[derive(Debug, Clone)]
 pub struct ApInfo {
@@ -73,7 +75,8 @@ const COUNT_FIXES_IN_RANGE_SQL: &str = "SELECT COUNT(*) FROM fixes INDEXED BY id
      WHERE at_rfc3339 >= ?1 AND at_rfc3339 <= ?2";
 
 const SELECT_NEWEST_FIXES_IN_RANGE_SQL: &str =
-    "SELECT id, at_rfc3339, lat, lon, accuracy_m, n_sources
+    "SELECT id, at_rfc3339, lat, lon, accuracy_m, n_sources,
+            implied_speed_kmh, last_fix_age_secs, inlier_ratio, confidence, suspect_reason
      FROM fixes INDEXED BY idx_fixes_at
      WHERE at_rfc3339 >= ?1 AND at_rfc3339 <= ?2
      ORDER BY at_rfc3339 DESC, id DESC
@@ -1289,17 +1292,25 @@ impl DbHandle {
         self.write_durable(move |db| db.set_last_fix(&fix)).await
     }
 
-    pub async fn persist_fix_and_history(&self, fix: LastFixRow) -> Result<()> {
-        self.write_durable(move |db| db.persist_fix_and_history(&fix))
+    pub async fn persist_fix_and_history(
+        &self,
+        fix: LastFixRow,
+        quality: FixQuality,
+    ) -> Result<()> {
+        self.write_durable(move |db| db.persist_fix_and_history(&fix, &quality))
             .await
     }
 
     /// Persist an autonomous observation and report whether the monotonic
     /// `last_fix` UPSERT accepted its timestamp. The history row commits in
     /// either case; `false` means a newer wall-clock fix remained authoritative.
-    pub async fn persist_autolocate_fix_and_history(&self, fix: LastFixRow) -> Result<bool> {
+    pub async fn persist_autolocate_fix_and_history(
+        &self,
+        fix: LastFixRow,
+        quality: FixQuality,
+    ) -> Result<bool> {
         self.write_durable(move |db| {
-            let outcome = db.persist_fix_and_history_outcome(&fix)?;
+            let outcome = db.persist_fix_and_history_outcome(&fix, &quality)?;
             let applied = matches!(outcome, LastFixUpdate::Applied);
             warn_if_last_fix_dropped(outcome);
             Ok(applied)
@@ -1559,7 +1570,7 @@ pub enum DebugDbStatus {
     New,
 }
 
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CorruptApiCallsValue {
@@ -1624,6 +1635,60 @@ pub struct FixRow {
     pub accuracy_m: f64,
     /// Number of cached APs used to compute this fix.
     pub n_sources: i64,
+    /// `None` is reserved for a legacy row whose five quality columns are all
+    /// NULL. Any partial or malformed persisted bundle is a read error.
+    pub(crate) quality: Option<FixQuality>,
+}
+
+fn corrupt_fix_quality(row_id: i64, message: impl std::fmt::Display) -> rusqlite::Error {
+    // The column index (10 = suspect_reason) and Type::Text are synthetic
+    // placeholders required by the rusqlite error shape; the malformed field may
+    // actually be a REAL. The authoritative context is the row-id + reason in
+    // the boxed message, which callers surface and tests assert on — do not
+    // read the ordinal/type as the true offending column.
+    rusqlite::Error::FromSqlConversionFailure(
+        10,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("corrupt fixes row id {row_id}: {message}"),
+        )),
+    )
+}
+
+fn decode_fix_quality(
+    row_id: i64,
+    implied_speed_kmh: Option<f64>,
+    last_fix_age_secs: Option<i64>,
+    inlier_ratio: Option<f64>,
+    confidence: Option<String>,
+    suspect_reason: Option<String>,
+) -> rusqlite::Result<Option<FixQuality>> {
+    let all_null = implied_speed_kmh.is_none()
+        && last_fix_age_secs.is_none()
+        && inlier_ratio.is_none()
+        && confidence.is_none()
+        && suspect_reason.is_none();
+    if all_null {
+        return Ok(None);
+    }
+    let confidence = confidence.ok_or_else(|| {
+        corrupt_fix_quality(
+            row_id,
+            "quality fields are present without the required confidence",
+        )
+    })?;
+    let confidence =
+        Confidence::from_db_str(&confidence).map_err(|error| corrupt_fix_quality(row_id, error))?;
+    FixQuality::new(
+        implied_speed_kmh,
+        last_fix_age_secs,
+        inlier_ratio,
+        confidence,
+        suspect_reason,
+    )
+    .map(Some)
+    .map_err(|error| corrupt_fix_quality(row_id, error))
 }
 
 /// A bounded newest-page of raw history fixes. `fixes` is returned in
@@ -1972,6 +2037,12 @@ impl Database {
             version = 6;
         }
 
+        if version < 7 {
+            info!("migrating database v{version} -> v7 (fix quality metadata)");
+            self.migrate_v6_to_v7()?;
+            version = 7;
+        }
+
         if version == SCHEMA_VERSION {
             debug!("database schema is up to date (v{version})");
         } else if version > SCHEMA_VERSION {
@@ -2221,6 +2292,64 @@ impl Database {
         })
     }
 
+    /// v6 -> v7: add the nullable quality bundle to history observations.
+    /// Existing rows intentionally remain all-NULL (legacy unknown). Each
+    /// column is probed independently so an interrupted/manual partial repair
+    /// can be completed without duplicate-column failures. A same-named
+    /// column with a different declaration is corruption, not a shape we can
+    /// safely reinterpret.
+    fn migrate_v6_to_v7(&self) -> Result<()> {
+        const COLUMNS: [(&str, &str); 5] = [
+            ("implied_speed_kmh", "REAL"),
+            ("last_fix_age_secs", "INTEGER"),
+            ("inlier_ratio", "REAL"),
+            ("confidence", "TEXT"),
+            ("suspect_reason", "TEXT"),
+        ];
+
+        self.run_migration(|tx| {
+            let mut existing = std::collections::HashMap::new();
+            {
+                let mut statement = tx.prepare("PRAGMA table_info(fixes)")?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (name, declared_type, not_null, default_value) = row?;
+                    existing.insert(name, (declared_type, not_null, default_value));
+                }
+            }
+
+            for (name, expected_type) in COLUMNS {
+                if let Some((declared_type, not_null, default_value)) = existing.get(name) {
+                    if declared_type != expected_type || *not_null != 0 || default_value.is_some() {
+                        anyhow::bail!(
+                            "malformed fixes.{name}: expected {expected_type} NULL with no default, \
+                             found type={declared_type:?} notnull={not_null} default={default_value:?}"
+                        );
+                    }
+                } else {
+                    tx.execute(
+                        &format!("ALTER TABLE fixes ADD COLUMN {name} {expected_type}"),
+                        [],
+                    )
+                    .with_context(|| format!("failed to add fixes.{name} column"))?;
+                }
+            }
+
+            tx.execute(
+                "UPDATE schema_version SET version = ?1 WHERE id = 1",
+                params![7],
+            )?;
+            Ok(())
+        })
+    }
+
     fn get_schema_version(&self) -> i32 {
         // Table may not exist yet
         let result: Result<i32, _> =
@@ -2250,7 +2379,8 @@ impl Database {
     /// task-0191 AC#3: the highest schema version whose on-disk *table shape*
     /// is actually present, capped at the `stamped` version (we never claim a
     /// shape newer than the stored stamp). v4 introduced `last_fix`, v5
-    /// introduced `fixes`, and v6 introduced `aps.is_mobile`. Each layer
+    /// introduced `fixes`, v6 introduced `aps.is_mobile`, and v7 introduced
+    /// the complete five-column history quality bundle. Each layer
     /// depends on the previous one, so a missing earlier shape caps the
     /// satisfied version before it. Versions below 4 touch only tables
     /// create_schema_v1 always creates, so anything < 4 is shape-satisfied by
@@ -2265,7 +2395,47 @@ impl Database {
         if stamped >= 6 && !self.column_exists("aps", "is_mobile") {
             return 5;
         }
+        if stamped >= 7 && !self.fix_quality_columns_have_expected_shape() {
+            return 6;
+        }
         stamped
+    }
+
+    fn fix_quality_columns_have_expected_shape(&self) -> bool {
+        const EXPECTED: [(&str, &str); 5] = [
+            ("implied_speed_kmh", "REAL"),
+            ("last_fix_age_secs", "INTEGER"),
+            ("inlier_ratio", "REAL"),
+            ("confidence", "TEXT"),
+            ("suspect_reason", "TEXT"),
+        ];
+        let Ok(mut statement) = self.conn.prepare("PRAGMA table_info(fixes)") else {
+            return false;
+        };
+        let Ok(rows) = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        }) else {
+            return false;
+        };
+        let mut columns = std::collections::HashMap::new();
+        for row in rows {
+            let Ok((name, declared_type, not_null, default_value)) = row else {
+                return false;
+            };
+            columns.insert(name, (declared_type, not_null, default_value));
+        }
+        EXPECTED.iter().all(|(name, expected_type)| {
+            columns
+                .get(*name)
+                .is_some_and(|(declared_type, not_null, default_value)| {
+                    declared_type == expected_type && *not_null == 0 && default_value.is_none()
+                })
+        })
     }
 
     fn column_exists(&self, table: &str, column: &str) -> bool {
@@ -3022,26 +3192,37 @@ impl Database {
 
     /// Persist the current fix and its history observation in one transaction.
     /// The monotonic guard in `set_last_fix` remains in force.
-    fn persist_fix_and_history(&mut self, fix: &LastFixRow) -> Result<()> {
-        let outcome = self.persist_fix_and_history_outcome(fix)?;
+    fn persist_fix_and_history(&mut self, fix: &LastFixRow, quality: &FixQuality) -> Result<()> {
+        let outcome = self.persist_fix_and_history_outcome(fix, quality)?;
         warn_if_last_fix_dropped(outcome);
         Ok(())
     }
 
-    fn persist_fix_and_history_outcome(&mut self, fix: &LastFixRow) -> Result<LastFixUpdate> {
+    fn persist_fix_and_history_outcome(
+        &mut self,
+        fix: &LastFixRow,
+        quality: &FixQuality,
+    ) -> Result<LastFixUpdate> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let outcome = upsert_last_fix(&tx, fix)?;
         tx.execute(
-            "INSERT INTO fixes (at_rfc3339, lat, lon, accuracy_m, n_sources)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO fixes (
+                 at_rfc3339, lat, lon, accuracy_m, n_sources,
+                 implied_speed_kmh, last_fix_age_secs, inlier_ratio, confidence, suspect_reason
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 fix.at_rfc3339,
                 fix.lat,
                 fix.lon,
                 fix.accuracy_m,
-                fix.sources
+                fix.sources,
+                quality.implied_speed_kmh(),
+                quality.last_fix_age_secs(),
+                quality.inlier_ratio(),
+                quality.confidence().as_db_str(),
+                quality.suspect_reason(),
             ],
         )?;
         tx.commit()?;
@@ -3077,19 +3258,29 @@ impl Database {
         end_rfc3339: &str,
     ) -> Result<Vec<FixRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, at_rfc3339, lat, lon, accuracy_m, n_sources
+            "SELECT id, at_rfc3339, lat, lon, accuracy_m, n_sources,
+                    implied_speed_kmh, last_fix_age_secs, inlier_ratio, confidence, suspect_reason
              FROM fixes
              WHERE at_rfc3339 >= ?1 AND at_rfc3339 <= ?2
              ORDER BY at_rfc3339 ASC",
         )?;
         let rows = stmt.query_map(params![start_rfc3339, end_rfc3339], |r| {
+            let id = r.get(0)?;
             Ok(FixRow {
-                id: r.get(0)?,
+                id,
                 at_rfc3339: r.get(1)?,
                 lat: r.get(2)?,
                 lon: r.get(3)?,
                 accuracy_m: r.get(4)?,
                 n_sources: r.get(5)?,
+                quality: decode_fix_quality(
+                    id,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
+                )?,
             })
         })?;
         let mut out = Vec::new();
@@ -3140,13 +3331,22 @@ impl Database {
 
         let mut statement = tx.prepare(SELECT_NEWEST_FIXES_IN_RANGE_SQL)?;
         let rows = statement.query_map(params![start_rfc3339, end_rfc3339, limit_i64], |row| {
+            let id = row.get(0)?;
             Ok(FixRow {
-                id: row.get(0)?,
+                id,
                 at_rfc3339: row.get(1)?,
                 lat: row.get(2)?,
                 lon: row.get(3)?,
                 accuracy_m: row.get(4)?,
                 n_sources: row.get(5)?,
+                quality: decode_fix_quality(
+                    id,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                )?,
             })
         })?;
         // Deliberately avoid with_capacity(max_fixes): even validated protocol
@@ -3251,6 +3451,11 @@ mod tests {
         field::{Field, Visit},
         span, subscriber, Event, Metadata, Subscriber,
     };
+
+    fn test_quality() -> FixQuality {
+        FixQuality::new(None, None, Some(1.0), Confidence::High, None)
+            .expect("test quality must be valid")
+    }
 
     #[derive(Clone, Default)]
     struct CapturedEvents(Arc<Mutex<Vec<(tracing::Level, String)>>>);
@@ -3410,14 +3615,17 @@ mod tests {
 
         let hits = db.lookup_cached_touch(&bssids).unwrap();
         assert_eq!(hits.len(), 10);
-        db.persist_fix_and_history(&LastFixRow {
-            lat: 55.6761,
-            lon: 12.5683,
-            accuracy_m: 8.0,
-            address: None,
-            at_rfc3339: "2026-07-05T00:00:00+00:00".to_owned(),
-            sources: 10,
-        })
+        db.persist_fix_and_history(
+            &LastFixRow {
+                lat: 55.6761,
+                lon: 12.5683,
+                accuracy_m: 8.0,
+                address: None,
+                at_rfc3339: "2026-07-05T00:00:00+00:00".to_owned(),
+                sources: 10,
+            },
+            &test_quality(),
+        )
         .unwrap();
 
         assert_eq!(
@@ -4717,6 +4925,16 @@ mod tests {
         db
     }
 
+    fn fresh_v6_db() -> Database {
+        let db = fresh_v2_db();
+        db.migrate_v2_to_v3().unwrap();
+        db.migrate_v3_to_v4().unwrap();
+        db.migrate_v4_to_v5().unwrap();
+        db.migrate_v5_to_v6().unwrap();
+        assert_eq!(db.get_schema_version(), 6, "fixture must start at v6");
+        db
+    }
+
     /// task-0191 AC#1/#2: step through the migration chain one version at a
     /// time, asserting the stored stamp AND the table shape after EACH step.
     /// This is the direct regression guard for the v2->v3
@@ -4764,6 +4982,11 @@ mod tests {
         db.migrate_v5_to_v6().unwrap();
         assert_eq!(db.get_schema_version(), 6);
         assert!(db.column_exists("aps", "is_mobile"));
+
+        // --- v6 -> v7: stamp 7, complete nullable quality bundle appears ---
+        db.migrate_v6_to_v7().unwrap();
+        assert_eq!(db.get_schema_version(), 7);
+        assert!(db.fix_quality_columns_have_expected_shape());
     }
 
     /// task-0191 AC#3 (positive): a DB stamped newer than its shape — the
@@ -4878,6 +5101,196 @@ mod tests {
     }
 
     #[test]
+    fn task0245_migrate_v6_to_v7_preserves_legacy_row_and_exact_column_shape() {
+        let db = fresh_v6_db();
+        db.conn
+            .execute(
+                "INSERT INTO fixes (at_rfc3339, lat, lon, accuracy_m, n_sources)
+                 VALUES ('2026-07-05T12:00:00+00:00', 55.0, 12.0, 3.0, 4)",
+                [],
+            )
+            .unwrap();
+
+        db.migrate_v6_to_v7().unwrap();
+
+        assert_eq!(db.get_schema_version(), 7);
+        let mut statement = db.conn.prepare("PRAGMA table_info(fixes)").unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .unwrap();
+        let columns: std::collections::HashMap<_, _> = rows
+            .map(|row| {
+                let (name, declared_type, not_null, default_value) = row.unwrap();
+                (name, (declared_type, not_null, default_value))
+            })
+            .collect();
+        for (name, declared_type) in [
+            ("implied_speed_kmh", "REAL"),
+            ("last_fix_age_secs", "INTEGER"),
+            ("inlier_ratio", "REAL"),
+            ("confidence", "TEXT"),
+            ("suspect_reason", "TEXT"),
+        ] {
+            assert_eq!(
+                columns.get(name),
+                Some(&(declared_type.to_string(), 0, None)),
+                "unexpected declaration for fixes.{name}"
+            );
+        }
+        let quality_nulls: i64 = db
+            .conn
+            .query_row(
+                "SELECT
+                    (implied_speed_kmh IS NULL) + (last_fix_age_secs IS NULL) +
+                    (inlier_ratio IS NULL) + (confidence IS NULL) + (suspect_reason IS NULL)
+                 FROM fixes",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            quality_nulls, 5,
+            "migration must not fabricate legacy quality"
+        );
+    }
+
+    #[test]
+    fn task0245_migrate_v6_to_v7_rolls_back_all_columns_then_retries() {
+        let db = fresh_v6_db();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_v7_stamp
+                 BEFORE UPDATE ON schema_version
+                 WHEN NEW.version = 7
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected v7 stamp failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = db.migrate_v6_to_v7().unwrap_err();
+        assert!(format!("{error:#}").contains("injected v7 stamp failure"));
+        assert_eq!(db.get_schema_version(), 6);
+        for name in [
+            "implied_speed_kmh",
+            "last_fix_age_secs",
+            "inlier_ratio",
+            "confidence",
+            "suspect_reason",
+        ] {
+            assert!(!db.column_exists("fixes", name), "{name} escaped rollback");
+        }
+
+        db.conn.execute("DROP TRIGGER reject_v7_stamp", []).unwrap();
+        db.migrate_v6_to_v7().unwrap();
+        assert_eq!(db.get_schema_version(), 7);
+        assert!(db.fix_quality_columns_have_expected_shape());
+    }
+
+    #[test]
+    fn task0245_v7_shape_repair_completes_every_individual_missing_column() {
+        let expected = [
+            ("implied_speed_kmh", "REAL"),
+            ("last_fix_age_secs", "INTEGER"),
+            ("inlier_ratio", "REAL"),
+            ("confidence", "TEXT"),
+            ("suspect_reason", "TEXT"),
+        ];
+        for omitted in expected.map(|(name, _)| name) {
+            let db = fresh_v6_db();
+            for (name, declared_type) in expected {
+                if name != omitted {
+                    db.conn
+                        .execute(
+                            &format!("ALTER TABLE fixes ADD COLUMN {name} {declared_type}"),
+                            [],
+                        )
+                        .unwrap();
+                }
+            }
+            db.conn
+                .execute("UPDATE schema_version SET version = 7 WHERE id = 1", [])
+                .unwrap();
+
+            db.migrate().unwrap();
+
+            assert_eq!(
+                db.get_schema_version(),
+                7,
+                "failed repair omitting {omitted}"
+            );
+            assert!(
+                db.fix_quality_columns_have_expected_shape(),
+                "incomplete repair omitting {omitted}"
+            );
+        }
+    }
+
+    #[test]
+    fn task0245_v7_partial_repair_preserves_existing_data_and_rejects_malformed_shape() {
+        let db = fresh_v6_db();
+        db.conn
+            .execute("ALTER TABLE fixes ADD COLUMN implied_speed_kmh REAL", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO fixes (
+                    at_rfc3339, lat, lon, accuracy_m, n_sources, implied_speed_kmh
+                 ) VALUES ('2026-07-05T12:00:00+00:00', 1, 2, 3, 4, 12.5)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute("UPDATE schema_version SET version = 7 WHERE id = 1", [])
+            .unwrap();
+        db.migrate().unwrap();
+        let preserved: f64 = db
+            .conn
+            .query_row("SELECT implied_speed_kmh FROM fixes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(preserved, 12.5);
+        assert!(db.fix_quality_columns_have_expected_shape());
+
+        let malformed = fresh_v6_db();
+        malformed
+            .conn
+            .execute(
+                "ALTER TABLE fixes ADD COLUMN confidence INTEGER DEFAULT 0",
+                [],
+            )
+            .unwrap();
+        malformed
+            .conn
+            .execute("UPDATE schema_version SET version = 7 WHERE id = 1", [])
+            .unwrap();
+        let error = malformed.migrate().unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("malformed fixes.confidence"), "{message}");
+        assert!(
+            message.contains("expected TEXT NULL with no default"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn task0245_future_schema_missing_quality_is_never_repaired_down() {
+        let db = fresh_v6_db();
+        db.conn
+            .execute("UPDATE schema_version SET version = 99 WHERE id = 1", [])
+            .unwrap();
+        db.migrate().unwrap();
+        assert_eq!(db.get_schema_version(), 99);
+        assert!(!db.column_exists("fixes", "confidence"));
+    }
+
+    #[test]
     fn migrate_repairs_v6_stamp_missing_is_mobile_column() {
         let db = fresh_v2_db();
         db.migrate_v2_to_v3().unwrap();
@@ -4890,7 +5303,11 @@ mod tests {
 
         db.migrate().unwrap();
 
-        assert_eq!(db.get_schema_version(), 6);
+        // The stamp is repaired down to the true shape (v5, is_mobile absent),
+        // then re-migrated forward all the way to current — restoring is_mobile
+        // (v6) and adding the quality bundle (v7). So the landing stamp tracks
+        // SCHEMA_VERSION, not the literal v6 this test was written against.
+        assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
         assert!(db.column_exists("aps", "is_mobile"));
     }
 
@@ -5537,7 +5954,10 @@ mod tests {
         let captured = CapturedEvents::default();
         let events = captured.clone();
         install_commit_marker(&db, &captured);
-        subscriber::with_default(captured, || db.persist_fix_and_history(&incoming).unwrap());
+        subscriber::with_default(captured, || {
+            db.persist_fix_and_history(&incoming, &test_quality())
+                .unwrap()
+        });
         db.conn.commit_hook(None::<fn() -> bool>);
         let events = events.0.lock().expect("capture lock poisoned").clone();
         assert_one_last_fix_drop_warning(&events, &incoming.at_rfc3339, &stored.at_rfc3339);
@@ -5550,6 +5970,11 @@ mod tests {
             .unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].at_rfc3339, incoming.at_rfc3339);
+        assert_eq!(
+            history[0].quality.as_ref(),
+            Some(&test_quality()),
+            "backward-clock history must retain incoming observation quality"
+        );
     }
 
     #[test]
@@ -5582,7 +6007,8 @@ mod tests {
             sources: 1,
         };
 
-        let (result, events) = capture_events(|| db.persist_fix_and_history(&incoming));
+        let (result, events) =
+            capture_events(|| db.persist_fix_and_history(&incoming, &test_quality()));
         assert!(result.is_err());
         assert!(
             warning_messages(&events)
@@ -5658,6 +6084,7 @@ mod tests {
             .get_fixes_in_range("2026-05-09T00:00:00+00:00", "2026-05-09T23:59:59+00:00")
             .unwrap();
         assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|row| row.quality.is_none()));
         assert_eq!(all[0].at_rfc3339, "2026-05-09T08:00:00+00:00");
         assert_eq!(all[2].at_rfc3339, "2026-05-09T16:00:00+00:00");
 
@@ -5667,6 +6094,129 @@ mod tests {
             .unwrap();
         assert_eq!(mid.len(), 1);
         assert!((mid[0].lat - 55.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn task0245_quality_round_trips_through_full_and_capped_queries() {
+        let mut db = Database::open_memory().unwrap();
+        db.insert_fix("2026-07-05T11:59:00+00:00", 1.0, 2.0, 3.0, 4)
+            .unwrap();
+        let quality = FixQuality::new(
+            Some(123.5),
+            Some(42),
+            Some(0.8),
+            Confidence::Suspect,
+            Some("exact policy reason".to_owned()),
+        )
+        .unwrap();
+        db.persist_fix_and_history(
+            &LastFixRow {
+                lat: 55.0,
+                lon: 12.0,
+                accuracy_m: 9.0,
+                address: None,
+                at_rfc3339: "2026-07-05T12:00:00+00:00".to_owned(),
+                sources: 5,
+            },
+            &quality,
+        )
+        .unwrap();
+
+        let full = db.get_fixes_in_range("0000", "9999").unwrap();
+        assert_eq!(full.len(), 2);
+        assert_eq!(full[0].quality, None, "legacy all-NULL row is unknown");
+        assert_eq!(full[1].quality.as_ref(), Some(&quality));
+
+        let capped = db.get_capped_fixes_in_range("0000", "9999", 1).unwrap();
+        assert_eq!(capped.elided, Some(1));
+        assert_eq!(capped.fixes.len(), 1);
+        assert_eq!(capped.fixes[0].quality.as_ref(), Some(&quality));
+    }
+
+    #[test]
+    fn task0245_quality_zero_and_ratio_boundaries_round_trip() {
+        let mut db = Database::open_memory().unwrap();
+        for (index, ratio) in [0.0, 1.0].into_iter().enumerate() {
+            let quality =
+                FixQuality::new(Some(0.0), Some(0), Some(ratio), Confidence::High, None).unwrap();
+            db.persist_fix_and_history(
+                &LastFixRow {
+                    lat: 1.0,
+                    lon: 2.0,
+                    accuracy_m: 3.0,
+                    address: None,
+                    at_rfc3339: format!("2026-07-05T12:00:0{index}+00:00"),
+                    sources: 4,
+                },
+                &quality,
+            )
+            .unwrap();
+        }
+        let rows = db.get_fixes_in_range("0000", "9999").unwrap();
+        assert_eq!(rows[0].quality.as_ref().unwrap().inlier_ratio(), Some(0.0));
+        assert_eq!(rows[1].quality.as_ref().unwrap().inlier_ratio(), Some(1.0));
+        assert!(rows.iter().all(|row| {
+            let quality = row.quality.as_ref().unwrap();
+            quality.implied_speed_kmh() == Some(0.0) && quality.last_fix_age_secs() == Some(0)
+        }));
+    }
+
+    #[test]
+    fn task0245_corrupt_quality_never_degrades_to_legacy_unknown() {
+        let db = Database::open_memory().unwrap();
+        let cases = [
+            ("-1, 1, NULL, 'high', NULL", "implied speed"),
+            ("1e999, 1, NULL, 'high', NULL", "implied speed"),
+            ("1, NULL, NULL, 'high', NULL", "present together"),
+            ("NULL, NULL, -0.1, 'low', NULL", "inlier ratio"),
+            ("NULL, NULL, 1.1, 'high', NULL", "inlier ratio"),
+            ("NULL, NULL, 1e999, 'high', NULL", "inlier ratio"),
+            ("NULL, NULL, NULL, 'future', NULL", "unknown confidence"),
+            ("NULL, NULL, NULL, 'high', 'wrong'", "only for suspect"),
+            (
+                "NULL, NULL, NULL, 'suspect', NULL",
+                "requires a nonempty reason",
+            ),
+            (
+                "NULL, NULL, NULL, 'suspect', ''",
+                "requires a nonempty reason",
+            ),
+            (
+                "NULL, NULL, 0.5, NULL, NULL",
+                "without the required confidence",
+            ),
+        ];
+        for (values, expected) in cases {
+            db.conn.execute("DELETE FROM fixes", []).unwrap();
+            db.conn
+                .execute_batch(&format!(
+                    "INSERT INTO fixes (
+                        at_rfc3339, lat, lon, accuracy_m, n_sources,
+                        implied_speed_kmh, last_fix_age_secs, inlier_ratio,
+                        confidence, suspect_reason
+                     ) VALUES ('2026-07-05T12:00:00+00:00', 1, 2, 3, 4, {values});"
+                ))
+                .unwrap();
+            let row_id: i64 = db
+                .conn
+                .query_row("SELECT id FROM fixes", [], |row| row.get(0))
+                .unwrap();
+            let error = db.get_fixes_in_range("0000", "9999").unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains(&format!("row id {row_id}")), "{message}");
+            assert!(message.contains(expected), "{message}");
+        }
+
+        db.conn.execute("DELETE FROM fixes", []).unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO fixes (
+                    at_rfc3339, lat, lon, accuracy_m, n_sources, confidence, inlier_ratio
+                 ) VALUES ('2026-07-05T12:00:00+00:00', 1, 2, 3, 4, 'high', 2.0);",
+            )
+            .unwrap();
+        let error = db.get_capped_fixes_in_range("0000", "9999", 1).unwrap_err();
+        assert!(format!("{error:#}").contains("corrupt fixes row id"));
     }
 
     #[test]

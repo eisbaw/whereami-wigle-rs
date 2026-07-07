@@ -451,7 +451,7 @@ erasure deadlines.
 | Store | Personal/operational data | Default lifecycle | Wipe behavior |
 | --- | --- | --- | --- |
 | `aps` | Resolved, stable cached access points: BSSID/SSID, coordinates, radio metadata, provenance, and timestamps | Prune 30 days after `last_seen`; `apsRetentionDays = 0` keeps indefinitely | Rows deleted |
-| `fixes` | Timestamped latitude/longitude, accuracy, and source count | Prune after 30 days; `historyRetentionDays = 0` keeps indefinitely | Rows deleted; its `sqlite_sequence` entry is removed |
+| `fixes` | Timestamped latitude/longitude, accuracy, source count, confidence, optional motion/consensus metrics, and a possible Suspect reason string | Prune after 30 days; `historyRetentionDays = 0` keeps indefinitely | Rows deleted; its `sqlite_sequence` entry is removed |
 | `last_fix` | Latest coordinates, optional address, timestamp, accuracy, and source count | No age pruning; replaced by a newer accepted fix | Row deleted |
 | `pending` | Unresolved BSSID/SSID, radio metadata, timestamps, and attempt count | Queue lifecycle, not days; by default deleted after 20 failed drain passes, with no wall-clock guarantee | Rows deleted |
 | `not_found` | BSSID and observation/check timestamps for negative results | A 30-day TTL makes a row eligible to move back to `pending`; it is not guaranteed deletion on day 30 | Rows deleted |

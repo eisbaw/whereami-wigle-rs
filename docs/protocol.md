@@ -368,12 +368,32 @@ Raw fixes are an explicit alternate response shape:
         "lat": 55.707250,
         "lon": 12.585598,
         "accuracy_m": 12.0,
-        "n_sources": 8
+        "n_sources": 8,
+        "implied_speed_kmh": 18.4,
+        "last_fix_age_secs": 42,
+        "inlier_ratio": 0.83,
+        "confidence": "high"
       }
     ],
     "elided": 27
 }
 ```
+
+The five additive quality fields are `implied_speed_kmh`,
+`last_fix_age_secs`, `inlier_ratio`, `confidence`, and `suspect_reason`.
+They describe the decision made when that observation was appended; they are
+not recomputed when history is read. New rows always include `confidence`.
+Speed and age are omitted together on the first fix, `inlier_ratio` is omitted
+when consensus is undefined, and `suspect_reason` is present exactly for
+`"suspect"`. A pre-v7 row has unknown quality and omits all five keys rather
+than emitting `null` or fabricating High confidence. Thus one response may
+legitimately mix old five-key fixes and quality-bearing fixes.
+
+History uses the same closed confidence vocabulary as `locate`: `"high"`,
+`"medium"`, `"low"`, or `"suspect"`. Typed clients reject an unknown token;
+the raw JSON API still returns the daemon bytes unchanged. Adding a confidence
+token requires a protocol-version bump. Quality never changes stay-point
+segmentation or the legacy `{from,to,segments}` response shape.
 
 `raw:true` bypasses both stay-point thresholds. `max_fixes` is valid only with
 raw mode and must be in `1..=10000`; omission defaults to 1000. The daemon

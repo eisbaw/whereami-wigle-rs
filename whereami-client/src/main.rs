@@ -658,6 +658,22 @@ fn format_history_elapsed(previous: &str, current: &str) -> String {
     }
 }
 
+/// Render one daemon-supplied reason inside a quoted history suffix. Terminal
+/// controls are made visible first, then quote and backslash are escaped so a
+/// reason cannot visually terminate or forge adjacent fields.
+fn quote_history_reason(reason: &str) -> String {
+    let sanitized = sanitize(reason);
+    let mut quoted = String::with_capacity(sanitized.len());
+    for character in sanitized.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            _ => quoted.push(character),
+        }
+    }
+    quoted
+}
+
 /// Render raw history as data rows only. The first shown row is the movement
 /// baseline even when earlier rows were capped, so it never implies a jump
 /// from a hidden fix.
@@ -683,8 +699,37 @@ fn render_history_fixes(response: &HistoryFixesResponse) -> String {
                 format_history_elapsed(&previous.at_rfc3339, &fix.at_rfc3339),
             )
         };
+        let quality = match fix.confidence {
+            None => "[quality=unknown]".to_string(),
+            Some(confidence) => {
+                let speed = fix
+                    .implied_speed_kmh
+                    .map(|value| format!("{value:.1}km/h"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let age = fix
+                    .last_fix_age_secs
+                    .map(|value| format!("{value}s"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let inliers = fix
+                    .inlier_ratio
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let reason = if confidence == Confidence::Suspect {
+                    fix.suspect_reason
+                        .as_deref()
+                        .filter(|reason| !reason.is_empty())
+                        .map(|reason| format!(" reason=\"{}\"", quote_history_reason(reason)))
+                        .unwrap_or_else(|| " reason=n/a".to_string())
+                } else {
+                    String::new()
+                };
+                format!(
+                    "[quality={confidence} speed={speed} last_age={age} inliers={inliers}{reason}]"
+                )
+            }
+        };
         output.push_str(&format!(
-            "{}  {:.6}, {:.6}  ±{}m  {}src  {distance} / {elapsed}\n",
+            "{}  {:.6}, {:.6}  ±{}m  {}src  {distance} / {elapsed}  {quality}\n",
             sanitize(&fix.at_rfc3339),
             fix.lat,
             fix.lon,
@@ -1257,6 +1302,11 @@ mod tests {
                     lon: 12.57933,
                     accuracy_m: 90.4,
                     n_sources: 8,
+                    implied_speed_kmh: None,
+                    last_fix_age_secs: None,
+                    inlier_ratio: None,
+                    confidence: None,
+                    suspect_reason: None,
                 },
                 whereami_client::HistoryFix {
                     at_rfc3339: "2026-05-19T06:43:36+00:00".to_string(),
@@ -1264,6 +1314,11 @@ mod tests {
                     lon: 12.57933,
                     accuracy_m: 10.0,
                     n_sources: 3,
+                    implied_speed_kmh: None,
+                    last_fix_age_secs: None,
+                    inlier_ratio: None,
+                    confidence: None,
+                    suspect_reason: None,
                 },
                 whereami_client::HistoryFix {
                     at_rfc3339: "2026-05-19T07:43:36+00:00".to_string(),
@@ -1271,15 +1326,20 @@ mod tests {
                     lon: 12.57933,
                     accuracy_m: 11.0,
                     n_sources: 4,
+                    implied_speed_kmh: None,
+                    last_fix_age_secs: None,
+                    inlier_ratio: None,
+                    confidence: None,
+                    suspect_reason: None,
                 },
             ],
             None,
         );
         assert_eq!(
             render_history_fixes(&response),
-            "2026-05-19T06:42:36+00:00  55.743910, 12.579330  ±90m  8src  +0.0m / -\n\
-             2026-05-19T06:43:36+00:00  55.743910, 12.579330  ±10m  3src  +0.0m / +1m\n\
-             2026-05-19T07:43:36+00:00  55.743910, 12.579330  ±11m  4src  +0.0m / +1h\n"
+            "2026-05-19T06:42:36+00:00  55.743910, 12.579330  ±90m  8src  +0.0m / -  [quality=unknown]\n\
+             2026-05-19T06:43:36+00:00  55.743910, 12.579330  ±10m  3src  +0.0m / +1m  [quality=unknown]\n\
+             2026-05-19T07:43:36+00:00  55.743910, 12.579330  ±11m  4src  +0.0m / +1h  [quality=unknown]\n"
         );
     }
 
@@ -1300,6 +1360,11 @@ mod tests {
                 lon: 12.57933,
                 accuracy_m: 90.0 - index as f64,
                 n_sources: 8 - index as i64,
+                implied_speed_kmh: None,
+                last_fix_age_secs: None,
+                inlier_ratio: None,
+                confidence: None,
+                suspect_reason: None,
             })
             .collect(),
             None,
@@ -1309,10 +1374,10 @@ mod tests {
         assert_eq!(output.lines().count(), 4, "every raw fix must be shown");
         assert_eq!(
             output,
-            "2026-05-19T06:40:00+00:00  55.743910, 12.579330  ±90m  8src  +0.0m / -\n\
-             2026-05-19T06:40:40+00:00  55.743910, 12.579330  ±89m  7src  +0.0m / +40s\n\
-             2026-05-19T06:41:20+00:00  55.743910, 12.579330  ±88m  6src  +0.0m / +40s\n\
-             2026-05-19T06:42:00+00:00  55.743910, 12.579330  ±87m  5src  +0.0m / +40s\n"
+            "2026-05-19T06:40:00+00:00  55.743910, 12.579330  ±90m  8src  +0.0m / -  [quality=unknown]\n\
+             2026-05-19T06:40:40+00:00  55.743910, 12.579330  ±89m  7src  +0.0m / +40s  [quality=unknown]\n\
+             2026-05-19T06:41:20+00:00  55.743910, 12.579330  ±88m  6src  +0.0m / +40s  [quality=unknown]\n\
+             2026-05-19T06:42:00+00:00  55.743910, 12.579330  ±87m  5src  +0.0m / +40s  [quality=unknown]\n"
         );
     }
 
@@ -1325,6 +1390,11 @@ mod tests {
                 lon: 12.57933,
                 accuracy_m: 90.0,
                 n_sources: 8,
+                implied_speed_kmh: None,
+                last_fix_age_secs: None,
+                inlier_ratio: None,
+                confidence: None,
+                suspect_reason: None,
             }],
             Some(500),
         );
@@ -1334,7 +1404,11 @@ mod tests {
             "... 500 earlier fixes elided; pass --max-fixes <N> or narrow the range"
         );
         assert!(!output.contains('…'));
-        assert!(output.lines().nth(1).unwrap().ends_with("+0.0m / -"));
+        assert!(output
+            .lines()
+            .nth(1)
+            .unwrap()
+            .ends_with("+0.0m / -  [quality=unknown]"));
     }
 
     #[test]
@@ -1390,13 +1464,73 @@ mod tests {
                 lon: 2.0,
                 accuracy_m: 3.0,
                 n_sources: 4,
+                implied_speed_kmh: None,
+                last_fix_age_secs: None,
+                inlier_ratio: None,
+                confidence: None,
+                suspect_reason: None,
             }],
             None,
         );
         let output = render_history_fixes(&response);
         assert_no_raw_control_bytes(&output);
         assert!(output.contains(r"bad\u{1b}[2Jtime"));
-        assert!(output.ends_with("+0.0m / -\n"));
+        assert!(output.ends_with("+0.0m / -  [quality=unknown]\n"));
+    }
+
+    #[test]
+    fn task0245_raw_history_renderer_distinguishes_known_unknown_and_malformed_reason() {
+        let response = raw_history_response(
+            vec![
+                whereami_client::HistoryFix {
+                    at_rfc3339: "2026-05-19T06:42:36+00:00".to_owned(),
+                    lat: 1.0,
+                    lon: 2.0,
+                    accuracy_m: 3.0,
+                    n_sources: 4,
+                    implied_speed_kmh: None,
+                    last_fix_age_secs: None,
+                    inlier_ratio: Some(1.0),
+                    confidence: Some(Confidence::High),
+                    suspect_reason: None,
+                },
+                whereami_client::HistoryFix {
+                    at_rfc3339: "2026-05-19T06:43:36+00:00".to_owned(),
+                    lat: 1.0,
+                    lon: 2.0,
+                    accuracy_m: 3.0,
+                    n_sources: 4,
+                    implied_speed_kmh: Some(321.25),
+                    last_fix_age_secs: Some(60),
+                    inlier_ratio: Some(0.8),
+                    confidence: Some(Confidence::Suspect),
+                    suspect_reason: Some("bad\"\\path\u{1b}[2J".to_owned()),
+                },
+                whereami_client::HistoryFix {
+                    at_rfc3339: "2026-05-19T06:44:36+00:00".to_owned(),
+                    lat: 1.0,
+                    lon: 2.0,
+                    accuracy_m: 3.0,
+                    n_sources: 4,
+                    implied_speed_kmh: Some(0.0),
+                    last_fix_age_secs: Some(0),
+                    inlier_ratio: None,
+                    confidence: Some(Confidence::Suspect),
+                    suspect_reason: None,
+                },
+            ],
+            None,
+        );
+
+        let output = render_history_fixes(&response);
+        let lines: Vec<_> = output.lines().collect();
+        assert!(lines[0].ends_with("[quality=High speed=n/a last_age=n/a inliers=1.00]"));
+        assert!(lines[1].ends_with(
+            r#"[quality=Suspect speed=321.2km/h last_age=60s inliers=0.80 reason="bad\"\\path\\u{1b}[2J"]"#
+        ));
+        assert!(lines[2]
+            .ends_with("[quality=Suspect speed=0.0km/h last_age=0s inliers=n/a reason=n/a]"));
+        assert_no_raw_control_bytes(&output);
     }
 
     #[test]
