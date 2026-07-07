@@ -182,49 +182,22 @@ mod tests {
     //! Direct Drop/consume tests for the WiGLE quota lease (task-0190
     //! AC#4), including the abort-mid-await leak the guard exists to close.
     use super::*;
-    use crate::config::Args;
-    use crate::server::{AddressCache, DaemonState};
-    use clap::Parser;
+    use crate::server::DaemonState;
 
-    // NOTE(task-0230): this is the 5th hand-written DaemonState literal (see
-    // main/pending/resolver/server). Consolidating them is tracked separately.
+    // task-0230: delegate to the single shared constructor in server.rs rather
+    // than hand-writing a DaemonState literal; only the WiGLE client varies here.
     fn test_state() -> Arc<DaemonState> {
-        test_state_with_wigle("", "")
+        crate::server::test_state()
     }
 
     fn test_state_with_wigle(api_user: &str, api_key: &str) -> Arc<DaemonState> {
-        test_state_with_wigle_client(crate::wigle::WigleClient::new(api_user, api_key))
+        crate::server::test_state_with_wigle_client(crate::wigle::WigleClient::new(
+            api_user, api_key,
+        ))
     }
 
     fn test_state_with_wigle_client(wigle: crate::wigle::WigleClient) -> Arc<DaemonState> {
-        let (db_runtime, db, test_db) = crate::db::DbRuntime::open_test().unwrap();
-        let args = Args::parse_from(["whereamid"]);
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        Arc::new(DaemonState {
-            db,
-            _db_runtime: Some(db_runtime),
-            test_db: std::sync::Mutex::new(test_db),
-            debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(10, 5)),
-            privacy: crate::privacy::PrivacyCoordinator::new(),
-            connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
-            args,
-            wigle,
-            apple: crate::apple::AppleClient::new(),
-            nominatim: crate::nominatim::NominatimClient::new(),
-            geocode: crate::server::geocode::GeocodeScheduler::new(shutdown.clone()),
-            last_fix: tokio::sync::Mutex::new(None),
-            inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
-            address_cache: std::sync::Mutex::new(AddressCache::new()),
-            db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            autolocate_fixes_written: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            api_counter_corruption_denials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
-            wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),
-            shutdown,
-            tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
-            privacy_wipes: std::sync::Mutex::new(tokio::task::JoinSet::new()),
-            orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
-        })
+        crate::server::test_state_with_wigle_client(wigle)
     }
 
     async fn reserve(state: &Arc<DaemonState>) -> crate::db::QuotaLease {

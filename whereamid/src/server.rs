@@ -3069,7 +3069,32 @@ pub(crate) fn test_state_with_nominatim(
     nominatim: crate::nominatim::NominatimClient,
 ) -> std::sync::Arc<DaemonState> {
     let (db_runtime, db, test_db) = crate::db::DbRuntime::open_test().unwrap();
-    test_state_with_db(db_runtime, db, test_db, nominatim)
+    test_state_with_db(
+        db_runtime,
+        db,
+        test_db,
+        crate::wigle::WigleClient::new("", ""),
+        nominatim,
+    )
+}
+
+/// task-0230: single shared test-only DaemonState constructor with a
+/// customizable WiGLE client, opening its own in-memory test DB. The
+/// provider/pending/resolver test modules route through this (and `test_state`)
+/// instead of hand-writing their own struct literals, so a new DaemonState
+/// field is added in exactly one place — `test_state_with_db` below.
+#[cfg(test)]
+pub(crate) fn test_state_with_wigle_client(
+    wigle: crate::wigle::WigleClient,
+) -> std::sync::Arc<DaemonState> {
+    let (db_runtime, db, test_db) = crate::db::DbRuntime::open_test().unwrap();
+    test_state_with_db(
+        db_runtime,
+        db,
+        test_db,
+        wigle,
+        crate::nominatim::NominatimClient::new(),
+    )
 }
 
 #[cfg(test)]
@@ -3077,9 +3102,13 @@ fn test_state_with_db(
     db_runtime: crate::db::DbRuntime,
     db: crate::db::DbHandle,
     test_db: crate::db::Database,
+    wigle: crate::wigle::WigleClient,
     nominatim: crate::nominatim::NominatimClient,
 ) -> std::sync::Arc<DaemonState> {
     use clap::Parser;
+    // Args defaults set debounce_window=10, debounce_threshold=5 — the exact
+    // values the former provider/pending/resolver literals hardcoded, so the
+    // args-derived debouncer here is behavior-identical to those call sites.
     let args = crate::config::Args::parse_from(["whereamid"]);
     let shutdown = tokio_util::sync::CancellationToken::new();
     std::sync::Arc::new(DaemonState {
@@ -3091,7 +3120,7 @@ fn test_state_with_db(
             args.debounce_threshold,
         )),
         privacy: crate::privacy::PrivacyCoordinator::new(),
-        wigle: crate::wigle::WigleClient::new("", ""),
+        wigle,
         apple: crate::apple::AppleClient::new(),
         nominatim,
         geocode: geocode::GeocodeScheduler::new(shutdown.clone()),
@@ -5355,6 +5384,7 @@ mod dispatch_tests {
             db_runtime,
             db,
             crate::db::Database::open_memory().unwrap(),
+            crate::wigle::WigleClient::new("", ""),
             crate::nominatim::NominatimClient::new(),
         );
         *state.last_fix.lock().await = Some(LastFix {

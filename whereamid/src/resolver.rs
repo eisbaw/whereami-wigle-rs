@@ -641,44 +641,16 @@ pub async fn resolve_background(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Args;
     use crate::db::{ApInfo, Source};
     use crate::provider::MockProvider;
-    use crate::server::{AddressCache, DaemonState};
-    use clap::Parser;
+    use crate::server::DaemonState;
 
-    /// Build a minimal DaemonState backed by an in-memory DB.
-    /// The Apple/WiGLE/Nominatim clients are real but never called when the
-    /// test uses only Provider::Mock(...) as the chain providers.
+    /// Build a minimal DaemonState backed by an in-memory DB via the single
+    /// shared test constructor (task-0230). The Apple/WiGLE/Nominatim clients
+    /// are real but never called when the test uses only Provider::Mock(...) as
+    /// the chain providers.
     fn test_state() -> Arc<DaemonState> {
-        let (db_runtime, db, test_db) = crate::db::DbRuntime::open_test().unwrap();
-        let args = Args::parse_from(["whereamid"]);
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        Arc::new(DaemonState {
-            db,
-            _db_runtime: Some(db_runtime),
-            test_db: std::sync::Mutex::new(test_db),
-            debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(10, 5)),
-            privacy: crate::privacy::PrivacyCoordinator::new(),
-            connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
-            args,
-            wigle: crate::wigle::WigleClient::new("", ""),
-            apple: crate::apple::AppleClient::new(),
-            nominatim: crate::nominatim::NominatimClient::new(),
-            geocode: crate::server::geocode::GeocodeScheduler::new(shutdown.clone()),
-            last_fix: tokio::sync::Mutex::new(None),
-            inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
-            address_cache: std::sync::Mutex::new(AddressCache::new()),
-            db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            autolocate_fixes_written: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            api_counter_corruption_denials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
-            wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),
-            shutdown,
-            tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
-            privacy_wipes: std::sync::Mutex::new(tokio::task::JoinSet::new()),
-            orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
-        })
+        crate::server::test_state()
     }
 
     fn mk_ap(bssid: &str, lat: f64, lon: f64, source: Source) -> ApInfo {

@@ -191,43 +191,14 @@ async fn drain_once(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Args;
     use crate::provider::{MockProvider, ProviderOutcome};
     use crate::resolver::{
         resolve_chain, ChainPolicy, HardStopAction, NetErrorAction, NotFoundPolicy, SkipAction,
     };
-    use crate::server::{AddressCache, DaemonState};
-    use clap::Parser;
-
+    use crate::server::DaemonState;
+    // task-0230: delegate to the single shared DaemonState constructor.
     fn test_state() -> Arc<DaemonState> {
-        let (db_runtime, db, test_db) = crate::db::DbRuntime::open_test().unwrap();
-        let args = Args::parse_from(["whereamid"]);
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        Arc::new(DaemonState {
-            db,
-            _db_runtime: Some(db_runtime),
-            test_db: std::sync::Mutex::new(test_db),
-            debouncer: tokio::sync::Mutex::new(crate::debounce::Debouncer::new(10, 5)),
-            privacy: crate::privacy::PrivacyCoordinator::new(),
-            connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
-            args,
-            wigle: crate::wigle::WigleClient::new("", ""),
-            apple: crate::apple::AppleClient::new(),
-            nominatim: crate::nominatim::NominatimClient::new(),
-            geocode: crate::server::geocode::GeocodeScheduler::new(shutdown.clone()),
-            last_fix: tokio::sync::Mutex::new(None),
-            inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
-            address_cache: std::sync::Mutex::new(AddressCache::new()),
-            db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            autolocate_fixes_written: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            api_counter_corruption_denials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            history_slot: Arc::new(tokio::sync::Semaphore::new(1)),
-            wipe_slot: Arc::new(tokio::sync::Semaphore::new(1)),
-            shutdown,
-            tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
-            privacy_wipes: std::sync::Mutex::new(tokio::task::JoinSet::new()),
-            orphan_tasks_aborted: std::sync::atomic::AtomicU64::new(0),
-        })
+        crate::server::test_state()
     }
 
     fn drain_policy() -> ChainPolicy {
