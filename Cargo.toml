@@ -1,3 +1,11 @@
 [workspace]
 members = ["whereamid", "whereami-client", "whereami-build-utils"]
 resolver = "2"
+
+# Single source of truth for fields shared by every member crate (task-0260).
+# Bump the version here, not in three manifests; the daemon/CLI wire version is
+# separate (whereamid::WIRE_VERSION / whereami-client::SUPPORTED_PROTOCOL_VERSION,
+# task-0145).
+[workspace.package]
+version = "0.6.2"
+edition = "2021"

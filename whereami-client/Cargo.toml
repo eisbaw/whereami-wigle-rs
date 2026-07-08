@@ -1,7 +1,8 @@
 [package]
 name = "whereami-client"
-version = "0.6.2"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+publish = false
 readme = "README.md"
 description = "Typed Rust client for the whereamid Wi-Fi geolocation daemon."
 license = "MIT"
