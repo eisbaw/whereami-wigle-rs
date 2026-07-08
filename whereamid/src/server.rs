@@ -1968,13 +1968,20 @@ async fn compute_locate_with_clock(
         // outlier-filter survival. Every eligible unique BSSID in the latest
         // scanner snapshot contributes exactly one denominator entry.
         visible_cached.push((ap.lat, ap.lon));
-        if active.contains_key(ap.bssid.as_str()) && positioned_aps.len() < state.args.top_n {
-            positioned_aps.push(PositionedAp {
-                lat: ap.lat,
-                lon: ap.lon,
-                signal_dbm: active.get(ap.bssid.as_str()).map(|c| c.signal_dbm),
-                is_mobile: ap.is_mobile,
-            });
+        // Single lookup (task-0264): membership and the signal come from the
+        // same `active` entry, so `signal_dbm: Some(candidate.signal_dbm)` states
+        // the always-present invariant honestly instead of `.map` over a value
+        // that can never be None here. Edition 2021 has no let-chains, hence the
+        // nested top-N `if`.
+        if let Some(candidate) = active.get(ap.bssid.as_str()) {
+            if positioned_aps.len() < state.args.top_n {
+                positioned_aps.push(PositionedAp {
+                    lat: ap.lat,
+                    lon: ap.lon,
+                    signal_dbm: Some(candidate.signal_dbm),
+                    is_mobile: ap.is_mobile,
+                });
+            }
         }
     }
     // `cached` counts only finite fixed cache hits admitted to this solve, not
