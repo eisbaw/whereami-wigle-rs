@@ -91,6 +91,10 @@ impl NominatimClient {
 
     /// Reverse geocode a lat/lon to an approximate street address.
     /// Enforces [`REQUEST_INTERVAL`] between requests per Nominatim policy.
+    ///
+    /// `lat`/`lon` must be finite; the caller is responsible for supplying
+    /// valid coordinates. The non-finite guard in [`reverse_geocode_if`] is
+    /// defence-in-depth (fail-closed), not a contract callers may lean on.
     #[allow(dead_code)]
     pub async fn reverse_geocode(&self, lat: f64, lon: f64) -> Result<Address> {
         self.reverse_geocode_if(lat, lon, || true)
@@ -106,6 +110,12 @@ impl NominatimClient {
     /// may be superseded while this method sleeps in the limiter. Returning
     /// `Ok(None)` means no HTTP request was issued and `last_request` was not
     /// advanced, so rejected work never consumes an empty rate slot.
+    ///
+    /// `lat`/`lon` must be finite; the caller is responsible for supplying
+    /// valid coordinates. The non-finite guard below is defence-in-depth
+    /// (fail-closed): it returns `Err` before touching the rate gate or the
+    /// transport, so a bad input issues no network request and consumes no
+    /// rate slot. It is not a contract callers may lean on.
     pub(crate) async fn reverse_geocode_if<F>(
         &self,
         lat: f64,
@@ -115,6 +125,15 @@ impl NominatimClient {
     where
         F: FnOnce() -> bool + Send,
     {
+        // Fail closed on non-finite coordinates before acquiring the rate lock
+        // or dispatching the transport: a NaN/Inf would build a malformed URL
+        // and must never reach the network, nor consume a rate slot.
+        if !lat.is_finite() || !lon.is_finite() {
+            return Err(anyhow::anyhow!(
+                "reverse geocode requires finite lat/lon, got ({lat}, {lon})"
+            ));
+        }
+
         // Enforce the policy interval since the last outbound request.
         let mut last = self.last_request.lock().await;
         let elapsed = last.elapsed();
@@ -135,12 +154,18 @@ impl NominatimClient {
 }
 
 async fn send_request(client: &Client, lat: f64, lon: f64) -> Result<Address> {
-    let url = format!(
-        "https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&addressdetails=1"
-    );
-
+    // Build the query via reqwest's builder so it percent-encodes each value.
+    // This prevents query-string injection or a malformed URL if a lat/lon
+    // ever originates from untrusted input (e.g. a future "paste coordinates"
+    // feature). Non-finite values are rejected earlier in `reverse_geocode_if`.
     let resp: NominatimResponse = client
-        .get(&url)
+        .get("https://nominatim.openstreetmap.org/reverse")
+        .query(&[
+            ("lat", lat.to_string()),
+            ("lon", lon.to_string()),
+            ("format", "json".to_string()),
+            ("addressdetails", "1".to_string()),
+        ])
         .header("User-Agent", "whereami-daemon/0.1")
         .send()
         .await?
@@ -207,6 +232,47 @@ mod tests {
             Instant::now(),
             after_rejection,
             "fresh current work waited on an empty rate slot"
+        );
+    }
+
+    /// TASK-0103: a non-finite lat/lon must fail closed *before* any transport
+    /// dispatch, so no network request is issued. We assert on the transport
+    /// call counter (which stays 0) rather than on logs.
+    #[tokio::test]
+    async fn non_finite_coordinates_reject_without_transport() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = NominatimClient::with_transport({
+            let calls = Arc::clone(&calls);
+            move |_lat, _lon| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(Address {
+                        display: "test".to_string(),
+                        road: None,
+                        house_number: None,
+                        city: None,
+                        postcode: None,
+                        country: None,
+                    })
+                }
+            }
+        });
+
+        // NaN latitude: rejected, transport never invoked.
+        assert!(client.reverse_geocode(f64::NAN, 12.0).await.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "NaN lat reached the transport"
+        );
+
+        // Infinite longitude: rejected, transport still never invoked.
+        assert!(client.reverse_geocode(55.0, f64::INFINITY).await.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "infinite lon reached the transport"
         );
     }
 }
