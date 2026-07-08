@@ -38,6 +38,11 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024; // 64 KiB max request size
 const MAX_RESOLVE_BSSIDS: usize = 256;
 const DEFAULT_RAW_HISTORY_MAX_FIXES: u64 = 1_000;
 const MAX_RAW_HISTORY_FIXES: u64 = 10_000;
+
+/// Wire protocol version emitted in every daemon response. Breaking
+/// wire-format changes bump this; clients use it to detect the daemon's
+/// protocol version.
+const WIRE_VERSION: u32 = 1;
 const WIPE_CONFIRMATION: &str = "delete-all-location-data";
 const WIPE_CONFIRMATION_ERROR: &str = "wipe: confirmation must equal 'delete-all-location-data'";
 const WIPE_TCP_ERROR: &str =
@@ -705,7 +710,7 @@ struct WipeResponse {
 fn error_json(msg: &str) -> String {
     serde_json::to_string(&ErrorResponse {
         ok: false,
-        v: 1,
+        v: WIRE_VERSION,
         error: msg.to_string(),
     })
     .unwrap_or_else(|_| r#"{"ok":false,"v":1,"error":"serialization failed"}"#.to_string())
@@ -2159,7 +2164,7 @@ async fn compute_locate_with_clock(
 
             let resp = LocateResponse {
                 ok: true,
-                v: 1,
+                v: WIRE_VERSION,
                 lat,
                 lon,
                 accuracy_m,
@@ -2226,7 +2231,7 @@ async fn return_last_fix_or_error(
         let age_s = age as u64;
         let resp = LocateResponse {
             ok: true,
-            v: 1,
+            v: WIRE_VERSION,
             lat: fix.lat,
             lon: fix.lon,
             accuracy_m: fix.accuracy_m,
@@ -2335,7 +2340,7 @@ async fn handle_resolve(
 
     let resp = ResolveResponse {
         ok: true,
-        v: 1,
+        v: WIRE_VERSION,
         results,
     };
     ok_json(&resp)
@@ -2364,7 +2369,7 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
 
     let resp = ScanResponse {
         ok: true,
-        v: 1,
+        v: WIRE_VERSION,
         networks,
         scan_age_ms,
         scanned_at,
@@ -2494,7 +2499,7 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
     let stable_count = stable_set.len();
     let resp = DebugResponse {
         ok: true,
-        v: 1,
+        v: WIRE_VERSION,
         daemon_rev: env!("GIT_REV"),
         scan_age_ms,
         samples_in_buffer: samples,
@@ -2516,7 +2521,7 @@ struct VersionResponse {
 fn handle_version() -> String {
     let resp = VersionResponse {
         ok: true,
-        v: 1,
+        v: WIRE_VERSION,
         version: env!("CARGO_PKG_VERSION"),
         git_rev: env!("GIT_REV"),
     };
@@ -2712,14 +2717,14 @@ where
         match body {
             HistoryBody::Segmented(segments) => ok_json(&HistoryResponse {
                 ok: true,
-                v: 1,
+                v: WIRE_VERSION,
                 from,
                 to,
                 segments,
             }),
             HistoryBody::Raw { fixes, elided } => ok_json(&RawHistoryResponse {
                 ok: true,
-                v: 1,
+                v: WIRE_VERSION,
                 range: RawHistoryRange {
                     from_rfc3339: from,
                     to_rfc3339: to,
@@ -3040,7 +3045,7 @@ async fn handle_wipe_observing_enqueue(
         Ok(Ok((counts, lease))) => CommandResponse::wipe(
             ok_json(&WipeResponse {
                 ok: true,
-                v: 1,
+                v: WIRE_VERSION,
                 aps_deleted: counts.aps_deleted,
                 pending_deleted: counts.pending_deleted,
                 not_found_deleted: counts.not_found_deleted,
@@ -3093,7 +3098,7 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
         .load(std::sync::atomic::Ordering::Relaxed);
     let resp = StatsResponse {
         ok: true,
-        v: 1,
+        v: WIRE_VERSION,
         cached_aps: stats.cached_aps,
         pending_aps: stats.pending_aps,
         not_found_aps: stats.not_found_aps,

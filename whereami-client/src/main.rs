@@ -1038,7 +1038,10 @@ mod tests {
     fn wipe_renderer_prints_exact_counts_and_repopulation_notice() {
         let output = render_wipe(&WipeResponse {
             ok: true,
-            v: 1,
+            // Fixtures emit a daemon at the client's max supported version,
+            // which is coherent for tests. The daemon's own emit constant is
+            // `whereamid::WIRE_VERSION` (separate crate; unified under task-0114).
+            v: whereami_client::SUPPORTED_PROTOCOL_VERSION,
             aps_deleted: 5,
             pending_deleted: 4,
             not_found_deleted: 3,
@@ -1227,7 +1230,7 @@ mod tests {
         // UTF-8 survives — in a single render pass.
         let resp = whereami_client::ScanResponse {
             ok: true,
-            v: 1,
+            v: whereami_client::SUPPORTED_PROTOCOL_VERSION,
             networks: vec![whereami_client::NetworkEntry {
                 bssid: "aa:bb:cc:dd:ee:ff".to_string(),
                 ssid: Some("Free\u{1b}[2KWiFi\u{0d}\u{9b}31m\u{07}😀".to_string()),
@@ -1260,7 +1263,7 @@ mod tests {
         // refactor against accidental spacing drift).
         let resp = whereami_client::ScanResponse {
             ok: true,
-            v: 1,
+            v: whereami_client::SUPPORTED_PROTOCOL_VERSION,
             networks: vec![whereami_client::NetworkEntry {
                 bssid: "aa:bb:cc:dd:ee:ff".to_string(),
                 ssid: Some("HomeNet".to_string()),
@@ -1283,7 +1286,7 @@ mod tests {
     ) -> HistoryFixesResponse {
         HistoryFixesResponse {
             ok: true,
-            v: 1,
+            v: whereami_client::SUPPORTED_PROTOCOL_VERSION,
             range: whereami_client::HistoryRange {
                 from_rfc3339: "2026-05-19T06:40:00+00:00".to_string(),
                 to_rfc3339: "2026-05-19T08:00:00+00:00".to_string(),
@@ -1539,7 +1542,7 @@ mod tests {
     fn render_stats_includes_last_clean_shutdown_abort_count_exactly() {
         let resp = whereami_client::StatsResponse {
             ok: true,
-            v: 1,
+            v: whereami_client::SUPPORTED_PROTOCOL_VERSION,
             cached_aps: 42,
             pending_aps: 3,
             not_found_aps: 4,
@@ -1577,7 +1580,7 @@ mod tests {
         // accidental format drift.
         let resp = whereami_client::LocateResponse {
             ok: true,
-            v: 1,
+            v: whereami_client::SUPPORTED_PROTOCOL_VERSION,
             lat: 55.676098,
             lon: 12.568337,
             accuracy_m: 42.7,
@@ -1607,7 +1610,7 @@ mod tests {
     fn render_locate_escapes_control_bytes_in_address() {
         let resp = whereami_client::LocateResponse {
             ok: true,
-            v: 1,
+            v: whereami_client::SUPPORTED_PROTOCOL_VERSION,
             lat: 1.5,
             lon: 2.5,
             accuracy_m: 10.0,
@@ -1640,7 +1643,7 @@ mod tests {
     fn locate_for_confidence(confidence: Confidence) -> LocateResponse {
         LocateResponse {
             ok: true,
-            v: 1,
+            v: whereami_client::SUPPORTED_PROTOCOL_VERSION,
             lat: 55.676098,
             lon: 12.568337,
             accuracy_m: 12.0,

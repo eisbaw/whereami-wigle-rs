@@ -160,8 +160,13 @@ pub trait DaemonResponse {
     fn error(&self) -> Option<&str>;
 }
 
-/// Highest daemon protocol version understood by this typed client.
-const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+/// Highest daemon protocol version understood by this typed client. A
+/// response advertising a higher `v` is rejected by the version gate. Also
+/// reused by the binary crate's test fixtures as the value a coherent daemon
+/// would emit at the client's max supported version. Breaking wire-format
+/// changes bump this in lockstep with the daemon's own emit constant
+/// (`whereamid::WIRE_VERSION`; unified under task-0114).
+pub const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
 /// Required prefix shared by every daemon response. Decode this before a
 /// command-specific response so a newer protocol cannot be mistaken for a
