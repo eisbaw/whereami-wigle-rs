@@ -5,6 +5,14 @@ and the project follows semver.
 
 ## [Unreleased]
 
+### Changed — documentation
+
+- `PRD.md` retired to a lean, version-agnostic one-page pointer (task-0113).
+  The detailed PRD had repeatedly drifted from the shipped reality, so it is
+  archived unmaintained at `cruft/PRD-v0.x-detailed.md`; `README.md`,
+  `docs/protocol.md`, and `CHANGELOG.md` are now the authoritative sources of
+  truth for CLI flags, wire response shapes, and release history.
+
 ### Added — privacy retention and wipe
 
 - `whereami wipe --yes` deletes AP, pending, negative-cache, fix-history, and
