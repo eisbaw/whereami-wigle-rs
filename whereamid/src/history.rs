@@ -98,6 +98,7 @@ fn finite_coord(fix: &FixRow) -> Option<(f64, f64)> {
     (fix.lat.is_finite() && fix.lon.is_finite()).then_some((fix.lat, fix.lon))
 }
 
+#[derive(Debug)]
 enum MedianComputation {
     Point((f64, f64)),
     Degenerate,
@@ -133,13 +134,47 @@ fn compute_geometric_median(
         geometric_median_detailed_cancellable, CancellableGeoMedianResult, GeoMedianResult,
     };
 
+    // NOTE: seg_id is not available at this layer. `compute_geometric_median`
+    // is an injected `MedianComputer` fn that receives only `(coords,
+    // is_cancelled)`; threading the segment id through the trait and its
+    // test double would be invasive and out of proportion for a log line
+    // (see task-0141). We log the iterate and `coords.len()` instead, which
+    // is enough to correlate a cap/fallback with the flushed segment.
     match geometric_median_detailed_cancellable(coords, is_cancelled) {
-        CancellableGeoMedianResult::Completed(
-            GeoMedianResult::Converged(point) | GeoMedianResult::Capped(point),
-        ) => MedianComputation::Point(point),
-        CancellableGeoMedianResult::Completed(
-            GeoMedianResult::Antipodal | GeoMedianResult::Degenerate,
-        ) => MedianComputation::Degenerate,
+        CancellableGeoMedianResult::Completed(GeoMedianResult::Converged(point)) => {
+            MedianComputation::Point(point)
+        }
+        CancellableGeoMedianResult::Completed(GeoMedianResult::Capped(point)) => {
+            // Weiszfeld hit WEISZFELD_MAX_ITERS without converging. The last
+            // iterate is still used best-effort (it is usually close to the
+            // true median), but the caller should know the reported segment
+            // centroid did not fully converge.
+            tracing::debug!(
+                ?point,
+                coord_count = coords.len(),
+                "history segment geometric median hit the Weiszfeld iteration cap \
+                 without converging; using the last iterate best-effort"
+            );
+            MedianComputation::Point(point)
+        }
+        CancellableGeoMedianResult::Completed(variant @ GeoMedianResult::Antipodal) => {
+            tracing::warn!(
+                variant = %variant,
+                coord_count = coords.len(),
+                "history segment geometric median is degenerate (near-antipodal \
+                 cluster); segment centroid falls back to a non-median estimate"
+            );
+            MedianComputation::Degenerate
+        }
+        CancellableGeoMedianResult::Completed(variant @ GeoMedianResult::Degenerate) => {
+            tracing::warn!(
+                variant = %variant,
+                coord_count = coords.len(),
+                "history segment geometric median is degenerate (unusable seed / \
+                 invalid coords); segment centroid falls back to a non-median estimate"
+            );
+            MedianComputation::Degenerate
+        }
         CancellableGeoMedianResult::Cancelled => MedianComputation::Cancelled,
     }
 }
@@ -756,6 +791,120 @@ mod tests {
             parse_range("100000000w").is_err(),
             "100000000w must overflow the date subtraction to Err"
         );
+    }
+
+    // task-0141: observability tests for compute_geometric_median. A capped
+    // (non-converged) iterate must emit a DEBUG event; an Antipodal/Degenerate
+    // cluster must emit a WARN before falling back. Mirrors the db.rs
+    // `CapturedEvents` scoped-subscriber sink verbatim.
+    mod median_observability {
+        use super::super::{compute_geometric_median, MedianComputation};
+        use std::sync::{Arc, Mutex};
+        use tracing::{
+            field::{Field, Visit},
+            span, subscriber, Event, Level, Metadata, Subscriber,
+        };
+
+        #[derive(Clone, Default)]
+        struct CapturedEvents(Arc<Mutex<Vec<(Level, String)>>>);
+
+        struct MessageVisitor(String);
+        impl Visit for MessageVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    self.0 = value.to_owned();
+                }
+            }
+        }
+
+        impl Subscriber for CapturedEvents {
+            fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut visitor = MessageVisitor(String::new());
+                event.record(&mut visitor);
+                self.0
+                    .lock()
+                    .expect("capture lock poisoned")
+                    .push((*event.metadata().level(), visitor.0));
+            }
+            fn enter(&self, _span: &span::Id) {}
+            fn exit(&self, _span: &span::Id) {}
+        }
+
+        fn capture<T>(operation: impl FnOnce() -> T) -> (T, Vec<(Level, String)>) {
+            // task-0251: install a permissive global subscriber first so the
+            // scoped capture below reliably sees events under `cargo test`.
+            crate::test_support::install_permissive_global_test_subscriber();
+            let captured = CapturedEvents::default();
+            let events = captured.clone();
+            let result = subscriber::with_default(captured, operation);
+            let events = events.0.lock().expect("capture lock poisoned").clone();
+            (result, events)
+        }
+
+        /// A cluster whose geometric median coincides with one of its input
+        /// points converges very slowly under Weiszfeld (singular weight near
+        /// the data point), so it exhausts WEISZFELD_MAX_ITERS -> Capped. Found
+        /// empirically against the real `geometric_median_detailed`; the last
+        /// iterate lands on ~(2.0, 15.0), i.e. the (2.0, 15.0) input point.
+        const CAPPED_CLUSTER: &[(f64, f64)] = &[(0.0, 0.0), (5.0, 20.0), (-5.0, 10.0), (2.0, 15.0)];
+
+        #[test]
+        fn capped_median_emits_debug_and_still_returns_point() {
+            let (result, events) =
+                capture(|| compute_geometric_median(CAPPED_CLUSTER, &mut || false));
+
+            // Behaviour is unchanged: the capped iterate is still used.
+            assert!(
+                matches!(result, MedianComputation::Point(_)),
+                "capped iterate must still be returned as a Point, got {result:?}"
+            );
+
+            let debug_msgs: Vec<&String> = events
+                .iter()
+                .filter(|(level, _)| *level == Level::DEBUG)
+                .map(|(_, msg)| msg)
+                .collect();
+            assert!(
+                debug_msgs.iter().any(|m| m.contains("iteration cap")),
+                "expected a DEBUG event about the Weiszfeld iteration cap; got {events:?}"
+            );
+        }
+
+        /// Two diametrically opposed points cancel the spherical seed to
+        /// magnitude ~0 -> Degenerate, which must warn before falling back.
+        #[test]
+        fn degenerate_median_emits_warn_and_falls_back() {
+            let antipodal: &[(f64, f64)] = &[(0.0, 0.0), (0.0, 180.0)];
+            let (result, events) = capture(|| compute_geometric_median(antipodal, &mut || false));
+
+            assert!(
+                matches!(result, MedianComputation::Degenerate),
+                "antipodal pair must fall back to Degenerate, got {result:?}"
+            );
+
+            let warn_msgs: Vec<&String> = events
+                .iter()
+                .filter(|(level, _)| *level == Level::WARN)
+                .map(|(_, msg)| msg)
+                .collect();
+            assert!(
+                warn_msgs.iter().any(|m| m.contains("degenerate")),
+                "expected a WARN event about the degenerate median; got {events:?}"
+            );
+        }
     }
 }
 
