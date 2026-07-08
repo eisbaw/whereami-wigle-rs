@@ -1,5 +1,5 @@
 [workspace]
-members = ["whereamid", "whereami-client", "whereami-build-utils"]
+members = ["whereamid", "whereami-client", "whereami-build-utils", "whereami-protocol"]
 resolver = "2"
 
 # Single source of truth for fields shared by every member crate (task-0260).

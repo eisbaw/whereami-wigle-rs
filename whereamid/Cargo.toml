@@ -16,6 +16,7 @@ path = "src/lib.rs"
 whereami-build-utils = { path = "../whereami-build-utils" }
 
 [dependencies]
+whereami-protocol = { path = "../whereami-protocol" }
 tokio = { version = "1", features = ["full"] }
 # CancellationToken lives in tokio-util's ungated `pub mod sync`; there is NO
 # "sync" feature, so default features suffice. Already in the lock graph as a

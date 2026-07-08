@@ -115,6 +115,28 @@ Every response includes:
 - `v`: protocol version integer (currently `1`).
 - On `ok=false`: `error` is a human-readable string.
 
+### Single source of truth (`whereami-protocol`)
+
+Every request and response type on this wire is defined exactly once in the
+`whereami-protocol` crate (task-0114). The daemon (`whereamid`) serializes those
+types and the typed client (`whereami-client`) deserializes the *same* types, so
+the two sides can no longer drift: a field rename, reorder, or changed
+skip/emit rule is a single edit, guarded by the round-trip tests in
+`whereami-protocol/tests/wire.rs`.
+
+Two deliberate asymmetries survive the shared definition:
+
+- **Extensible enums are strict on the daemon, tolerant on the client.**
+  `source` (`Provenance`) and `db_status` (`DbStatus`) share one enum that
+  carries a tolerant `Unknown` variant (serde `other`). The daemon is strict
+  *by construction* — it only ever emits the documented tokens and never
+  `Unknown` — while the client maps an unrecognised future token to `Unknown`
+  instead of failing the whole response (see Versioning below).
+- **`confidence` defaults to `high` on locate but is optional on history.** The
+  shared `Confidence` enum defaults to `high`, so an old daemon's missing
+  `locate.confidence` reads as the historic optimistic value; history fixes use
+  an optional `confidence` where absence is legacy-unknown, never `high`.
+
 ## Commands
 
 ### `locate` — current best-known position

@@ -1969,6 +1969,15 @@ dependencies = [
  "serde",
  "serde_json",
  "whereami-build-utils",
+ "whereami-protocol",
+]
+
+[[package]]
+name = "whereami-protocol"
+version = "0.6.2"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1990,6 +1999,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "whereami-build-utils",
+ "whereami-protocol",
 ]
 
 [[package]]

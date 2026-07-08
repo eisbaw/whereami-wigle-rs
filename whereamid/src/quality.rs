@@ -1,30 +1,28 @@
 //! Validated quality metadata attached to one persisted location observation.
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 
-/// Closed confidence vocabulary shared by locate responses and persisted
-/// history. Adding a variant is a wire-protocol and schema compatibility
-/// change, not a display-only edit.
-///
-/// MIRROR: `whereami_client::Confidence` is a hand-kept copy across the crate
-/// boundary (no shared protocol crate yet — task-0114). Both derive
-/// `#[serde(rename_all = "lowercase")]` over the SAME variants in the SAME
-/// order, so they MUST serialize to identical tokens. If you reorder or rename
-/// a variant here, change the client mirror in lockstep. The only intended
-/// asymmetry is the client's `#[default] High` (inert for history, which is
-/// `Option<Confidence>`).
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Confidence {
-    High,
-    Medium,
-    Low,
-    Suspect,
+/// The closed confidence vocabulary is defined once in `whereami-protocol` (the
+/// shared wire crate, task-0114); the daemon serializes it and the client
+/// deserializes the same type, so the two can no longer drift. Its wire tokens
+/// (`#[serde(rename_all = "lowercase")]`), `Default` (`High`), and `Display` all
+/// live in that crate.
+pub use whereami_protocol::Confidence;
+
+/// Daemon-side persistence mapping for [`Confidence`]. This is the SQLite text
+/// encoding, kept in the daemon (not the wire crate) because it is a storage
+/// concern; it happens to match the lowercase wire token but the two are
+/// intentionally decoupled. Adding a variant is a schema change.
+pub trait ConfidenceDb: Sized {
+    /// The lowercase string persisted in SQLite.
+    fn as_db_str(&self) -> &'static str;
+    /// Parse the persisted SQLite string, erroring on an unknown value so a
+    /// corrupt row fails loudly rather than silently mislabeling a fix.
+    fn from_db_str(value: &str) -> Result<Self>;
 }
 
-impl Confidence {
-    pub const fn as_db_str(self) -> &'static str {
+impl ConfidenceDb for Confidence {
+    fn as_db_str(&self) -> &'static str {
         match self {
             Self::High => "high",
             Self::Medium => "medium",
@@ -33,7 +31,7 @@ impl Confidence {
         }
     }
 
-    pub fn from_db_str(value: &str) -> Result<Self> {
+    fn from_db_str(value: &str) -> Result<Self> {
         match value {
             "high" => Ok(Self::High),
             "medium" => Ok(Self::Medium),
@@ -41,17 +39,6 @@ impl Confidence {
             "suspect" => Ok(Self::Suspect),
             _ => anyhow::bail!("unknown confidence value {value:?}"),
         }
-    }
-}
-
-impl std::fmt::Display for Confidence {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::High => "High",
-            Self::Medium => "Medium",
-            Self::Low => "Low",
-            Self::Suspect => "Suspect",
-        })
     }
 }
 
@@ -132,6 +119,25 @@ impl FixQuality {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confidence_db_encoding_round_trips_and_matches_wire_token() {
+        // The DB text encoding (as_db_str/from_db_str) and the JSON wire token
+        // (serde rename_all="lowercase") are separately maintained; pin that
+        // they round-trip and currently agree, so a future edit to one but not
+        // the other is caught here.
+        for c in [
+            Confidence::High,
+            Confidence::Medium,
+            Confidence::Low,
+            Confidence::Suspect,
+        ] {
+            assert_eq!(Confidence::from_db_str(c.as_db_str()).unwrap(), c);
+            let wire = serde_json::to_string(&c).unwrap();
+            assert_eq!(wire, format!("\"{}\"", c.as_db_str()));
+        }
+        assert!(Confidence::from_db_str("bogus").is_err());
+    }
 
     #[test]
     fn task0245_quality_validation_rejects_invalid_bundles() {

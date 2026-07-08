@@ -29,6 +29,24 @@ and the project follows semver.
   sending them is harmlessly tolerated by a new client, and a client whose
   struct kept `serde(default)` treats their absence as `0`.
 
+### Internal — refactor (no wire change)
+
+- Extracted a new `whereami-protocol` crate as the single source of truth for
+  every JSON wire type (task-0114). The daemon and the typed client previously
+  each defined their own copy of every request/response struct and enum, which
+  had drifted (daemon `skip_serializing_if` vs client `serde(default)`; the
+  client's tolerant `Unknown` enum variants vs the daemon's strict enums). Both
+  crates now depend on the shared definitions, so the wire contract cannot drift
+  again. The on-the-wire JSON is byte-identical to before — field names, order,
+  null-vs-omitted shape, and enum tokens are unchanged; the protocol version
+  stays `v=1`. New round-trip tests in `whereami-protocol/tests/wire.rs`
+  structurally prove serialization (daemon) and deserialization (client) agree.
+  This includes the raw-fix history response: the daemon's `From<db::Fix>`
+  conversion now targets the shared `HistoryFix` directly (coherence allows the
+  impl because `db::Fix` is a local type), so the previously daemon-private
+  `RawHistoryFix`/`RawHistoryRange`/`RawHistoryResponse` structs are gone and
+  every wire type is genuinely single-source.
+
 ### Changed — documentation
 
 - `PRD.md` retired to a lean, version-agnostic one-page pointer (task-0113).

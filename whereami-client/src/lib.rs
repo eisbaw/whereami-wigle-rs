@@ -182,22 +182,13 @@ trait ProtocolResponse {
 }
 
 // --- Request types ---
-
-#[derive(Serialize)]
-struct LocateRequest {
-    cmd: &'static str,
-}
-
-#[derive(Serialize)]
-struct ResolveRequest {
-    cmd: &'static str,
-    bssids: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct SimpleRequest {
-    cmd: &'static str,
-}
+//
+// The outbound request wire shapes are defined once in `whereami-protocol`
+// (task-0114); each `*_raw()` method below serializes exactly one of these,
+// preserving the task-0183 single-source request contract.
+use whereami_protocol::{
+    HistoryFixesRequest, HistoryRequest, LocateRequest, ResolveRequest, SimpleRequest,
+};
 
 const WIPE_CONFIRMATION_TOKEN: &str = "delete-all-location-data";
 
@@ -209,6 +200,8 @@ pub enum WipeConfirmation {
     Confirmed,
 }
 
+/// The `wipe` request stays client-side: it is built only here, from a
+/// [`WipeConfirmation`], and carries the confirmation token.
 #[derive(Serialize)]
 struct WipeRequest {
     cmd: &'static str,
@@ -216,371 +209,18 @@ struct WipeRequest {
 }
 
 // --- Response types ---
-
-/// Plausibility confidence attached to every successful locate response.
-///
-/// MIRROR: this is a hand-kept copy of `whereamid`'s `quality::Confidence`
-/// across the crate boundary (no shared protocol crate yet — task-0114). Both
-/// derive `#[serde(rename_all = "lowercase")]` over the SAME variants in the
-/// SAME order, so they MUST serialize to identical tokens. Keep them in
-/// lockstep. The `#[default] High` below is intentional and client-only: an
-/// older daemon predates confidence, so a missing locate field reads High —
-/// but history's field is `Option<Confidence>`, where absence is legacy
-/// unknown (`None`), never High.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Confidence {
-    /// Backward-compatible default for responses from older daemons, which
-    /// predate explicit uncertainty reporting.
-    #[default]
-    High,
-    Medium,
-    Low,
-    Suspect,
-}
-
-impl std::fmt::Display for Confidence {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Confidence::High => "High",
-            Confidence::Medium => "Medium",
-            Confidence::Low => "Low",
-            Confidence::Suspect => "Suspect",
-        })
-    }
-}
-
-/// Response from the `locate` command.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct LocateResponse {
-    pub ok: bool,
-    pub v: u32,
-    #[serde(default)]
-    pub lat: f64,
-    #[serde(default)]
-    pub lon: f64,
-    /// Weighted spread of contributing AP positions around the centroid,
-    /// clamped to [10, 1000] m; a rough dispersion estimate, NOT a calibrated
-    /// 68%/95% confidence radius. When `fallback` is true this is the 1000 m
-    /// antipodal-ambiguity sentinel rather than a measured spread.
-    #[serde(default)]
-    pub accuracy_m: f64,
-    #[serde(default)]
-    pub sources: usize,
-    #[serde(default)]
-    pub cached: usize,
-    #[serde(default)]
-    pub visible: usize,
-    #[serde(default)]
-    pub stable: usize,
-    #[serde(default)]
-    pub address: Option<String>,
-    /// True when the daemon could not produce a current fix and is
-    /// returning the previous known position. Defaults to false.
-    #[serde(default)]
-    pub stale: bool,
-    /// True when the reported position is the daemon's antipodal-cancellation
-    /// fallback (the centroid was ambiguous; `accuracy_m` is then the 1000 m
-    /// sentinel, not a measured spread). Omitted by the daemon when false and
-    /// by older daemons entirely, both of which decode to false.
-    #[serde(default)]
-    pub fallback: bool,
-    /// Age of the stale fix, in seconds. Only meaningful when `stale`.
-    #[serde(default)]
-    pub age_s: Option<u64>,
-    /// Implied speed from the previous accepted fix, absent on cold boot or
-    /// when returning the generic stale fallback.
-    #[serde(default)]
-    pub implied_speed_kmh: Option<f64>,
-    /// Age of the previous accepted fix used by the plausibility check.
-    #[serde(default)]
-    pub last_fix_age_secs: Option<i64>,
-    /// Consensus fraction for the selected winner, absent with fewer than
-    /// three eligible visible cached APs.
-    #[serde(default)]
-    pub inlier_ratio: Option<f64>,
-    /// Older daemons omit confidence; preserve their historic optimistic
-    /// behavior by interpreting that omission as High.
-    #[serde(default)]
-    pub confidence: Confidence,
-    #[serde(default)]
-    pub suspect_reason: Option<String>,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-/// Provenance of a `resolve` result (task-0062).
-///
-/// Disambiguated from the daemon's data-`Source` enum (apple/wigle/...)
-/// by the rename: the wire field is still `source` for backward compat
-/// but the typed Rust field on this struct is `provenance`. An unknown
-/// value from a future daemon maps to `Provenance::Unknown` so older
-/// clients keep parsing.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Provenance {
-    /// Fetched live during the request.
-    Api,
-    /// Served from the daemon's local cache.
-    Cache,
-    /// Authoritatively absent: a provider returned NotFound this call, or the
-    /// daemon's not_found table recorded absence within its TTL.
-    NotFound,
-    /// task-0194: the daemon could not consult a provider for this BSSID this
-    /// call (deferred to an in-flight resolution, provider skipped for missing
-    /// creds / exhausted or corrupt quota, or a transient failure), so absence
-    /// is NOT established. Retry later rather than caching it as absent.
-    Unresolved,
-    /// A value the daemon emitted that this client version does not
-    /// recognise. Forward-compat escape hatch (`#[serde(other)]`).
-    #[serde(other)]
-    Unknown,
-}
-
-impl std::fmt::Display for Provenance {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Provenance::Api => "api",
-            Provenance::Cache => "cache",
-            Provenance::NotFound => "not_found",
-            Provenance::Unresolved => "unresolved",
-            Provenance::Unknown => "unknown",
-        })
-    }
-}
-
-/// A single result from the `resolve` command.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ResolveResultEntry {
-    pub bssid: String,
-    pub lat: Option<f64>,
-    pub lon: Option<f64>,
-    pub ssid: Option<String>,
-    /// Wire field name is `source` for backward compat. task-0062 renamed
-    /// the Rust field to `provenance` to disambiguate from the data-
-    /// source `Source` enum (apple/wigle/...).
-    #[serde(rename = "source")]
-    pub provenance: Provenance,
-}
-
-/// Response from the `resolve` command.
-#[derive(Deserialize, Debug)]
-pub struct ResolveResponse {
-    pub ok: bool,
-    pub v: u32,
-    #[serde(default)]
-    pub results: Vec<ResolveResultEntry>,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-/// A single network from the `scan` command.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct NetworkEntry {
-    pub bssid: String,
-    pub ssid: Option<String>,
-    pub signal_dbm: i32,
-    pub channel: Option<i32>,
-}
-
-/// Response from the `scan` command.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ScanResponse {
-    pub ok: bool,
-    pub v: u32,
-    #[serde(default)]
-    pub networks: Vec<NetworkEntry>,
-    /// Age of the most recent scan in milliseconds. None if no scan
-    /// has completed yet.
-    #[serde(default)]
-    pub scan_age_ms: Option<u64>,
-    /// RFC 3339 timestamp of the most recent scan, if any.
-    #[serde(default)]
-    pub scanned_at: Option<String>,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-/// DB classification of a BSSID seen by the debouncer (task-0062).
-///
-/// Wire format mirrors the daemon's snake_case strings. An unknown
-/// value from a future daemon maps to `DbStatus::Unknown` so older
-/// clients keep parsing.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DbStatus {
-    /// In the daemon's `aps` cache.
-    Cached,
-    /// Queued for resolution.
-    Pending,
-    /// In the daemon's `not_found` table (definitively absent within TTL).
-    NotFound,
-    /// First-seen this scan.
-    New,
-    /// A value the daemon emitted that this client version does not
-    /// recognise. Forward-compat escape hatch (`#[serde(other)]`).
-    #[serde(other)]
-    Unknown,
-}
-
-impl std::fmt::Display for DbStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            DbStatus::Cached => "cached",
-            DbStatus::Pending => "pending",
-            DbStatus::NotFound => "not_found",
-            DbStatus::New => "new",
-            DbStatus::Unknown => "unknown",
-        })
-    }
-}
-
-/// One BSSID's debug state, as the daemon returns it under `bssids`.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DebugBssid {
-    pub bssid: String,
-    /// None when the BSSID is debounce-stable but missing from the most
-    /// recent scan. Daemon previously fabricated -90 dBm here (task-0051).
-    #[serde(default)]
-    pub signal_dbm: Option<i32>,
-    pub seen: usize,
-    pub needed: usize,
-    pub is_stable: bool,
-    pub db_status: DbStatus,
-}
-
-/// Response from the `debug` command.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DebugResponse {
-    pub ok: bool,
-    pub v: u32,
-    #[serde(default)]
-    pub daemon_rev: Option<String>,
-    #[serde(default)]
-    pub scan_age_ms: Option<u64>,
-    #[serde(default)]
-    pub samples_in_buffer: usize,
-    #[serde(default)]
-    pub visible: usize,
-    #[serde(default)]
-    pub stable: usize,
-    #[serde(default)]
-    pub bssids: Vec<DebugBssid>,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-/// Response from the `version` command.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct VersionResponse {
-    pub ok: bool,
-    pub v: u32,
-    #[serde(default)]
-    pub version: Option<String>,
-    #[serde(default)]
-    pub git_rev: Option<String>,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-/// One stay-point segment in a `history` response.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct HistorySegment {
-    pub start_rfc3339: String,
-    pub end_rfc3339: String,
-    pub duration_secs: i64,
-    pub centroid_lat: f64,
-    pub centroid_lon: f64,
-    pub mean_accuracy_m: f64,
-    pub n_fixes: usize,
-}
-
-/// Response from the `history` command.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct HistoryResponse {
-    pub ok: bool,
-    pub v: u32,
-    #[serde(default)]
-    pub from: String,
-    #[serde(default)]
-    pub to: String,
-    #[serde(default)]
-    pub segments: Vec<HistorySegment>,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-#[derive(Serialize)]
-struct HistoryRequest {
-    cmd: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    range: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    from: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    to: Option<String>,
-}
-
-#[derive(Serialize)]
-struct HistoryFixesRequest {
-    cmd: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    range: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    from: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    to: Option<String>,
-    raw: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_fixes: Option<u64>,
-}
-
-/// Normalized inclusive bounds returned by raw history.
-#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
-pub struct HistoryRange {
-    pub from_rfc3339: String,
-    pub to_rfc3339: String,
-}
-
-/// One unsegmented location-history observation.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct HistoryFix {
-    pub at_rfc3339: String,
-    pub lat: f64,
-    pub lon: f64,
-    pub accuracy_m: f64,
-    pub n_sources: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub implied_speed_kmh: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_fix_age_secs: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inlier_ratio: Option<f64>,
-    /// Unlike locate responses, absent history confidence is legacy unknown
-    /// and must never default to High.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<Confidence>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub suspect_reason: Option<String>,
-}
-
-/// Response from an opt-in raw-fix `history` request.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct HistoryFixesResponse {
-    pub ok: bool,
-    pub v: u32,
-    /// Empty only on an `ok:false` error envelope.
-    #[serde(default)]
-    pub range: HistoryRange,
-    /// Empty only when the successful range contains no fixes, or on error.
-    #[serde(default)]
-    pub fixes: Vec<HistoryFix>,
-    /// Exact number of matching earlier rows omitted by the requested cap.
-    #[serde(default)]
-    pub elided: Option<i64>,
-    #[serde(default)]
-    pub error: Option<String>,
-}
+//
+// Every response, the shared enums, and `HistoryFix`/`HistoryRange`/
+// `HistorySegment`/`NetworkEntry`/`ResolveResultEntry` are re-exported from
+// `whereami-protocol` (task-0114), the single source of truth the daemon also
+// links. This crate adds only client behavior (the `DaemonResponse`/
+// `ProtocolResponse` trait impls below and the raw-history presence validator).
+pub use whereami_protocol::{
+    Confidence, DbStatus, DebugBssid, DebugResponse, ErrorResponse, HistoryFix,
+    HistoryFixesResponse, HistoryRange, HistoryResponse, HistorySegment, LocateResponse,
+    NetworkEntry, Provenance, ResolveResponse, ResolveResultEntry, ScanResponse, StatsResponse,
+    VersionResponse, WipeResponse,
+};
 
 /// Presence-checking wire view. Public response fields remain defaultable so
 /// normal `ok:false` envelopes parse like every other client API; successful
@@ -664,73 +304,6 @@ impl ProtocolResponse for HistoryFixesShape {
     fn protocol_version(&self) -> u32 {
         self.v
     }
-}
-
-/// Response from the `stats` command.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct StatsResponse {
-    pub ok: bool,
-    pub v: u32,
-    #[serde(default)]
-    pub cached_aps: i64,
-    #[serde(default)]
-    pub pending_aps: i64,
-    #[serde(default)]
-    pub not_found_aps: i64,
-    #[serde(default)]
-    pub db_size_bytes: i64,
-    #[serde(default)]
-    pub api_calls_today: u32,
-    /// Executed WiGLE reservations denied since daemon start because the
-    /// same-day persisted API counter was malformed. Distinct from normal
-    /// quota exhaustion and defaults to 0 for older daemons.
-    #[serde(default)]
-    pub api_counter_corruption_denials: u64,
-    /// In-flight provider lookups currently coalescing concurrent requests.
-    /// task-0074. Defaults to 0 for older daemons that don't emit it.
-    #[serde(default)]
-    pub inflight: usize,
-    /// Cumulative count of best-effort DB writes that failed since daemon
-    /// start. task-0076. Defaults to 0 for older daemons.
-    #[serde(default)]
-    pub db_write_failures: u64,
-    /// Cumulative count of best-effort DB reads (cache lookups) that failed
-    /// since daemon start. task-0105. Distinguishes a real read error from a
-    /// genuine cache miss. Defaults to 0 for older daemons that don't emit it.
-    #[serde(default)]
-    pub db_read_failures: u64,
-    /// Successfully committed autonomous history rows since daemon start.
-    /// Defaults to 0 for older daemons.
-    #[serde(default)]
-    pub autolocate_fixes_written: u64,
-    /// Number of tasks force-aborted at the end of the last clean daemon
-    /// shutdown. This is one persisted shutdown snapshot, neither a current
-    /// count nor a cumulative total. The daemon reloads it on startup; a crash
-    /// or SIGKILL does not update it. Defaults to 0 for older daemons that do
-    /// not emit the field.
-    #[serde(default)]
-    pub orphan_tasks_aborted: u64,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-/// Response from a confirmed privacy wipe.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct WipeResponse {
-    pub ok: bool,
-    pub v: u32,
-    #[serde(default)]
-    pub aps_deleted: usize,
-    #[serde(default)]
-    pub pending_deleted: usize,
-    #[serde(default)]
-    pub not_found_deleted: usize,
-    #[serde(default)]
-    pub fixes_deleted: usize,
-    #[serde(default)]
-    pub last_fix_deleted: usize,
-    #[serde(default)]
-    pub error: Option<String>,
 }
 
 impl WhereAmIClient {
@@ -1542,59 +1115,6 @@ mod wipe_wire_tests {
 }
 
 #[cfg(test)]
-mod stats_wire_tests {
-    //! TASK-0243: the typed stats response stays aligned with the canonical
-    //! daemon success shape while remaining compatible with older daemons.
-    use super::*;
-
-    fn client() -> WhereAmIClient {
-        WhereAmIClient::unix("/test/whereamid.sock")
-    }
-
-    #[test]
-    fn current_daemon_stats_shape_deserializes_every_typed_field() {
-        let json = r#"{"ok":true,"v":1,"cached_aps":41,"pending_aps":2,"not_found_aps":3,"db_size_bytes":49152,"api_calls_today":4,"api_counter_corruption_denials":8,"inflight":5,"db_write_failures":6,"db_read_failures":10,"autolocate_fixes_written":9,"orphan_tasks_aborted":7}"#;
-        let stats: StatsResponse = client().parse_response_line(json).unwrap();
-
-        assert!(stats.ok);
-        assert_eq!(stats.v, 1);
-        assert_eq!(stats.cached_aps, 41);
-        assert_eq!(stats.pending_aps, 2);
-        assert_eq!(stats.not_found_aps, 3);
-        assert_eq!(stats.db_size_bytes, 49_152);
-        assert_eq!(stats.api_calls_today, 4);
-        assert_eq!(stats.api_counter_corruption_denials, 8);
-        assert_eq!(stats.inflight, 5);
-        assert_eq!(stats.db_write_failures, 6);
-        assert_eq!(stats.db_read_failures, 10);
-        assert_eq!(stats.autolocate_fixes_written, 9);
-        assert_eq!(stats.orphan_tasks_aborted, 7);
-        assert!(stats.error.is_none());
-    }
-
-    #[test]
-    fn legacy_stats_shape_defaults_missing_last_shutdown_aborts_to_zero() {
-        let json = r#"{"ok":true,"v":1,"cached_aps":101,"pending_aps":102,"not_found_aps":103,"db_size_bytes":104,"api_calls_today":105,"inflight":106,"db_write_failures":107}"#;
-        let stats: StatsResponse = client().parse_response_line(json).unwrap();
-
-        assert!(stats.ok);
-        assert_eq!(stats.v, 1);
-        assert_eq!(stats.cached_aps, 101);
-        assert_eq!(stats.pending_aps, 102);
-        assert_eq!(stats.not_found_aps, 103);
-        assert_eq!(stats.db_size_bytes, 104);
-        assert_eq!(stats.api_calls_today, 105);
-        assert_eq!(stats.api_counter_corruption_denials, 0);
-        assert_eq!(stats.inflight, 106);
-        assert_eq!(stats.db_write_failures, 107);
-        assert_eq!(stats.db_read_failures, 0);
-        assert_eq!(stats.autolocate_fixes_written, 0);
-        assert_eq!(stats.orphan_tasks_aborted, 0);
-        assert!(stats.error.is_none());
-    }
-}
-
-#[cfg(test)]
 mod protocol_version_tests {
     use super::*;
 
@@ -1710,92 +1230,6 @@ mod protocol_version_tests {
 }
 
 #[cfg(test)]
-mod wire_enum_tests {
-    //! task-0062: round-trip the typed wire enums against the strings the
-    //! daemon emits, including the Unknown forward-compat fallback.
-    use super::*;
-
-    #[test]
-    fn db_status_strings_match_daemon_vocabulary() {
-        for (variant, expected) in [
-            (DbStatus::Cached, "\"cached\""),
-            (DbStatus::Pending, "\"pending\""),
-            (DbStatus::NotFound, "\"not_found\""),
-            (DbStatus::New, "\"new\""),
-        ] {
-            assert_eq!(serde_json::to_string(&variant).unwrap(), expected);
-            let back: DbStatus = serde_json::from_str(expected).unwrap();
-            assert_eq!(back, variant);
-        }
-    }
-
-    #[test]
-    fn db_status_unknown_string_maps_to_unknown_variant() {
-        // Forward-compat: a future daemon emitting a new variant must not
-        // break clients linked against this version.
-        let v: DbStatus = serde_json::from_str("\"future_variant\"").unwrap();
-        assert_eq!(v, DbStatus::Unknown);
-    }
-
-    #[test]
-    fn provenance_strings_match_daemon_vocabulary() {
-        for (variant, expected) in [
-            (Provenance::Api, "\"api\""),
-            (Provenance::Cache, "\"cache\""),
-            (Provenance::NotFound, "\"not_found\""),
-            // task-0194: daemon emits `unresolved` for deferred/skipped/
-            // transient BSSIDs (absence not established).
-            (Provenance::Unresolved, "\"unresolved\""),
-        ] {
-            assert_eq!(serde_json::to_string(&variant).unwrap(), expected);
-            let back: Provenance = serde_json::from_str(expected).unwrap();
-            assert_eq!(back, variant);
-        }
-    }
-
-    #[test]
-    fn provenance_unknown_string_maps_to_unknown_variant() {
-        let v: Provenance = serde_json::from_str("\"future_variant\"").unwrap();
-        assert_eq!(v, Provenance::Unknown);
-    }
-
-    #[test]
-    fn resolve_result_entry_reads_legacy_source_field() {
-        // The wire still uses `source`; the typed Rust field is `provenance`.
-        // A client must parse responses produced by the current daemon.
-        let json =
-            r#"{"bssid":"aa:bb:cc:dd:ee:ff","lat":1.0,"lon":2.0,"ssid":"x","source":"cache"}"#;
-        let r: ResolveResultEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(r.provenance, Provenance::Cache);
-    }
-
-    #[test]
-    fn resolve_result_entry_emits_source_field_name() {
-        let r = ResolveResultEntry {
-            bssid: "aa:bb:cc:dd:ee:ff".to_string(),
-            lat: Some(1.0),
-            lon: Some(2.0),
-            ssid: None,
-            provenance: Provenance::Api,
-        };
-        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
-        assert_eq!(v.get("source").and_then(|x| x.as_str()), Some("api"));
-        assert!(v.get("provenance").is_none());
-    }
-
-    #[test]
-    fn debug_bssid_round_trip_with_typed_db_status() {
-        let json = r#"{"bssid":"aa:bb:cc:dd:ee:ff","signal_dbm":-50,"seen":3,"needed":3,"is_stable":true,"db_status":"cached"}"#;
-        let d: DebugBssid = serde_json::from_str(json).unwrap();
-        assert_eq!(d.db_status, DbStatus::Cached);
-        // Round-trip back to JSON and re-parse.
-        let s = serde_json::to_string(&d).unwrap();
-        let d2: DebugBssid = serde_json::from_str(&s).unwrap();
-        assert_eq!(d2.db_status, DbStatus::Cached);
-    }
-}
-
-#[cfg(test)]
 mod target_resolution_tests {
     //! task-0196: default connect-target resolution order, exercised purely —
     //! env values and the existence probe are injected, so the tests never
@@ -1902,315 +1336,28 @@ mod target_resolution_tests {
     }
 }
 
-/// Daemon-emit -> client-decode wire cross-tests (task-0152).
-///
-/// The rest of the suite tests the client's typed enums/structs in isolation,
-/// and the daemon (`whereamid/src/server.rs`) tests its own emitted JSON in
-/// isolation. Neither side ever feeds a byte-exact *daemon-produced* response
-/// through the *client's* typed deserializer, so a daemon field rename or a
-/// switch to multi-line `to_string_pretty` would slip past both suites.
-///
-/// FIXTURE AUTHENTICITY: every fixture below is hand-derived from the DAEMON
-/// side, NOT from what the client wishes to receive (a client-shaped fixture
-/// would be circular and miss real drift). Each `&str` mirrors, in the exact
-/// serde declaration order, the corresponding daemon `#[derive(Serialize)]`
-/// struct in `whereamid/src/server.rs`, with the same field names, the same
-/// `snake_case`/`lowercase` enum tokens, and the same null-vs-omitted shape
-/// dictated by each field's `skip_serializing_if`:
-///   - `LocateResponse`    server.rs:565  (confidence is lowercase `Confidence`)
-///   - `ResolveResponse`   server.rs:597 / `ResolveResult` :632 (`source` tag)
-///   - `ScanResponse`      server.rs:645 / `NetworkInfo` :655 (Option -> null)
-///   - `StatsResponse`     server.rs:663  (all 13 counters always present)
-///   - `DebugResponse`     server.rs:2410 / `DebugBssid` :2398 (signal null)
-///   - `HistoryResponse`   server.rs:2532 / `history::Segment`
-///   - `VersionResponse`   server.rs:2514
-///   - error envelope      `error_json` server.rs:710 -> `{ok:false,v,error}`
-///
-/// Value shapes cross-checked against the daemon's own exact-JSON wire tests:
-/// `stats_wire_reports_corruption_denials_...` (server.rs:3245) and
-/// `scan_and_debug_option_fields_pin_null_vs_omitted_wire_shape` (server.rs:6507),
-/// the latter confirming `scan_age_ms`/`signal_dbm`/`ssid`/`channel` serialize
-/// as JSON `null` (no `skip_serializing_if`) while `scanned_at` is omitted.
-///
-/// FLOAT COMPARISON: this workspace builds serde_json WITHOUT the
-/// `float_roundtrip` feature, so its default f64 parser is not correctly
-/// rounded and can land 1 ULP away from the same literal parsed by rustc.
-/// Float assertions therefore use a relative tolerance, never `assert_eq!`
-/// (carried forward from task-0245).
+/// The client read path: `exchange` must return exactly the first response
+/// line. The wire-format contract itself is proven in
+/// `whereami-protocol/tests/wire.rs` (task-0114); this is the one part of the
+/// old cross-suite that exercises client I/O rather than serde, so it stays
+/// here.
 #[cfg(test)]
-mod daemon_wire_cross_tests {
+mod client_read_path_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
 
-    /// Byte-exact daemon `locate` response with every optional field present,
-    /// in `LocateResponse` (server.rs:565) declaration order.
-    const LOCATE_FIXTURE: &str = r#"{"ok":true,"v":1,"lat":55.6761,"lon":12.5683,"accuracy_m":42.5,"sources":7,"cached":5,"visible":9,"stable":6,"address":"Copenhagen, Denmark","stale":true,"age_s":120,"implied_speed_kmh":13.5,"last_fix_age_secs":30,"inlier_ratio":0.75,"confidence":"medium","suspect_reason":"speed"}"#;
+    const LOCATE_FIXTURE: &str = r#"{"ok":true,"v":1,"lat":55.6761,"lon":12.5683,"accuracy_m":42.5,"sources":7,"cached":5,"visible":9,"stable":6,"confidence":"medium"}"#;
 
-    /// `resolve` response mixing a located (`cache`) and an absent (`not_found`)
-    /// entry; `ResolveResult` (server.rs:632) emits `lat`/`lon`/`ssid` as null
-    /// (no `skip_serializing_if`) and the provenance under the wire tag `source`.
-    const RESOLVE_FIXTURE: &str = r#"{"ok":true,"v":1,"results":[{"bssid":"02:00:00:00:00:01","lat":55.1,"lon":12.2,"ssid":"cafe","source":"cache"},{"bssid":"02:00:00:00:00:02","lat":null,"lon":null,"ssid":null,"source":"not_found"}]}"#;
-
-    /// `scan` response; `NetworkInfo` (server.rs:655) emits `ssid`/`channel` as
-    /// present values here, `scan_age_ms` is present, `scanned_at` present.
-    const SCAN_FIXTURE: &str = r#"{"ok":true,"v":1,"networks":[{"bssid":"02:00:00:00:00:0a","ssid":"home","signal_dbm":-52,"channel":6}],"scan_age_ms":1500,"scanned_at":"2026-01-02T03:04:05Z"}"#;
-
-    /// `stats` response with all 13 always-present counters (`StatsResponse`
-    /// server.rs:663), values shaped like the daemon's own
-    /// `stats_wire_reports_corruption_denials_...` test (server.rs:3245).
-    const STATS_FIXTURE: &str = r#"{"ok":true,"v":1,"cached_aps":100,"pending_aps":5,"not_found_aps":3,"db_size_bytes":40960,"api_calls_today":12,"api_counter_corruption_denials":3,"inflight":2,"db_write_failures":1,"db_read_failures":4,"autolocate_fixes_written":7,"orphan_tasks_aborted":0}"#;
-
-    /// `debug` response; second BSSID reproduces the production `signal_dbm:null`
-    /// shape (stable but absent from the latest scan; server.rs:2400 + the
-    /// daemon test at server.rs:6556) and the `new`/`cached` `DbStatus` tokens.
-    const DEBUG_FIXTURE: &str = r#"{"ok":true,"v":1,"daemon_rev":"abc1234","scan_age_ms":800,"samples_in_buffer":4,"visible":3,"stable":2,"bssids":[{"bssid":"02:00:00:00:00:aa","signal_dbm":-48,"seen":5,"needed":3,"is_stable":true,"db_status":"cached"},{"bssid":"02:00:00:00:00:bb","signal_dbm":null,"seen":2,"needed":3,"is_stable":false,"db_status":"new"}]}"#;
-
-    /// Segmented `history` response (`HistoryResponse` server.rs:2532 +
-    /// `history::Segment`).
-    const HISTORY_FIXTURE: &str = r#"{"ok":true,"v":1,"from":"2026-01-01T00:00:00Z","to":"2026-01-02T00:00:00Z","segments":[{"start_rfc3339":"2026-01-01T08:00:00Z","end_rfc3339":"2026-01-01T09:30:00Z","duration_secs":5400,"centroid_lat":55.6761,"centroid_lon":12.5683,"mean_accuracy_m":35.0,"n_fixes":42}]}"#;
-
-    /// `version` response (`VersionResponse` server.rs:2514).
-    const VERSION_FIXTURE: &str = r#"{"ok":true,"v":1,"version":"0.1.0","git_rev":"deadbeef"}"#;
-
-    /// Daemon error envelope (`error_json` server.rs:710).
-    const ERROR_FIXTURE: &str = r#"{"ok":false,"v":1,"error":"unknown command"}"#;
-
-    /// Relative-tolerance float compare (see module-level note on serde_json's
-    /// non-round-tripping default parser).
-    #[track_caller]
-    fn approx(actual: f64, expected: f64) {
-        let tol = 1e-9 * expected.abs().max(1.0);
-        assert!(
-            (actual - expected).abs() <= tol,
-            "float mismatch: actual={actual} expected={expected} tol={tol}"
-        );
-    }
-
-    // ---- AC#1 / AC#2: byte-exact daemon JSON -> typed client Response ----
-
-    #[test]
-    fn locate_fixture_populates_every_field() {
-        let r: LocateResponse = serde_json::from_slice(LOCATE_FIXTURE.as_bytes()).unwrap();
-        assert!(r.ok);
-        assert_eq!(r.v, 1);
-        approx(r.lat, 55.6761);
-        approx(r.lon, 12.5683);
-        approx(r.accuracy_m, 42.5);
-        assert_eq!(r.sources, 7);
-        assert_eq!(r.cached, 5);
-        assert_eq!(r.visible, 9);
-        assert_eq!(r.stable, 6);
-        assert_eq!(r.address.as_deref(), Some("Copenhagen, Denmark"));
-        assert!(r.stale);
-        assert_eq!(r.age_s, Some(120));
-        approx(r.implied_speed_kmh.unwrap(), 13.5);
-        assert_eq!(r.last_fix_age_secs, Some(30));
-        approx(r.inlier_ratio.unwrap(), 0.75);
-        assert_eq!(r.confidence, Confidence::Medium);
-        assert_eq!(r.suspect_reason.as_deref(), Some("speed"));
-        assert!(r.error.is_none());
-        // The daemon skip-serializes `fallback` when false, so the primary
-        // fixture omits it entirely; it must decode to false via serde default.
-        assert!(
-            !r.fallback,
-            "absent fallback field must default to false, not error"
-        );
-    }
-
-    /// Byte-exact daemon `locate` response for the antipodal-cancellation
-    /// fallback: `fallback:true` present and `accuracy_m` at the 1000 m
-    /// sentinel (task-0127). The daemon only emits `fallback` when true.
-    const LOCATE_FALLBACK_FIXTURE: &str = r#"{"ok":true,"v":1,"lat":0.0,"lon":0.0,"accuracy_m":1000.0,"sources":2,"cached":2,"visible":2,"stable":2,"fallback":true,"confidence":"low"}"#;
-
-    #[test]
-    fn locate_fallback_fixture_decodes_fallback_true() {
-        let r: LocateResponse = serde_json::from_slice(LOCATE_FALLBACK_FIXTURE.as_bytes()).unwrap();
-        assert!(r.ok);
-        assert!(r.fallback, "fallback:true on the wire must decode to true");
-        approx(r.accuracy_m, 1000.0);
-        assert!(!r.stale);
-    }
-
-    #[test]
-    fn resolve_fixture_populates_entries_and_provenance() {
-        let r: ResolveResponse = serde_json::from_slice(RESOLVE_FIXTURE.as_bytes()).unwrap();
-        assert!(r.ok);
-        assert_eq!(r.v, 1);
-        assert_eq!(r.results.len(), 2);
-
-        let cached = &r.results[0];
-        assert_eq!(cached.bssid, "02:00:00:00:00:01");
-        approx(cached.lat.unwrap(), 55.1);
-        approx(cached.lon.unwrap(), 12.2);
-        assert_eq!(cached.ssid.as_deref(), Some("cafe"));
-        assert_eq!(cached.provenance, Provenance::Cache);
-
-        let absent = &r.results[1];
-        assert_eq!(absent.bssid, "02:00:00:00:00:02");
-        assert!(absent.lat.is_none());
-        assert!(absent.lon.is_none());
-        assert!(absent.ssid.is_none());
-        assert_eq!(absent.provenance, Provenance::NotFound);
-    }
-
-    #[test]
-    fn scan_fixture_populates_networks() {
-        let r: ScanResponse = serde_json::from_slice(SCAN_FIXTURE.as_bytes()).unwrap();
-        assert!(r.ok);
-        assert_eq!(r.v, 1);
-        assert_eq!(r.scan_age_ms, Some(1500));
-        assert_eq!(r.scanned_at.as_deref(), Some("2026-01-02T03:04:05Z"));
-        assert_eq!(r.networks.len(), 1);
-        let n = &r.networks[0];
-        assert_eq!(n.bssid, "02:00:00:00:00:0a");
-        assert_eq!(n.ssid.as_deref(), Some("home"));
-        assert_eq!(n.signal_dbm, -52);
-        assert_eq!(n.channel, Some(6));
-        assert!(r.error.is_none());
-    }
-
-    #[test]
-    fn stats_fixture_populates_all_counters() {
-        let r: StatsResponse = serde_json::from_slice(STATS_FIXTURE.as_bytes()).unwrap();
-        assert!(r.ok);
-        assert_eq!(r.v, 1);
-        assert_eq!(r.cached_aps, 100);
-        assert_eq!(r.pending_aps, 5);
-        assert_eq!(r.not_found_aps, 3);
-        assert_eq!(r.db_size_bytes, 40960);
-        assert_eq!(r.api_calls_today, 12);
-        assert_eq!(r.api_counter_corruption_denials, 3);
-        assert_eq!(r.inflight, 2);
-        assert_eq!(r.db_write_failures, 1);
-        assert_eq!(r.db_read_failures, 4);
-        assert_eq!(r.autolocate_fixes_written, 7);
-        assert_eq!(r.orphan_tasks_aborted, 0);
-        assert!(r.error.is_none());
-    }
-
-    #[test]
-    fn debug_fixture_populates_bssids_and_null_signal() {
-        let r: DebugResponse = serde_json::from_slice(DEBUG_FIXTURE.as_bytes()).unwrap();
-        assert!(r.ok);
-        assert_eq!(r.v, 1);
-        assert_eq!(r.daemon_rev.as_deref(), Some("abc1234"));
-        assert_eq!(r.scan_age_ms, Some(800));
-        assert_eq!(r.samples_in_buffer, 4);
-        assert_eq!(r.visible, 3);
-        assert_eq!(r.stable, 2);
-        assert_eq!(r.bssids.len(), 2);
-
-        let strong = &r.bssids[0];
-        assert_eq!(strong.bssid, "02:00:00:00:00:aa");
-        assert_eq!(strong.signal_dbm, Some(-48));
-        assert_eq!(strong.seen, 5);
-        assert_eq!(strong.needed, 3);
-        assert!(strong.is_stable);
-        assert_eq!(strong.db_status, DbStatus::Cached);
-
-        let absent = &r.bssids[1];
-        assert_eq!(absent.signal_dbm, None);
-        assert!(!absent.is_stable);
-        assert_eq!(absent.db_status, DbStatus::New);
-    }
-
-    #[test]
-    fn history_fixture_populates_segments() {
-        let r: HistoryResponse = serde_json::from_slice(HISTORY_FIXTURE.as_bytes()).unwrap();
-        assert!(r.ok);
-        assert_eq!(r.v, 1);
-        assert_eq!(r.from, "2026-01-01T00:00:00Z");
-        assert_eq!(r.to, "2026-01-02T00:00:00Z");
-        assert_eq!(r.segments.len(), 1);
-        let s = &r.segments[0];
-        assert_eq!(s.start_rfc3339, "2026-01-01T08:00:00Z");
-        assert_eq!(s.end_rfc3339, "2026-01-01T09:30:00Z");
-        assert_eq!(s.duration_secs, 5400);
-        approx(s.centroid_lat, 55.6761);
-        approx(s.centroid_lon, 12.5683);
-        approx(s.mean_accuracy_m, 35.0);
-        assert_eq!(s.n_fixes, 42);
-    }
-
-    #[test]
-    fn version_fixture_populates_fields() {
-        let r: VersionResponse = serde_json::from_slice(VERSION_FIXTURE.as_bytes()).unwrap();
-        assert!(r.ok);
-        assert_eq!(r.v, 1);
-        assert_eq!(r.version.as_deref(), Some("0.1.0"));
-        assert_eq!(r.git_rev.as_deref(), Some("deadbeef"));
-        assert!(r.error.is_none());
-    }
-
-    #[test]
-    fn error_envelope_decodes_into_typed_responses() {
-        // The daemon returns the same `{ok:false,v,error}` envelope for any
-        // command; it must decode as ok:false with the message on whichever
-        // typed response the client was expecting.
-        let locate: LocateResponse = serde_json::from_slice(ERROR_FIXTURE.as_bytes()).unwrap();
-        assert!(!locate.ok);
-        assert_eq!(locate.v, 1);
-        assert_eq!(locate.error.as_deref(), Some("unknown command"));
-
-        let scan: ScanResponse = serde_json::from_slice(ERROR_FIXTURE.as_bytes()).unwrap();
-        assert!(!scan.ok);
-        assert_eq!(scan.error.as_deref(), Some("unknown command"));
-        assert!(scan.networks.is_empty());
-    }
-
-    /// A daemon field rename is what this cross-test exists to catch. Two
-    /// distinct failure modes, both proven here so the guarantee is explicit:
-    ///
-    ///  1. Fields WITHOUT `#[serde(default)]` on the client (`bssid`,
-    ///     `signal_dbm`, `provenance`, every `HistorySegment` field, ...) turn
-    ///     a rename into a HARD `serde_json` error — decode fails outright.
-    ///  2. Fields WITH `#[serde(default)]` (most `locate`/`stats` scalars,
-    ///     e.g. `accuracy_m`) silently default on rename, so the value
-    ///     assertion — not the decode — is what bites: the field reads its
-    ///     zero default instead of the fixture's value.
-    #[test]
-    fn a_daemon_rename_is_caught_by_decode_or_by_value() {
-        // Case 1: rename a required field -> hard decode error.
-        let renamed_required = RESOLVE_FIXTURE.replace(
-            r#""bssid":"02:00:00:00:00:01""#,
-            r#""station":"02:00:00:00:00:01""#,
-        );
-        assert!(
-            serde_json::from_slice::<ResolveResponse>(renamed_required.as_bytes()).is_err(),
-            "renaming a non-defaulted field must fail decode"
-        );
-
-        // Case 2: rename a defaulted scalar -> decode succeeds but the value
-        // is wrong, so the field assertion is the guard.
-        let renamed_defaulted =
-            LOCATE_FIXTURE.replace(r#""accuracy_m":42.5"#, r#""accuracy_meters":42.5"#);
-        let r: LocateResponse = serde_json::from_slice(renamed_defaulted.as_bytes())
-            .expect("defaulted field rename still decodes");
-        assert_eq!(
-            r.accuracy_m, 0.0,
-            "a renamed defaulted field falls back to its default, which the value assertion catches"
-        );
-    }
-
-    // ---- AC#3: single-line framing over the real read path ----
-
-    /// The client (`exchange`, lib.rs:820) reads EXACTLY one line via
-    /// `BufReader::read_line`. This drives that real path over a real socket:
-    /// the peer writes a valid compact response line, a newline, then extra
-    /// bytes (as a mistaken multi-line `to_string_pretty` emit would). The
-    /// client must return only the first line and decode it cleanly — proving
-    /// trailing bytes cannot corrupt the decode, and documenting that a
-    /// genuinely multi-line daemon response would be truncated at line one.
+    /// The peer writes a valid compact line, a newline, then trailing garbage
+    /// (as a mistaken multi-line `to_string_pretty` emit would). The client
+    /// must return only the first line and decode it cleanly.
     #[test]
     fn client_reads_exactly_the_first_response_line() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
-
-        // Trailing garbage after the first newline: a second JSON line plus a
-        // fragment that is not even valid JSON. Neither may reach the decoder.
         let payload = format!("{LOCATE_FIXTURE}\n{{\"ok\":true,\"v\":1}}\nNOT JSON AT ALL");
 
         let server = thread::spawn(move || {
@@ -2218,13 +1365,10 @@ mod daemon_wire_cross_tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("server read timeout");
-            // The client half-closes its write side after the request, so this
-            // read returns once EOF is seen; then we send the framed payload.
             let mut request = String::new();
             let _ = stream.read_to_string(&mut request);
             stream.write_all(payload.as_bytes()).expect("write payload");
             stream.flush().expect("flush payload");
-            // Drop closes the connection, giving the client's read_line its EOF.
         });
 
         let client = WhereAmIClient::tcp(&addr.to_string());
@@ -2240,6 +1384,6 @@ mod daemon_wire_cross_tests {
         let decoded: LocateResponse =
             serde_json::from_slice(line.as_bytes()).expect("first line decodes on its own");
         assert!(decoded.ok);
-        approx(decoded.accuracy_m, 42.5);
+        assert_eq!(decoded.confidence, Confidence::Medium);
     }
 }

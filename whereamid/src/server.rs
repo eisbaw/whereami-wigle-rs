@@ -22,6 +22,15 @@ use crate::db::{DbHandle, DebugDbStatus, LastFix};
 use crate::debounce::{Debouncer, TimestampedScan};
 use crate::nominatim::NominatimClient;
 use crate::wigle::WigleClient;
+// The JSON wire types are defined once in `whereami-protocol` (task-0114); the
+// daemon serializes them and the client deserializes the identical types. The
+// daemon is strict by construction: it never builds the tolerant `Unknown`
+// variant of `Provenance`/`DbStatus`, so its emitted JSON is unchanged.
+use whereami_protocol::{
+    DbStatus, DebugBssid, DebugResponse, ErrorResponse, HistoryFix, HistoryFixesResponse,
+    HistoryRange, HistoryResponse, LocateResponse, NetworkEntry, Provenance, ResolveResponse,
+    ResolveResultEntry, ScanResponse, StatsResponse, VersionResponse, WipeResponse,
+};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Total budget to write the response and close the socket. A slow client
@@ -426,168 +435,7 @@ enum Request {
     },
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    ok: bool,
-    v: u32,
-    error: String,
-}
-
 use crate::quality::{Confidence, FixQuality};
-
-#[derive(Serialize)]
-struct LocateResponse {
-    ok: bool,
-    v: u32,
-    lat: f64,
-    lon: f64,
-    /// Weighted spread of contributing AP positions around the centroid,
-    /// clamped to [10, 1000] m; a rough dispersion estimate, NOT a calibrated
-    /// 68%/95% confidence radius. When `fallback` is true this is the 1000 m
-    /// antipodal-ambiguity sentinel rather than a measured spread.
-    accuracy_m: f64,
-    sources: usize,
-    cached: usize,
-    visible: usize,
-    stable: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    address: Option<String>,
-    /// True if this is a stale last-known position (no current fix)
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    stale: bool,
-    /// True iff the reported position is the antipodal-cancellation fallback
-    /// (the centroid was ambiguous, so the strongest AP was used and
-    /// `accuracy_m` is the 1000 m sentinel). Emitted only when true, mirroring
-    /// `stale`; absence decodes as false on older/normal responses.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    fallback: bool,
-    /// Age of the last-known position in seconds (only set when stale)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    age_s: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    implied_speed_kmh: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_fix_age_secs: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    inlier_ratio: Option<f64>,
-    confidence: Confidence,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    suspect_reason: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ResolveResponse {
-    ok: bool,
-    v: u32,
-    results: Vec<ResolveResult>,
-}
-
-/// Provenance of a single `resolve` result (task-0062).
-///
-/// Distinct from the data-`Source` enum (apple/wigle/beacondb/manual/
-/// unknown) which records WHO supplied the position. Provenance records
-/// HOW the daemon obtained it for *this request*: from the on-disk cache,
-/// fetched live during the request, or absent. The wire field name is
-/// kept as `source` for backward compatibility with CLIs and curl scripts
-/// that already parse the prior stringly-typed protocol.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Provenance {
-    /// Fetched via a remote provider during this resolve call.
-    Api,
-    /// Served from the local SQLite cache.
-    Cache,
-    /// Authoritative absence: a provider returned NotFound for this BSSID on
-    /// this call, or the not_found table recorded absence within its TTL.
-    /// Safe for a client to cache as "not locatable".
-    NotFound,
-    /// task-0194: the daemon could not consult a provider for this BSSID this
-    /// call, so absence is NOT established — the lookup was deferred to an
-    /// in-flight resolution, the only provider was skipped (missing creds /
-    /// exhausted or corrupt quota), or a transient failure occurred. Distinct
-    /// from NotFound so clients that cache not_found don't blacklist a BSSID
-    /// that is still resolvable; the client should retry later.
-    Unresolved,
-}
-
-#[derive(Serialize)]
-struct ResolveResult {
-    bssid: String,
-    lat: Option<f64>,
-    lon: Option<f64>,
-    ssid: Option<String>,
-    /// Wire field name stays `source` for backward compat. Internally
-    /// `provenance` to disambiguate from the data-source `Source` enum
-    /// (task-0062).
-    #[serde(rename = "source")]
-    provenance: Provenance,
-}
-
-#[derive(Serialize)]
-struct ScanResponse {
-    ok: bool,
-    v: u32,
-    networks: Vec<NetworkInfo>,
-    scan_age_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scanned_at: Option<String>,
-}
-
-#[derive(Serialize)]
-struct NetworkInfo {
-    bssid: String,
-    ssid: Option<String>,
-    signal_dbm: i32,
-    channel: Option<i32>,
-}
-
-#[derive(Serialize)]
-struct StatsResponse {
-    ok: bool,
-    v: u32,
-    cached_aps: i64,
-    pending_aps: i64,
-    not_found_aps: i64,
-    db_size_bytes: i64,
-    api_calls_today: u32,
-    /// Executed reservation attempts denied since daemon start because the
-    /// same-day persisted API counter was malformed. Reset on restart.
-    api_counter_corruption_denials: u64,
-    /// Number of BSSIDs currently undergoing remote provider lookup
-    /// (size of state.inflight). task-0074.
-    inflight: usize,
-    /// Cumulative count of best-effort DB writes that failed and were
-    /// warned-only. Helps spot silent corruption (full disk, missing
-    /// write permissions, etc.). Reset on daemon restart. task-0076.
-    db_write_failures: u64,
-    /// Cumulative count of best-effort DB reads (cache lookups) that failed
-    /// and were warned-only. Distinguishes a real read error from a genuine
-    /// cache miss so silent quota-wasting failures are visible. Reset on
-    /// daemon restart. task-0105.
-    db_read_failures: u64,
-    /// Successfully committed autonomous history rows since daemon start.
-    autolocate_fixes_written: u64,
-    /// Number of background tasks (tracked resolve/backfill spawns and the
-    /// named scan/pending/geocode/prune/autolocate/server loops) force-aborted
-    /// at the end
-    /// of the LAST clean shutdown because they did not finish within the
-    /// drain budget. Persisted at shutdown and reloaded at startup — the count is
-    /// produced after the server socket closes, so the previous run's value
-    /// is the only observable one. A crash/SIGKILL does not update it.
-    /// task-0102.
-    orphan_tasks_aborted: u64,
-}
-
-#[derive(Serialize)]
-struct WipeResponse {
-    ok: bool,
-    v: u32,
-    aps_deleted: usize,
-    pending_deleted: usize,
-    not_found_deleted: usize,
-    fixes_deleted: usize,
-    last_fix_deleted: usize,
-}
 
 fn error_json(msg: &str) -> String {
     serde_json::to_string(&ErrorResponse {
@@ -2172,6 +2020,7 @@ async fn compute_locate_with_clock(
                 inlier_ratio: decision.quality.inlier_ratio(),
                 confidence: decision.quality.confidence(),
                 suspect_reason: decision.quality.suspect_reason().map(str::to_owned),
+                error: None,
             };
             LocateOutcome::Interactive(ok_json(&resp))
         }
@@ -2238,6 +2087,7 @@ async fn return_last_fix_or_error(
             inlier_ratio: None,
             confidence: Confidence::Low,
             suspect_reason: None,
+            error: None,
         };
         ok_json(&resp)
     } else {
@@ -2269,11 +2119,11 @@ async fn handle_resolve(
 
     let result = resolver::resolve_readonly(&normalized, state, ticket).await;
 
-    let results: Vec<ResolveResult> = normalized
+    let results: Vec<ResolveResultEntry> = normalized
         .iter()
         .map(|bssid| {
             match result.positioned.iter().find(|a| &a.bssid == bssid) {
-                Some(ap) if ap.lat.is_finite() && ap.lon.is_finite() => ResolveResult {
+                Some(ap) if ap.lat.is_finite() && ap.lon.is_finite() => ResolveResultEntry {
                     bssid: bssid.clone(),
                     lat: Some(ap.lat),
                     lon: Some(ap.lon),
@@ -2294,7 +2144,7 @@ async fn handle_resolve(
                         "discarding resolve position for {}: non-finite coordinates ({}, {})",
                         ap.bssid, ap.lat, ap.lon
                     );
-                    ResolveResult {
+                    ResolveResultEntry {
                         bssid: bssid.clone(),
                         lat: None,
                         lon: None,
@@ -2315,7 +2165,7 @@ async fn handle_resolve(
                     } else {
                         Provenance::Unresolved
                     };
-                    ResolveResult {
+                    ResolveResultEntry {
                         bssid: bssid.clone(),
                         lat: None,
                         lon: None,
@@ -2331,6 +2181,7 @@ async fn handle_resolve(
         ok: true,
         v: WIRE_VERSION,
         results,
+        error: None,
     };
     ok_json(&resp)
 }
@@ -2341,9 +2192,9 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
     let scanned_at = debouncer.latest_scan_time().map(|t| t.to_rfc3339());
     let networks = match debouncer.latest_scan() {
         Some(sample) => {
-            let mut nets: Vec<NetworkInfo> = sample
+            let mut nets: Vec<NetworkEntry> = sample
                 .iter()
-                .map(|(bssid, entry)| NetworkInfo {
+                .map(|(bssid, entry)| NetworkEntry {
                     bssid: bssid.clone(),
                     ssid: entry.ssid.clone(),
                     signal_dbm: entry.signal_dbm,
@@ -2362,49 +2213,9 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
         networks,
         scan_age_ms,
         scanned_at,
+        error: None,
     };
     ok_json(&resp)
-}
-
-/// DB classification of a BSSID seen by the debouncer (task-0062).
-/// Wire format is the lowercase string the previous stringly-typed
-/// implementation emitted; see `Provenance` for the rename rationale.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum DbStatus {
-    /// BSSID is in the `aps` cache.
-    Cached,
-    /// BSSID is queued for resolution.
-    Pending,
-    /// BSSID is in the `not_found` table (definitively absent at every
-    /// provider, within the TTL window).
-    NotFound,
-    /// BSSID has not been observed by the daemon before this scan.
-    New,
-}
-
-#[derive(Serialize)]
-struct DebugBssid {
-    bssid: String,
-    /// None when the BSSID is debounce-stable but absent from the most
-    /// recent scan (was previously fabricated as -90 dBm; task-0051).
-    signal_dbm: Option<i32>,
-    seen: usize,   // times seen in debounce window
-    needed: usize, // threshold to be stable
-    is_stable: bool,
-    db_status: DbStatus,
-}
-
-#[derive(Serialize)]
-struct DebugResponse {
-    ok: bool,
-    v: u32,
-    daemon_rev: &'static str,
-    scan_age_ms: Option<u64>,
-    samples_in_buffer: usize,
-    visible: usize,
-    stable: usize,
-    bssids: Vec<DebugBssid>,
 }
 
 async fn handle_debug(state: &Arc<DaemonState>) -> String {
@@ -2489,72 +2300,38 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
     let resp = DebugResponse {
         ok: true,
         v: WIRE_VERSION,
-        daemon_rev: env!("GIT_REV"),
+        // The shared wire type carries `Option<String>` (an old daemon could
+        // omit it); the daemon always emits its compiled-in revision, so the
+        // bytes are unchanged.
+        daemon_rev: Some(env!("GIT_REV").to_string()),
         scan_age_ms,
         samples_in_buffer: samples,
         visible,
         stable: stable_count,
         bssids,
+        error: None,
     };
     ok_json(&resp)
-}
-
-#[derive(Serialize)]
-struct VersionResponse {
-    ok: bool,
-    v: u32,
-    version: &'static str,
-    git_rev: &'static str,
 }
 
 fn handle_version() -> String {
     let resp = VersionResponse {
         ok: true,
         v: WIRE_VERSION,
-        version: env!("CARGO_PKG_VERSION"),
-        git_rev: env!("GIT_REV"),
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        git_rev: Some(env!("GIT_REV").to_string()),
+        error: None,
     };
     ok_json(&resp)
 }
 
-#[derive(Serialize)]
-struct HistoryResponse {
-    ok: bool,
-    v: u32,
-    /// RFC3339 inclusive start of the queried range.
-    from: String,
-    /// RFC3339 inclusive end of the queried range.
-    to: String,
-    /// Stay-point segments in ascending time order.
-    segments: Vec<crate::history::Segment>,
-}
-
-#[derive(Serialize)]
-struct RawHistoryRange {
-    from_rfc3339: String,
-    to_rfc3339: String,
-}
-
-#[derive(Serialize)]
-struct RawHistoryFix {
-    at_rfc3339: String,
-    lat: f64,
-    lon: f64,
-    accuracy_m: f64,
-    n_sources: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    implied_speed_kmh: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_fix_age_secs: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    inlier_ratio: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    confidence: Option<Confidence>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    suspect_reason: Option<String>,
-}
-
-impl From<crate::db::Fix> for RawHistoryFix {
+/// Build the shared wire [`HistoryFix`] from a persisted DB row. The conversion
+/// lives here (not in the protocol crate) because it depends on daemon-internal
+/// types (`crate::db::Fix`, `crate::quality::FixQuality`); coherence permits it
+/// because `db::Fix` is local even though `HistoryFix` is foreign. The daemon
+/// thus serializes the shared type directly — there is no daemon-private
+/// raw-history struct to drift from the client's (task-0114).
+impl From<crate::db::Fix> for HistoryFix {
     fn from(row: crate::db::Fix) -> Self {
         let (implied_speed_kmh, last_fix_age_secs, inlier_ratio, confidence, suspect_reason) = row
             .quality
@@ -2580,16 +2357,6 @@ impl From<crate::db::Fix> for RawHistoryFix {
             suspect_reason,
         }
     }
-}
-
-#[derive(Serialize)]
-struct RawHistoryResponse {
-    ok: bool,
-    v: u32,
-    range: RawHistoryRange,
-    fixes: Vec<RawHistoryFix>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    elided: Option<i64>,
 }
 
 /// Async-side cancellation bridge for blocking history work. Dropping an
@@ -2694,7 +2461,7 @@ where
                 HistoryBody::Segmented(segments)
             }
             HistoryOutput::Raw { elided } => HistoryBody::Raw {
-                fixes: fixes.into_iter().map(RawHistoryFix::from).collect(),
+                fixes: fixes.into_iter().map(HistoryFix::from).collect(),
                 elided,
             },
         };
@@ -2710,16 +2477,18 @@ where
                 from,
                 to,
                 segments,
+                error: None,
             }),
-            HistoryBody::Raw { fixes, elided } => ok_json(&RawHistoryResponse {
+            HistoryBody::Raw { fixes, elided } => ok_json(&HistoryFixesResponse {
                 ok: true,
                 v: WIRE_VERSION,
-                range: RawHistoryRange {
+                range: HistoryRange {
                     from_rfc3339: from,
                     to_rfc3339: to,
                 },
                 fixes,
                 elided,
+                error: None,
             }),
         }
     });
@@ -2729,7 +2498,7 @@ where
 enum HistoryBody {
     Segmented(Vec<crate::history::Segment>),
     Raw {
-        fixes: Vec<RawHistoryFix>,
+        fixes: Vec<HistoryFix>,
         elided: Option<i64>,
     },
 }
@@ -3039,6 +2808,7 @@ async fn handle_wipe_observing_enqueue(
                 not_found_deleted: counts.not_found_deleted,
                 fixes_deleted: counts.fixes_deleted,
                 last_fix_deleted: counts.last_fix_deleted,
+                error: None,
             }),
             lease,
             admission,
@@ -3098,6 +2868,7 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
         db_read_failures,
         autolocate_fixes_written,
         orphan_tasks_aborted,
+        error: None,
     };
     ok_json(&resp)
 }
@@ -3470,108 +3241,6 @@ mod last_fix_concurrency_tests {
         assert_eq!(disk_row.address, memory_row.address);
         assert_eq!(disk_row.at, memory_row.at);
         assert_eq!(disk_row.sources, memory_row.sources);
-    }
-}
-
-#[cfg(test)]
-mod wire_enum_tests {
-    //! task-0062: wire-format round-trip for the typed enums that
-    //! previously crossed the protocol as raw strings. These tests
-    //! pin the on-the-wire spelling so a future variant rename
-    //! (Rust-side) cannot silently break clients.
-    use super::*;
-
-    #[test]
-    fn db_status_serializes_to_documented_strings() {
-        assert_eq!(
-            serde_json::to_string(&DbStatus::Cached).unwrap(),
-            "\"cached\""
-        );
-        assert_eq!(
-            serde_json::to_string(&DbStatus::Pending).unwrap(),
-            "\"pending\""
-        );
-        assert_eq!(
-            serde_json::to_string(&DbStatus::NotFound).unwrap(),
-            "\"not_found\""
-        );
-        assert_eq!(serde_json::to_string(&DbStatus::New).unwrap(), "\"new\"");
-    }
-
-    #[test]
-    fn db_status_round_trip() {
-        for v in [
-            DbStatus::Cached,
-            DbStatus::Pending,
-            DbStatus::NotFound,
-            DbStatus::New,
-        ] {
-            let s = serde_json::to_string(&v).unwrap();
-            let back: DbStatus = serde_json::from_str(&s).unwrap();
-            assert_eq!(back, v);
-        }
-    }
-
-    #[test]
-    fn provenance_serializes_to_documented_strings() {
-        assert_eq!(serde_json::to_string(&Provenance::Api).unwrap(), "\"api\"");
-        assert_eq!(
-            serde_json::to_string(&Provenance::Cache).unwrap(),
-            "\"cache\""
-        );
-        assert_eq!(
-            serde_json::to_string(&Provenance::NotFound).unwrap(),
-            "\"not_found\""
-        );
-        // task-0194: new wire value.
-        assert_eq!(
-            serde_json::to_string(&Provenance::Unresolved).unwrap(),
-            "\"unresolved\""
-        );
-    }
-
-    #[test]
-    fn provenance_round_trip() {
-        for v in [
-            Provenance::Api,
-            Provenance::Cache,
-            Provenance::NotFound,
-            Provenance::Unresolved,
-        ] {
-            let s = serde_json::to_string(&v).unwrap();
-            let back: Provenance = serde_json::from_str(&s).unwrap();
-            assert_eq!(back, v);
-        }
-    }
-
-    #[test]
-    fn resolve_result_emits_source_field_name() {
-        // Provenance is internal; the JSON field MUST stay `source` for
-        // backward-compatible clients (curl scripts, older CLIs).
-        let r = ResolveResult {
-            bssid: "aa:bb:cc:dd:ee:ff".to_string(),
-            lat: Some(1.0),
-            lon: Some(2.0),
-            ssid: Some("x".to_string()),
-            provenance: Provenance::Cache,
-        };
-        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
-        assert_eq!(v.get("source").and_then(|x| x.as_str()), Some("cache"));
-        assert!(
-            v.get("provenance").is_none(),
-            "internal field name must not leak onto the wire"
-        );
-    }
-
-    #[test]
-    fn unknown_db_status_string_is_rejected() {
-        // We deliberately do NOT add #[serde(other)] — an unknown variant
-        // on the wire is a protocol mismatch and we want it loud, not
-        // silently mapped to a fallback. Newer daemons emitting a new
-        // variant will need a coordinated client bump (or a future
-        // task to add a tagged-other escape hatch).
-        let r: Result<DbStatus, _> = serde_json::from_str("\"unrecognised\"");
-        assert!(r.is_err(), "deserializing unknown db_status must fail");
     }
 }
 

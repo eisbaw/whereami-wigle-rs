@@ -1,0 +1,16 @@
+[package]
+name = "whereami-protocol"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Single source of truth for the whereamid JSON wire types (shared by daemon and client)."
+
+[lib]
+name = "whereami_protocol"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tracing::{debug, info};
 
-use crate::quality::{Confidence, FixQuality};
+use crate::quality::{Confidence, ConfidenceDb, FixQuality};
 
 /// Information about a resolved access point.
 #[derive(Debug, Clone)]

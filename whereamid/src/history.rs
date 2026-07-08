@@ -9,29 +9,16 @@
 //! whose duration is below `min_duration_secs` are dropped — a 30-second
 //! detour past a coffee shop is not a "place".
 
-use serde::Serialize;
-
 use crate::db::Fix;
 
-/// A grouped stay-point: a run of fixes within `dist_threshold_m` of each
-/// other for at least `min_duration_secs`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Segment {
-    /// First fix in the segment (RFC3339).
-    pub start_rfc3339: String,
-    /// Last fix in the segment (RFC3339).
-    pub end_rfc3339: String,
-    /// Duration in seconds.
-    pub duration_secs: i64,
-    /// Centroid latitude (geometric median of fix latitudes — task-0084).
-    pub centroid_lat: f64,
-    /// Centroid longitude (geometric median of fix longitudes — task-0084).
-    pub centroid_lon: f64,
-    /// Mean accuracy_m of fixes in the segment.
-    pub mean_accuracy_m: f64,
-    /// Number of fixes aggregated.
-    pub n_fixes: usize,
-}
+/// A grouped stay-point: a run of fixes within `dist_threshold_m` of each other
+/// for at least `min_duration_secs`.
+///
+/// This is the shared wire type [`whereami_protocol::HistorySegment`] (the
+/// segmented-history segment); the daemon builds these and the client decodes
+/// the identical type (task-0114). Re-exported under the domain-local name
+/// `Segment` so the segmentation code below reads naturally.
+pub use whereami_protocol::HistorySegment as Segment;
 
 /// Result of cancellation-aware history segmentation.
 ///
