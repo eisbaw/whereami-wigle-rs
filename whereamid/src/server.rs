@@ -2760,7 +2760,7 @@ async fn handle_history(
         (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
             return error_json("history: 'range' and 'from'/'to' are mutually exclusive").into();
         }
-        (Some(spec), None, None) => match crate::history::parse_range(spec) {
+        (Some(spec), None, None) => match crate::duration_spec::parse_range(spec) {
             Ok(r) => r,
             Err(e) => return error_json(&format!("history: invalid range: {e}")).into(),
         },
@@ -2782,9 +2782,8 @@ async fn handle_history(
             }
             (f, t)
         }
-        (None, None, None) => {
-            crate::history::parse_range("7d").expect("hardcoded default range '7d' must parse")
-        }
+        (None, None, None) => crate::duration_spec::parse_range("7d")
+            .expect("hardcoded default range '7d' must parse"),
         _ => {
             return error_json("history: provide either 'range' or both 'from' and 'to'").into();
         }

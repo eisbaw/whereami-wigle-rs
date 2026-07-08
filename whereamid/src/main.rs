@@ -10,6 +10,7 @@ mod boot_clock;
 mod config;
 mod db;
 mod debounce;
+mod duration_spec;
 mod geo;
 mod history;
 mod http;
