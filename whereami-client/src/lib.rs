@@ -1895,3 +1895,327 @@ mod target_resolution_tests {
         );
     }
 }
+
+/// Daemon-emit -> client-decode wire cross-tests (task-0152).
+///
+/// The rest of the suite tests the client's typed enums/structs in isolation,
+/// and the daemon (`whereamid/src/server.rs`) tests its own emitted JSON in
+/// isolation. Neither side ever feeds a byte-exact *daemon-produced* response
+/// through the *client's* typed deserializer, so a daemon field rename or a
+/// switch to multi-line `to_string_pretty` would slip past both suites.
+///
+/// FIXTURE AUTHENTICITY: every fixture below is hand-derived from the DAEMON
+/// side, NOT from what the client wishes to receive (a client-shaped fixture
+/// would be circular and miss real drift). Each `&str` mirrors, in the exact
+/// serde declaration order, the corresponding daemon `#[derive(Serialize)]`
+/// struct in `whereamid/src/server.rs`, with the same field names, the same
+/// `snake_case`/`lowercase` enum tokens, and the same null-vs-omitted shape
+/// dictated by each field's `skip_serializing_if`:
+///   - `LocateResponse`    server.rs:565  (confidence is lowercase `Confidence`)
+///   - `ResolveResponse`   server.rs:597 / `ResolveResult` :632 (`source` tag)
+///   - `ScanResponse`      server.rs:645 / `NetworkInfo` :655 (Option -> null)
+///   - `StatsResponse`     server.rs:663  (all 13 counters always present)
+///   - `DebugResponse`     server.rs:2410 / `DebugBssid` :2398 (signal null)
+///   - `HistoryResponse`   server.rs:2532 / `history::Segment`
+///   - `VersionResponse`   server.rs:2514
+///   - error envelope      `error_json` server.rs:710 -> `{ok:false,v,error}`
+///
+/// Value shapes cross-checked against the daemon's own exact-JSON wire tests:
+/// `stats_wire_reports_corruption_denials_...` (server.rs:3245) and
+/// `scan_and_debug_option_fields_pin_null_vs_omitted_wire_shape` (server.rs:6507),
+/// the latter confirming `scan_age_ms`/`signal_dbm`/`ssid`/`channel` serialize
+/// as JSON `null` (no `skip_serializing_if`) while `scanned_at` is omitted.
+///
+/// FLOAT COMPARISON: this workspace builds serde_json WITHOUT the
+/// `float_roundtrip` feature, so its default f64 parser is not correctly
+/// rounded and can land 1 ULP away from the same literal parsed by rustc.
+/// Float assertions therefore use a relative tolerance, never `assert_eq!`
+/// (carried forward from task-0245).
+#[cfg(test)]
+mod daemon_wire_cross_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Byte-exact daemon `locate` response with every optional field present,
+    /// in `LocateResponse` (server.rs:565) declaration order.
+    const LOCATE_FIXTURE: &str = r#"{"ok":true,"v":1,"lat":55.6761,"lon":12.5683,"accuracy_m":42.5,"sources":7,"cached":5,"fetched":2,"pending":1,"visible":9,"stable":6,"address":"Copenhagen, Denmark","stale":true,"age_s":120,"implied_speed_kmh":13.5,"last_fix_age_secs":30,"inlier_ratio":0.75,"confidence":"medium","suspect_reason":"speed"}"#;
+
+    /// `resolve` response mixing a located (`cache`) and an absent (`not_found`)
+    /// entry; `ResolveResult` (server.rs:632) emits `lat`/`lon`/`ssid` as null
+    /// (no `skip_serializing_if`) and the provenance under the wire tag `source`.
+    const RESOLVE_FIXTURE: &str = r#"{"ok":true,"v":1,"results":[{"bssid":"02:00:00:00:00:01","lat":55.1,"lon":12.2,"ssid":"cafe","source":"cache"},{"bssid":"02:00:00:00:00:02","lat":null,"lon":null,"ssid":null,"source":"not_found"}]}"#;
+
+    /// `scan` response; `NetworkInfo` (server.rs:655) emits `ssid`/`channel` as
+    /// present values here, `scan_age_ms` is present, `scanned_at` present.
+    const SCAN_FIXTURE: &str = r#"{"ok":true,"v":1,"networks":[{"bssid":"02:00:00:00:00:0a","ssid":"home","signal_dbm":-52,"channel":6}],"scan_age_ms":1500,"scanned_at":"2026-01-02T03:04:05Z"}"#;
+
+    /// `stats` response with all 13 always-present counters (`StatsResponse`
+    /// server.rs:663), values shaped like the daemon's own
+    /// `stats_wire_reports_corruption_denials_...` test (server.rs:3245).
+    const STATS_FIXTURE: &str = r#"{"ok":true,"v":1,"cached_aps":100,"pending_aps":5,"not_found_aps":3,"db_size_bytes":40960,"api_calls_today":12,"api_counter_corruption_denials":3,"inflight":2,"db_write_failures":1,"db_read_failures":4,"autolocate_fixes_written":7,"orphan_tasks_aborted":0}"#;
+
+    /// `debug` response; second BSSID reproduces the production `signal_dbm:null`
+    /// shape (stable but absent from the latest scan; server.rs:2400 + the
+    /// daemon test at server.rs:6556) and the `new`/`cached` `DbStatus` tokens.
+    const DEBUG_FIXTURE: &str = r#"{"ok":true,"v":1,"daemon_rev":"abc1234","scan_age_ms":800,"samples_in_buffer":4,"visible":3,"stable":2,"bssids":[{"bssid":"02:00:00:00:00:aa","signal_dbm":-48,"seen":5,"needed":3,"is_stable":true,"db_status":"cached"},{"bssid":"02:00:00:00:00:bb","signal_dbm":null,"seen":2,"needed":3,"is_stable":false,"db_status":"new"}]}"#;
+
+    /// Segmented `history` response (`HistoryResponse` server.rs:2532 +
+    /// `history::Segment`).
+    const HISTORY_FIXTURE: &str = r#"{"ok":true,"v":1,"from":"2026-01-01T00:00:00Z","to":"2026-01-02T00:00:00Z","segments":[{"start_rfc3339":"2026-01-01T08:00:00Z","end_rfc3339":"2026-01-01T09:30:00Z","duration_secs":5400,"centroid_lat":55.6761,"centroid_lon":12.5683,"mean_accuracy_m":35.0,"n_fixes":42}]}"#;
+
+    /// `version` response (`VersionResponse` server.rs:2514).
+    const VERSION_FIXTURE: &str = r#"{"ok":true,"v":1,"version":"0.1.0","git_rev":"deadbeef"}"#;
+
+    /// Daemon error envelope (`error_json` server.rs:710).
+    const ERROR_FIXTURE: &str = r#"{"ok":false,"v":1,"error":"unknown command"}"#;
+
+    /// Relative-tolerance float compare (see module-level note on serde_json's
+    /// non-round-tripping default parser).
+    #[track_caller]
+    fn approx(actual: f64, expected: f64) {
+        let tol = 1e-9 * expected.abs().max(1.0);
+        assert!(
+            (actual - expected).abs() <= tol,
+            "float mismatch: actual={actual} expected={expected} tol={tol}"
+        );
+    }
+
+    // ---- AC#1 / AC#2: byte-exact daemon JSON -> typed client Response ----
+
+    #[test]
+    fn locate_fixture_populates_every_field() {
+        let r: LocateResponse = serde_json::from_slice(LOCATE_FIXTURE.as_bytes()).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.v, 1);
+        approx(r.lat, 55.6761);
+        approx(r.lon, 12.5683);
+        approx(r.accuracy_m, 42.5);
+        assert_eq!(r.sources, 7);
+        assert_eq!(r.cached, 5);
+        assert_eq!(r.fetched, 2);
+        assert_eq!(r.pending, 1);
+        assert_eq!(r.visible, 9);
+        assert_eq!(r.stable, 6);
+        assert_eq!(r.address.as_deref(), Some("Copenhagen, Denmark"));
+        assert!(r.stale);
+        assert_eq!(r.age_s, Some(120));
+        approx(r.implied_speed_kmh.unwrap(), 13.5);
+        assert_eq!(r.last_fix_age_secs, Some(30));
+        approx(r.inlier_ratio.unwrap(), 0.75);
+        assert_eq!(r.confidence, Confidence::Medium);
+        assert_eq!(r.suspect_reason.as_deref(), Some("speed"));
+        assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn resolve_fixture_populates_entries_and_provenance() {
+        let r: ResolveResponse = serde_json::from_slice(RESOLVE_FIXTURE.as_bytes()).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.v, 1);
+        assert_eq!(r.results.len(), 2);
+
+        let cached = &r.results[0];
+        assert_eq!(cached.bssid, "02:00:00:00:00:01");
+        approx(cached.lat.unwrap(), 55.1);
+        approx(cached.lon.unwrap(), 12.2);
+        assert_eq!(cached.ssid.as_deref(), Some("cafe"));
+        assert_eq!(cached.provenance, Provenance::Cache);
+
+        let absent = &r.results[1];
+        assert_eq!(absent.bssid, "02:00:00:00:00:02");
+        assert!(absent.lat.is_none());
+        assert!(absent.lon.is_none());
+        assert!(absent.ssid.is_none());
+        assert_eq!(absent.provenance, Provenance::NotFound);
+    }
+
+    #[test]
+    fn scan_fixture_populates_networks() {
+        let r: ScanResponse = serde_json::from_slice(SCAN_FIXTURE.as_bytes()).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.v, 1);
+        assert_eq!(r.scan_age_ms, Some(1500));
+        assert_eq!(r.scanned_at.as_deref(), Some("2026-01-02T03:04:05Z"));
+        assert_eq!(r.networks.len(), 1);
+        let n = &r.networks[0];
+        assert_eq!(n.bssid, "02:00:00:00:00:0a");
+        assert_eq!(n.ssid.as_deref(), Some("home"));
+        assert_eq!(n.signal_dbm, -52);
+        assert_eq!(n.channel, Some(6));
+        assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn stats_fixture_populates_all_counters() {
+        let r: StatsResponse = serde_json::from_slice(STATS_FIXTURE.as_bytes()).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.v, 1);
+        assert_eq!(r.cached_aps, 100);
+        assert_eq!(r.pending_aps, 5);
+        assert_eq!(r.not_found_aps, 3);
+        assert_eq!(r.db_size_bytes, 40960);
+        assert_eq!(r.api_calls_today, 12);
+        assert_eq!(r.api_counter_corruption_denials, 3);
+        assert_eq!(r.inflight, 2);
+        assert_eq!(r.db_write_failures, 1);
+        assert_eq!(r.db_read_failures, 4);
+        assert_eq!(r.autolocate_fixes_written, 7);
+        assert_eq!(r.orphan_tasks_aborted, 0);
+        assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn debug_fixture_populates_bssids_and_null_signal() {
+        let r: DebugResponse = serde_json::from_slice(DEBUG_FIXTURE.as_bytes()).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.v, 1);
+        assert_eq!(r.daemon_rev.as_deref(), Some("abc1234"));
+        assert_eq!(r.scan_age_ms, Some(800));
+        assert_eq!(r.samples_in_buffer, 4);
+        assert_eq!(r.visible, 3);
+        assert_eq!(r.stable, 2);
+        assert_eq!(r.bssids.len(), 2);
+
+        let strong = &r.bssids[0];
+        assert_eq!(strong.bssid, "02:00:00:00:00:aa");
+        assert_eq!(strong.signal_dbm, Some(-48));
+        assert_eq!(strong.seen, 5);
+        assert_eq!(strong.needed, 3);
+        assert!(strong.is_stable);
+        assert_eq!(strong.db_status, DbStatus::Cached);
+
+        let absent = &r.bssids[1];
+        assert_eq!(absent.signal_dbm, None);
+        assert!(!absent.is_stable);
+        assert_eq!(absent.db_status, DbStatus::New);
+    }
+
+    #[test]
+    fn history_fixture_populates_segments() {
+        let r: HistoryResponse = serde_json::from_slice(HISTORY_FIXTURE.as_bytes()).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.v, 1);
+        assert_eq!(r.from, "2026-01-01T00:00:00Z");
+        assert_eq!(r.to, "2026-01-02T00:00:00Z");
+        assert_eq!(r.segments.len(), 1);
+        let s = &r.segments[0];
+        assert_eq!(s.start_rfc3339, "2026-01-01T08:00:00Z");
+        assert_eq!(s.end_rfc3339, "2026-01-01T09:30:00Z");
+        assert_eq!(s.duration_secs, 5400);
+        approx(s.centroid_lat, 55.6761);
+        approx(s.centroid_lon, 12.5683);
+        approx(s.mean_accuracy_m, 35.0);
+        assert_eq!(s.n_fixes, 42);
+    }
+
+    #[test]
+    fn version_fixture_populates_fields() {
+        let r: VersionResponse = serde_json::from_slice(VERSION_FIXTURE.as_bytes()).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.v, 1);
+        assert_eq!(r.version.as_deref(), Some("0.1.0"));
+        assert_eq!(r.git_rev.as_deref(), Some("deadbeef"));
+        assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn error_envelope_decodes_into_typed_responses() {
+        // The daemon returns the same `{ok:false,v,error}` envelope for any
+        // command; it must decode as ok:false with the message on whichever
+        // typed response the client was expecting.
+        let locate: LocateResponse = serde_json::from_slice(ERROR_FIXTURE.as_bytes()).unwrap();
+        assert!(!locate.ok);
+        assert_eq!(locate.v, 1);
+        assert_eq!(locate.error.as_deref(), Some("unknown command"));
+
+        let scan: ScanResponse = serde_json::from_slice(ERROR_FIXTURE.as_bytes()).unwrap();
+        assert!(!scan.ok);
+        assert_eq!(scan.error.as_deref(), Some("unknown command"));
+        assert!(scan.networks.is_empty());
+    }
+
+    /// A daemon field rename is what this cross-test exists to catch. Two
+    /// distinct failure modes, both proven here so the guarantee is explicit:
+    ///
+    ///  1. Fields WITHOUT `#[serde(default)]` on the client (`bssid`,
+    ///     `signal_dbm`, `provenance`, every `HistorySegment` field, ...) turn
+    ///     a rename into a HARD `serde_json` error — decode fails outright.
+    ///  2. Fields WITH `#[serde(default)]` (most `locate`/`stats` scalars,
+    ///     e.g. `accuracy_m`) silently default on rename, so the value
+    ///     assertion — not the decode — is what bites: the field reads its
+    ///     zero default instead of the fixture's value.
+    #[test]
+    fn a_daemon_rename_is_caught_by_decode_or_by_value() {
+        // Case 1: rename a required field -> hard decode error.
+        let renamed_required = RESOLVE_FIXTURE.replace(
+            r#""bssid":"02:00:00:00:00:01""#,
+            r#""station":"02:00:00:00:00:01""#,
+        );
+        assert!(
+            serde_json::from_slice::<ResolveResponse>(renamed_required.as_bytes()).is_err(),
+            "renaming a non-defaulted field must fail decode"
+        );
+
+        // Case 2: rename a defaulted scalar -> decode succeeds but the value
+        // is wrong, so the field assertion is the guard.
+        let renamed_defaulted =
+            LOCATE_FIXTURE.replace(r#""accuracy_m":42.5"#, r#""accuracy_meters":42.5"#);
+        let r: LocateResponse = serde_json::from_slice(renamed_defaulted.as_bytes())
+            .expect("defaulted field rename still decodes");
+        assert_eq!(
+            r.accuracy_m, 0.0,
+            "a renamed defaulted field falls back to its default, which the value assertion catches"
+        );
+    }
+
+    // ---- AC#3: single-line framing over the real read path ----
+
+    /// The client (`exchange`, lib.rs:820) reads EXACTLY one line via
+    /// `BufReader::read_line`. This drives that real path over a real socket:
+    /// the peer writes a valid compact response line, a newline, then extra
+    /// bytes (as a mistaken multi-line `to_string_pretty` emit would). The
+    /// client must return only the first line and decode it cleanly — proving
+    /// trailing bytes cannot corrupt the decode, and documenting that a
+    /// genuinely multi-line daemon response would be truncated at line one.
+    #[test]
+    fn client_reads_exactly_the_first_response_line() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Trailing garbage after the first newline: a second JSON line plus a
+        // fragment that is not even valid JSON. Neither may reach the decoder.
+        let payload = format!("{LOCATE_FIXTURE}\n{{\"ok\":true,\"v\":1}}\nNOT JSON AT ALL");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("server read timeout");
+            // The client half-closes its write side after the request, so this
+            // read returns once EOF is seen; then we send the framed payload.
+            let mut request = String::new();
+            let _ = stream.read_to_string(&mut request);
+            stream.write_all(payload.as_bytes()).expect("write payload");
+            stream.flush().expect("flush payload");
+            // Drop closes the connection, giving the client's read_line its EOF.
+        });
+
+        let client = WhereAmIClient::tcp(&addr.to_string());
+        let line = client
+            .raw_command(r#"{"cmd":"locate"}"#)
+            .expect("raw_command should return exactly the first line");
+        server.join().expect("server thread");
+
+        assert_eq!(
+            line, LOCATE_FIXTURE,
+            "client must return exactly the first line, trailing bytes stripped"
+        );
+        let decoded: LocateResponse =
+            serde_json::from_slice(line.as_bytes()).expect("first line decodes on its own");
+        assert!(decoded.ok);
+        approx(decoded.accuracy_m, 42.5);
+    }
+}
