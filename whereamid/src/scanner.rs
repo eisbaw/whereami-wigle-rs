@@ -1978,6 +1978,16 @@ mod tests {
         runner.assert_exhausted();
     }
 
+    // FLAVOR DEPENDENCY: this test relies on `#[tokio::test]` defaulting to the
+    // CURRENT-THREAD runtime. Two sleeps below are intentionally different and
+    // must NOT be unified: phase 1 (wait for the child's pid) uses async
+    // `sleep().await` because it shares the single runtime thread with the
+    // child-spawning task and must yield for it to start; phase 2 (verify the
+    // child died) uses BLOCKING `std::thread::sleep` so its verdict is
+    // independent of the (load-starved) runtime AND so the runtime cannot reap
+    // the child mid-check (see phase-2 INVARIANT). Switching to
+    // `flavor = "multi_thread"` invalidates BOTH rationales — don't, without
+    // re-deriving them (task-0249).
     #[tokio::test]
     async fn tokio_runner_kills_child_when_scan_future_is_cancelled() {
         let unique = std::time::SystemTime::now()
@@ -1996,42 +2006,106 @@ mod tests {
             let mut runner = TokioScanCommandRunner;
             runner.run(command).await
         });
-        let child_pid = timeout(Duration::from_secs(5), async {
+        // The child writes its PID via `printf '%s' $$ > pid_file`. The shell's
+        // `>` redirection TRUNCATES/creates the file BEFORE `printf` writes, so a
+        // read that wins the race sees an empty (or, defensively, partial) file.
+        // Treat "exists but not yet a valid PID" as not-ready and keep polling —
+        // do NOT `expect`-panic on it (that was a second, rarer flake exposed
+        // once the reap flake below was fixed, task-0249). Budget widened to 10s
+        // for headroom under parallel-load starvation. Async sleep is required:
+        // this poll loop shares the single current-thread runtime with the
+        // child-spawning task, so it must yield for the child to start at all.
+        let child_pid = timeout(Duration::from_secs(10), async {
             loop {
                 if let Ok(contents) = std::fs::read_to_string(&pid_file) {
-                    break contents
-                        .parse::<u32>()
-                        .expect("child must write its numeric PID");
+                    if let Ok(pid) = contents.trim().parse::<u32>() {
+                        break pid;
+                    }
                 }
                 sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("scanner child did not start in time");
+        .expect("scanner child did not start and write its PID in time");
 
         task.abort();
         let aborted = task.await.expect_err("scanner future should be cancelled");
         assert!(aborted.is_cancelled());
 
-        let proc_path = std::path::PathBuf::from(format!("/proc/{child_pid}"));
-        let gone = timeout(Duration::from_secs(5), async {
-            loop {
-                if !proc_path.exists() {
-                    break;
-                }
-                sleep(Duration::from_millis(10)).await;
+        // Once the aborted task's future (and its tokio Child) is dropped,
+        // kill_on_drop delivers SIGKILL SYNCHRONOUSLY (tokio 1.52
+        // ChildDropGuard::drop -> Kill::kill; verified against source). The
+        // kernel turns the child into a zombie near-instantly. `/proc/<pid>`
+        // then lingers only until tokio's BEST-EFFORT async reaper runs waitpid
+        // (documented as best-effort). Under parallel `cargo test` load the
+        // current-thread runtime — and thus that reaper — can be starved for
+        // many seconds, so the OLD check (poll `/proc/<pid>` existence via a
+        // tokio `timeout`) misread a correctly-killed-but-unreaped zombie as
+        // "still alive" and also depended on the very runtime that was starved
+        // (task-0249). We instead assert the child is DEAD — gone OR a zombie —
+        // rather than fully reaped, and poll with BLOCKING std + a wall-clock
+        // deadline so the verdict does not depend on the async runtime at all.
+        // Kernel SIGKILL teardown is not load-sensitive, so the generous budget
+        // is only ever consumed on a genuine "still running" regression.
+        //
+        // INVARIANT — this loop MUST NOT `.await`/yield. Blocking the (already
+        // idle, post-abort) current-thread runtime here is deliberate: it keeps
+        // tokio's async reaper from running, so the killed child stays an
+        // un-reaped zombie, its pid is never freed, and `child_is_dead` can never
+        // read a REUSED pid's live process as "our child still alive". If this
+        // loop ever yields, a concurrent forking test could reuse the reaped pid
+        // and the safety-net `libc::kill` below would then target a stranger.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let killed = loop {
+            if child_is_dead(child_pid) {
+                break true;
             }
-        })
-        .await;
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         let _ = std::fs::remove_file(&pid_file);
-        if gone.is_err() {
-            // Keep a failing regression test from leaking its fixture process.
+        if !killed {
+            // Genuine regression: the child is still a live process. Reap the
+            // leaked fixture so the failing test does not orphan a `sleep 60`.
             // SAFETY: `child_pid` came from the exact child this test spawned.
             unsafe {
                 libc::kill(child_pid as libc::pid_t, libc::SIGKILL);
             }
-            panic!("cancelled scanner child {child_pid} remained alive");
+            panic!("cancelled scanner child {child_pid} remained a live process");
         }
+    }
+
+    /// Whether `pid` is no longer a live process — i.e. fully reaped (gone), a
+    /// zombie awaiting reap ('Z'), or in the transient dead states ('X'/'x'). A
+    /// zombie/dead process counts as killed: SIGKILL has already torn it down,
+    /// only the `waitpid` bookkeeping is pending. Reads `/proc/<pid>/stat` with
+    /// blocking std so the verdict does not depend on any async runtime (which is
+    /// what the de-flake requires under load). Linux-only, which is fine — the
+    /// whole path is `/proc`-bound.
+    ///
+    /// NOTE(pid-reuse): a reaped pid reused by another concurrent process would
+    /// read as "alive" here. In this test that cannot happen: the phase-2 loop
+    /// blocks the only runtime that could reap this child (see its INVARIANT), so
+    /// the pid is never freed while we poll. The safety only holds as long as
+    /// that loop stays yield-free.
+    fn child_is_dead(pid: u32) -> bool {
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(contents) => contents,
+            // No stat file => already reaped (or never existed) => dead.
+            Err(_) => return true,
+        };
+        // `/proc/<pid>/stat` is "<pid> (<comm>) <state> ...". `comm` may itself
+        // contain spaces and ')', so the state char is the first token AFTER the
+        // final ')'. 'Z' = zombie; 'X'/'x' = dead (both mean killed). Any other
+        // (or unparseable) state is treated as still-alive — conservative: never
+        // certify a kill we cannot confirm.
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .and_then(|token| token.chars().next());
+        matches!(state, Some('Z' | 'X' | 'x'))
     }
 
     fn patterns(values: &[&str]) -> Vec<String> {
