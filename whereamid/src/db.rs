@@ -915,6 +915,10 @@ impl DbHandle {
             .await
     }
 
+    pub async fn prune_not_found(&self, ttl_days: i64) -> Result<usize> {
+        self.write(move |db| db.prune_not_found(ttl_days)).await
+    }
+
     pub async fn get_metadata(&self, key: impl Into<String>) -> Result<Option<String>> {
         let key = key.into();
         self.read(move |db| db.get_metadata(&key)).await
@@ -2857,6 +2861,24 @@ impl Database {
         let deleted = self.conn.execute(
             "DELETE FROM pending WHERE attempts >= ?1",
             params![max_attempts],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Prune not_found rows whose `checked_at` is older than `2 × ttl_days`.
+    ///
+    /// Past 1×ttl a row is already never re-checked (`is_not_found` only
+    /// counts rows within ttl, and `revive_expired_not_found` moves expired
+    /// rows back to pending in bounded batches). 2×ttl is therefore a safe
+    /// soft cap on definitively-dead rows, bounding the monotonic growth of
+    /// the negative cache on a long-running daemon at a busy location
+    /// (task-0110). The cutoff mirrors `is_not_found`'s time arithmetic so the
+    /// boundary is consistent. Returns the number of rows deleted.
+    pub fn prune_not_found(&self, ttl_days: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::TimeDelta::days(2 * ttl_days)).to_rfc3339();
+        let deleted = self.conn.execute(
+            "DELETE FROM not_found WHERE checked_at < ?1",
+            params![cutoff],
         )?;
         Ok(deleted)
     }
@@ -6029,6 +6051,60 @@ mod tests {
         db.insert_not_found("AA:BB:CC:DD:EE:FF").unwrap();
         assert!(db.is_not_found("AA:BB:CC:DD:EE:FF", 30).unwrap());
         assert!(!db.is_not_found("11:22:33:44:55:66", 30).unwrap());
+    }
+
+    /// `prune_not_found` must delete rows older than 2×ttl while leaving
+    /// still-live rows untouched. The AC nominally says 1000 stale rows, but a
+    /// handful proves the DELETE identically and runs fast; the load-bearing
+    /// assertion is the boundary — a fresh row (checked_at = now) must SURVIVE,
+    /// so a prune that wiped the whole table would fail here (task-0110).
+    #[test]
+    fn prune_not_found_evicts_past_2x_ttl_and_spares_fresh() {
+        let db = Database::open_memory().unwrap();
+        let ttl_days = 30_i64;
+
+        // Backdate a handful of rows to well past 2×ttl (75 days > 60) by
+        // inserting a fixed old RFC3339 checked_at directly. Columns/format
+        // mirror insert_not_found_on: (bssid, first_seen, last_seen, checked_at).
+        let stale_checked_at = (Utc::now() - chrono::TimeDelta::days(75)).to_rfc3339();
+        for i in 0..4 {
+            let bssid = format!("AA:BB:CC:DD:EE:{i:02X}");
+            db.execute_batch_for_test(&format!(
+                "INSERT INTO not_found (bssid, first_seen, last_seen, checked_at)
+                 VALUES ('{bssid}', '{stale_checked_at}', '{stale_checked_at}', '{stale_checked_at}');"
+            ))
+            .unwrap();
+        }
+
+        // A mid-age row at 45 days: expired past 1×ttl (30) but INSIDE 2×ttl
+        // (60), so prune must SPARE it. This pins the `2 *` multiplier — if
+        // prune used 1×ttl instead of 2×ttl this row would be deleted and the
+        // assertions below (pruned==4, count==2) would fail (task-0110 review).
+        let mid_checked_at = (Utc::now() - chrono::TimeDelta::days(45)).to_rfc3339();
+        db.execute_batch_for_test(&format!(
+            "INSERT INTO not_found (bssid, first_seen, last_seen, checked_at)
+             VALUES ('99:99:99:99:99:99', '{mid_checked_at}', '{mid_checked_at}', '{mid_checked_at}');"
+        ))
+        .unwrap();
+
+        // One fresh row within ttl: checked_at = now.
+        db.insert_not_found("11:22:33:44:55:66").unwrap();
+        assert_eq!(db.not_found_ap_count().unwrap(), 6);
+
+        // Prune: only the 4 >2×ttl rows go; the 45-day (1×<age<2×) and the fresh
+        // row both stay. pruned==4 (not 5) is what pins the 2×ttl boundary.
+        let pruned = db.prune_not_found(ttl_days).unwrap();
+        assert_eq!(pruned, 4, "only rows older than 2×ttl (60d) must be pruned");
+        assert_eq!(
+            db.not_found_ap_count().unwrap(),
+            2,
+            "the 45-day (past 1×ttl, within 2×ttl) row and the fresh row must both survive"
+        );
+        // The fresh row is still within ttl (queryable); the 45-day row survived
+        // prune but is expired for is_not_found purposes (that is correct — it is
+        // eligible for revival, not deletion, until it crosses 2×ttl).
+        assert!(db.is_not_found("11:22:33:44:55:66", ttl_days).unwrap());
+        assert!(!db.is_not_found("99:99:99:99:99:99", ttl_days).unwrap());
     }
 
     #[test]

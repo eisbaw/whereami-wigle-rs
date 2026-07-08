@@ -108,6 +108,29 @@ async fn drain_once(
         }
     }
 
+    // Prune definitively-dead not_found rows (older than 2x TTL) so the
+    // negative cache cannot grow monotonically on a long-running daemon at a
+    // busy location. Past 1x TTL a row is never re-checked anyway (task-0110).
+    {
+        let Some(_privacy) = state.privacy.read(ticket).await else {
+            return;
+        };
+        match state
+            .db
+            .prune_not_found(state.args.not_found_ttl_days)
+            .await
+        {
+            Ok(n) if n > 0 => {
+                info!("pruned {n} not_found entries older than 2x TTL");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("failed to prune not_found: {e}");
+                state.record_db_failure();
+            }
+        }
+    }
+
     // Pick up to PENDING_DRAIN_BATCH pending MACs
     let pending = {
         let Some(_privacy) = state.privacy.read(ticket).await else {
