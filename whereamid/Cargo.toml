@@ -11,6 +11,9 @@ path = "src/main.rs"
 name = "whereamid"
 path = "src/lib.rs"
 
+[build-dependencies]
+whereami-build-utils = { path = "../whereami-build-utils" }
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 # CancellationToken lives in tokio-util's ungated `pub mod sync`; there is NO

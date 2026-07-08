@@ -1954,6 +1954,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "whereami-build-utils"
+version = "0.6.2"
+
+[[package]]
 name = "whereami-client"
 version = "0.6.2"
 dependencies = [
@@ -1964,6 +1968,7 @@ dependencies = [
  "nu-ansi-term",
  "serde",
  "serde_json",
+ "whereami-build-utils",
 ]
 
 [[package]]
@@ -1984,6 +1989,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "whereami-build-utils",
 ]
 
 [[package]]

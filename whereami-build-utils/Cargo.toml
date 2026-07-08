@@ -1,0 +1,8 @@
+[package]
+name = "whereami-build-utils"
+version = "0.6.2"
+edition = "2021"
+
+[lib]
+name = "whereami_build_utils"
+path = "src/lib.rs"
