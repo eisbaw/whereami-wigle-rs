@@ -2107,6 +2107,15 @@ impl Database {
             // numbers here rather than calling Source::priority(): future code
             // changes to the enum must not silently rewrite historical data.
             // (If you change the priority ladder, write a new migration.)
+            //
+            // INVARIANT: these constants must EQUAL Source::priority() AT THE
+            // TIME THIS MIGRATION SHIPPED. A later renumbering of the enum
+            // requires a NEW migration, not editing this one — this frozen SQL
+            // must never move. task-0111's consistency test
+            // (migrate_v1_to_v2_priorities_match_source_enum) pins this
+            // equality: if the enum is renumbered without a new migration, that
+            // test fails, telling you to write the migration instead of editing
+            // these numbers.
             tx.execute_batch(
                 "UPDATE aps SET source_priority = 40 WHERE source = 'apple';
                  UPDATE aps SET source_priority = 30 WHERE source = 'wigle';
@@ -4924,6 +4933,75 @@ mod tests {
         db.migrate_v1_to_v2().unwrap();
         assert_eq!(db.get_schema_version(), 2, "fixture must start at v2");
         db
+    }
+
+    /// task-0111: the v1->v2 backfill hardcodes source priorities in frozen
+    /// SQL (apple=40, wigle=30, beacondb=20, manual=10, else=0) and must NOT
+    /// call Source::priority() — a migration is frozen archaeology that must
+    /// not silently rewrite historical data if the enum is later renumbered.
+    /// That discipline is correct, but nothing otherwise asserts the hardcoded
+    /// numbers EQUAL Source::priority() AT THIS COMMIT. This test is the
+    /// tripwire: if someone renumbers the enum (e.g. Apple 40->50) and forgets
+    /// to write a NEW migration, the read-back priority for that source no
+    /// longer matches Source::priority() and this assertion fails, saying
+    /// "you changed the ladder; write a new migration, don't edit the frozen
+    /// one." The unrecognised legacy string exercises the migration's
+    /// `NOT IN (...)` -> 0 branch (Source::Unknown -> priority 0); it must
+    /// match too.
+    #[test]
+    fn migrate_v1_to_v2_priorities_match_source_enum() {
+        let db = Database {
+            conn: Connection::open_in_memory().unwrap(),
+            mobile_ssid_denylist: crate::scanner::default_mobile_ssid_denylist(),
+        };
+        db.create_schema_v1().unwrap();
+
+        // One aps row per source string, using distinct locally-administered
+        // (02:00:...) BSSIDs. "legacy_prototype" is unrecognised and exercises
+        // the migration's NOT IN (...) -> 0 branch. v1 aps has NOT NULL
+        // bssid/lat/lon/source/first_seen/last_seen/fetched_at and NO
+        // source_priority column (that is what migrate_v1_to_v2 adds).
+        let cases = [
+            ("02:00:00:00:00:01", "apple"),
+            ("02:00:00:00:00:02", "wigle"),
+            ("02:00:00:00:00:03", "beacondb"),
+            ("02:00:00:00:00:04", "manual"),
+            ("02:00:00:00:00:05", "legacy_prototype"),
+        ];
+        for (bssid, source) in cases {
+            db.conn
+                .execute(
+                    "INSERT INTO aps
+                        (bssid, lat, lon, source, first_seen, last_seen, fetched_at)
+                     VALUES (?1, 0.0, 0.0, ?2, 't', 't', 't')",
+                    params![bssid, source],
+                )
+                .unwrap();
+        }
+
+        db.migrate_v1_to_v2().unwrap();
+
+        // Read back each row's backfilled source_priority and assert it equals
+        // the live enum's priority for that source. This makes the migration's
+        // hardcoded numbers and Source::priority() provably equal AT THIS
+        // COMMIT.
+        for (bssid, source) in cases {
+            let stored: i32 = db
+                .conn
+                .query_row(
+                    "SELECT source_priority FROM aps WHERE bssid = ?1",
+                    params![bssid],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let expected = Source::from_db_str(source).priority();
+            assert_eq!(
+                stored, expected,
+                "migration backfill for source {source:?} ({stored}) must equal \
+                 Source::priority() ({expected}); if these diverge, renumber via \
+                 a NEW migration, do not edit migrate_v1_to_v2"
+            );
+        }
     }
 
     fn fresh_v6_db() -> Database {
