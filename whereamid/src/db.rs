@@ -3477,68 +3477,31 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use tracing::{
-        field::{Field, Visit},
-        span, subscriber, Event, Metadata, Subscriber,
-    };
+    use tracing::subscriber;
 
     fn test_quality() -> FixQuality {
         FixQuality::new(None, None, Some(1.0), Confidence::High, None)
             .expect("test quality must be valid")
     }
 
-    #[derive(Clone, Default)]
-    struct CapturedEvents(Arc<Mutex<Vec<(tracing::Level, String)>>>);
-
-    struct MessageVisitor(String);
-
-    impl Visit for MessageVisitor {
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = format!("{value:?}");
-            }
-        }
-
-        fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == "message" {
-                self.0 = value.to_owned();
-            }
-        }
-    }
-
-    impl Subscriber for CapturedEvents {
-        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
-            span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
-        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
-
-        fn event(&self, event: &Event<'_>) {
-            let mut visitor = MessageVisitor(String::new());
-            event.record(&mut visitor);
-            self.0
-                .lock()
-                .expect("capture lock poisoned")
-                .push((*event.metadata().level(), visitor.0));
-        }
-
-        fn enter(&self, _span: &span::Id) {}
-        fn exit(&self, _span: &span::Id) {}
+    // task-0255: capture tracing via the shared `test_support::CaptureSink`.
+    // This module asserts on (level, message) only, so it drops the unified
+    // sink's `target` column. The sync `capture_events` delegates to the shared
+    // `capture` helper; the commit-marker tests below need the raw `CaptureSink`
+    // (they install a SQLite commit hook that injects a marker BETWEEN sink
+    // construction and the scoped install).
+    fn to_level_message(
+        events: Vec<crate::test_support::CapturedEvent>,
+    ) -> Vec<(tracing::Level, String)> {
+        events
+            .into_iter()
+            .map(|(level, _target, message)| (level, message))
+            .collect()
     }
 
     fn capture_events<T>(operation: impl FnOnce() -> T) -> (T, Vec<(tracing::Level, String)>) {
-        crate::test_support::install_permissive_global_test_subscriber(); // task-0251
-        let captured = CapturedEvents::default();
-        let events = captured.clone();
-        let result = subscriber::with_default(captured, operation);
-        let events = events.0.lock().expect("capture lock poisoned").clone();
-        (result, events)
+        let (result, events) = crate::test_support::capture(operation);
+        (result, to_level_message(events))
     }
 
     fn warning_messages(events: &[(tracing::Level, String)]) -> Vec<&str> {
@@ -3575,13 +3538,13 @@ mod tests {
         assert!(warnings[0].contains("memory/history may still contain the incoming observation"));
     }
 
-    fn install_commit_marker(db: &Database, captured: &CapturedEvents) {
-        let events = Arc::clone(&captured.0);
+    fn install_commit_marker(db: &Database, captured: &crate::test_support::CaptureSink) {
+        let sink = captured.clone();
         db.conn.commit_hook(Some(move || {
-            events
-                .lock()
-                .expect("capture lock poisoned")
-                .push((tracing::Level::INFO, "test commit".to_owned()));
+            // Inject a marker in capture order so the tests can assert the
+            // transaction commit precedes the last_fix drop warning. `target`
+            // is irrelevant here (the assertions match on the message).
+            sink.record_event(tracing::Level::INFO, "test", "test commit");
             false
         }));
     }
@@ -6421,16 +6384,12 @@ mod tests {
             sources: 1,
         };
         crate::test_support::install_permissive_global_test_subscriber(); // task-0251
-        let captured = CapturedEvents::default();
-        let older_events = captured.clone();
+        let captured = crate::test_support::CaptureSink::default();
+        let older_handle = captured.clone();
         install_commit_marker(&db, &captured);
         subscriber::with_default(captured, || db.set_last_fix(&t1).unwrap());
         db.conn.commit_hook(None::<fn() -> bool>);
-        let older_events = older_events
-            .0
-            .lock()
-            .expect("capture lock poisoned")
-            .clone();
+        let older_events = to_level_message(older_handle.events());
         assert_one_last_fix_drop_warning(&older_events, &t1.at_rfc3339, &t2.at_rfc3339);
         assert_commit_precedes_last_fix_warning(&older_events);
 
@@ -6501,15 +6460,15 @@ mod tests {
         };
 
         crate::test_support::install_permissive_global_test_subscriber(); // task-0251
-        let captured = CapturedEvents::default();
-        let events = captured.clone();
+        let captured = crate::test_support::CaptureSink::default();
+        let handle = captured.clone();
         install_commit_marker(&db, &captured);
         subscriber::with_default(captured, || {
             db.persist_fix_and_history(&incoming, &test_quality())
                 .unwrap()
         });
         db.conn.commit_hook(None::<fn() -> bool>);
-        let events = events.0.lock().expect("capture lock poisoned").clone();
+        let events = to_level_message(handle.events());
         assert_one_last_fix_drop_warning(&events, &incoming.at_rfc3339, &stored.at_rfc3339);
         assert_commit_precedes_last_fix_warning(&events);
         let retained = db.get_last_fix().unwrap().unwrap();

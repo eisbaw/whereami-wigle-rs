@@ -1615,58 +1615,11 @@ mod tests {
     /// (silent-fallback paths self-report).
     #[test]
     fn filter_outliers_emits_tracing_on_degenerate_fallback() {
-        use std::sync::{Arc, Mutex};
-        use tracing::{
-            field::{Field, Visit},
-            span, subscriber, Event, Metadata, Subscriber,
-        };
-
-        // Minimal Subscriber that records (level, target, message) for
-        // every event. We use this rather than a full
-        // tracing_subscriber::Registry to keep the test free of extra
-        // moving parts.
-        #[derive(Default, Clone)]
-        struct Captured(Arc<Mutex<Vec<(tracing::Level, String, String)>>>);
-        struct MsgVisitor(String);
-        impl Visit for MsgVisitor {
-            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{value:?}");
-                }
-            }
-            fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "message" {
-                    self.0 = value.to_string();
-                }
-            }
-        }
-        impl Subscriber for Captured {
-            fn enabled(&self, _md: &Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, _attrs: &span::Attributes<'_>) -> span::Id {
-                span::Id::from_u64(1)
-            }
-            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
-            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
-            fn event(&self, event: &Event<'_>) {
-                let mut v = MsgVisitor(String::new());
-                event.record(&mut v);
-                let md = event.metadata();
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((*md.level(), md.target().to_string(), v.0));
-            }
-            fn enter(&self, _: &span::Id) {}
-            fn exit(&self, _: &span::Id) {}
-        }
-
-        crate::test_support::install_permissive_global_test_subscriber(); // task-0251
-        let captured = Captured::default();
-        let cloned = captured.clone();
-
-        subscriber::with_default(captured, || {
+        // task-0255: shared `test_support::capture` sink records (level,
+        // target, message) for every event and installs the permissive global
+        // (task-0251) so the scoped capture reliably sees its events. This site
+        // filters on `target` — the assertion below is unchanged.
+        let (_, events) = crate::test_support::capture(|| {
             // Antipodal pair plus an offset point: 3 APs so filter_outliers
             // does not short-circuit at the n<=2 fast path. The first two
             // are antipodal, the third is on the equator. Stage 1 likely
@@ -1741,7 +1694,6 @@ mod tests {
         // target. We don't pin the exact message text — that's free to
         // evolve — but we do require it came from
         // whereamid::trilaterate.
-        let events = cloned.0.lock().unwrap().clone();
         let from_trilaterate: Vec<_> = events
             .iter()
             .filter(|(_, target, _)| target == "whereamid::trilaterate")

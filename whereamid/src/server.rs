@@ -3633,52 +3633,6 @@ mod dispatch_tests {
     const WIPE_FAIL_STOP_CHILD_TEST: &str =
         "server::dispatch_tests::wipe_post_commit_panic_fail_stop_child";
 
-    #[derive(Clone, Default)]
-    struct CapturedEvents(Arc<std::sync::Mutex<Vec<(tracing::Level, String, String)>>>);
-
-    struct MessageVisitor(String);
-
-    impl tracing::field::Visit for MessageVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = format!("{value:?}");
-            }
-        }
-
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "message" {
-                self.0 = value.to_owned();
-            }
-        }
-    }
-
-    impl tracing::Subscriber for CapturedEvents {
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut visitor = MessageVisitor(String::new());
-            event.record(&mut visitor);
-            self.0.lock().expect("capture lock poisoned").push((
-                *event.metadata().level(),
-                event.metadata().target().to_owned(),
-                visitor.0,
-            ));
-        }
-
-        fn enter(&self, _span: &tracing::span::Id) {}
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
     fn wait_for_child_marker(
         child: &mut std::process::Child,
         path: &std::path::Path,
@@ -4057,22 +4011,18 @@ mod dispatch_tests {
 
     #[test]
     fn clock_read_and_future_evidence_fail_closed_with_actionable_warning() {
-        crate::test_support::install_permissive_global_test_subscriber(); // task-0248: deterministic scoped capture
+        // task-0255: shared capture sink (installs the permissive global,
+        // task-0248, internally). This site filters WARN and maps to message.
         let refresh = BootTime::from_duration(Duration::from_secs(20));
         let snapshot = scan_snapshot_with_evidence(Some(refresh));
 
-        let captured = CapturedEvents::default();
-        let events = captured.clone();
-        let outcome = tracing::subscriber::with_default(captured, || {
+        let (outcome, events) = crate::test_support::capture(|| {
             admit_autolocate_scan(Some(&snapshot), 180, || {
                 Err(std::io::Error::other("injected boot clock failure"))
             })
         });
         assert_eq!(outcome, Err(AutolocateOutcome::ScanClockFailure));
         let warnings: Vec<String> = events
-            .0
-            .lock()
-            .expect("capture lock poisoned")
             .iter()
             .filter(|(level, _, _)| *level == tracing::Level::WARN)
             .map(|(_, _, message)| message.clone())
@@ -4086,18 +4036,13 @@ mod dispatch_tests {
             "missing actionable clock warning: {warnings:?}"
         );
 
-        let captured = CapturedEvents::default();
-        let events = captured.clone();
-        let outcome = tracing::subscriber::with_default(captured, || {
+        let (outcome, events) = crate::test_support::capture(|| {
             admit_autolocate_scan(Some(&snapshot), 180, || {
                 Ok(BootTime::from_duration(Duration::from_secs(19)))
             })
         });
         assert_eq!(outcome, Err(AutolocateOutcome::ScanClockFailure));
         let warnings: Vec<String> = events
-            .0
-            .lock()
-            .expect("capture lock poisoned")
             .iter()
             .filter(|(level, _, _)| *level == tracing::Level::WARN)
             .map(|(_, _, message)| message.clone())
@@ -4711,17 +4656,18 @@ mod dispatch_tests {
             .execute_batch_for_test("DROP TABLE last_fix;")
             .unwrap();
 
-        let captured = CapturedEvents::default();
-        let events = captured.clone();
+        // task-0255: raw shared CaptureSink (async site attaches the sink to
+        // the future via WithSubscriber, so the scoped `capture` helper does
+        // not fit). The permissive global is installed above (task-0248/0251).
+        let captured = crate::test_support::CaptureSink::default();
+        let handle = captured.clone();
         let outcome =
             run_autolocate_pass_at(&state, state.privacy.ticket(), fixed_autolocate_time())
                 .with_subscriber(captured)
                 .await;
         assert_eq!(outcome, AutolocateOutcome::Failed);
-        let warnings: Vec<String> = events
-            .0
-            .lock()
-            .expect("capture lock poisoned")
+        let warnings: Vec<String> = handle
+            .events()
             .iter()
             .filter(|(level, _, _)| *level == tracing::Level::WARN)
             .map(|(_, _, message)| message.clone())
@@ -6485,8 +6431,10 @@ mod dispatch_tests {
         // Attach the subscriber to the future itself: a thread-local guard
         // around future construction would end before the async handler is
         // polled and could silently miss the production warning.
-        let captured = CapturedEvents::default();
-        let events = captured.clone();
+        // task-0255: raw shared CaptureSink; async site filters on WARN +
+        // target, so it keeps the unified (level, target, message) tuple.
+        let captured = crate::test_support::CaptureSink::default();
+        let handle = captured.clone();
         let response = dispatch_command(&Request::Locate, &state)
             .with_subscriber(captured)
             .await;
@@ -6500,7 +6448,7 @@ mod dispatch_tests {
         assert!((json["lat"].as_f64().unwrap() - 55.6760).abs() < 0.001);
         assert!((json["lon"].as_f64().unwrap() - 12.5681).abs() < 0.001);
 
-        let events = events.0.lock().expect("capture lock poisoned").clone();
+        let events = handle.events();
         let server_target = module_path!()
             .strip_suffix("::dispatch_tests")
             .expect("test module path must end in dispatch_tests");

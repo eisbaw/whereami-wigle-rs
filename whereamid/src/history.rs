@@ -669,63 +669,25 @@ mod tests {
 
     // task-0141: observability tests for compute_geometric_median. A capped
     // (non-converged) iterate must emit a DEBUG event; an Antipodal/Degenerate
-    // cluster must emit a WARN before falling back. Mirrors the db.rs
-    // `CapturedEvents` scoped-subscriber sink verbatim.
+    // cluster must emit a WARN before falling back. Uses the shared
+    // `test_support::capture` sink (task-0255).
     mod median_observability {
         use super::super::{compute_geometric_median, MedianComputation};
-        use std::sync::{Arc, Mutex};
-        use tracing::{
-            field::{Field, Visit},
-            span, subscriber, Event, Level, Metadata, Subscriber,
-        };
+        use tracing::Level;
 
-        #[derive(Clone, Default)]
-        struct CapturedEvents(Arc<Mutex<Vec<(Level, String)>>>);
-
-        struct MessageVisitor(String);
-        impl Visit for MessageVisitor {
-            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{value:?}");
-                }
-            }
-            fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "message" {
-                    self.0 = value.to_owned();
-                }
-            }
-        }
-
-        impl Subscriber for CapturedEvents {
-            fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
-                span::Id::from_u64(1)
-            }
-            fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
-            fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
-            fn event(&self, event: &Event<'_>) {
-                let mut visitor = MessageVisitor(String::new());
-                event.record(&mut visitor);
-                self.0
-                    .lock()
-                    .expect("capture lock poisoned")
-                    .push((*event.metadata().level(), visitor.0));
-            }
-            fn enter(&self, _span: &span::Id) {}
-            fn exit(&self, _span: &span::Id) {}
-        }
-
+        /// Thin wrapper over the shared `test_support::capture` (task-0255):
+        /// this module asserts on `(level, message)` only, so drop the unified
+        /// sink's `target` column. Assertions are unchanged from when a local
+        /// 2-field `CapturedEvents` sink lived here.
         fn capture<T>(operation: impl FnOnce() -> T) -> (T, Vec<(Level, String)>) {
-            // task-0251: install a permissive global subscriber first so the
-            // scoped capture below reliably sees events under `cargo test`.
-            crate::test_support::install_permissive_global_test_subscriber();
-            let captured = CapturedEvents::default();
-            let events = captured.clone();
-            let result = subscriber::with_default(captured, operation);
-            let events = events.0.lock().expect("capture lock poisoned").clone();
-            (result, events)
+            let (result, events) = crate::test_support::capture(operation);
+            (
+                result,
+                events
+                    .into_iter()
+                    .map(|(level, _target, message)| (level, message))
+                    .collect(),
+            )
         }
 
         /// A cluster whose geometric median coincides with one of its input

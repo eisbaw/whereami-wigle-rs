@@ -91,3 +91,105 @@ pub(crate) fn install_permissive_global_test_subscriber() {
         let _ = tracing::subscriber::set_global_default(Permissive);
     });
 }
+
+/// One captured tracing event as `(level, target, message)`.
+///
+/// This is the SUPERSET shape: 3-field call sites (server, trilaterate) filter
+/// on `target`; 2-field call sites (db, config, scanner, history) ignore the
+/// `target` column and map down to `(level, message)`. Consolidating on the
+/// superset lets ONE sink serve all six former per-module `CapturedEvents` /
+/// `Captured` structs (task-0255).
+pub(crate) type CapturedEvent = (tracing::Level, String, String);
+
+/// Test-only tracing subscriber that records every event's
+/// `(level, target, message)` into a shared, cheaply-clonable buffer.
+///
+/// Clones share the same buffer (`Arc<Mutex<…>>`), so the idiom is: build one,
+/// clone a handle, install the original as the scoped subscriber
+/// (`with_default` / `with_subscriber`), run the code under test, then snapshot
+/// via the retained handle's [`CaptureSink::events`]. `enabled()` returns
+/// `true` so it records everything; it can never fabricate an event, so absence
+/// assertions stay sound. Most sync call sites should prefer [`capture`], which
+/// wires up the permissive global and the scoped install in one call.
+#[derive(Clone, Default)]
+pub(crate) struct CaptureSink(std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>);
+
+impl CaptureSink {
+    /// Snapshot the events captured so far, in emission order.
+    pub(crate) fn events(&self) -> Vec<CapturedEvent> {
+        self.0.lock().expect("capture lock poisoned").clone()
+    }
+
+    /// Inject a synthetic event into the buffer in the current capture order.
+    ///
+    /// Used by db.rs's SQLite commit-hook marker to interleave a `"test
+    /// commit"` marker with the genuinely-emitted `warn!` so a test can assert
+    /// the commit precedes the warning. Not a tracing event — a direct buffer
+    /// write from a non-tracing callback.
+    pub(crate) fn record_event(&self, level: tracing::Level, target: &str, message: &str) {
+        self.0.lock().expect("capture lock poisoned").push((
+            level,
+            target.to_owned(),
+            message.to_owned(),
+        ));
+    }
+}
+
+/// Extracts the `message` field from a tracing event. Copied verbatim from the
+/// (now-deleted) per-module visitors; lives here once (task-0255).
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = value.to_owned();
+        }
+    }
+}
+
+impl tracing::Subscriber for CaptureSink {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().expect("capture lock poisoned").push((
+            *event.metadata().level(),
+            event.metadata().target().to_owned(),
+            visitor.0,
+        ));
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Install the permissive global (task-0251), run `f` under a scoped
+/// [`CaptureSink`], and return `f`'s result plus the captured events.
+///
+/// This is the one-call ergonomic path for the common SYNC capture pattern.
+/// Async sites that attach the sink to a future (`WithSubscriber`) need the raw
+/// [`CaptureSink`] instead, since the scoped guard must span the whole future.
+pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
+    install_permissive_global_test_subscriber();
+    let sink = CaptureSink::default();
+    let handle = sink.clone();
+    let result = tracing::subscriber::with_default(sink, f);
+    (result, handle.events())
+}

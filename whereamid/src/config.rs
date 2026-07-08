@@ -467,11 +467,6 @@ fn load_config_file_with_credentials_directory(
 mod tests {
     use super::*;
     use clap::Parser;
-    use std::sync::{Arc, Mutex};
-    use tracing::{
-        field::{Field, Visit},
-        span, subscriber, Event, Metadata, Subscriber,
-    };
 
     const TEST_API_KEY: &str = "unit-secret-that-must-never-be-logged";
 
@@ -502,50 +497,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct CapturedEvents(Arc<Mutex<Vec<(tracing::Level, String)>>>);
-
-    struct MessageVisitor(String);
-
-    impl Visit for MessageVisitor {
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = format!("{value:?}");
-            }
-        }
-
-        fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == "message" {
-                self.0 = value.to_owned();
-            }
-        }
-    }
-
-    impl Subscriber for CapturedEvents {
-        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
-            span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
-        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
-
-        fn event(&self, event: &Event<'_>) {
-            let mut visitor = MessageVisitor(String::new());
-            event.record(&mut visitor);
-            self.0
-                .lock()
-                .expect("capture lock poisoned")
-                .push((*event.metadata().level(), visitor.0));
-        }
-
-        fn enter(&self, _span: &span::Id) {}
-        fn exit(&self, _span: &span::Id) {}
-    }
-
     fn write_config(path: &std::path::Path, mode: u32) {
         std::fs::write(
             path,
@@ -569,17 +520,19 @@ mod tests {
         path: &std::path::Path,
         credentials_directory: Option<&std::path::Path>,
     ) -> (ConfigFile, Vec<(tracing::Level, String)>) {
-        crate::test_support::install_permissive_global_test_subscriber(); // task-0251
-        let captured = CapturedEvents::default();
-        let events = captured.clone();
-        let config = subscriber::with_default(captured, || {
+        // task-0255: shared capture sink; this site asserts on (level,
+        // message) only, so drop the unified sink's `target` column.
+        let (config, events) = crate::test_support::capture(|| {
             load_config_file_with_credentials_directory(
                 path.to_str().expect("UTF-8 config test path"),
                 credentials_directory,
             )
-        })
-        .expect("load config test file");
-        let events = events.0.lock().expect("capture lock poisoned").clone();
+        });
+        let config = config.expect("load config test file");
+        let events = events
+            .into_iter()
+            .map(|(level, _target, message)| (level, message))
+            .collect();
         (config, events)
     }
 

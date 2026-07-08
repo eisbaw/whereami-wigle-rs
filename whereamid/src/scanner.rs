@@ -2345,72 +2345,25 @@ BSS 11:22:33:44:55:66(on wlan0)
     // --- tracing-capture support for the malformed-signal warn tests ---------
     //
     // `parse_iw_output` / `parse_nmcli_output` are pure fns, so verifying their
-    // `warn!` requires a scoped subscriber. This mirrors db.rs's `CapturedEvents`
-    // sink verbatim. `install_permissive_global_test_subscriber()` (task-0251)
-    // is called first inside `capture_scanner_events` so the process-global
-    // tracing interest cache cannot silently drop the event under the parallel
-    // harness (task-0248/0251) — this module compiles into BOTH the lib and bin
-    // test binaries, so the de-flake must be active in both.
-
-    use std::sync::{Arc, Mutex};
-    use tracing::{
-        field::{Field, Visit},
-        span, subscriber, Event, Metadata, Subscriber,
-    };
-
-    #[derive(Clone, Default)]
-    struct CapturedEvents(Arc<Mutex<Vec<(tracing::Level, String)>>>);
-
-    struct MessageVisitor(String);
-
-    impl Visit for MessageVisitor {
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = format!("{value:?}");
-            }
-        }
-
-        fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == "message" {
-                self.0 = value.to_owned();
-            }
-        }
-    }
-
-    impl Subscriber for CapturedEvents {
-        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
-            span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
-        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
-
-        fn event(&self, event: &Event<'_>) {
-            let mut visitor = MessageVisitor(String::new());
-            event.record(&mut visitor);
-            self.0
-                .lock()
-                .expect("capture lock poisoned")
-                .push((*event.metadata().level(), visitor.0));
-        }
-
-        fn enter(&self, _span: &span::Id) {}
-        fn exit(&self, _span: &span::Id) {}
-    }
+    // `warn!` requires a scoped subscriber. This delegates to the shared
+    // `test_support::capture` sink (task-0255), which installs the permissive
+    // global (task-0251) so the process-global tracing interest cache cannot
+    // silently drop the event under the parallel harness (task-0248/0251) —
+    // this module compiles into BOTH the lib and bin test binaries, so the
+    // de-flake must be active in both. This site asserts on (level, message)
+    // only, so it drops the unified sink's `target` column.
 
     fn capture_scanner_events<T>(
         operation: impl FnOnce() -> T,
     ) -> (T, Vec<(tracing::Level, String)>) {
-        crate::test_support::install_permissive_global_test_subscriber(); // task-0251
-        let captured = CapturedEvents::default();
-        let events = captured.clone();
-        let result = subscriber::with_default(captured, operation);
-        let events = events.0.lock().expect("capture lock poisoned").clone();
-        (result, events)
+        let (result, events) = crate::test_support::capture(operation);
+        (
+            result,
+            events
+                .into_iter()
+                .map(|(level, _target, message)| (level, message))
+                .collect(),
+        )
     }
 
     fn warning_messages(events: &[(tracing::Level, String)]) -> Vec<&str> {
