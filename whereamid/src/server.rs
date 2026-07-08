@@ -76,15 +76,20 @@ impl DaemonState {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Bump the cumulative best-effort-DB-read-failure counter.
-    /// task-0105. Currently wired at the cache-lookup entry points
-    /// (`lookup_cached` / `lookup_cached_readonly`) so a real DB error
-    /// (corruption, disk full, lock contention) there is visible via the stats
-    /// endpoint instead of masquerading as a cache miss that wastes API quota
-    /// re-fetching resident rows. NOTE: this counter does NOT yet cover the
-    /// `resolve_chain` skip-cached / skip-not_found read-error swallow sites
-    /// (task-0252), so `db_read_failures: 0` does not prove no DB read fault —
-    /// it means none at the covered entry points.
+    /// Bump the cumulative counter of SWALLOWED DB read failures — reads that
+    /// returned `Err` and were handled by continuing with a default/empty
+    /// result, so the fault is otherwise invisible to ops (unlike a read error
+    /// that already surfaces an error response, e.g. `get_last_fix` on the
+    /// locate path, which is NOT counted here because it is already visible).
+    /// Surfaced via the stats endpoint so a real DB fault (corruption, disk
+    /// full, lock contention) does not masquerade as "no data" — a miss that
+    /// wastes API quota, a zeroed stat, or a silently aborted drain.
+    /// task-0105 (cache-lookup entry points), task-0252 (resolve_chain
+    /// skip-cached / skip-not_found, pending drain, stats + debug reporting).
+    /// Call it at every such warn-and-continue-with-default DB-read site
+    /// REACHABLE after `DaemonState` exists. (Startup rehydration reads in
+    /// `main.rs` — e.g. the initial `get_last_fix` / `get_metadata` — predate
+    /// the counter's construction and so cannot bump it; they warn only.)
     pub fn record_db_read_failure(&self) {
         self.db_read_failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2445,14 +2450,23 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
         .collect();
     drop(debouncer);
 
-    let statuses = state
+    let statuses = match state
         .db
         .debug_statuses(
             debug_inputs.iter().map(|item| item.0.clone()).collect(),
             state.args.not_found_ttl_days,
         )
         .await
-        .unwrap_or_default();
+    {
+        Ok(statuses) => statuses,
+        Err(e) => {
+            // A read error would silently mislabel every BSSID's DB status on
+            // the debug surface. Count it so the fault is visible (task-0252).
+            warn!("db error reading debug statuses (all reported as unknown): {e}");
+            state.record_db_read_failure();
+            Default::default()
+        }
+    };
     let statuses: std::collections::HashMap<_, _> = statuses.into_iter().collect();
     let mut bssids: Vec<DebugBssid> = debug_inputs
         .into_iter()
@@ -3052,9 +3066,6 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
     let db_write_failures = state
         .db_write_failures
         .load(std::sync::atomic::Ordering::Relaxed);
-    let db_read_failures = state
-        .db_read_failures
-        .load(std::sync::atomic::Ordering::Relaxed);
     let api_counter_corruption_denials = state
         .api_counter_corruption_denials
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -3064,7 +3075,22 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
     let orphan_tasks_aborted = state
         .orphan_tasks_aborted
         .load(std::sync::atomic::Ordering::Relaxed);
-    let stats = state.db.stats().await.unwrap_or_default();
+    // A stats read error silently zeroes cached_aps/pending_aps/not_found_aps/
+    // db_size_bytes (the row counts would lie). Count it so the fault is visible
+    // via db_read_failures, then fall back to defaults (task-0252).
+    let stats = match state.db.stats().await {
+        Ok(stats) => stats,
+        Err(e) => {
+            warn!("db error reading stats (row counts fall back to 0): {e}");
+            state.record_db_read_failure();
+            crate::db::DbStats::default()
+        }
+    };
+    // Snapshot db_read_failures AFTER the stats read so a stats-read fault this
+    // call is reflected in THIS response (self-consistent), not only the next.
+    let db_read_failures = state
+        .db_read_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
     let resp = StatsResponse {
         ok: true,
         v: 1,

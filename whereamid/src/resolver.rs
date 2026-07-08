@@ -302,7 +302,13 @@ async fn resolve_chain_inner(
                 Some(_privacy) => match state.db.lookup_cached_touch(vec![bssid.clone()]).await {
                     Ok(mut hits) => hits.pop(),
                     Err(e) => {
+                        // A real DB read error here (not a miss) falls through to
+                        // CALL the providers below — directly burning API quota
+                        // for a BSSID that may still be resident. Count it so the
+                        // fault is visible via /stats, not just the journal
+                        // (task-0252).
                         warn!("db error looking up {bssid}: {e}");
+                        state.record_db_read_failure();
                         None
                     }
                 },
@@ -318,11 +324,23 @@ async fn resolve_chain_inner(
 
         // Short-circuit: in not_found cache (within TTL).
         if policy.skip_not_found {
-            let is_nf = state
+            let is_nf = match state
                 .db
                 .is_not_found(bssid.clone(), state.args.not_found_ttl_days)
                 .await
-                .unwrap_or(false);
+            {
+                Ok(is_nf) => is_nf,
+                Err(e) => {
+                    // Previously swallowed silently (`unwrap_or(false)`): a real
+                    // DB read error read as "not in not_found" and fell through to
+                    // CALL the providers — same quota-burn hazard. Now warn +
+                    // count it, then continue treating it as not-not_found so a
+                    // read fault never suppresses a legitimate lookup (task-0252).
+                    warn!("db error checking not_found for {bssid}: {e}");
+                    state.record_db_read_failure();
+                    false
+                }
+            };
             if is_nf {
                 debug!("{bssid} in not_found cache, skipping");
                 // task-0194: the not_found table is authoritative within TTL,
@@ -1224,6 +1242,70 @@ mod tests {
             state.db_read_failures.load(Relaxed),
             2,
             "lookup_cached_readonly must count the DB read failure"
+        );
+    }
+
+    /// task-0252: the `resolve_chain` skip-cached short-circuit swallows a real
+    /// DB read error to `None` and FALLS THROUGH to call the providers (burning
+    /// quota). Force that read to error (drop `aps`) and assert the counter
+    /// increments. `not_found` is left intact so only the skip-cached read
+    /// fails, isolating the site. The mock returns NotFound so nothing writes a
+    /// position back into the dropped table.
+    #[tokio::test]
+    async fn resolve_chain_skip_cached_read_error_increments_db_read_failures() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let state = test_state();
+        crate::server::lock_db(&state)
+            .execute_batch_for_test("DROP TABLE aps;")
+            .unwrap();
+        let mock = std::sync::Arc::new(MockProvider::new("m", |_| ProviderOutcome::NotFound));
+        let providers = [Provider::Mock(std::sync::Arc::clone(&mock))];
+
+        assert_eq!(state.db_read_failures.load(Relaxed), 0);
+        let _ = resolve_chain(
+            &["aa:bb:cc:dd:ee:01".to_string()],
+            &state,
+            &providers,
+            &permissive_policy(),
+            state.privacy.ticket(),
+        )
+        .await;
+        assert_eq!(
+            state.db_read_failures.load(Relaxed),
+            1,
+            "skip-cached DB read error must be counted"
+        );
+    }
+
+    /// task-0252: the `resolve_chain` skip-not_found short-circuit previously
+    /// swallowed a read error via `unwrap_or(false)`. Drop `not_found` (leaving
+    /// `aps` intact so skip-cached reads cleanly) and assert the read error is
+    /// warned + counted rather than silently treated as "not in not_found".
+    #[tokio::test]
+    async fn resolve_chain_skip_not_found_read_error_increments_db_read_failures() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let state = test_state();
+        crate::server::lock_db(&state)
+            .execute_batch_for_test("DROP TABLE not_found;")
+            .unwrap();
+        let mock = std::sync::Arc::new(MockProvider::new("m", |_| ProviderOutcome::NotFound));
+        let providers = [Provider::Mock(std::sync::Arc::clone(&mock))];
+
+        assert_eq!(state.db_read_failures.load(Relaxed), 0);
+        let _ = resolve_chain(
+            &["aa:bb:cc:dd:ee:02".to_string()],
+            &state,
+            &providers,
+            &permissive_policy(),
+            state.privacy.ticket(),
+        )
+        .await;
+        assert_eq!(
+            state.db_read_failures.load(Relaxed),
+            1,
+            "skip-not_found DB read error must be counted"
         );
     }
 }

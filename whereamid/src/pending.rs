@@ -116,7 +116,11 @@ async fn drain_once(
         match state.db.get_pending(PENDING_DRAIN_BATCH).await {
             Ok(p) => p,
             Err(e) => {
+                // A read error silently aborts this drain pass (invisible to
+                // ops except in the journal); count it so /stats reflects the
+                // DB read fault (task-0252).
                 warn!("failed to get pending entries: {e}");
+                state.record_db_read_failure();
                 return;
             }
         }
@@ -591,6 +595,35 @@ mod tests {
             start.elapsed() < Duration::from_secs(300),
             "must not wait out the pending interval (elapsed {:?})",
             start.elapsed()
+        );
+    }
+
+    /// task-0252: `drain_once` reads the pending queue via `get_pending`; a real
+    /// read error there silently aborts the drain pass (invisible to ops except
+    /// in the journal). Drop `pending` to force the error deterministically and
+    /// assert it is counted via `db_read_failures`.
+    #[tokio::test]
+    async fn drain_once_counts_db_read_failure_when_pending_read_errors() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let state = test_state();
+        crate::server::lock_db(&state)
+            .execute_batch_for_test("DROP TABLE pending;")
+            .unwrap();
+        let providers = [mock("m", |_| ProviderOutcome::NotFound)];
+
+        assert_eq!(state.db_read_failures.load(Relaxed), 0);
+        drain_once(
+            &state,
+            state.args.pending_max_attempts,
+            &providers,
+            state.privacy.ticket(),
+        )
+        .await;
+        assert_eq!(
+            state.db_read_failures.load(Relaxed),
+            1,
+            "get_pending read error must be counted"
         );
     }
 }
