@@ -1351,22 +1351,34 @@ async fn dispatch_command_for_transport(
     }
 }
 
+/// One scanner-eligible AP observed in the latest scan, carrying the fields the
+/// locate pipeline threads from the debouncer boundary to trilateration input:
+/// its BSSID, measured RSSI, and SSID (used for mobile-AP classification and
+/// provider backfill). Replaces the former parallel `(String, i32, Option<String>)`
+/// tuples so field access is named rather than positional.
+#[derive(Debug, Clone)]
+struct Candidate {
+    bssid: String,
+    signal_dbm: i32,
+    ssid: Option<String>,
+}
+
 /// Select bounded cold-start provider work after cache lookup. Cached rows are
 /// removed before the limit because the provider chain skips them; allowing
 /// persisted-mobile or non-finite cache hits to occupy this list would waste
 /// every slot and starve genuinely unknown scanner-eligible APs.
 fn bounded_uncached_observations(
-    candidates: &[(String, i32, Option<String>)],
+    candidates: &[Candidate],
     cached_bssids: &std::collections::HashSet<String>,
     limit: usize,
 ) -> Vec<crate::resolver::ObservedAp> {
     candidates
         .iter()
-        .filter(|(bssid, _, _)| !cached_bssids.contains(bssid))
+        .filter(|candidate| !cached_bssids.contains(&candidate.bssid))
         .take(limit)
-        .map(|(bssid, _, ssid)| crate::resolver::ObservedAp {
-            bssid: bssid.clone(),
-            ssid: ssid.clone(),
+        .map(|candidate| crate::resolver::ObservedAp {
+            bssid: candidate.bssid.clone(),
+            ssid: candidate.ssid.clone(),
         })
         .collect()
 }
@@ -1843,7 +1855,7 @@ async fn compute_locate_with_clock(
     // This full set is the consensus universe; solver membership is derived
     // separately below so stability and top-N never shrink the denominator.
     let stable_count = stable.len();
-    let mut visible_candidates: Vec<(String, i32, Option<String>)> = debouncer
+    let mut visible_candidates: Vec<Candidate> = debouncer
         .latest_scan()
         .map(|scan| {
             scan.iter()
@@ -1853,17 +1865,21 @@ async fn compute_locate_with_clock(
                         &state.args.mobile_ssid_denylist,
                     )
                 })
-                .map(|(bssid, entry)| (bssid.clone(), entry.signal_dbm, entry.ssid.clone()))
+                .map(|(bssid, entry)| Candidate {
+                    bssid: bssid.clone(),
+                    signal_dbm: entry.signal_dbm,
+                    ssid: entry.ssid.clone(),
+                })
                 .collect()
         })
         .unwrap_or_default();
-    visible_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
+    visible_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.signal_dbm));
 
     // Stable BSSIDs that fell out of the current scan are absent from this
     // list instead of receiving a fabricated -90 dBm signal (task-0051).
-    let stable_candidates: Vec<(String, i32, Option<String>)> = visible_candidates
+    let stable_candidates: Vec<Candidate> = visible_candidates
         .iter()
-        .filter(|(bssid, _, _)| stable.contains(bssid))
+        .filter(|candidate| stable.contains(&candidate.bssid))
         .cloned()
         .collect();
 
@@ -1902,14 +1918,10 @@ async fn compute_locate_with_clock(
 
     // Both purposes read every scanner-eligible AP in the latest snapshot so
     // TASK-0094 consensus keeps its full-visible denominator. Autonomous
-    // solver membership remains stable-only through `active_bssids` below.
+    // solver membership remains stable-only through the `active` index below.
     let bssids: Vec<String> = visible_candidates
         .iter()
-        .map(|(bssid, _, _)| bssid.clone())
-        .collect();
-    let signal_map: std::collections::HashMap<String, i32> = active_candidates
-        .iter()
-        .map(|(bssid, signal, _)| (bssid.clone(), *signal))
+        .map(|candidate| candidate.bssid.clone())
         .collect();
 
     // Cache-only lookup — never blocks on WiGLE. This is the sole cache lookup
@@ -1934,9 +1946,9 @@ async fn compute_locate_with_clock(
     // both run before take(top_n). Otherwise stronger ineligible cache rows can
     // fill every slot and starve weaker fixed rows. trilaterate() independently
     // re-applies these guards for callers that bypass this server path.
-    let active_bssids: std::collections::HashSet<&str> = active_candidates
+    let active: std::collections::HashMap<&str, &Candidate> = active_candidates
         .iter()
-        .map(|(bssid, _, _)| bssid.as_str())
+        .map(|candidate| (candidate.bssid.as_str(), candidate))
         .collect();
     let mut visible_cached = Vec::new();
     let mut positioned_aps = Vec::new();
@@ -1956,11 +1968,11 @@ async fn compute_locate_with_clock(
         // outlier-filter survival. Every eligible unique BSSID in the latest
         // scanner snapshot contributes exactly one denominator entry.
         visible_cached.push((ap.lat, ap.lon));
-        if active_bssids.contains(ap.bssid.as_str()) && positioned_aps.len() < state.args.top_n {
+        if active.contains_key(ap.bssid.as_str()) && positioned_aps.len() < state.args.top_n {
             positioned_aps.push(PositionedAp {
                 lat: ap.lat,
                 lon: ap.lon,
-                signal_dbm: signal_map.get(&ap.bssid).copied(),
+                signal_dbm: active.get(ap.bssid.as_str()).map(|c| c.signal_dbm),
                 is_mobile: ap.is_mobile,
             });
         }
@@ -5465,16 +5477,18 @@ mod dispatch_tests {
         let cached: std::collections::HashSet<String> = (0..11)
             .map(|index| format!("cached-mobile-{index}"))
             .collect();
-        let candidates: Vec<(String, i32, Option<String>)> = cached
+        let candidates: Vec<Candidate> = cached
             .iter()
             .cloned()
-            .map(|bssid| (bssid, -10, None))
-            .chain((0..12).map(|index| {
-                (
-                    format!("unknown-fixed-{index}"),
-                    -40 - index,
-                    Some(format!("fixed-{index}")),
-                )
+            .map(|bssid| Candidate {
+                bssid,
+                signal_dbm: -10,
+                ssid: None,
+            })
+            .chain((0..12).map(|index| Candidate {
+                bssid: format!("unknown-fixed-{index}"),
+                signal_dbm: -40 - index,
+                ssid: Some(format!("fixed-{index}")),
             }))
             .collect();
 
