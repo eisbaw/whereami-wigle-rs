@@ -3262,6 +3262,72 @@ mod stats_tests {
         assert_eq!(response["autolocate_fixes_written"], 4);
         assert_eq!(response["db_read_failures"], 5);
     }
+
+    /// task-0254: a real read error in `db.stats()` silently zeroes the row
+    /// counts (they would lie). Drop `aps` (which `stats()` counts first) so the
+    /// read errors, then assert the fault is counted via db_read_failures AND
+    /// the same response reflects it (the snapshot is taken after `stats()`).
+    #[tokio::test]
+    async fn handle_stats_counts_db_read_failure_when_stats_read_errors() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let state = test_state();
+        lock_db(&state)
+            .execute_batch_for_test("DROP TABLE aps;")
+            .unwrap();
+
+        assert_eq!(state.db_read_failures.load(Relaxed), 0);
+        let response: serde_json::Value =
+            serde_json::from_str(&handle_stats(&state).await).unwrap();
+        assert_eq!(
+            state.db_read_failures.load(Relaxed),
+            1,
+            "stats() read error must be counted"
+        );
+        assert_eq!(
+            response["db_read_failures"], 1,
+            "the faulting response must reflect the increment (post-stats snapshot)"
+        );
+        assert_eq!(
+            response["cached_aps"], 0,
+            "row counts fall back to 0, not stale/lying data"
+        );
+    }
+
+    /// task-0254: a real read error in `debug_statuses` silently mislabels every
+    /// BSSID's DB status. Seed a scan so debug has an input BSSID, drop `aps`
+    /// (read during the per-BSSID cache check) so the status read errors, then
+    /// assert the fault is counted.
+    #[tokio::test]
+    async fn handle_debug_counts_db_read_failure_when_status_read_errors() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let state = test_state();
+        {
+            let mut deb = state.debouncer.lock().await;
+            let mut sample = crate::debounce::ScanSample::new();
+            sample.insert(
+                "aa:bb:cc:dd:ee:01".to_string(),
+                crate::debounce::ScanEntry {
+                    signal_dbm: -50,
+                    ssid: None,
+                    channel: Some(1),
+                },
+            );
+            deb.push_scan(sample);
+        }
+        lock_db(&state)
+            .execute_batch_for_test("DROP TABLE aps;")
+            .unwrap();
+
+        assert_eq!(state.db_read_failures.load(Relaxed), 0);
+        let _ = handle_debug(&state).await;
+        assert_eq!(
+            state.db_read_failures.load(Relaxed),
+            1,
+            "debug_statuses read error must be counted"
+        );
+    }
 }
 
 #[cfg(test)]
