@@ -118,15 +118,16 @@ async fn main() -> Result<()> {
     // immediately after a restart, before the first scan-and-resolve cycle
     // completes. A malformed timestamp or non-finite coordinate is treated as
     // "no last fix" — better to discard it than serve a poisoned stale fix.
+    // task-0134: get_last_fix now returns the domain `LastFix` (Row->domain
+    // marshalling + task-0238 guard live in the DB layer). A corrupt persisted
+    // row is a typed `CorruptLastFix` error, distinct from a genuine read
+    // failure, so both former warn messages are preserved.
     let initial_last_fix = match db.get_last_fix().await {
-        Ok(Some(row)) => match server::LastFix::try_from(row) {
-            Ok(fix) => Some(fix),
-            Err(e) => {
-                tracing::warn!("discarding persisted last_fix: {e}");
-                None
-            }
-        },
-        Ok(None) => None,
+        Ok(fix) => fix,
+        Err(e) if e.downcast_ref::<db::CorruptLastFix>().is_some() => {
+            tracing::warn!("discarding persisted last_fix: {e}");
+            None
+        }
         Err(e) => {
             tracing::warn!("failed to read persisted last_fix: {e}");
             None

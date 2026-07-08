@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 use crate::apple::AppleClient;
 use crate::boot_clock::BootTime;
 use crate::config::Args;
-use crate::db::{DbHandle, DebugDbStatus};
+use crate::db::{DbHandle, DebugDbStatus, LastFix};
 use crate::debounce::{Debouncer, TimestampedScan};
 use crate::nominatim::NominatimClient;
 use crate::wigle::WigleClient;
@@ -234,69 +234,11 @@ pub struct DaemonState {
     pub orphan_tasks_aborted: std::sync::atomic::AtomicU64,
 }
 
-/// A cached last-known position with timestamp.
-///
-/// `at` is `chrono::DateTime<Utc>` rather than `std::time::Instant` so that
-/// the value can be persisted to SQLite (`last_fix` table) and rehydrated
-/// across daemon restarts. Wall-clock age is what users want anyway.
-#[derive(Clone)]
-pub struct LastFix {
-    pub lat: f64,
-    pub lon: f64,
-    pub accuracy_m: f64,
-    pub address: Option<String>,
-    pub at: chrono::DateTime<chrono::Utc>,
-    pub sources: usize,
-}
-
-// task-0059: bridge in-memory LastFix and on-disk LastFixRow. The
-// open-coded marshalling previously lived at three call sites in
-// handle_locate, the address-backfill task, and main.rs::main.
-impl From<&LastFix> for crate::db::LastFixRow {
-    fn from(fix: &LastFix) -> Self {
-        crate::db::LastFixRow {
-            lat: fix.lat,
-            lon: fix.lon,
-            accuracy_m: fix.accuracy_m,
-            address: fix.address.clone(),
-            at_rfc3339: fix.at.to_rfc3339(),
-            sources: fix.sources as i64,
-        }
-    }
-}
-
-impl TryFrom<crate::db::LastFixRow> for LastFix {
-    type Error = anyhow::Error;
-    fn try_from(row: crate::db::LastFixRow) -> Result<Self, Self::Error> {
-        // task-0238: SQLite REAL columns can contain NaN/+-Inf. Reject the
-        // persisted row at the rehydration choke point so main.rs discards it
-        // (and warns with this root cause) instead of making a poisoned stale
-        // fix available to return_last_fix_or_error.
-        if !row.lat.is_finite() || !row.lon.is_finite() {
-            anyhow::bail!(
-                "non-finite last_fix coordinates: lat={}, lon={}",
-                row.lat,
-                row.lon
-            );
-        }
-        if !row.accuracy_m.is_finite() || row.accuracy_m < 0.0 {
-            anyhow::bail!("invalid last_fix accuracy_m: {}", row.accuracy_m);
-        }
-        let at = chrono::DateTime::parse_from_rfc3339(&row.at_rfc3339)
-            .map_err(|e| {
-                anyhow::anyhow!("unparseable last_fix timestamp {:?}: {e}", row.at_rfc3339)
-            })?
-            .with_timezone(&chrono::Utc);
-        Ok(LastFix {
-            lat: row.lat,
-            lon: row.lon,
-            accuracy_m: row.accuracy_m,
-            address: row.address,
-            at,
-            sources: row.sources.max(0) as usize,
-        })
-    }
-}
+// task-0134: the cached last-known position (`LastFix`) and the Row<->domain
+// marshalling now live in `crate::db` (the DB layer owns RFC3339<->DateTime and
+// the task-0238 non-finite guard). `LastFix` is imported at the top of this
+// module. The former open-coded `From`/`TryFrom` adapters are gone; callers pass
+// domain `LastFix` values straight to the DB methods.
 
 /// Update `last_fix.address` for a still-current position and persist the
 /// resulting row while the in-memory `last_fix` guard remains held.
@@ -315,7 +257,7 @@ async fn backfill_last_fix_address_with<P, F>(
     persist: P,
 ) -> Result<bool>
 where
-    P: FnOnce(DbHandle, crate::db::LastFixRow) -> F + Send,
+    P: FnOnce(DbHandle, LastFix) -> F + Send,
     F: std::future::Future<Output = Result<()>> + Send,
 {
     let Some(_privacy) = state.privacy.read(ticket).await else {
@@ -337,8 +279,7 @@ where
     }
 
     fix.address = Some(display.to_owned());
-    let row: crate::db::LastFixRow = (&*fix).into();
-    let result = persist(state.db.clone(), row).await;
+    let result = persist(state.db.clone(), fix.clone()).await;
     // task-0046: prove the guard spans the persistence call. Do not move this
     // drop above `persist`; the concurrency regression asserts this ordering.
     drop(last);
@@ -356,10 +297,10 @@ async fn persist_last_fix_and_history_locked(
     new_fix: LastFix,
     quality: FixQuality,
 ) {
-    let row: crate::db::LastFixRow = (&new_fix).into();
+    let persisted = new_fix.clone();
     *last = Some(new_fix);
 
-    if let Err(e) = state.db.persist_fix_and_history(row, quality).await {
+    if let Err(e) = state.db.persist_fix_and_history(persisted, quality).await {
         warn!("failed to persist last_fix and history: {e}");
         state.record_db_failure();
     }
@@ -382,12 +323,12 @@ async fn persist_locate_fix_and_schedule_locked(
         });
         let address = cache.get(new_fix.lat, new_fix.lon);
         new_fix.address = address.clone();
-        let row: crate::db::LastFixRow = (&new_fix).into();
-        *last = Some(new_fix);
+        let persisted = new_fix.clone();
         state
             .geocode
-            .observe(row.lat, row.lon, address.is_none(), ticket);
-        (address, row)
+            .observe(new_fix.lat, new_fix.lon, address.is_none(), ticket);
+        *last = Some(new_fix);
+        (address, persisted)
     };
 
     if let Err(error) = state.db.persist_fix_and_history(row, quality).await {
@@ -438,77 +379,10 @@ async fn persist_locate_fix_and_schedule(
     .await
 }
 
-#[cfg(test)]
-mod last_fix_rehydration_tests {
-    use super::*;
-
-    fn row(lat: f64, lon: f64) -> crate::db::LastFixRow {
-        crate::db::LastFixRow {
-            lat,
-            lon,
-            accuracy_m: 25.0,
-            address: Some("Copenhagen".to_string()),
-            at_rfc3339: "2026-07-04T12:00:00+00:00".to_string(),
-            sources: 3,
-        }
-    }
-
-    /// task-0238 AC#1/#3: main.rs maps this conversion's Err to None. Cover
-    /// every non-finite class in either coordinate; a finite counterpart
-    /// remains present so this cannot regress into rejecting all persisted
-    /// fixes.
-    #[test]
-    fn last_fix_rehydration_discards_non_finite_coordinates() {
-        let poisoned = [
-            (f64::NAN, 12.5, "NaN latitude"),
-            (f64::INFINITY, 12.5, "+Inf latitude"),
-            (f64::NEG_INFINITY, 12.5, "-Inf latitude"),
-            (55.6, f64::NAN, "NaN longitude"),
-            (55.6, f64::INFINITY, "+Inf longitude"),
-            (55.6, f64::NEG_INFINITY, "-Inf longitude"),
-        ];
-
-        for (lat, lon, case) in poisoned {
-            let persisted = row(lat, lon);
-            let error = LastFix::try_from(persisted.clone())
-                .err()
-                .unwrap_or_else(|| panic!("{case} must return Err"));
-            assert!(
-                error
-                    .to_string()
-                    .contains("non-finite last_fix coordinates"),
-                "{case} error must name the root cause, got {error}"
-            );
-            assert!(
-                LastFix::try_from(persisted).ok().is_none(),
-                "{case} must rehydrate as None at the startup call site"
-            );
-        }
-
-        let finite = LastFix::try_from(row(55.6, 12.5)).expect("finite row must rehydrate");
-        assert_eq!(finite.lat, 55.6);
-        assert_eq!(finite.lon, 12.5);
-    }
-
-    #[test]
-    fn last_fix_rehydration_rejects_invalid_accuracy() {
-        for accuracy_m in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01] {
-            let mut persisted = row(55.6, 12.5);
-            persisted.accuracy_m = accuracy_m;
-            let error = LastFix::try_from(persisted)
-                .err()
-                .expect("non-finite or negative accuracy must be rejected");
-            assert!(error.to_string().contains("invalid last_fix accuracy_m"));
-        }
-
-        let mut zero = row(55.6, 12.5);
-        zero.accuracy_m = 0.0;
-        assert!(
-            LastFix::try_from(zero).is_ok(),
-            "zero accuracy remains valid"
-        );
-    }
-}
+// task-0134: the task-0238 non-finite/invalid-accuracy rehydration tests moved
+// to `crate::db` alongside the relocated guard (`last_fix_from_columns`), since
+// NaN/±Inf cannot round-trip through a SQLite REAL column and so must be tested
+// against the conversion function directly rather than via `get_last_fix`.
 
 // --- Protocol types ---
 
@@ -2043,8 +1917,23 @@ async fn compute_locate_with_clock(
                 );
             };
             let mut last = state.last_fix.lock().await;
-            let previous_row = match state.db.get_last_fix().await {
-                Ok(row) => row,
+            // task-0134: get_last_fix now returns the domain `LastFix` with the
+            // Row->domain guard applied. A poisoned persisted row surfaces as a
+            // `CorruptLastFix` error, distinct from a genuine read failure, so
+            // this preserves the pre-refactor split: ignore a corrupt row and
+            // still answer; abort only on an actual SQLite read failure.
+            let previous = match state.db.get_last_fix().await {
+                Ok(previous) => previous,
+                // This downcast depends on `CorruptLastFix` remaining the
+                // top-level anyhow error out of `get_last_fix` (do NOT
+                // `.context(..)`-wrap it in the DB layer — see the invariant on
+                // `last_fix_from_columns`). If it breaks, a poisoned row would
+                // fall through to the abort arm below instead of being ignored;
+                // `locate_with_corrupt_persisted_last_fix_still_answers` pins it.
+                Err(error) if error.downcast_ref::<crate::db::CorruptLastFix>().is_some() => {
+                    warn!("ignoring invalid persisted last_fix during locate: {error}");
+                    None
+                }
                 Err(error) => {
                     if purpose == LocatePurpose::Autolocate {
                         warn!("autolocate failed to read persisted last_fix: {error}");
@@ -2056,13 +1945,6 @@ async fn compute_locate_with_clock(
                     );
                 }
             };
-            let previous = previous_row.and_then(|row| match LastFix::try_from(row) {
-                Ok(fix) => Some(fix),
-                Err(error) => {
-                    warn!("ignoring invalid persisted last_fix during locate: {error}");
-                    None
-                }
-            });
             let now = clock.now();
             if purpose == LocatePurpose::Autolocate
                 && previous.as_ref().is_some_and(|previous| {
@@ -2116,10 +1998,12 @@ async fn compute_locate_with_clock(
                             });
                             new_fix.address = cache.get(new_fix.lat, new_fix.lon);
                         }
-                        let row: crate::db::LastFixRow = (&new_fix).into();
                         let last_fix_applied = match state
                             .db
-                            .persist_autolocate_fix_and_history(row, decision.quality.clone())
+                            .persist_autolocate_fix_and_history(
+                                new_fix.clone(),
+                                decision.quality.clone(),
+                            )
                             .await
                         {
                             Ok(applied) => applied,
@@ -2595,8 +2479,8 @@ struct RawHistoryFix {
     suspect_reason: Option<String>,
 }
 
-impl From<crate::db::FixRow> for RawHistoryFix {
-    fn from(row: crate::db::FixRow) -> Self {
+impl From<crate::db::Fix> for RawHistoryFix {
+    fn from(row: crate::db::Fix) -> Self {
         let (implied_speed_kmh, last_fix_age_secs, inlier_ratio, confidence, suspect_reason) = row
             .quality
             .map_or((None, None, None, None, None), |quality| {
@@ -2609,7 +2493,7 @@ impl From<crate::db::FixRow> for RawHistoryFix {
                 )
             });
         Self {
-            at_rfc3339: row.at_rfc3339,
+            at_rfc3339: row.at.to_rfc3339(),
             lat: row.lat,
             lon: row.lon,
             accuracy_m: row.accuracy_m,
@@ -2668,7 +2552,7 @@ impl Drop for HistoryCancellationGuard {
 /// a Tokio worker. The injected `before_work` seam is a per-call deterministic
 /// test gate; production passes an empty closure (no globals or hooks).
 struct HistoryWork {
-    fixes: Vec<crate::db::FixRow>,
+    fixes: Vec<crate::db::Fix>,
     from: String,
     to: String,
     output: HistoryOutput,
@@ -3394,7 +3278,7 @@ mod last_fix_concurrency_tests {
             at,
             sources: 3,
         };
-        let old_row: crate::db::LastFixRow = (&old_fix).into();
+        let old_row = old_fix.clone();
         {
             let mut last = state.last_fix.lock().await;
             *last = Some(old_fix);
@@ -3491,7 +3375,7 @@ mod last_fix_concurrency_tests {
 
         let memory_row = {
             let last = state.last_fix.lock().await;
-            crate::db::LastFixRow::from(last.as_ref().expect("last_fix missing in memory"))
+            last.as_ref().expect("last_fix missing in memory").clone()
         };
         let disk_row = state
             .db
@@ -3509,7 +3393,7 @@ mod last_fix_concurrency_tests {
         assert_eq!(disk_row.lon, memory_row.lon);
         assert_eq!(disk_row.accuracy_m, memory_row.accuracy_m);
         assert_eq!(disk_row.address, memory_row.address);
-        assert_eq!(disk_row.at_rfc3339, memory_row.at_rfc3339);
+        assert_eq!(disk_row.at, memory_row.at);
         assert_eq!(disk_row.sources, memory_row.sources);
     }
 }
@@ -3851,13 +3735,13 @@ mod dispatch_tests {
         );
     }
 
-    fn previous_row(lat: f64, lon: f64, age: chrono::Duration) -> crate::db::LastFixRow {
-        crate::db::LastFixRow {
+    fn previous_row(lat: f64, lon: f64, age: chrono::Duration) -> LastFix {
+        LastFix {
             lat,
             lon,
             accuracy_m: 20.0,
             address: Some("previous address".to_string()),
-            at_rfc3339: (chrono::Utc::now() - age).to_rfc3339(),
+            at: chrono::Utc::now() - age,
             sources: 7,
         }
     }
@@ -3905,7 +3789,7 @@ mod dispatch_tests {
             .len()
     }
 
-    async fn history_rows(state: &Arc<DaemonState>) -> Vec<crate::db::FixRow> {
+    async fn history_rows(state: &Arc<DaemonState>) -> Vec<crate::db::Fix> {
         state.db.get_fixes_in_range("0000", "9999").await.unwrap()
     }
 
@@ -4114,7 +3998,7 @@ mod dispatch_tests {
             1
         );
         let persisted = state.db.get_last_fix().await.unwrap().unwrap();
-        assert_eq!(persisted.at_rfc3339, now.to_rfc3339());
+        assert_eq!(persisted.at, now);
         assert_eq!(persisted.address.as_deref(), Some("cached street"));
         let memory = state.last_fix.lock().await;
         assert_eq!(memory.as_ref().unwrap().at, now);
@@ -4143,11 +4027,7 @@ mod dispatch_tests {
             at: now - chrono::TimeDelta::minutes(5),
             sources: 5,
         };
-        state
-            .db
-            .set_last_fix(crate::db::LastFixRow::from(&previous))
-            .await
-            .unwrap();
+        state.db.set_last_fix(previous.clone()).await.unwrap();
         *state.last_fix.lock().await = Some(previous);
 
         let mut sample = crate::debounce::ScanSample::new();
@@ -4283,12 +4163,12 @@ mod dispatch_tests {
         let now = fixed_autolocate_time();
         state
             .db
-            .set_last_fix(crate::db::LastFixRow {
+            .set_last_fix(LastFix {
                 lat: location.0,
                 lon: location.1,
                 accuracy_m: 5.0,
                 address: None,
-                at_rfc3339: (now + chrono::TimeDelta::seconds(1)).to_rfc3339(),
+                at: now + chrono::TimeDelta::seconds(1),
                 sources: 3,
             })
             .await
@@ -4320,11 +4200,7 @@ mod dispatch_tests {
             at: future,
             sources: 3,
         };
-        state
-            .db
-            .set_last_fix(crate::db::LastFixRow::from(&previous))
-            .await
-            .unwrap();
+        state.db.set_last_fix(previous.clone()).await.unwrap();
         *state.last_fix.lock().await = Some(previous);
         // Far enough to bypass distance dedup. A non-positive elapsed time has
         // zero implied speed, so TASK-0094 accepts the current observation;
@@ -4349,7 +4225,14 @@ mod dispatch_tests {
         assert_eq!(quality.last_fix_age_secs(), Some(0));
         assert_eq!(quality.inlier_ratio(), Some(1.0));
         assert_eq!(
-            state.db.get_last_fix().await.unwrap().unwrap().at_rfc3339,
+            state
+                .db
+                .get_last_fix()
+                .await
+                .unwrap()
+                .unwrap()
+                .at
+                .to_rfc3339(),
             future.to_rfc3339()
         );
         assert_eq!(state.last_fix.lock().await.as_ref().unwrap().at, future);
@@ -4414,11 +4297,7 @@ mod dispatch_tests {
             at: wall_now - chrono::TimeDelta::minutes(1),
             sources: 3,
         };
-        state
-            .db
-            .set_last_fix(crate::db::LastFixRow::from(&previous))
-            .await
-            .unwrap();
+        state.db.set_last_fix(previous.clone()).await.unwrap();
         *state.last_fix.lock().await = Some(previous.clone());
 
         let refresh = BootTime::from_duration(Duration::from_secs(100));
@@ -4463,7 +4342,14 @@ mod dispatch_tests {
 
         assert_eq!(history_len(&state).await, 0);
         assert_eq!(
-            state.db.get_last_fix().await.unwrap().unwrap().at_rfc3339,
+            state
+                .db
+                .get_last_fix()
+                .await
+                .unwrap()
+                .unwrap()
+                .at
+                .to_rfc3339(),
             previous.at.to_rfc3339()
         );
         assert_eq!(
@@ -4602,11 +4488,7 @@ mod dispatch_tests {
             at: now + chrono::TimeDelta::seconds(1),
             sources: 3,
         };
-        state
-            .db
-            .set_last_fix(crate::db::LastFixRow::from(&previous))
-            .await
-            .unwrap();
+        state.db.set_last_fix(previous.clone()).await.unwrap();
         *state.last_fix.lock().await = Some(previous.clone());
         seed_autolocate_cluster(&state, 0x75, -12.8940, -38.2920).await;
         lock_db(&state)
@@ -4626,7 +4508,14 @@ mod dispatch_tests {
             previous.at
         );
         assert_eq!(
-            state.db.get_last_fix().await.unwrap().unwrap().at_rfc3339,
+            state
+                .db
+                .get_last_fix()
+                .await
+                .unwrap()
+                .unwrap()
+                .at
+                .to_rfc3339(),
             previous.at.to_rfc3339()
         );
         assert_eq!(history_len(&state).await, 0);
@@ -4686,6 +4575,92 @@ mod dispatch_tests {
         assert!(interactive["error"].as_str().is_some_and(
             |error| error.contains("failed to read last_fix: no such table: last_fix")
         ));
+    }
+
+    /// task-0134 review hardening: the sibling of the read-failure test above.
+    /// A *corrupt* persisted last_fix (present row, unparseable timestamp) is a
+    /// `CorruptLastFix` — a DISTINCT category from a read failure — so the
+    /// locate path must IGNORE it and still answer with a fresh position, not
+    /// hard-abort. This pins the `get_last_fix` -> `CorruptLastFix` -> downcast
+    /// arm-ordering in handle_locate; if that ever regresses (e.g. a
+    /// `.context(..)` wrap defeats the downcast), a corrupt row would silently
+    /// become a fatal `failed to read last_fix` and this test would fail.
+    #[tokio::test]
+    async fn locate_with_corrupt_persisted_last_fix_still_answers() {
+        use tracing::instrument::WithSubscriber as _;
+        crate::test_support::install_permissive_global_test_subscriber(); // task-0248/0251
+
+        let state = test_state();
+        // Cached APs + a debounced stable scan so the interactive locate can
+        // trilaterate a fresh position (mirrors the cold-boot locate test).
+        let mut sample = crate::debounce::ScanSample::new();
+        for (index, (lat, lon)) in [(55.6760, 12.5680), (55.6761, 12.5682), (55.6759, 12.5681)]
+            .into_iter()
+            .enumerate()
+        {
+            add_cached_scan_ap(
+                &state,
+                &mut sample,
+                &format!("02:00:00:00:3c:{index:02x}"),
+                lat,
+                lon,
+                -50 - index as i32,
+                Some("fixed-home"),
+            );
+        }
+        push_stable_scan(&state, sample).await;
+
+        // Persist a VALID last_fix, then corrupt its timestamp IN PLACE. A
+        // string round-trips through the TEXT column (unlike NaN through a
+        // REAL), so the read path parses and rejects it as `CorruptLastFix`.
+        state
+            .db
+            .set_last_fix(LastFix {
+                lat: 55.6761,
+                lon: 12.5683,
+                accuracy_m: 10.0,
+                address: None,
+                at: fixed_autolocate_time(),
+                sources: 3,
+            })
+            .await
+            .unwrap();
+        lock_db(&state)
+            .execute_batch_for_test(
+                "UPDATE last_fix SET at_rfc3339 = 'not-a-timestamp' WHERE id = 1;",
+            )
+            .unwrap();
+
+        let captured = crate::test_support::CaptureSink::default();
+        let handle = captured.clone();
+        let response = dispatch_command(&Request::Locate, &state)
+            .with_subscriber(captured)
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        // (1) The corrupt row is ignored, not fatal: locate still answers.
+        assert_eq!(
+            json["ok"], true,
+            "corrupt persisted last_fix must be ignored, not abort locate: {response}"
+        );
+        assert!(
+            json["lat"].as_f64().is_some() && json["lon"].as_f64().is_some(),
+            "expected a fresh trilaterated position: {response}"
+        );
+
+        // (2) The ignore path is observable via the scoped warn capture.
+        let warnings: Vec<String> = handle
+            .events()
+            .iter()
+            .filter(|(level, _, _)| *level == tracing::Level::WARN)
+            .map(|(_, _, message)| message.clone())
+            .collect();
+        assert!(
+            warnings.iter().any(
+                |message| message.contains("ignoring invalid persisted last_fix during locate")
+            ),
+            "expected the ignore-and-continue warn, got: {warnings:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4763,12 +4738,12 @@ mod dispatch_tests {
         let now = fixed_autolocate_time();
         state
             .db
-            .set_last_fix(crate::db::LastFixRow {
+            .set_last_fix(LastFix {
                 lat: PREVIOUS.0,
                 lon: PREVIOUS.1,
                 accuracy_m: 20.0,
                 address: Some("previous address".to_string()),
-                at_rfc3339: (now - chrono::TimeDelta::minutes(5)).to_rfc3339(),
+                at: now - chrono::TimeDelta::minutes(5),
                 sources: 7,
             })
             .await
@@ -4827,7 +4802,14 @@ mod dispatch_tests {
             0
         );
         assert_eq!(
-            state.db.get_last_fix().await.unwrap().unwrap().at_rfc3339,
+            state
+                .db
+                .get_last_fix()
+                .await
+                .unwrap()
+                .unwrap()
+                .at
+                .to_rfc3339(),
             (now - chrono::TimeDelta::minutes(5)).to_rfc3339()
         );
     }
@@ -5112,7 +5094,7 @@ mod dispatch_tests {
 
         let stored = state.db.get_last_fix().await.unwrap().unwrap();
         assert_eq!(
-            stored.at_rfc3339, previous.at_rfc3339,
+            stored.at, previous.at,
             "policy reuse must not refresh the observation timestamp"
         );
         assert_eq!(
@@ -5469,12 +5451,14 @@ mod dispatch_tests {
             db.insert_not_found("not-found").unwrap();
             db.insert_fix("2026-01-01T00:00:00+00:00", 55.0, 12.0, 5.0, 1)
                 .unwrap();
-            db.set_last_fix(&crate::db::LastFixRow {
+            db.set_last_fix(&LastFix {
                 lat: 55.0,
                 lon: 12.0,
                 accuracy_m: 5.0,
                 address: Some("private address".to_string()),
-                at_rfc3339: "2026-01-01T00:00:00+00:00".to_string(),
+                at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
                 sources: 1,
             })
             .unwrap();
@@ -5645,12 +5629,14 @@ mod dispatch_tests {
             db.insert_not_found("not-found").unwrap();
             db.insert_fix("2026-01-01T00:00:00+00:00", 55.0, 12.0, 5.0, 1)
                 .unwrap();
-            db.set_last_fix(&crate::db::LastFixRow {
+            db.set_last_fix(&LastFix {
                 lat: 55.0,
                 lon: 12.0,
                 accuracy_m: 5.0,
                 address: Some("private address".to_string()),
-                at_rfc3339: "2026-01-01T00:00:00+00:00".to_string(),
+                at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
                 sources: 1,
             })
             .unwrap();
@@ -6824,12 +6810,14 @@ mod dispatch_tests {
         state
             .db
             .persist_fix_and_history(
-                crate::db::LastFixRow {
+                LastFix {
                     lat: 55.0,
                     lon: 12.0,
                     accuracy_m: 10.0,
                     address: None,
-                    at_rfc3339: "2026-07-05T12:00:00+00:00".to_owned(),
+                    at: chrono::DateTime::parse_from_rfc3339("2026-07-05T12:00:00+00:00")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
                     sources: 3,
                 },
                 cold,
@@ -6847,12 +6835,14 @@ mod dispatch_tests {
         state
             .db
             .persist_fix_and_history(
-                crate::db::LastFixRow {
+                LastFix {
                     lat: 56.0,
                     lon: 13.0,
                     accuracy_m: 20.0,
                     address: None,
-                    at_rfc3339: "2026-07-05T12:01:00+00:00".to_owned(),
+                    at: chrono::DateTime::parse_from_rfc3339("2026-07-05T12:01:00+00:00")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
                     sources: 4,
                 },
                 suspect,
@@ -6922,12 +6912,14 @@ mod dispatch_tests {
             known
                 .db
                 .persist_fix_and_history(
-                    crate::db::LastFixRow {
+                    LastFix {
                         lat,
                         lon,
                         accuracy_m: 10.0,
                         address: None,
-                        at_rfc3339: timestamp.to_owned(),
+                        at: chrono::DateTime::parse_from_rfc3339(timestamp)
+                            .unwrap()
+                            .with_timezone(&chrono::Utc),
                         sources: 3,
                     },
                     FixQuality::new(None, None, Some(1.0), Confidence::High, None).unwrap(),

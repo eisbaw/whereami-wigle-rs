@@ -854,7 +854,7 @@ mod tests {
             .get(OLD_LAT, OLD_LON);
         let memory_row = {
             let last = state.last_fix.lock().await;
-            crate::db::LastFixRow::from(last.as_ref().expect("last_fix missing"))
+            last.as_ref().expect("last_fix missing").clone()
         };
         let disk_row = lock_db(&state)
             .get_last_fix()

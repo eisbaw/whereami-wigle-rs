@@ -1,7 +1,7 @@
 //! SQLite database: schema creation, WAL mode, CRUD operations for aps/not_found/pending/metadata.
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1288,19 +1288,15 @@ impl DbHandle {
         self.read(|db| db.api_calls_today()).await
     }
 
-    pub async fn get_last_fix(&self) -> Result<Option<LastFixRow>> {
+    pub async fn get_last_fix(&self) -> Result<Option<LastFix>> {
         self.read(|db| db.get_last_fix()).await
     }
 
-    pub async fn set_last_fix(&self, fix: LastFixRow) -> Result<()> {
+    pub async fn set_last_fix(&self, fix: LastFix) -> Result<()> {
         self.write_durable(move |db| db.set_last_fix(&fix)).await
     }
 
-    pub async fn persist_fix_and_history(
-        &self,
-        fix: LastFixRow,
-        quality: FixQuality,
-    ) -> Result<()> {
+    pub async fn persist_fix_and_history(&self, fix: LastFix, quality: FixQuality) -> Result<()> {
         self.write_durable(move |db| db.persist_fix_and_history(&fix, &quality))
             .await
     }
@@ -1310,7 +1306,7 @@ impl DbHandle {
     /// either case; `false` means a newer wall-clock fix remained authoritative.
     pub async fn persist_autolocate_fix_and_history(
         &self,
-        fix: LastFixRow,
+        fix: LastFix,
         quality: FixQuality,
     ) -> Result<bool> {
         self.write_durable(move |db| {
@@ -1378,7 +1374,7 @@ impl DbHandle {
         &self,
         start: impl Into<String>,
         end: impl Into<String>,
-    ) -> Result<Vec<FixRow>> {
+    ) -> Result<Vec<Fix>> {
         let start = start.into();
         let end = end.into();
         self.read(move |db| db.get_fixes_in_range(&start, &end))
@@ -1396,7 +1392,7 @@ impl DbHandle {
         start: impl Into<String>,
         end: impl Into<String>,
         guard: G,
-    ) -> Result<Vec<FixRow>>
+    ) -> Result<Vec<Fix>>
     where
         G: Send + 'static,
     {
@@ -1445,7 +1441,7 @@ impl DbHandle {
         guard: G,
         queued: Option<tokio::sync::oneshot::Sender<()>>,
         before_query: H,
-    ) -> Result<Vec<FixRow>>
+    ) -> Result<Vec<Fix>>
     where
         G: Send + 'static,
         H: FnOnce() + Send + 'static,
@@ -1474,7 +1470,7 @@ impl DbHandle {
         guard: G,
         queued: Option<tokio::sync::oneshot::Sender<()>>,
         before_query: H,
-    ) -> Result<Vec<FixRow>>
+    ) -> Result<Vec<Fix>>
     where
         G: Send + 'static,
         H: FnOnce() + Send + 'static,
@@ -1621,19 +1617,25 @@ pub fn retention_cutoff(retention_days: i64) -> Result<Option<String>> {
     Ok(Some(cutoff.to_rfc3339()))
 }
 
-/// A historical fix row from the `fixes` table (task-0031). Each row records
-/// one successful locate response so the daemon can answer "where was I N
-/// days ago" queries by grouping rows into stay-point segments.
+/// A historical fix from the `fixes` table (task-0031). Each records one
+/// successful locate response so the daemon can answer "where was I N days
+/// ago" queries by grouping fixes into stay-point segments.
+///
+/// task-0134: this is a DOMAIN type — the DB layer owns the on-disk RFC3339
+/// string and hands callers an already-parsed `at: DateTime<Utc>`. History
+/// segmentation therefore never re-parses a timestamp per iteration, and a
+/// corrupt persisted timestamp becomes a typed read error at this boundary
+/// rather than a silently-defaulted zero duration.
 ///
 /// `id` and `n_sources` are read from the DB but the segmentation logic
 /// (`history::segment_fixes`) only needs the position+timestamp+accuracy.
 /// They're carried for completeness so external consumers (e.g. analysis
-/// tools that consume the typed struct) get the full row.
+/// tools that consume the typed struct) get the full record.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub struct FixRow {
+pub struct Fix {
     pub id: i64,
-    pub at_rfc3339: String,
+    pub at: DateTime<Utc>,
     pub lat: f64,
     pub lon: f64,
     pub accuracy_m: f64,
@@ -1642,6 +1644,21 @@ pub struct FixRow {
     /// `None` is reserved for a legacy row whose five quality columns are all
     /// NULL. Any partial or malformed persisted bundle is a read error.
     pub(crate) quality: Option<FixQuality>,
+}
+
+/// Parse a `fixes.at_rfc3339` string to `DateTime<Utc>` inside a rusqlite row
+/// closure (task-0134). A malformed timestamp is a corrupt-row read error,
+/// carrying the row id, mirroring [`corrupt_fix_quality`]. This replaces the
+/// former silent `_ => 0` default that `history::segment_fixes` applied.
+fn parse_fix_timestamp(row_id: i64, at_rfc3339: &str) -> rusqlite::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(at_rfc3339)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|error| {
+            corrupt_fix_quality(
+                row_id,
+                format!("unparseable timestamp {at_rfc3339:?}: {error}"),
+            )
+        })
 }
 
 fn corrupt_fix_quality(row_id: i64, message: impl std::fmt::Display) -> rusqlite::Error {
@@ -1701,22 +1718,98 @@ fn decode_fix_quality(
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct CappedFixRows {
-    pub fixes: Vec<FixRow>,
+    pub fixes: Vec<Fix>,
     pub elided: Option<i64>,
 }
 
-/// A persisted last-known position. Stored as a single row in `last_fix`
-/// (CHECK id = 1) so the daemon can rehydrate after a restart.
+/// A persisted last-known position (task-0134 domain type; formerly split into
+/// an on-disk `LastFixRow` + an in-memory `server::LastFix`). The DB layer owns
+/// the RFC3339<->`DateTime<Utc>` marshalling so callers never hand-marshal, and
+/// wall-clock age across restarts is computed directly on `at`.
+///
+/// task-0238 non-finite guard: a persisted row with a non-finite coordinate or
+/// accuracy, or an unparseable timestamp, is rejected at read time by
+/// [`last_fix_from_columns`] and never materialises into a `LastFix`.
 #[derive(Debug, Clone)]
-pub struct LastFixRow {
+pub struct LastFix {
     pub lat: f64,
     pub lon: f64,
     pub accuracy_m: f64,
     pub address: Option<String>,
-    /// RFC3339 timestamp; the in-memory representation in server.rs uses
-    /// chrono::DateTime<Utc> for age computation across restarts.
-    pub at_rfc3339: String,
-    pub sources: i64,
+    pub at: DateTime<Utc>,
+    pub sources: usize,
+}
+
+/// A persisted `last_fix` row was read but is unusable — a non-finite
+/// coordinate/accuracy (task-0238) or an unparseable timestamp — and was
+/// discarded rather than served. This is a DISTINCT error category from a
+/// SQLite read failure so callers can branch:
+///
+/// - startup rehydration (`main.rs`) discards either kind as `None` + a warn;
+/// - the locate path (`server.rs`) ignores a corrupt row and still answers,
+///   but aborts on a genuine read failure.
+///
+/// `get_last_fix` returns this (wrapped in `anyhow::Error`) so callers use
+/// `error.downcast_ref::<CorruptLastFix>()` to tell the two apart.
+#[derive(Debug)]
+pub struct CorruptLastFix(String);
+
+impl std::fmt::Display for CorruptLastFix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CorruptLastFix {}
+
+/// Convert the six raw `last_fix` columns into the domain [`LastFix`],
+/// applying the task-0238 non-finite guard and parsing the RFC3339 timestamp.
+/// This is the single Row->domain choke point (relocated from the former
+/// `TryFrom<LastFixRow> for server::LastFix`); a rejected row surfaces as a
+/// [`CorruptLastFix`] so it is discarded, never served.
+fn last_fix_from_columns(
+    lat: f64,
+    lon: f64,
+    accuracy_m: f64,
+    address: Option<String>,
+    at_rfc3339: String,
+    sources: i64,
+) -> Result<LastFix> {
+    // INVARIANT: every rejection here MUST surface `CorruptLastFix` as the
+    // TOP-LEVEL anyhow error. Do NOT `.context(..)`-wrap it (here, in
+    // `get_last_fix`, or in the DbHandle `read` plumbing): `handle_locate` and
+    // `main.rs` branch on `error.downcast_ref::<CorruptLastFix>()` to
+    // distinguish a poisoned-but-ignorable row from a genuine read failure.
+    // A context wrapper would reparent the chain, defeat the downcast, and
+    // silently turn a corrupt last_fix into a hard locate abort.
+    //
+    // task-0238: SQLite REAL columns can contain NaN/±Inf. Reject the persisted
+    // row here so it is discarded (and the cause warned) instead of exposing a
+    // poisoned stale fix to return_last_fix_or_error.
+    if !lat.is_finite() || !lon.is_finite() {
+        return Err(CorruptLastFix(format!(
+            "non-finite last_fix coordinates: lat={lat}, lon={lon}"
+        ))
+        .into());
+    }
+    if !accuracy_m.is_finite() || accuracy_m < 0.0 {
+        return Err(CorruptLastFix(format!("invalid last_fix accuracy_m: {accuracy_m}")).into());
+    }
+    let at = DateTime::parse_from_rfc3339(&at_rfc3339)
+        .map_err(|error| {
+            CorruptLastFix(format!(
+                "unparseable last_fix timestamp {at_rfc3339:?}: {error}"
+            ))
+        })?
+        .with_timezone(&Utc);
+    Ok(LastFix {
+        lat,
+        lon,
+        accuracy_m,
+        address,
+        at,
+        sources: sources.max(0) as usize,
+    })
 }
 
 const UPSERT_LAST_FIX_SQL: &str =
@@ -1737,7 +1830,13 @@ enum LastFixUpdate {
     DroppedOlder { incoming: String, stored: String },
 }
 
-fn upsert_last_fix(connection: &Connection, fix: &LastFixRow) -> Result<LastFixUpdate> {
+fn upsert_last_fix(connection: &Connection, fix: &LastFix) -> Result<LastFixUpdate> {
+    // task-0134/task-0238 invariant: the byte-identical `DateTime::<Utc>::
+    // to_rfc3339()` format is what the monotonic UPSERT's lexical `>=` compare
+    // (and the range-query string bounds) rely on. Marshal it HERE, inside the
+    // DB layer, so callers pass a domain `at: DateTime<Utc>` and cannot vary the
+    // on-disk format.
+    let at_rfc3339 = fix.at.to_rfc3339();
     let changed = connection.execute(
         UPSERT_LAST_FIX_SQL,
         params![
@@ -1745,8 +1844,8 @@ fn upsert_last_fix(connection: &Connection, fix: &LastFixRow) -> Result<LastFixU
             fix.lon,
             fix.accuracy_m,
             fix.address,
-            fix.at_rfc3339,
-            fix.sources
+            at_rfc3339,
+            fix.sources as i64
         ],
     )?;
     match changed {
@@ -1758,7 +1857,7 @@ fn upsert_last_fix(connection: &Connection, fix: &LastFixRow) -> Result<LastFixU
                 |row| row.get(0),
             )?;
             Ok(LastFixUpdate::DroppedOlder {
-                incoming: fix.at_rfc3339.clone(),
+                incoming: at_rfc3339,
                 stored,
             })
         }
@@ -3183,7 +3282,7 @@ impl Database {
     /// fractional seconds still sort correctly because the `.` that starts a
     /// fraction sorts after the `+` of the offset.) A non-UTC offset, or a
     /// writer switching timestamp formats, would break this.
-    pub fn set_last_fix(&self, fix: &LastFixRow) -> Result<()> {
+    pub fn set_last_fix(&self, fix: &LastFix) -> Result<()> {
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let outcome = upsert_last_fix(&tx, fix)?;
         tx.commit()?;
@@ -3223,7 +3322,7 @@ impl Database {
 
     /// Persist the current fix and its history observation in one transaction.
     /// The monotonic guard in `set_last_fix` remains in force.
-    fn persist_fix_and_history(&mut self, fix: &LastFixRow, quality: &FixQuality) -> Result<()> {
+    fn persist_fix_and_history(&mut self, fix: &LastFix, quality: &FixQuality) -> Result<()> {
         let outcome = self.persist_fix_and_history_outcome(fix, quality)?;
         warn_if_last_fix_dropped(outcome);
         Ok(())
@@ -3231,24 +3330,27 @@ impl Database {
 
     fn persist_fix_and_history_outcome(
         &mut self,
-        fix: &LastFixRow,
+        fix: &LastFix,
         quality: &FixQuality,
     ) -> Result<LastFixUpdate> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let outcome = upsert_last_fix(&tx, fix)?;
+        // Same RFC3339 marshalling as the UPSERT (invariant in `upsert_last_fix`):
+        // the history row's `at_rfc3339` string is what `get_fixes_in_range`'s
+        // lexical bounds order by.
         tx.execute(
             "INSERT INTO fixes (
                  at_rfc3339, lat, lon, accuracy_m, n_sources,
                  implied_speed_kmh, last_fix_age_secs, inlier_ratio, confidence, suspect_reason
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
-                fix.at_rfc3339,
+                fix.at.to_rfc3339(),
                 fix.lat,
                 fix.lon,
                 fix.accuracy_m,
-                fix.sources,
+                fix.sources as i64,
                 quality.implied_speed_kmh(),
                 quality.last_fix_age_secs(),
                 quality.inlier_ratio(),
@@ -3283,11 +3385,7 @@ impl Database {
 
     /// Read fix rows whose `at_rfc3339` falls within `[start_rfc3339, end_rfc3339]`,
     /// in ascending time order.
-    pub fn get_fixes_in_range(
-        &self,
-        start_rfc3339: &str,
-        end_rfc3339: &str,
-    ) -> Result<Vec<FixRow>> {
+    pub fn get_fixes_in_range(&self, start_rfc3339: &str, end_rfc3339: &str) -> Result<Vec<Fix>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, at_rfc3339, lat, lon, accuracy_m, n_sources,
                     implied_speed_kmh, last_fix_age_secs, inlier_ratio, confidence, suspect_reason
@@ -3297,9 +3395,10 @@ impl Database {
         )?;
         let rows = stmt.query_map(params![start_rfc3339, end_rfc3339], |r| {
             let id = r.get(0)?;
-            Ok(FixRow {
+            let at_rfc3339: String = r.get(1)?;
+            Ok(Fix {
                 id,
-                at_rfc3339: r.get(1)?,
+                at: parse_fix_timestamp(id, &at_rfc3339)?,
                 lat: r.get(2)?,
                 lon: r.get(3)?,
                 accuracy_m: r.get(4)?,
@@ -3363,9 +3462,10 @@ impl Database {
         let mut statement = tx.prepare(SELECT_NEWEST_FIXES_IN_RANGE_SQL)?;
         let rows = statement.query_map(params![start_rfc3339, end_rfc3339, limit_i64], |row| {
             let id = row.get(0)?;
-            Ok(FixRow {
+            let at_rfc3339: String = row.get(1)?;
+            Ok(Fix {
                 id,
-                at_rfc3339: row.get(1)?,
+                at: parse_fix_timestamp(id, &at_rfc3339)?,
                 lat: row.get(2)?,
                 lon: row.get(3)?,
                 accuracy_m: row.get(4)?,
@@ -3451,26 +3551,38 @@ impl Database {
     }
 
     /// Read the persisted last-known position, if any.
-    pub fn get_last_fix(&self) -> Result<Option<LastFixRow>> {
-        let row = self
+    ///
+    /// task-0134: returns the DOMAIN [`LastFix`] with `at: DateTime<Utc>`. The
+    /// Row->domain conversion (RFC3339 parse + task-0238 non-finite guard) runs
+    /// in [`last_fix_from_columns`]; a corrupt persisted row is a typed
+    /// [`CorruptLastFix`] error (discarded, never served), NOT a silent stale
+    /// value. A genuine SQLite read failure is a distinct (non-`CorruptLastFix`)
+    /// error so the locate path can branch ignore-vs-abort.
+    pub fn get_last_fix(&self) -> Result<Option<LastFix>> {
+        let columns = self
             .conn
             .query_row(
                 "SELECT lat, lon, accuracy_m, address, at_rfc3339, sources
                  FROM last_fix WHERE id = 1",
                 [],
                 |row| {
-                    Ok(LastFixRow {
-                        lat: row.get(0)?,
-                        lon: row.get(1)?,
-                        accuracy_m: row.get(2)?,
-                        address: row.get(3)?,
-                        at_rfc3339: row.get(4)?,
-                        sources: row.get(5)?,
-                    })
+                    Ok((
+                        row.get::<_, f64>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
                 },
             )
             .optional()?;
-        Ok(row)
+        match columns {
+            Some((lat, lon, accuracy_m, address, at_rfc3339, sources)) => Ok(Some(
+                last_fix_from_columns(lat, lon, accuracy_m, address, at_rfc3339, sources)?,
+            )),
+            None => Ok(None),
+        }
     }
 }
 
@@ -3482,6 +3594,16 @@ mod tests {
     fn test_quality() -> FixQuality {
         FixQuality::new(None, None, Some(1.0), Confidence::High, None)
             .expect("test quality must be valid")
+    }
+
+    /// task-0134: parse a fixed RFC3339 string into the `DateTime<Utc>` that
+    /// the domain `LastFix`/`Fix` now carry. `to_rfc3339()` round-trips these
+    /// back to the byte-identical `+00:00` form the monotonic-UPSERT and
+    /// range-query lexical comparisons rely on.
+    fn ts(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .expect("test timestamp must be valid RFC3339")
+            .with_timezone(&Utc)
     }
 
     // task-0255: capture tracing via the shared `test_support::CaptureSink`.
@@ -3611,12 +3733,12 @@ mod tests {
         let hits = db.lookup_cached_touch(&bssids).unwrap();
         assert_eq!(hits.len(), 10);
         db.persist_fix_and_history(
-            &LastFixRow {
+            &LastFix {
                 lat: 55.6761,
                 lon: 12.5683,
                 accuracy_m: 8.0,
                 address: None,
-                at_rfc3339: "2026-07-05T00:00:00+00:00".to_owned(),
+                at: ts("2026-07-05T00:00:00+00:00"),
                 sources: 10,
             },
             &test_quality(),
@@ -3834,12 +3956,12 @@ mod tests {
         db.insert_not_found("not-found").unwrap();
         db.insert_fix("2026-01-01T00:00:00+00:00", 1.0, 2.0, 3.0, 4)
             .unwrap();
-        db.set_last_fix(&LastFixRow {
+        db.set_last_fix(&LastFix {
             lat: 1.0,
             lon: 2.0,
             accuracy_m: 3.0,
             address: Some("private address".to_string()),
-            at_rfc3339: "2026-01-01T00:00:00+00:00".to_string(),
+            at: ts("2026-01-01T00:00:00+00:00"),
             sources: 4,
         })
         .unwrap();
@@ -6296,12 +6418,12 @@ mod tests {
         // Empty initially.
         assert!(db.get_last_fix().unwrap().is_none());
 
-        let row = LastFixRow {
+        let row = LastFix {
             lat: 55.6761,
             lon: 12.5683,
             accuracy_m: 42.0,
             address: Some("Copenhagen".to_string()),
-            at_rfc3339: "2026-05-09T12:34:56+00:00".to_string(),
+            at: ts("2026-05-09T12:34:56+00:00"),
             sources: 5,
         };
         db.set_last_fix(&row).unwrap();
@@ -6310,16 +6432,16 @@ mod tests {
         assert!((got.lon - row.lon).abs() < 1e-9);
         assert!((got.accuracy_m - row.accuracy_m).abs() < 1e-9);
         assert_eq!(got.address, row.address);
-        assert_eq!(got.at_rfc3339, row.at_rfc3339);
+        assert_eq!(got.at, row.at);
         assert_eq!(got.sources, row.sources);
 
         // Overwrite must work and stay single-row.
-        let updated = LastFixRow {
+        let updated = LastFix {
             lat: 48.8566,
             lon: 2.3522,
             accuracy_m: 99.0,
             address: None,
-            at_rfc3339: "2026-05-10T00:00:00+00:00".to_string(),
+            at: ts("2026-05-10T00:00:00+00:00"),
             sources: 7,
         };
         db.set_last_fix(&updated).unwrap();
@@ -6333,16 +6455,136 @@ mod tests {
         assert_eq!(count, 1, "last_fix must remain single-row after overwrite");
     }
 
+    /// task-0238 (relocated from `server::last_fix_rehydration_tests` in
+    /// task-0134): `last_fix_from_columns` — the single Row->domain choke point
+    /// `get_last_fix` funnels through — rejects a non-finite coordinate as a
+    /// `CorruptLastFix`. Tested against the conversion directly because NaN/±Inf
+    /// cannot round-trip through a SQLite REAL column (SQLite stores them NULL).
+    #[test]
+    fn last_fix_from_columns_discards_non_finite_coordinates() {
+        let poisoned = [
+            (f64::NAN, 12.5, "NaN latitude"),
+            (f64::INFINITY, 12.5, "+Inf latitude"),
+            (f64::NEG_INFINITY, 12.5, "-Inf latitude"),
+            (55.6, f64::NAN, "NaN longitude"),
+            (55.6, f64::INFINITY, "+Inf longitude"),
+            (55.6, f64::NEG_INFINITY, "-Inf longitude"),
+        ];
+        for (lat, lon, case) in poisoned {
+            let error = last_fix_from_columns(
+                lat,
+                lon,
+                25.0,
+                Some("Copenhagen".to_string()),
+                "2026-07-04T12:00:00+00:00".to_string(),
+                3,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{case} must return Err"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("non-finite last_fix coordinates"),
+                "{case} error must name the root cause, got {error}"
+            );
+            assert!(
+                error.downcast_ref::<CorruptLastFix>().is_some(),
+                "{case} must be a CorruptLastFix (discard, not a read failure)"
+            );
+        }
+
+        let finite = last_fix_from_columns(
+            55.6,
+            12.5,
+            25.0,
+            None,
+            "2026-07-04T12:00:00+00:00".to_string(),
+            3,
+        )
+        .expect("finite row must convert");
+        assert_eq!(finite.lat, 55.6);
+        assert_eq!(finite.lon, 12.5);
+    }
+
+    /// task-0238 (relocated in task-0134): non-finite or negative accuracy is a
+    /// `CorruptLastFix`; zero accuracy remains valid.
+    #[test]
+    fn last_fix_from_columns_rejects_invalid_accuracy() {
+        for accuracy_m in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01] {
+            let error = last_fix_from_columns(
+                55.6,
+                12.5,
+                accuracy_m,
+                None,
+                "2026-07-04T12:00:00+00:00".to_string(),
+                3,
+            )
+            .expect_err("non-finite or negative accuracy must be rejected");
+            assert!(error.to_string().contains("invalid last_fix accuracy_m"));
+            assert!(error.downcast_ref::<CorruptLastFix>().is_some());
+        }
+
+        assert!(
+            last_fix_from_columns(
+                55.6,
+                12.5,
+                0.0,
+                None,
+                "2026-07-04T12:00:00+00:00".to_string(),
+                3,
+            )
+            .is_ok(),
+            "zero accuracy remains valid"
+        );
+    }
+
+    /// task-0134 AC#2/#5: a corrupt `at_rfc3339` STRING round-trips through the
+    /// SQLite TEXT column (unlike NaN), so this drives the real `get_last_fix`
+    /// read path. It must return a typed `CorruptLastFix` error — NOT `Ok` with
+    /// a silently-defaulted or stale timestamp.
+    #[test]
+    fn get_last_fix_on_corrupt_timestamp_is_err_not_stale() {
+        let db = Database::open_memory().unwrap();
+        // A valid row first, so a regression that ignores the corruption would
+        // surface a stale-but-parseable value rather than an error.
+        db.set_last_fix(&LastFix {
+            lat: 55.0,
+            lon: 12.0,
+            accuracy_m: 10.0,
+            address: None,
+            at: ts("2026-07-04T12:00:00+00:00"),
+            sources: 3,
+        })
+        .unwrap();
+        // Overwrite the timestamp column in place with an unparseable value.
+        db.execute_batch_for_test(
+            "UPDATE last_fix SET at_rfc3339 = 'not-a-timestamp' WHERE id = 1;",
+        )
+        .unwrap();
+
+        let error = db
+            .get_last_fix()
+            .expect_err("a corrupt persisted timestamp must be a typed read error");
+        assert!(
+            error.to_string().contains("unparseable last_fix timestamp"),
+            "error must name the root cause, got {error}"
+        );
+        assert!(
+            error.downcast_ref::<CorruptLastFix>().is_some(),
+            "a corrupt persisted row must be a CorruptLastFix (discarded, not served)"
+        );
+    }
+
     #[test]
     fn last_fix_table_rejects_second_row() {
         // The CHECK (id = 1) constraint must reject any insert with id != 1.
         let db = Database::open_memory().unwrap();
-        let row = LastFixRow {
+        let row = LastFix {
             lat: 0.0,
             lon: 0.0,
             accuracy_m: 1.0,
             address: None,
-            at_rfc3339: "2026-05-09T00:00:00+00:00".to_string(),
+            at: ts("2026-05-09T00:00:00+00:00"),
             sources: 0,
         };
         db.set_last_fix(&row).unwrap();
@@ -6364,23 +6606,23 @@ mod tests {
     #[test]
     fn set_last_fix_drops_older_timestamp() {
         let db = Database::open_memory().unwrap();
-        let t2 = LastFixRow {
+        let t2 = LastFix {
             lat: 55.0,
             lon: 12.0,
             accuracy_m: 10.0,
             address: Some("newer".to_string()),
-            at_rfc3339: "2026-05-10T00:00:00+00:00".to_string(),
+            at: ts("2026-05-10T00:00:00+00:00"),
             sources: 5,
         };
         db.set_last_fix(&t2).unwrap();
 
         // Older write (T1 < T2) must NOT overwrite the newer stored fix.
-        let t1 = LastFixRow {
+        let t1 = LastFix {
             lat: 48.0,
             lon: 2.0,
             accuracy_m: 99.0,
             address: Some("older".to_string()),
-            at_rfc3339: "2026-05-09T00:00:00+00:00".to_string(),
+            at: ts("2026-05-09T00:00:00+00:00"),
             sources: 1,
         };
         crate::test_support::install_permissive_global_test_subscriber(); // task-0251
@@ -6390,12 +6632,13 @@ mod tests {
         subscriber::with_default(captured, || db.set_last_fix(&t1).unwrap());
         db.conn.commit_hook(None::<fn() -> bool>);
         let older_events = to_level_message(older_handle.events());
-        assert_one_last_fix_drop_warning(&older_events, &t1.at_rfc3339, &t2.at_rfc3339);
+        assert_one_last_fix_drop_warning(&older_events, &t1.at.to_rfc3339(), &t2.at.to_rfc3339());
         assert_commit_precedes_last_fix_warning(&older_events);
 
         let got = db.get_last_fix().unwrap().unwrap();
         assert_eq!(
-            got.at_rfc3339, "2026-05-10T00:00:00+00:00",
+            got.at.to_rfc3339(),
+            "2026-05-10T00:00:00+00:00",
             "older write must be dropped"
         );
         assert!(
@@ -6406,25 +6649,25 @@ mod tests {
         assert_eq!(got.address, Some("newer".to_string()));
 
         // Sanity: an equal-or-newer write still applies.
-        let t3 = LastFixRow {
+        let t3 = LastFix {
             lat: 10.0,
             lon: 20.0,
             accuracy_m: 5.0,
             address: Some("newest".to_string()),
-            at_rfc3339: "2026-05-11T00:00:00+00:00".to_string(),
+            at: ts("2026-05-11T00:00:00+00:00"),
             sources: 9,
         };
         let (_, newer_events) = capture_events(|| db.set_last_fix(&t3).unwrap());
         assert!(warning_messages(&newer_events).is_empty());
         let got = db.get_last_fix().unwrap().unwrap();
-        assert_eq!(got.at_rfc3339, "2026-05-11T00:00:00+00:00");
+        assert_eq!(got.at.to_rfc3339(), "2026-05-11T00:00:00+00:00");
         assert!((got.lat - 10.0).abs() < 1e-9);
 
         // Equal-timestamp write MUST apply: the address-backfill path
         // (server.rs) re-persists the same fix with only `address` changed
         // and an unchanged `at_rfc3339`. This pins the `>=` (not `>`) guard —
         // a regression to `>` would silently stop address backfill.
-        let t3_backfill = LastFixRow {
+        let t3_backfill = LastFix {
             address: Some("backfilled".to_string()),
             ..t3.clone()
         };
@@ -6441,21 +6684,21 @@ mod tests {
     #[test]
     fn combined_older_fix_keeps_last_fix_appends_history_and_warns_after_commit() {
         let mut db = Database::open_memory().unwrap();
-        let stored = LastFixRow {
+        let stored = LastFix {
             lat: 55.0,
             lon: 12.0,
             accuracy_m: 10.0,
             address: Some("stored".to_owned()),
-            at_rfc3339: "2026-05-10T00:00:00+00:00".to_owned(),
+            at: ts("2026-05-10T00:00:00+00:00"),
             sources: 5,
         };
         db.set_last_fix(&stored).unwrap();
-        let incoming = LastFixRow {
+        let incoming = LastFix {
             lat: 48.0,
             lon: 2.0,
             accuracy_m: 99.0,
             address: Some("incoming".to_owned()),
-            at_rfc3339: "2026-05-09T00:00:00+00:00".to_owned(),
+            at: ts("2026-05-09T00:00:00+00:00"),
             sources: 1,
         };
 
@@ -6469,16 +6712,20 @@ mod tests {
         });
         db.conn.commit_hook(None::<fn() -> bool>);
         let events = to_level_message(handle.events());
-        assert_one_last_fix_drop_warning(&events, &incoming.at_rfc3339, &stored.at_rfc3339);
+        assert_one_last_fix_drop_warning(
+            &events,
+            &incoming.at.to_rfc3339(),
+            &stored.at.to_rfc3339(),
+        );
         assert_commit_precedes_last_fix_warning(&events);
         let retained = db.get_last_fix().unwrap().unwrap();
-        assert_eq!(retained.at_rfc3339, stored.at_rfc3339);
+        assert_eq!(retained.at, stored.at);
         assert_eq!(retained.address, stored.address);
         let history = db
             .get_fixes_in_range("2026-05-08T00:00:00+00:00", "2026-05-11T00:00:00+00:00")
             .unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].at_rfc3339, incoming.at_rfc3339);
+        assert_eq!(history[0].at, incoming.at);
         assert_eq!(
             history[0].quality.as_ref(),
             Some(&test_quality()),
@@ -6489,12 +6736,12 @@ mod tests {
     #[test]
     fn combined_older_fix_history_failure_rolls_back_without_warning() {
         let mut db = Database::open_memory().unwrap();
-        let stored = LastFixRow {
+        let stored = LastFix {
             lat: 55.0,
             lon: 12.0,
             accuracy_m: 10.0,
             address: Some("stored".to_owned()),
-            at_rfc3339: "2026-05-10T00:00:00+00:00".to_owned(),
+            at: ts("2026-05-10T00:00:00+00:00"),
             sources: 5,
         };
         db.set_last_fix(&stored).unwrap();
@@ -6507,12 +6754,12 @@ mod tests {
                  END;",
             )
             .unwrap();
-        let incoming = LastFixRow {
+        let incoming = LastFix {
             lat: 48.0,
             lon: 2.0,
             accuracy_m: 99.0,
             address: Some("incoming".to_owned()),
-            at_rfc3339: "2026-05-09T00:00:00+00:00".to_owned(),
+            at: ts("2026-05-09T00:00:00+00:00"),
             sources: 1,
         };
 
@@ -6526,7 +6773,7 @@ mod tests {
             "rolled-back operation must emit no drop warning: {events:?}"
         );
         let retained = db.get_last_fix().unwrap().unwrap();
-        assert_eq!(retained.at_rfc3339, stored.at_rfc3339);
+        assert_eq!(retained.at, stored.at);
         let history_count: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM fixes", [], |row| row.get(0))
@@ -6594,8 +6841,8 @@ mod tests {
             .unwrap();
         assert_eq!(all.len(), 3);
         assert!(all.iter().all(|row| row.quality.is_none()));
-        assert_eq!(all[0].at_rfc3339, "2026-05-09T08:00:00+00:00");
-        assert_eq!(all[2].at_rfc3339, "2026-05-09T16:00:00+00:00");
+        assert_eq!(all[0].at.to_rfc3339(), "2026-05-09T08:00:00+00:00");
+        assert_eq!(all[2].at.to_rfc3339(), "2026-05-09T16:00:00+00:00");
 
         // Narrow query to the middle hour: only the 12:00 fix.
         let mid = db
@@ -6619,12 +6866,12 @@ mod tests {
         )
         .unwrap();
         db.persist_fix_and_history(
-            &LastFixRow {
+            &LastFix {
                 lat: 55.0,
                 lon: 12.0,
                 accuracy_m: 9.0,
                 address: None,
-                at_rfc3339: "2026-07-05T12:00:00+00:00".to_owned(),
+                at: ts("2026-07-05T12:00:00+00:00"),
                 sources: 5,
             },
             &quality,
@@ -6649,12 +6896,12 @@ mod tests {
             let quality =
                 FixQuality::new(Some(0.0), Some(0), Some(ratio), Confidence::High, None).unwrap();
             db.persist_fix_and_history(
-                &LastFixRow {
+                &LastFix {
                     lat: 1.0,
                     lon: 2.0,
                     accuracy_m: 3.0,
                     address: None,
-                    at_rfc3339: format!("2026-07-05T12:00:0{index}+00:00"),
+                    at: ts(&format!("2026-07-05T12:00:0{index}+00:00")),
                     sources: 4,
                 },
                 &quality,
@@ -6949,12 +7196,12 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let row = LastFixRow {
+        let row = LastFix {
             lat: 51.5074,
             lon: -0.1278,
             accuracy_m: 25.0,
             address: Some("London".to_string()),
-            at_rfc3339: "2026-05-09T08:00:00+00:00".to_string(),
+            at: ts("2026-05-09T08:00:00+00:00"),
             sources: 3,
         };
         let result = (|| -> Result<()> {

@@ -9,10 +9,9 @@
 //! whose duration is below `min_duration_secs` are dropped — a 30-second
 //! detour past a coffee shop is not a "place".
 
-use chrono::DateTime;
 use serde::Serialize;
 
-use crate::db::FixRow;
+use crate::db::Fix;
 
 /// A grouped stay-point: a run of fixes within `dist_threshold_m` of each
 /// other for at least `min_duration_secs`.
@@ -59,7 +58,7 @@ struct RunningSphericalMean {
 }
 
 impl RunningSphericalMean {
-    fn new(fix: &FixRow) -> Self {
+    fn new(fix: &Fix) -> Self {
         let first_fix = finite_coord(fix);
         let mut mean = Self {
             x: 0.0,
@@ -71,7 +70,7 @@ impl RunningSphericalMean {
         mean
     }
 
-    fn add(&mut self, fix: &FixRow) {
+    fn add(&mut self, fix: &Fix) {
         let Some((lat, lon)) = finite_coord(fix) else {
             return;
         };
@@ -93,7 +92,7 @@ impl RunningSphericalMean {
     }
 }
 
-fn finite_coord(fix: &FixRow) -> Option<(f64, f64)> {
+fn finite_coord(fix: &Fix) -> Option<(f64, f64)> {
     (fix.lat.is_finite() && fix.lon.is_finite()).then_some((fix.lat, fix.lon))
 }
 
@@ -186,11 +185,7 @@ fn compute_geometric_median(
 /// The fixes array MUST be sorted ascending by timestamp; the caller (DB
 /// layer) does that.
 #[cfg(test)]
-pub fn segment_fixes(
-    fixes: &[FixRow],
-    dist_threshold_m: f64,
-    min_duration_secs: i64,
-) -> Vec<Segment> {
+pub fn segment_fixes(fixes: &[Fix], dist_threshold_m: f64, min_duration_secs: i64) -> Vec<Segment> {
     match segment_fixes_cancellable(fixes, dist_threshold_m, min_duration_secs, || false) {
         SegmentFixesOutcome::Complete(segments) => segments,
         SegmentFixesOutcome::Cancelled => {
@@ -203,7 +198,7 @@ pub fn segment_fixes(
 /// worker. The async request's Drop guard and daemon shutdown token are folded
 /// into this callback so an aborted waiter never yields a partial response.
 pub(crate) fn segment_fixes_cancellable<C>(
-    fixes: &[FixRow],
+    fixes: &[Fix],
     dist_threshold_m: f64,
     min_duration_secs: i64,
     mut is_cancelled: C,
@@ -225,7 +220,7 @@ where
 /// total median work structurally, without process-global atomics or races
 /// between parallel tests.
 fn segment_fixes_impl(
-    fixes: &[FixRow],
+    fixes: &[Fix],
     dist_threshold_m: f64,
     min_duration_secs: i64,
     is_cancelled: &mut dyn FnMut() -> bool,
@@ -239,7 +234,7 @@ fn segment_fixes_impl(
     };
 
     let mut segments = Vec::new();
-    let mut cur: Vec<&FixRow> = vec![first];
+    let mut cur: Vec<&Fix> = vec![first];
     let mut running_center = RunningSphericalMean::new(first);
 
     for fix in fixes.iter().skip(1) {
@@ -282,7 +277,7 @@ enum FlushOutcome {
 }
 
 fn flush_segment(
-    cur: &[&FixRow],
+    cur: &[&Fix],
     min_duration_secs: i64,
     segments: &mut Vec<Segment>,
     is_cancelled: &mut dyn FnMut() -> bool,
@@ -297,14 +292,12 @@ fn flush_segment(
     let end = cur
         .last()
         .expect("a segment with a first fix has a last fix");
-    // Duration: end - start (ts strings are RFC3339, parseable).
-    let duration_secs = match (
-        DateTime::parse_from_rfc3339(&start.at_rfc3339),
-        DateTime::parse_from_rfc3339(&end.at_rfc3339),
-    ) {
-        (Ok(s), Ok(e)) => (e - s).num_seconds(),
-        _ => 0,
-    };
+    // task-0134: `at` is already a `DateTime<Utc>` parsed at the DB boundary,
+    // so duration is a direct subtraction. The former per-flush
+    // `parse_from_rfc3339` with a silent `_ => 0` default (which hid a corrupt
+    // timestamp as a zero-length segment) is gone — a corrupt timestamp now
+    // fails at `get_fixes_in_range`.
+    let duration_secs = (end.at - start.at).num_seconds();
     if duration_secs < min_duration_secs {
         // Drop short segments before marshalling coordinates or invoking the
         // median — they are not reported stay-points.
@@ -339,8 +332,8 @@ fn flush_segment(
     };
 
     segments.push(Segment {
-        start_rfc3339: start.at_rfc3339.clone(),
-        end_rfc3339: end.at_rfc3339.clone(),
+        start_rfc3339: start.at.to_rfc3339(),
+        end_rfc3339: end.at.to_rfc3339(),
         duration_secs,
         centroid_lat,
         centroid_lon,
@@ -362,10 +355,12 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn fix(ts: &str, lat: f64, lon: f64, acc: f64) -> FixRow {
-        FixRow {
+    fn fix(ts: &str, lat: f64, lon: f64, acc: f64) -> Fix {
+        Fix {
             id: 0,
-            at_rfc3339: ts.to_string(),
+            at: chrono::DateTime::parse_from_rfc3339(ts)
+                .expect("test fix timestamp must be valid RFC3339")
+                .with_timezone(&chrono::Utc),
             lat,
             lon,
             accuracy_m: acc,
