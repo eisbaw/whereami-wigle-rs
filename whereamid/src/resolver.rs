@@ -182,6 +182,7 @@ pub async fn lookup_cached(
         Ok(result) => result,
         Err(error) => {
             warn!("cached AP lookup failed: {error}");
+            state.record_db_read_failure();
             Vec::new()
         }
     }
@@ -202,6 +203,7 @@ pub async fn lookup_cached_readonly(
         Ok(result) => result,
         Err(error) => {
             warn!("read-only cached AP lookup failed: {error}");
+            state.record_db_read_failure();
             Vec::new()
         }
     }
@@ -1182,5 +1184,46 @@ mod tests {
             .is_not_found(&target, state.args.not_found_ttl_days)
             .unwrap());
         assert!(!db.is_pending(&target).unwrap());
+    }
+
+    /// task-0105 AC#3: a real DB read error must be counted, not silently
+    /// swallowed as a cache miss. We force the read to error deterministically
+    /// by dropping the `aps` table out from under both cache-lookup variants,
+    /// then assert the returned Vec is empty (behavior unchanged) AND the
+    /// `db_read_failures` counter incremented once per failed lookup. The
+    /// counter is asserted directly rather than the warn! log line, which is
+    /// flaky to capture here (task-0248).
+    #[tokio::test]
+    async fn lookup_cached_read_error_increments_db_read_failures_counter() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let state = test_state();
+        let bssids = vec!["aa:bb:cc:dd:ee:ff".to_string()];
+
+        // Drop the table both lookup variants read from, forcing a real query
+        // error (a "no such table" error, not an empty result set).
+        crate::server::lock_db(&state)
+            .execute_batch_for_test("DROP TABLE aps;")
+            .unwrap();
+
+        assert_eq!(state.db_read_failures.load(Relaxed), 0);
+
+        // Interactive (touch) variant.
+        let touched = lookup_cached(&bssids, &state, state.privacy.ticket()).await;
+        assert!(touched.is_empty(), "read error must return an empty Vec");
+        assert_eq!(
+            state.db_read_failures.load(Relaxed),
+            1,
+            "lookup_cached must count the DB read failure"
+        );
+
+        // Read-only variant increments the same counter.
+        let readonly = lookup_cached_readonly(&bssids, &state, state.privacy.ticket()).await;
+        assert!(readonly.is_empty(), "read error must return an empty Vec");
+        assert_eq!(
+            state.db_read_failures.load(Relaxed),
+            2,
+            "lookup_cached_readonly must count the DB read failure"
+        );
     }
 }

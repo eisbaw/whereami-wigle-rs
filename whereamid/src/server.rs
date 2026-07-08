@@ -76,6 +76,20 @@ impl DaemonState {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Bump the cumulative best-effort-DB-read-failure counter.
+    /// task-0105. Currently wired at the cache-lookup entry points
+    /// (`lookup_cached` / `lookup_cached_readonly`) so a real DB error
+    /// (corruption, disk full, lock contention) there is visible via the stats
+    /// endpoint instead of masquerading as a cache miss that wastes API quota
+    /// re-fetching resident rows. NOTE: this counter does NOT yet cover the
+    /// `resolve_chain` skip-cached / skip-not_found read-error swallow sites
+    /// (task-0252), so `db_read_failures: 0` does not prove no DB read fault —
+    /// it means none at the covered entry points.
+    pub fn record_db_read_failure(&self) {
+        self.db_read_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Spawn work tracked by the shutdown drain (task-0102). Background
     /// resolves and accepted connection handlers route through here so a
     /// SIGTERM can wait under one budget and force-abort stragglers before the
@@ -161,6 +175,12 @@ pub struct DaemonState {
     /// sites). Surfaced via the stats endpoint (task-0076) so silent
     /// corruption is visible without scraping the journal.
     pub db_write_failures: Arc<std::sync::atomic::AtomicU64>,
+    /// Cumulative count of best-effort DB reads that failed and were
+    /// warned-only (cache lookups). Surfaced via the stats endpoint
+    /// (task-0105) so silent read errors — which waste API quota by looking
+    /// like cache misses and triggering redundant background resolves — are
+    /// visible without scraping the journal. Reset on daemon restart.
+    pub db_read_failures: Arc<std::sync::atomic::AtomicU64>,
     /// Successfully committed autonomous history rows since daemon start.
     /// Manual locate writes are deliberately excluded. Reset on restart.
     pub autolocate_fixes_written: Arc<std::sync::atomic::AtomicU64>,
@@ -648,6 +668,11 @@ struct StatsResponse {
     /// warned-only. Helps spot silent corruption (full disk, missing
     /// write permissions, etc.). Reset on daemon restart. task-0076.
     db_write_failures: u64,
+    /// Cumulative count of best-effort DB reads (cache lookups) that failed
+    /// and were warned-only. Distinguishes a real read error from a genuine
+    /// cache miss so silent quota-wasting failures are visible. Reset on
+    /// daemon restart. task-0105.
+    db_read_failures: u64,
     /// Successfully committed autonomous history rows since daemon start.
     autolocate_fixes_written: u64,
     /// Number of background tasks (tracked resolve/backfill spawns and the
@@ -3027,6 +3052,9 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
     let db_write_failures = state
         .db_write_failures
         .load(std::sync::atomic::Ordering::Relaxed);
+    let db_read_failures = state
+        .db_read_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
     let api_counter_corruption_denials = state
         .api_counter_corruption_denials
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -3048,6 +3076,7 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
         api_counter_corruption_denials,
         inflight,
         db_write_failures,
+        db_read_failures,
         autolocate_fixes_written,
         orphan_tasks_aborted,
     };
@@ -3128,6 +3157,7 @@ fn test_state_with_db(
         inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
         address_cache: std::sync::Mutex::new(AddressCache::new()),
         db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        db_read_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         autolocate_fixes_written: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         api_counter_corruption_denials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),
@@ -3193,6 +3223,9 @@ mod stats_tests {
         state
             .autolocate_fixes_written
             .store(4, std::sync::atomic::Ordering::Relaxed);
+        state
+            .db_read_failures
+            .store(5, std::sync::atomic::Ordering::Relaxed);
 
         let response: serde_json::Value =
             serde_json::from_str(&handle_stats(&state).await).unwrap();
@@ -3201,6 +3234,7 @@ mod stats_tests {
         assert_eq!(response["api_calls_today"], 0);
         assert_eq!(response["api_counter_corruption_denials"], 3);
         assert_eq!(response["autolocate_fixes_written"], 4);
+        assert_eq!(response["db_read_failures"], 5);
     }
 }
 

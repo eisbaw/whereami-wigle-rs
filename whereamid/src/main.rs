@@ -179,6 +179,7 @@ async fn main() -> Result<()> {
         last_fix: tokio::sync::Mutex::new(initial_last_fix),
         inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
         db_write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        db_read_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         autolocate_fixes_written: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         api_counter_corruption_denials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connection_slots: Arc::new(tokio::sync::Semaphore::new(args.max_connections)),

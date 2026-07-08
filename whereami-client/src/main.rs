@@ -338,6 +338,7 @@ fn render_stats(resp: &StatsResponse) -> String {
          API today:     {}\n\
          API counter corruption denials: {}\n\
          db write fail: {}\n\
+         db read fail:  {}\n\
          autolocate fixes written: {}\n\
          tasks aborted at last clean shutdown: {}\n",
         resp.cached_aps,
@@ -348,6 +349,7 @@ fn render_stats(resp: &StatsResponse) -> String {
         resp.api_calls_today,
         resp.api_counter_corruption_denials,
         resp.db_write_failures,
+        resp.db_read_failures,
         resp.autolocate_fixes_written,
         resp.orphan_tasks_aborted,
     )
@@ -1546,6 +1548,7 @@ mod tests {
             api_counter_corruption_denials: 9,
             inflight: 6,
             db_write_failures: 7,
+            db_read_failures: 11,
             autolocate_fixes_written: 10,
             orphan_tasks_aborted: 8,
             error: None,
@@ -1561,6 +1564,7 @@ mod tests {
              API today:     5\n\
              API counter corruption denials: 9\n\
              db write fail: 7\n\
+             db read fail:  11\n\
              autolocate fixes written: 10\n\
              tasks aborted at last clean shutdown: 8\n"
         );
