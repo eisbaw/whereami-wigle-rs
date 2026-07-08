@@ -1657,6 +1657,113 @@ pub(crate) async fn run_autolocate_pass_at_boot_time(
     }
 }
 
+/// Trilateration ran over surviving solver membership. Carries the outcome
+/// plus the metadata `compute_locate_*` needs to build the wire response and
+/// run plausibility without re-deriving either.
+struct SolvedLocate {
+    /// Trilateration outcome: Ok position, or the failure to surface.
+    result: anyhow::Result<crate::trilaterate::Position>,
+    /// task-0094 consensus denominator: every finite non-mobile visible cache
+    /// hit, independent of stability, RSSI, top-N and outlier survival.
+    visible_cached: Vec<(f64, f64)>,
+    /// Number of cache rows handed to trilateration (== solver membership).
+    source_count: usize,
+    /// Finite fixed cache hits admitted to this solve (coincides with
+    /// `source_count`; locate is cache-only).
+    cached_count: usize,
+}
+
+/// Outcome of the pure locate kernel (task-0116).
+enum LocateKernel {
+    /// No finite non-mobile cached position survived filtering. The caller
+    /// owns the cold-start policy (interactive background resolve vs.
+    /// autonomous `NoCachedPositions`).
+    NoPositions,
+    /// Trilateration was attempted over the surviving top-N membership.
+    Solved(SolvedLocate),
+}
+
+/// Pure locate kernel (task-0116): filter cached rows into trilateration input
+/// and solve. No mutex acquisition, no task spawn, no DB write — deterministic
+/// in `(cached_aps, active, top_n)`, hence unit-testable against synthetic rows.
+///
+/// The cache READ deliberately stays with the caller: interactive locate
+/// touches `last_seen` while autonomous locate is read-only, so that single
+/// impure step is the one part of "cached lookup + filter + trilat" this kernel
+/// excludes.
+///
+/// `visible_cached` (the consensus denominator) is built in the SAME pass as
+/// `positioned_aps` (top-N solver membership) and must stay together: consensus
+/// counts every finite non-mobile visible cache hit regardless of stability,
+/// RSSI, top-N or outlier survival, so splitting the pass would change the
+/// denominator. Persisted-mobile and non-finite eligibility both run before the
+/// top-N cutoff so stronger ineligible rows cannot starve weaker fixed rows;
+/// `trilaterate` independently re-applies these guards for callers that bypass
+/// this path.
+fn solve_locate_from_cache(
+    cached_aps: &[crate::db::ApInfo],
+    active: &std::collections::HashMap<&str, &Candidate>,
+    top_n: usize,
+) -> LocateKernel {
+    use crate::trilaterate::{trilaterate, PositionedAp};
+
+    let mut visible_cached = Vec::new();
+    let mut positioned_aps = Vec::new();
+    for ap in cached_aps {
+        // task-0227: SQLite REAL columns can hold NaN/±Inf; a non-finite
+        // coordinate would flow through to_unit_vec -> NaN vector -> the
+        // `mag > 0` guards are false-on-NaN -> a "successful" (NaN, NaN) fix.
+        // Skip such rows here and name the offending bssid so the poisoned
+        // cache row is traceable.
+        if !ap.lat.is_finite() || !ap.lon.is_finite() {
+            warn!(
+                "skipping AP {}: non-finite cached position ({}, {})",
+                ap.bssid, ap.lat, ap.lon
+            );
+            continue;
+        }
+        if ap.is_mobile {
+            continue;
+        }
+
+        // Consensus deliberately ignores stability, RSSI, top-N and eventual
+        // outlier-filter survival. Every eligible unique BSSID in the latest
+        // scanner snapshot contributes exactly one denominator entry.
+        visible_cached.push((ap.lat, ap.lon));
+        // Single lookup (task-0264): membership and the signal come from the
+        // same `active` entry, so `signal_dbm: Some(candidate.signal_dbm)` states
+        // the always-present invariant honestly. Edition 2021 has no let-chains,
+        // hence the nested top-N `if`.
+        if let Some(candidate) = active.get(ap.bssid.as_str()) {
+            if positioned_aps.len() < top_n {
+                positioned_aps.push(PositionedAp {
+                    lat: ap.lat,
+                    lon: ap.lon,
+                    signal_dbm: Some(candidate.signal_dbm),
+                    is_mobile: ap.is_mobile,
+                });
+            }
+        }
+    }
+
+    if positioned_aps.is_empty() {
+        return LocateKernel::NoPositions;
+    }
+
+    // `cached` counts only finite fixed cache hits admitted to this solve, not
+    // every row examined while filling top-N. `sources` is the number handed to
+    // trilateration; locate is cache-only, so they coincide for fresh fixes.
+    let cached_count = positioned_aps.len();
+    let source_count = positioned_aps.len();
+    let result = trilaterate(&positioned_aps);
+    LocateKernel::Solved(SolvedLocate {
+        result,
+        visible_cached,
+        source_count,
+        cached_count,
+    })
+}
+
 async fn compute_locate(
     state: &Arc<DaemonState>,
     ticket: crate::privacy::PrivacyTicket,
@@ -1699,7 +1806,6 @@ async fn compute_locate_with_clock(
     scan_age_clock: ScanAgeClock,
 ) -> LocateOutcome {
     use crate::resolver;
-    use crate::trilaterate::{trilaterate, PositionedAp};
 
     let Some(privacy) = state.privacy.read(ticket).await else {
         return locate_early_outcome(
@@ -1807,101 +1913,70 @@ async fn compute_locate_with_clock(
         LocatePurpose::Autolocate => resolver::lookup_cached_readonly(&bssids, state, ticket).await,
     };
 
-    // Build trilateration input.
-    //
-    // task-0227: SQLite REAL columns can hold NaN/±Inf, and a non-finite
-    // coordinate flows straight through to_unit_vec -> NaN vector -> the
-    // `mag > 0` guards are false-on-NaN -> from_unit_vec returns (NaN, NaN)
-    // as a "successful" Ok(Position). Skip such rows here (first line of
-    // defense) and name the offending bssid so the poisoned cache row is
-    // traceable. trilaterate() re-filters as defense in depth for callers
-    // that bypass this path.
-    // Persisted mobile classification and finite-coordinate eligibility must
-    // both run before take(top_n). Otherwise stronger ineligible cache rows can
-    // fill every slot and starve weaker fixed rows. trilaterate() independently
-    // re-applies these guards for callers that bypass this server path.
+    // Index the active candidate set by BSSID so the pure kernel can resolve
+    // solver membership and per-AP signal from one lookup. The impure cache
+    // READ above is deliberately outside the kernel (see `solve_locate_from_cache`).
     let active: std::collections::HashMap<&str, &Candidate> = active_candidates
         .iter()
         .map(|candidate| (candidate.bssid.as_str(), candidate))
         .collect();
-    let mut visible_cached = Vec::new();
-    let mut positioned_aps = Vec::new();
-    for ap in &cached_aps {
-        if !ap.lat.is_finite() || !ap.lon.is_finite() {
-            warn!(
-                "skipping AP {}: non-finite cached position ({}, {})",
-                ap.bssid, ap.lat, ap.lon
-            );
-            continue;
-        }
-        if ap.is_mobile {
-            continue;
-        }
 
-        // Consensus deliberately ignores stability, RSSI, top-N and eventual
-        // outlier-filter survival. Every eligible unique BSSID in the latest
-        // scanner snapshot contributes exactly one denominator entry.
-        visible_cached.push((ap.lat, ap.lon));
-        // Single lookup (task-0264): membership and the signal come from the
-        // same `active` entry, so `signal_dbm: Some(candidate.signal_dbm)` states
-        // the always-present invariant honestly instead of `.map` over a value
-        // that can never be None here. Edition 2021 has no let-chains, hence the
-        // nested top-N `if`.
-        if let Some(candidate) = active.get(ap.bssid.as_str()) {
-            if positioned_aps.len() < state.args.top_n {
-                positioned_aps.push(PositionedAp {
-                    lat: ap.lat,
-                    lon: ap.lon,
-                    signal_dbm: Some(candidate.signal_dbm),
-                    is_mobile: ap.is_mobile,
-                });
+    let (result, visible_cached, source_count, cached_count) =
+        match solve_locate_from_cache(&cached_aps, &active, state.args.top_n) {
+            LocateKernel::NoPositions => {
+                if purpose == LocatePurpose::Autolocate {
+                    return LocateOutcome::Autolocate(AutolocateOutcome::NoCachedPositions);
+                }
+                // Cold-start provider work must stay bounded even though cache
+                // lookup examines every scanner-eligible candidate to backfill
+                // top-N around persisted-mobile/non-finite rows. Cached rows
+                // cannot benefit from the skip-cached provider chain, so omit
+                // them before taking the limit; this prevents stronger invalid
+                // cache hits from starving unknown fixed APs.
+                let cached_bssids: std::collections::HashSet<String> =
+                    cached_aps.iter().map(|ap| ap.bssid.clone()).collect();
+                let unresolved_observations: Vec<resolver::ObservedAp> = if using_fallback {
+                    bounded_uncached_observations(
+                        active_candidates,
+                        &cached_bssids,
+                        state.args.top_n,
+                    )
+                } else {
+                    Vec::new()
+                };
+                let resolving_in_background = !unresolved_observations.is_empty();
+                if resolving_in_background {
+                    // task-0102: track so the shutdown drain waits for this
+                    // resolve instead of killing it mid-API-call (which would
+                    // leak a WiGLE quota lease / leave partial writes).
+                    let resolve_state = Arc::clone(state);
+                    state.spawn_tracked(async move {
+                        resolver::resolve_background(
+                            &unresolved_observations,
+                            &resolve_state,
+                            ticket,
+                        )
+                        .await;
+                    });
+                }
+                let error = if resolving_in_background {
+                    "no cached positions for visible APs (resolving in background)"
+                } else {
+                    "no eligible cached positions for visible APs"
+                };
+                return LocateOutcome::Interactive(
+                    return_last_fix_or_error(state, ticket, error, visible, stable_count).await,
+                );
             }
-        }
-    }
-    // `cached` counts only finite fixed cache hits admitted to this solve, not
-    // every row examined while filling top-N. `sources` is the number handed
-    // to trilateration; locate is cache-only, so they coincide for fresh fixes.
-    let cached_count = positioned_aps.len();
-    let source_count = positioned_aps.len();
-
-    if positioned_aps.is_empty() {
-        if purpose == LocatePurpose::Autolocate {
-            return LocateOutcome::Autolocate(AutolocateOutcome::NoCachedPositions);
-        }
-        // Cold-start provider work must stay bounded even though cache lookup
-        // examines every scanner-eligible candidate to backfill top-N around
-        // persisted-mobile/non-finite rows. Cached rows cannot benefit from the
-        // skip-cached provider chain, so omit them before taking the limit; this
-        // prevents stronger invalid cache hits from starving unknown fixed APs.
-        let cached_bssids: std::collections::HashSet<String> =
-            cached_aps.iter().map(|ap| ap.bssid.clone()).collect();
-        let unresolved_observations: Vec<resolver::ObservedAp> = if using_fallback {
-            bounded_uncached_observations(active_candidates, &cached_bssids, state.args.top_n)
-        } else {
-            Vec::new()
+            LocateKernel::Solved(solved) => (
+                solved.result,
+                solved.visible_cached,
+                solved.source_count,
+                solved.cached_count,
+            ),
         };
-        let resolving_in_background = !unresolved_observations.is_empty();
-        if resolving_in_background {
-            // task-0102: track so the shutdown drain waits for this resolve
-            // instead of killing it mid-API-call (which would leak a WiGLE
-            // quota lease / leave partial writes).
-            let resolve_state = Arc::clone(state);
-            state.spawn_tracked(async move {
-                resolver::resolve_background(&unresolved_observations, &resolve_state, ticket)
-                    .await;
-            });
-        }
-        let error = if resolving_in_background {
-            "no cached positions for visible APs (resolving in background)"
-        } else {
-            "no eligible cached positions for visible APs"
-        };
-        return LocateOutcome::Interactive(
-            return_last_fix_or_error(state, ticket, error, visible, stable_count).await,
-        );
-    }
 
-    match trilaterate(&positioned_aps) {
+    match result {
         Ok(pos) => {
             // The complete policy boundary is serialized in the established
             // privacy -> last_fix -> database order. Read the previous row
@@ -4940,6 +5015,144 @@ mod dispatch_tests {
         assert_eq!(future_clock.quality.last_fix_age_secs(), Some(0));
         assert_eq!(future_clock.quality.confidence(), Confidence::High);
         assert_eq!(future_clock.winner, PlausibilityWinner::CurrentTrilat);
+    }
+
+    /// Synthetic cache row for the pure locate kernel. No DB, no scan — the
+    /// kernel is a function of `(cached_aps, active, top_n)` alone (task-0116).
+    fn kernel_ap(bssid: &str, lat: f64, lon: f64, is_mobile: bool) -> crate::db::ApInfo {
+        crate::db::ApInfo {
+            bssid: bssid.to_string(),
+            ssid: Some("kernel-ap".to_string()),
+            lat,
+            lon,
+            encryption: None,
+            channel: None,
+            frequency: None,
+            city: None,
+            country: None,
+            is_mobile,
+            source: crate::db::Source::Manual,
+        }
+    }
+
+    fn kernel_candidates(bssids: &[(&str, i32)]) -> Vec<Candidate> {
+        bssids
+            .iter()
+            .map(|(bssid, signal_dbm)| Candidate {
+                bssid: (*bssid).to_string(),
+                signal_dbm: *signal_dbm,
+                ssid: Some("kernel-ap".to_string()),
+            })
+            .collect()
+    }
+
+    fn active_index(candidates: &[Candidate]) -> std::collections::HashMap<&str, &Candidate> {
+        candidates
+            .iter()
+            .map(|candidate| (candidate.bssid.as_str(), candidate))
+            .collect()
+    }
+
+    /// AC#5: the pure kernel returns the expected Position from synthetic
+    /// candidates + synthetic cache rows, with no DB access, no mutex, no
+    /// spawn. Mirrors the cold-boot fixture cluster.
+    #[test]
+    fn locate_kernel_returns_expected_position_from_synthetic_rows() {
+        let cluster = [
+            ("02:00:00:00:60:00", 55.6760, 12.5680),
+            ("02:00:00:00:60:01", 55.6761, 12.5682),
+            ("02:00:00:00:60:02", 55.6759, 12.5681),
+        ];
+        let cached_aps: Vec<crate::db::ApInfo> = cluster
+            .iter()
+            .map(|(bssid, lat, lon)| kernel_ap(bssid, *lat, *lon, false))
+            .collect();
+        let candidates = kernel_candidates(&[
+            ("02:00:00:00:60:00", -50),
+            ("02:00:00:00:60:01", -51),
+            ("02:00:00:00:60:02", -52),
+        ]);
+        let active = active_index(&candidates);
+
+        let LocateKernel::Solved(solved) = solve_locate_from_cache(&cached_aps, &active, 8) else {
+            panic!("three finite non-mobile cached APs must solve");
+        };
+        let pos = solved.result.expect("cluster must trilaterate");
+        assert!(
+            (pos.lat - 55.6760).abs() < 0.01 && (pos.lon - 12.5681).abs() < 0.01,
+            "kernel position {pos:?} must land on the seeded cluster"
+        );
+        assert!(
+            !pos.fallback,
+            "a normal cluster is not the antipodal fallback"
+        );
+        assert!(
+            pos.accuracy_m.is_finite() && pos.accuracy_m > 0.0,
+            "accuracy must be a finite positive spread, got {}",
+            pos.accuracy_m
+        );
+        assert_eq!(solved.source_count, 3, "all three eligible rows solve");
+        assert_eq!(solved.cached_count, 3);
+        assert_eq!(
+            solved.visible_cached.len(),
+            3,
+            "consensus denominator counts every finite non-mobile cache hit"
+        );
+    }
+
+    /// AC#5: the kernel's eligibility filters are pure and testable — non-finite
+    /// and persisted-mobile rows are excluded from BOTH consensus and solver
+    /// membership; a cached row absent from `active` still counts toward the
+    /// consensus denominator but never becomes solver membership; and `top_n`
+    /// caps membership without shrinking the denominator.
+    #[test]
+    fn locate_kernel_filters_ineligible_rows_and_respects_top_n() {
+        let cached_aps = vec![
+            kernel_ap("02:00:00:00:61:00", 55.6760, 12.5680, false),
+            kernel_ap("02:00:00:00:61:01", 55.6761, 12.5682, false),
+            // Present in the scan-consensus cache but NOT an active candidate:
+            // contributes to visible_cached only.
+            kernel_ap("02:00:00:00:61:02", 55.6759, 12.5681, false),
+            // Non-finite and persisted-mobile rows: excluded everywhere.
+            kernel_ap("02:00:00:00:61:03", f64::INFINITY, 12.5680, false),
+            kernel_ap("02:00:00:00:61:04", 55.6762, 12.5683, true),
+        ];
+        let candidates = kernel_candidates(&[
+            ("02:00:00:00:61:00", -50),
+            ("02:00:00:00:61:01", -51),
+            // 61:03 / 61:04 are active too, proving the row-level (not
+            // candidate-level) eligibility guard rejects them.
+            ("02:00:00:00:61:03", -40),
+            ("02:00:00:00:61:04", -39),
+        ]);
+        let active = active_index(&candidates);
+
+        // top_n = 1 keeps only the first eligible membership row but must not
+        // shrink the consensus denominator.
+        let LocateKernel::Solved(solved) = solve_locate_from_cache(&cached_aps, &active, 1) else {
+            panic!("two eligible fixed rows must solve");
+        };
+        assert_eq!(
+            solved.source_count, 1,
+            "top_n caps solver membership at one row"
+        );
+        assert_eq!(
+            solved.visible_cached.len(),
+            3,
+            "consensus counts the three finite non-mobile rows; non-finite and \
+             mobile are excluded, top_n does not shrink it"
+        );
+
+        // With no eligible cache hit at all, the kernel reports NoPositions and
+        // leaves the cold-start policy to the caller.
+        let barren = vec![kernel_ap("02:00:00:00:61:03", f64::NAN, 12.5680, false)];
+        assert!(
+            matches!(
+                solve_locate_from_cache(&barren, &active, 8),
+                LocateKernel::NoPositions
+            ),
+            "a non-finite-only cache must yield NoPositions"
+        );
     }
 
     #[tokio::test]
