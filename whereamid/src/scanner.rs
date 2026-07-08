@@ -717,7 +717,13 @@ pub fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
         // thus poisons trilateration weights with fake data.
         let signal_pct: i32 = match fields[2].trim().parse() {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                warn!(
+                    "nmcli scan: unparseable signal {:?}; skipping AP row",
+                    fields[2].trim()
+                );
+                continue;
+            }
         };
         let channel: Option<i32> = fields[3].parse().ok();
         let freq = parse_nmcli_frequency(&fields[4]);
@@ -900,6 +906,17 @@ pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
             let signal_str = rest.split_whitespace().next().unwrap_or("");
             if let Ok(signal) = signal_str.parse::<f64>() {
                 current_signal = Some(signal as i32);
+            } else {
+                // Malformed signal (e.g. driver prints "signal: unknown dBm").
+                // `current_signal` stays None, so this BSS block is dropped at
+                // the next `BSS ` boundary. Without this warn the AP vanishes
+                // silently and an operator cannot see why. There is one
+                // `signal:` line per BSS block, so this is effectively
+                // once-per-block (no extra rate-limit machinery needed).
+                warn!(
+                    "iw scan: unparseable signal value in {line:?}; the AP is dropped unless \
+                     another signal line in this block parses"
+                );
             }
         } else if let Some(rest) = line.strip_prefix("SSID:") {
             let ssid = rest.trim();
@@ -2323,6 +2340,147 @@ BSS 11:22:33:44:55:66(on wlan0)
                 );
             }
         }
+    }
+
+    // --- tracing-capture support for the malformed-signal warn tests ---------
+    //
+    // `parse_iw_output` / `parse_nmcli_output` are pure fns, so verifying their
+    // `warn!` requires a scoped subscriber. This mirrors db.rs's `CapturedEvents`
+    // sink verbatim. `install_permissive_global_test_subscriber()` (task-0251)
+    // is called first inside `capture_scanner_events` so the process-global
+    // tracing interest cache cannot silently drop the event under the parallel
+    // harness (task-0248/0251) — this module compiles into BOTH the lib and bin
+    // test binaries, so the de-flake must be active in both.
+
+    use std::sync::{Arc, Mutex};
+    use tracing::{
+        field::{Field, Visit},
+        span, subscriber, Event, Metadata, Subscriber,
+    };
+
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    struct MessageVisitor(String);
+
+    impl Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.0 = value.to_owned();
+            }
+        }
+    }
+
+    impl Subscriber for CapturedEvents {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .expect("capture lock poisoned")
+                .push((*event.metadata().level(), visitor.0));
+        }
+
+        fn enter(&self, _span: &span::Id) {}
+        fn exit(&self, _span: &span::Id) {}
+    }
+
+    fn capture_scanner_events<T>(
+        operation: impl FnOnce() -> T,
+    ) -> (T, Vec<(tracing::Level, String)>) {
+        crate::test_support::install_permissive_global_test_subscriber(); // task-0251
+        let captured = CapturedEvents::default();
+        let events = captured.clone();
+        let result = subscriber::with_default(captured, operation);
+        let events = events.0.lock().expect("capture lock poisoned").clone();
+        (result, events)
+    }
+
+    fn warning_messages(events: &[(tracing::Level, String)]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|(level, message)| {
+                (*level == tracing::Level::WARN).then_some(message.as_str())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_iw_output_warns_and_drops_bss_with_malformed_signal() {
+        // Two BSS blocks: the first fully valid, the second malformed only in
+        // its `signal:` line. The malformed AP must be dropped (correct
+        // behavior, AC#2) but the drop must be observable via a WARN (AC#1).
+        let text = "BSS 02:00:00:00:24:20(on wlan-test)\n\
+            freq: 5180\n\
+            signal: -60.00 dBm\n\
+            SSID: fixture-valid\n\
+            DS Parameter set: channel 36\n\
+            BSS 02:00:00:00:24:21(on wlan-test)\n\
+            freq: 2437\n\
+            signal: unknown dBm\n\
+            SSID: fixture-malformed\n\
+            DS Parameter set: channel 6\n";
+
+        let (networks, events) = capture_scanner_events(|| parse_iw_output(text));
+
+        // AC#2: valid BSS present, malformed BSS absent.
+        let bssids: Vec<&str> = networks.iter().map(|n| n.bssid.as_str()).collect();
+        assert_eq!(
+            bssids,
+            vec!["02:00:00:00:24:20"],
+            "malformed-signal BSS must be dropped, valid one kept: {networks:?}"
+        );
+
+        // AC#1: the drop is observable via a WARN naming the offending line.
+        let warnings = warning_messages(&events);
+        assert!(
+            warnings
+                .iter()
+                .any(|m| m.contains("unparseable signal value") && m.contains("unknown dBm")),
+            "expected a warn naming the malformed signal line; got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn parse_nmcli_output_warns_and_skips_row_with_malformed_signal() {
+        // Parity with the iw parser: an unparseable nmcli signal field must skip
+        // the row (correct) but emit a WARN so the skip is observable.
+        let text = "02\\:00\\:00\\:00\\:24\\:30:fixture-valid:80:6:2437 MHz\n\
+            02\\:00\\:00\\:00\\:24\\:31:fixture-malformed:notanumber:11:2462 MHz\n";
+
+        let (networks, events) = capture_scanner_events(|| parse_nmcli_output(text));
+
+        let bssids: Vec<&str> = networks.iter().map(|n| n.bssid.as_str()).collect();
+        assert_eq!(
+            bssids,
+            vec!["02:00:00:00:24:30"],
+            "malformed-signal nmcli row must be skipped, valid one kept: {networks:?}"
+        );
+
+        let warnings = warning_messages(&events);
+        assert!(
+            warnings
+                .iter()
+                .any(|m| m.contains("unparseable signal") && m.contains("notanumber")),
+            "expected a warn naming the malformed nmcli signal; got: {events:?}"
+        );
     }
 }
 
