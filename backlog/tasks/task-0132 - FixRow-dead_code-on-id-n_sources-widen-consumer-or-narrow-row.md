@@ -4,6 +4,7 @@ title: 'FixRow dead_code on id/n_sources: widen consumer or narrow row'
 status: To Do
 assignee: []
 created_date: '2026-05-20 21:21'
+updated_date: '2026-07-08 19:18'
 labels:
   - refactor
 dependencies: []
@@ -22,3 +23,9 @@ src/db.rs:76-86. FixRow.id and FixRow.n_sources carry #[allow(dead_code)] since 
 - [ ] #3 If narrowed: FixRow shrinks to (at, lat, lon, accuracy_m); db.rs queries select only those columns
 - [ ] #4 #[allow(dead_code)] removed
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Triaged 2026-07-08: two-path decision. PREFERRED = expose (AC#2): add mean_n_sources to the HistorySegment WIRE struct (daemon server + whereami-client, serde default for back-compat) + segment_fixes averages n_sources — a wire-format ADDITION touching both crates + client rendering + tests (medium blast radius, wants a non-fatigued context + full dual review gate). Alternative = narrow FixRow (AC#3, simpler, drops the info). Recommend expose. Not started.
+<!-- SECTION:NOTES:END -->
