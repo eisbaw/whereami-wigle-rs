@@ -5068,6 +5068,399 @@ mod tests {
         assert!(db.fix_quality_columns_have_expected_shape());
     }
 
+    // --- task-0151: real historical-shape DB files opened via the PUBLIC
+    // Database::open cascade -----------------------------------------------
+    //
+    // The lockstep test above steps the migrate fns directly on ONE in-memory
+    // connection. That is deliberately distinct from what open() does on a
+    // fresh file. These tests instead: build a tempfile DB stamped at exactly
+    // a historical shape v (create_schema_v1 + migrate fns 1..=v), close it,
+    // then reopen via `Database::open` — driving the whole v -> SCHEMA_VERSION
+    // cascade — and assert both the final shape AND that seeded rows survived.
+    //
+    // AUTHENTICITY: each historical shape is produced solely by running the
+    // real migration fns up to v. Those fns ARE the definition of each
+    // version, so the on-disk shape cannot drift from what a genuine vN
+    // database looked like (no hand-copied DDL that could accidentally include
+    // a later version's column). A migration re-ordering or a broken
+    // intermediate step that still passes the fresh-DB path can corrupt a real
+    // upgrade; opening genuine historical files is what catches it.
+
+    /// RAII throwaway directory for one file-backed migration test. Reuses the
+    /// existing `unique_tempdir` (no `tempfile` dependency — the crate
+    /// deliberately avoids it). Drop removes the directory including the
+    /// `-wal`/`-shm` sidecars `Database::open` creates, so cleanup happens even
+    /// if an assertion panics mid-test.
+    struct TempDbDir(std::path::PathBuf);
+
+    impl TempDbDir {
+        fn new(tag: &str) -> Self {
+            TempDbDir(unique_tempdir(tag))
+        }
+
+        fn db_path(&self) -> std::path::PathBuf {
+            self.0.join("aps.sqlite")
+        }
+    }
+
+    impl Drop for TempDbDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Compare two f64s without tripping clippy's `float_cmp` under
+    /// `-D warnings`. The seeded literal round-trips through SQLite REAL
+    /// (IEEE-754 double) unchanged, so a tiny epsilon is ample.
+    fn assert_close(actual: f64, expected: f64, what: &str) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "{what}: expected {expected}, got {actual}"
+        );
+    }
+
+    /// Does an index named `name` exist? (`table_exists` only covers tables.)
+    fn index_exists(db: &Database, name: &str) -> bool {
+        db.conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+                params![name],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|o| o.is_some())
+            .unwrap_or(false)
+    }
+
+    // Fixed seed values, shared by the builder (write) and the verifier (read)
+    // so we can assert exact preservation across the cascade.
+    const SEED_AP_BSSID: &str = "aa:bb:cc:dd:ee:01";
+    const SEED_AP_SSID: &str = "seed-net";
+    const SEED_AP_LAT: f64 = 55.6761;
+    const SEED_AP_LON: f64 = 12.5683;
+    const SEED_AP_SOURCE: &str = "wigle";
+    const SEED_NOT_FOUND_BSSID: &str = "11:22:33:44:55:66";
+    const SEED_PENDING_BSSID: &str = "99:88:77:66:55:44";
+    const SEED_PENDING_ATTEMPTS: i64 = 2;
+    const SEED_LAST_FIX_LAT: f64 = 55.0;
+    const SEED_LAST_FIX_ACCURACY: f64 = 42.0;
+    const SEED_FIXES_AT: &str = "2020-05-01T00:00:00Z";
+    const SEED_FIXES_LAT: f64 = 56.0;
+    const SEED_FIXES_N_SOURCES: i64 = 4;
+
+    /// Seed representative rows into exactly the tables that exist at `version`.
+    /// aps/not_found/pending exist from v1; last_fix from v4; fixes from v5.
+    /// The aps INSERT names only v1 columns (source_priority is added at v2,
+    /// is_mobile at v6, both with defaults), so the same statement is valid at
+    /// every version and does not smuggle in a newer column.
+    fn seed_sample_rows(db: &Database, version: i32) {
+        db.conn
+            .execute(
+                "INSERT INTO aps
+                    (bssid, ssid, lat, lon, encryption, channel, frequency,
+                     city, country, source, first_seen, last_seen, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4, 'wpa2', 6, 2437, 'Copenhagen', 'DK',
+                         ?5, '2020-01-01T00:00:00Z', '2020-01-02T00:00:00Z',
+                         '2020-01-02T00:00:00Z')",
+                params![
+                    SEED_AP_BSSID,
+                    SEED_AP_SSID,
+                    SEED_AP_LAT,
+                    SEED_AP_LON,
+                    SEED_AP_SOURCE
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO not_found (bssid, first_seen, last_seen, checked_at)
+                 VALUES (?1, '2020-02-01T00:00:00Z', '2020-02-02T00:00:00Z',
+                         '2020-02-02T00:00:00Z')",
+                params![SEED_NOT_FOUND_BSSID],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO pending
+                    (bssid, ssid, channel, frequency, signal_dbm,
+                     first_seen, last_seen, attempts)
+                 VALUES (?1, 'pending-net', 11, 2462, -70,
+                         '2020-03-01T00:00:00Z', '2020-03-02T00:00:00Z', ?2)",
+                params![SEED_PENDING_BSSID, SEED_PENDING_ATTEMPTS],
+            )
+            .unwrap();
+        if version >= 4 {
+            db.conn
+                .execute(
+                    "INSERT INTO last_fix
+                        (id, lat, lon, accuracy_m, address, at_rfc3339, sources)
+                     VALUES (1, ?1, 12.0, ?2, 'Somewhere',
+                             '2020-04-01T00:00:00Z', 3)",
+                    params![SEED_LAST_FIX_LAT, SEED_LAST_FIX_ACCURACY],
+                )
+                .unwrap();
+        }
+        if version >= 5 {
+            db.conn
+                .execute(
+                    "INSERT INTO fixes (at_rfc3339, lat, lon, accuracy_m, n_sources)
+                     VALUES (?1, ?2, 13.0, 25.0, ?3)",
+                    params![SEED_FIXES_AT, SEED_FIXES_LAT, SEED_FIXES_N_SOURCES],
+                )
+                .unwrap();
+        }
+    }
+
+    /// Build a tempfile DB stamped at exactly historical shape `target`
+    /// (1..=6) and seed it, then close it. Authenticity is guaranteed by
+    /// constructing the shape ONLY from `create_schema_v1` + the real migrate
+    /// fns up to `target` — never hand-written DDL.
+    fn build_historical_shape(path: &Path, target: i32) {
+        assert!(
+            (1..=6).contains(&target),
+            "historical shapes are v1..=v6; v7 is the current shape"
+        );
+        let db = Database {
+            conn: Connection::open(path).unwrap(),
+            mobile_ssid_denylist: crate::scanner::default_mobile_ssid_denylist(),
+        };
+        db.create_schema_v1().unwrap();
+        if target >= 2 {
+            db.migrate_v1_to_v2().unwrap();
+        }
+        if target >= 3 {
+            db.migrate_v2_to_v3().unwrap();
+        }
+        if target >= 4 {
+            db.migrate_v3_to_v4().unwrap();
+        }
+        if target >= 5 {
+            db.migrate_v4_to_v5().unwrap();
+        }
+        if target >= 6 {
+            db.migrate_v5_to_v6().unwrap();
+        }
+        assert_eq!(
+            db.get_schema_version(),
+            target,
+            "builder must produce a genuine v{target} stamp before seeding"
+        );
+        seed_sample_rows(&db, target);
+        // `db` (and its Connection) drops here, flushing/closing the file so
+        // Database::open below reopens it cleanly.
+    }
+
+    /// After `Database::open` has cascaded a historical file to the current
+    /// version, assert the complete current shape and that the seeded rows
+    /// (those that existed at `origin`) survived intact.
+    fn assert_current_shape_and_seed(db: &Database, origin: i32) {
+        assert_eq!(
+            db.get_schema_version(),
+            SCHEMA_VERSION,
+            "opening a v{origin} file must cascade to v{SCHEMA_VERSION}"
+        );
+
+        for table in [
+            "schema_version",
+            "aps",
+            "not_found",
+            "pending",
+            "metadata",
+            "last_fix",
+            "fixes",
+        ] {
+            assert!(
+                db.table_exists(table),
+                "table {table} must exist after cascade from v{origin}"
+            );
+        }
+        for index in ["idx_aps_geo", "idx_aps_last_seen", "idx_fixes_at"] {
+            assert!(
+                index_exists(db, index),
+                "index {index} must exist after cascade from v{origin}"
+            );
+        }
+
+        assert!(
+            schema_version_is_single_row_constrained(db),
+            "schema_version must be single-row constrained after cascade from v{origin}"
+        );
+        assert_eq!(
+            schema_version_row_count(db),
+            1,
+            "exactly one schema_version row after cascade from v{origin}"
+        );
+
+        // Columns added by v2 and v6 migrations of aps.
+        assert!(
+            db.column_exists("aps", "source_priority"),
+            "aps.source_priority (v2) must exist after cascade from v{origin}"
+        );
+        assert!(
+            db.column_exists("aps", "is_mobile"),
+            "aps.is_mobile (v6) must exist after cascade from v{origin}"
+        );
+        // v7 nullable quality bundle on fixes.
+        assert!(
+            db.fix_quality_columns_have_expected_shape(),
+            "fixes v7 quality columns must exist after cascade from v{origin}"
+        );
+
+        // Seeded aps row (present at every origin) survived unchanged.
+        let (ssid, lat, lon, source): (String, f64, f64, String) = db
+            .conn
+            .query_row(
+                "SELECT ssid, lat, lon, source FROM aps WHERE bssid = ?1",
+                params![SEED_AP_BSSID],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(ssid, SEED_AP_SSID, "aps.ssid preserved (origin v{origin})");
+        assert_close(lat, SEED_AP_LAT, "aps.lat");
+        assert_close(lon, SEED_AP_LON, "aps.lon");
+        assert_eq!(
+            source, SEED_AP_SOURCE,
+            "aps.source preserved (origin v{origin})"
+        );
+
+        // not_found + pending survived.
+        let not_found_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM not_found WHERE bssid = ?1",
+                params![SEED_NOT_FOUND_BSSID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            not_found_count, 1,
+            "not_found row preserved (origin v{origin})"
+        );
+        let pending_attempts: i64 = db
+            .conn
+            .query_row(
+                "SELECT attempts FROM pending WHERE bssid = ?1",
+                params![SEED_PENDING_BSSID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending_attempts, SEED_PENDING_ATTEMPTS,
+            "pending row preserved (origin v{origin})"
+        );
+
+        // last_fix only seeded when it existed at origin (v4+).
+        if origin >= 4 {
+            let (lf_lat, lf_accuracy): (f64, f64) = db
+                .conn
+                .query_row(
+                    "SELECT lat, accuracy_m FROM last_fix WHERE id = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_close(lf_lat, SEED_LAST_FIX_LAT, "last_fix.lat");
+            assert_close(lf_accuracy, SEED_LAST_FIX_ACCURACY, "last_fix.accuracy_m");
+        }
+
+        // fixes only seeded when it existed at origin (v5+).
+        if origin >= 5 {
+            let (fx_lat, fx_n): (f64, i64) = db
+                .conn
+                .query_row(
+                    "SELECT lat, n_sources FROM fixes WHERE at_rfc3339 = ?1",
+                    params![SEED_FIXES_AT],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_close(fx_lat, SEED_FIXES_LAT, "fixes.lat");
+            assert_eq!(
+                fx_n, SEED_FIXES_N_SOURCES,
+                "fixes.n_sources preserved (origin v{origin})"
+            );
+            // The v6->v7 migration must leave pre-existing rows' quality
+            // columns NULL (legacy unknown), not fabricate values.
+            let confidence: Option<String> = db
+                .conn
+                .query_row(
+                    "SELECT confidence FROM fixes WHERE at_rfc3339 = ?1",
+                    params![SEED_FIXES_AT],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                confidence.is_none(),
+                "v7 quality columns must be NULL for pre-v7 rows (origin v{origin})"
+            );
+        }
+    }
+
+    /// AC#1/#2/#4: for each historical stamped shape v in {1,2,3,4,5,6}, build
+    /// a genuine v-shape tempfile with seed rows, open it through the PUBLIC
+    /// `Database::open` cascade, and assert it reaches SCHEMA_VERSION with the
+    /// full current shape and every seeded row preserved. Distinct from
+    /// `migration_chain_stamps_each_version_in_lockstep`, which steps the
+    /// migrate fns directly on one in-memory connection and never exercises
+    /// `Database::open` on a real historical file.
+    #[test]
+    fn open_each_historical_shape_cascades_to_current() {
+        for origin in 1..=6 {
+            let tmp = TempDbDir::new(&format!("task0151-cascade-v{origin}"));
+            let path = tmp.db_path();
+            build_historical_shape(&path, origin);
+            let db = Database::open(&path).unwrap();
+            assert_current_shape_and_seed(&db, origin);
+        }
+    }
+
+    /// AC#3: the v3 -> v7 path specifically. A v3-shape DB has neither the v4
+    /// last_fix table, the v5 fixes table, the v6 aps.is_mobile column, nor the
+    /// v7 fixes quality columns. Opening it must run migrate_v3_to_v4 /
+    /// v4_to_v5 / v5_to_v6 / v6_to_v7 in sequence, producing all of them while
+    /// preserving the aps/not_found/pending rows seeded at v3.
+    ///
+    /// Why this catches a broken intermediate migration: if, say,
+    /// migrate_v5_to_v6 were a no-op, opening this v3 file would still stamp 7
+    /// (later migrations run and stamp) but aps.is_mobile would be absent — the
+    /// `column_exists("aps", "is_mobile")` assertion fails. The shape repair in
+    /// migrate() does NOT mask this: it runs off the STORED stamp (3 here, a
+    /// genuine v3 shape), so it declines to repair and the real cascade is what
+    /// must build every later shape.
+    #[test]
+    fn open_v3_shape_runs_all_upper_migrations_and_preserves_rows() {
+        let tmp = TempDbDir::new("task0151-v3-to-v7");
+        let path = tmp.db_path();
+        build_historical_shape(&path, 3);
+
+        // Confirm the on-disk file really is a v3 shape before opening: none of
+        // the v4/v5/v6/v7 artifacts may be present yet.
+        {
+            let probe = Database {
+                conn: Connection::open(&path).unwrap(),
+                mobile_ssid_denylist: crate::scanner::default_mobile_ssid_denylist(),
+            };
+            assert_eq!(probe.get_schema_version(), 3, "pre-open file must be v3");
+            assert!(
+                !probe.table_exists("last_fix"),
+                "v3 file must lack last_fix"
+            );
+            assert!(!probe.table_exists("fixes"), "v3 file must lack fixes");
+            assert!(
+                !probe.column_exists("aps", "is_mobile"),
+                "v3 file must lack aps.is_mobile"
+            );
+            assert!(
+                !probe.fix_quality_columns_have_expected_shape(),
+                "v3 file must lack the v7 fixes quality columns"
+            );
+        }
+
+        // Open through the public cascade and assert every upper migration ran
+        // and the seeded rows survived.
+        let db = Database::open(&path).unwrap();
+        assert_current_shape_and_seed(&db, 3);
+    }
+
     /// task-0191 AC#3 (positive): a DB stamped newer than its shape — the
     /// exact strand the old SCHEMA_VERSION bug produced — is detected and
     /// repaired on migrate(), not silently skipped. We manufacture the strand:
