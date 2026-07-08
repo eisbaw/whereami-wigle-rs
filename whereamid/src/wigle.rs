@@ -54,8 +54,13 @@ struct WigleSearchResponse {
 
 #[derive(Deserialize, Debug)]
 struct WigleResult {
-    #[serde(rename = "netid")]
-    _netid: Option<String>,
+    // Deserialized from the response's "netid" (the BSSID) but not yet wired
+    // through. Kept as a documented placeholder for when a consumer needs it;
+    // an explicit `#[allow(dead_code)]` says "parsed-but-currently-unused" far
+    // more clearly than a leading-underscore name, which reads as an accidental
+    // throwaway a future contributor would delete or fail to wire (task-0138).
+    #[allow(dead_code)]
+    netid: Option<String>,
     ssid: Option<String>,
     trilat: Option<f64>,
     trilong: Option<f64>,
