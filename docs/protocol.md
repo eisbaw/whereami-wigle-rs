@@ -124,7 +124,7 @@ Every response includes:
 ← {
     "ok": true, "v": 1,
     "lat": 55.707250, "lon": 12.585598, "accuracy_m": 11.95,
-    "sources": 6, "cached": 6, "fetched": 0, "pending": 0,
+    "sources": 6, "cached": 6,
     "visible": 12, "stable": 11,
     "implied_speed_kmh": 18.4, "last_fix_age_secs": 42,
     "inlier_ratio": 0.83, "confidence": "high"

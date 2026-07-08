@@ -266,10 +266,6 @@ pub struct LocateResponse {
     #[serde(default)]
     pub cached: usize,
     #[serde(default)]
-    pub fetched: usize,
-    #[serde(default)]
-    pub pending: usize,
-    #[serde(default)]
     pub visible: usize,
     #[serde(default)]
     pub stable: usize,
@@ -1941,7 +1937,7 @@ mod daemon_wire_cross_tests {
 
     /// Byte-exact daemon `locate` response with every optional field present,
     /// in `LocateResponse` (server.rs:565) declaration order.
-    const LOCATE_FIXTURE: &str = r#"{"ok":true,"v":1,"lat":55.6761,"lon":12.5683,"accuracy_m":42.5,"sources":7,"cached":5,"fetched":2,"pending":1,"visible":9,"stable":6,"address":"Copenhagen, Denmark","stale":true,"age_s":120,"implied_speed_kmh":13.5,"last_fix_age_secs":30,"inlier_ratio":0.75,"confidence":"medium","suspect_reason":"speed"}"#;
+    const LOCATE_FIXTURE: &str = r#"{"ok":true,"v":1,"lat":55.6761,"lon":12.5683,"accuracy_m":42.5,"sources":7,"cached":5,"visible":9,"stable":6,"address":"Copenhagen, Denmark","stale":true,"age_s":120,"implied_speed_kmh":13.5,"last_fix_age_secs":30,"inlier_ratio":0.75,"confidence":"medium","suspect_reason":"speed"}"#;
 
     /// `resolve` response mixing a located (`cache`) and an absent (`not_found`)
     /// entry; `ResolveResult` (server.rs:632) emits `lat`/`lon`/`ssid` as null
@@ -1995,8 +1991,6 @@ mod daemon_wire_cross_tests {
         approx(r.accuracy_m, 42.5);
         assert_eq!(r.sources, 7);
         assert_eq!(r.cached, 5);
-        assert_eq!(r.fetched, 2);
-        assert_eq!(r.pending, 1);
         assert_eq!(r.visible, 9);
         assert_eq!(r.stable, 6);
         assert_eq!(r.address.as_deref(), Some("Copenhagen, Denmark"));

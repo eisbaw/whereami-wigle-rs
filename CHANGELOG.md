@@ -5,6 +5,18 @@ and the project follows semver.
 
 ## [Unreleased]
 
+### Changed — wire format
+
+- `locate` response no longer emits the `fetched` and `pending` integer fields
+  (task-0117). Both were dead: they were hardcoded to `0` at every construction
+  site because `locate` is cache-only — live fetching and pending-queue drain
+  happen in background tasks and were never reflected here. The retained counts
+  (`sources`, `cached`, `visible`, `stable`) still carry real computed values.
+  The removal is backward-compatible: (a) the fields were always `0`, so no
+  information is lost; (b) clients ignore unknown fields, so an old daemon still
+  sending them is harmlessly tolerated by a new client, and a client whose
+  struct kept `serde(default)` treats their absence as `0`.
+
 ### Changed — documentation
 
 - `PRD.md` retired to a lean, version-agnostic one-page pointer (task-0113).
