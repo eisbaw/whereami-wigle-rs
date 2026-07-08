@@ -4,11 +4,11 @@ title: >-
   De-flake task-0239 tracing-capture test
   (locate_skips_non_finite_cached_ap_and_warns_with_bssid) — ~1-in-8 under
   parallel load
-status: To Do
+status: Done
 assignee:
   - '@myself'
 created_date: '2026-07-07 23:24'
-updated_date: '2026-07-08 06:37'
+updated_date: '2026-07-08 08:36'
 labels:
   - robustness
   - test-flake
@@ -25,30 +25,49 @@ The e2e gate has a pre-existing intermittent flake surfaced by the task-0230 QA 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Root cause of the empty-capture flake is identified and fixed at the harness level (not by weakening the WARN assertion)
-- [ ] #2 The test passes >=50/50 under full-parallel just e2e load (measured, not a single sample)
-- [ ] #3 The non-finite-skip WARN behavior is still positively asserted (the guard still bites)
+- [x] #1 Root cause of the empty-capture flake is identified and fixed at the harness level (not by weakening the WARN assertion)
+- [x] #2 The test passes >=50/50 under full-parallel just e2e load (measured, not a single sample)
+- [x] #3 The non-finite-skip WARN behavior is still positively asserted (the guard still bites)
 <!-- AC:END -->
 
 ## Implementation Plan
 
 <!-- SECTION:PLAN:BEGIN -->
-CONFIRMED root cause (session 2026-07-08 diagnosis): tracing keeps a PROCESS-GLOBAL per-callsite Interest cache. Under cargo test's parallel harness, any scoped-subscriber test entering/leaving `with_default`/`with_subscriber` triggers a global rebuild_interest_cache that can clobber the WARN callsite (server.rs:1902) to `never` in a window where our capturing subscriber is not the one the rebuild sees — so the `warn!` short-circuits BEFORE consulting the active dispatcher and the event is dropped. There are 9+ scoped-subscriber sites across FOUR modules (server.rs x4, db.rs x3, trilaterate.rs, config.rs) all churning this global state; that concurrency is the real driver (measured ~12% under full bin-suite parallelism).
+ROOT CAUSE (verified against tracing-core 0.1.36 source):
+- Process-global per-callsite Interest cache. rebuild_callsite_interest folds every REGISTERED dispatcher's register_callsite via Interest::and and falls back to Interest::never() when the fold is empty.
+- Thread-local with_default/with_subscriber dispatchers ARE registered into the global DISPATCHERS registry (Dispatch::new -> register_dispatch), but a callsite exercised by only ONE scoped test (the handle_locate non-finite warn!) can be first-registered in a window where that dispatcher is not folded in -> cached never -> warn! short-circuits -> event dropped -> capture sees [].
+- The two prior fixes failed because they only touched the thread-local CAPTURING subscriber, never a PERMANENT registry member the fold reads.
 
-TWO FIXES ATTEMPTED THIS SESSION — BOTH FAILED (reverted):
-1. register_callsite -> Interest::sometimes() on CapturedEvents (defeat always/never caching) + keep per-poll WithSubscriber: still flaked 1/60.
-2. #1 plus rewrite the test to whole-scope tracing::subscriber::with_default over a manual current-thread runtime (dispatcher active for the entire block_on, mirroring the reliable synchronous with_default tests): FLAKED 12/100. So neither sometimes() nor holding our dispatcher for the whole test wins the cross-thread global-cache race.
+FIX (candidate b, algebraic not probabilistic): install once a global default subscriber (set_global_default -> leaked, permanent DISPATCHERS member) whose register_callsite returns Interest::sometimes(). Interest::and collapses any mismatched pair to sometimes(), so every rebuild now yields at worst sometimes -> warn! always consults the current thread-local dispatcher -> scoped capture deterministically sees its own event. No-op sink (enabled=false) so no other test's captured set changes.
 
-CANDIDATE FIXES for the next session (ranked):
-(a) Serialize ALL scoped-subscriber tests behind one process-global Mutex so no two dispatcher-changing tests run concurrently (removes the parallel rebuild that clobbers the cache). Requires a shared guard used at all 9+ sites across the 4 modules (today each module has its own CapturedEvents copy) — cross-cutting but conceptually simple. Verify it actually stops the clobber (thread-local dispatchers may or may not participate in rebuilds).
-(b) Install ONCE (std::sync::Once) a process-global default subscriber whose register_callsite returns Interest::sometimes() and whose event() is a no-op sink, so every callsite is permanently `sometimes` -> per-event enabled() is always evaluated against the CURRENT thread dispatcher -> capture tests deterministically see their own events. One localized change but changes global test tracing behavior; verify it does not perturb the other 8 capture tests.
-(c) Abandon tracing-capture for THIS assertion: extract the non-finite-skip+warn loop into a small unit and assert the diagnostic deterministically without the async/global-dispatcher path. Most robust, but a production refactor of handle_locate.
+PLACEMENT: install_permissive_global_test_subscriber() in server.rs dispatch_tests (bin crate, where the flake lives). Called at top of the flaky test + the other two server dispatch_tests capture tests.
 
-VERIFICATION BAR: base rate is ~12% under full bin-suite parallelism (repro harness: loop `cargo test -p whereamid --bin whereamid` >=100x and grep for the test). A fix must show 0 failures across >=300 runs to be decisive (0 across 100 is NOT enough). Do NOT weaken the WARN assertion to hide the drop (AC#3).
+VERIFY: harness loops full bin suite (cargo test -p whereamid --bin whereamid). Unfixed 40x: caught target FAIL (detector validated). Fixed: require 0 target failures across >=300.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
 Session 2026-07-08: diagnosed + reproduced (1/60 then 12/100), attempted fixes (a-precursor) sometimes() and whole-scope with_default — BOTH failed, reverted to clean master (server.rs untouched on disk). Left In Progress work as durable plan above. Stopping per honest-failure discipline: two confident fixes both wrong = the overconfidence stop signal. This is a cross-cutting tracing-test-infra change, not the quick de-flake it first looked like — wants a fresh dedicated context. The gate flake REMAINS (~12% under load); treat `just e2e` as not-yet-reliable until this lands.
+
+Session 2026-07-08 (fresh context, cycle 16 resumed):
+- Read tracing-core 0.1.36 source directly to correct the prior mental model. KEY correction: thread-local dispatchers DO enter the DISPATCHERS registry (via Dispatch::new); the never-clobber comes from an empty/mismatched fold at first-registration, and Interest::and makes a single sometimes() sticky. This is why a permanent global sometimes() member is decisive.
+- Implemented install_permissive_global_test_subscriber() (server.rs dispatch_tests) + wired into the 3 server capture tests. WARN assertion UNCHANGED (AC#3 preserved).
+- Harness validated on UNFIXED (git stash) 40x: target test FAILED at run 14 -> detector proven to catch the flake; base rate reconfirmed present.
+- INCIDENTAL: harness also caught a SECOND, unrelated pre-existing flake at run 19: scanner::tests::tokio_runner_kills_child_when_scan_future_is_cancelled (33s timeout under load) -> filed task-0249 (NOT in scope for 0248).
+- Fixed 300x verification launched (decisive: require 0 target failures).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Root-caused and fixed the tracing-capture flake at the harness level, verified decisively under load.
+
+ROOT CAUSE (confirmed against tracing-core 0.1.36 source): tracing keeps a process-global per-callsite Interest cache. rebuild_callsite_interest folds each registered dispatcher's register_callsite via Interest::and and falls back to Interest::never() on an empty fold. The handle_locate non-finite warn! callsite is exercised by only ONE scoped test; under parallel cargo test it could be first-registered in a window where that test's dispatcher is not folded in -> cached never -> warn! short-circuits -> event dropped -> capture sees []. The two prior in-code fixes failed because they only touched the thread-local capturing subscriber, never a permanent member of the dispatcher registry the fold reads.
+
+FIX: install once (std::sync::Once) a process-global default subscriber whose register_callsite returns Interest::sometimes() and which is a no-op sink (enabled()=false). Interest::and collapses any mismatched pair to sometimes(), and set_global_default leaks the dispatch so its weak registrar is a permanent fold member -> no callsite can ever be cached never -> warn! always consults the current thread-local dispatcher -> scoped capture is deterministic. Algebraic invariant, not probabilistic. The exact-match WARN assertion is UNCHANGED (AC#3). Wired into the three server::dispatch_tests capture tests.
+
+VERIFICATION: harness loops the full whereamid bin suite (drives the parallel churn). Detector validated on the UNFIXED tree (git stash): target FAILED at run 14/40. FIXED tree: 0 target failures across 300 runs; QA reviewer independently 0/60 (0/360 cumulative). clippy -D warnings clean; fmt clean; full workspace 736 tests pass. Review gate: qa-test-runner GO, mped-architect GO (conditional; conditions met — AC#2 green + docstring corrected). In-thread review hardening: corrected the misleading "no other test's captured set changes" comment, documented the set_global_default Err silent-no-op failure mode, dropped dead pub(crate) visibility.
+
+SCOPE/HONEST LIMITS: this hardens the three server capture tests and decisively fixes the reported gate flake. The root cause is process-global; sibling capture tests (db.rs exact-count in the lib binary, config.rs absence tests, trilaterate.rs) share the same latent mechanism and are order-dependent across run shapes — filed as task-0251 (not observed flaking in 360+ runs, latent only). Two UNRELATED pre-existing gate flakes surfaced during verification: task-0249 (scanner child-kill timeout ~1.7%) and task-0250 (post_commit_wipe subprocess timing ~0.3%).
+<!-- SECTION:FINAL_SUMMARY:END -->
