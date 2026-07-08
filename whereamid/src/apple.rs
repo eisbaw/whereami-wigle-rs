@@ -762,6 +762,106 @@ mod tests {
         assert_eq!(ap.bssid, "02:00:00:00:00:01");
         assert!(matches!(ap.source, crate::db::Source::Apple));
     }
+
+    // --- decode_response golden positive-path tests (task-0148) ---
+
+    /// Append one WifiDevice as a top-level field=2 (wire type 2) entry of the
+    /// response body, exactly as `decode_response` expects to iterate them.
+    fn push_wifi_device(response: &mut Vec<u8>, bssid: &str, lat: f64, lon: f64) {
+        let loc = encode_location_msg(Some(scaled(lat)), Some(scaled(lon)));
+        let dev = encode_wifi_device_msg(bssid, Some(&loc));
+        encode_bytes(response, 2, &dev);
+    }
+
+    /// AC#1/#2/#3: golden decode of a full response body with the requested_set
+    /// filter engaged. The body carries THREE WifiDevice entries at known
+    /// coordinates, but the request asks for only two of them. decode_response
+    /// must return exactly the two requested-and-present APs (with normalized
+    /// BSSID and correct lat/lon) and DROP the third, unrequested one.
+    ///
+    /// This pins two independently-refactorable contracts at once:
+    ///   * field/wire routing (top-level field=2 wire=2 -> WifiDevice), and
+    ///   * the requested_set membership filter (task-0049 regression guard).
+    #[test]
+    fn decode_response_golden_filters_to_requested_bssids() {
+        // Fixed, locally-administered fixture BSSIDs at distinct known coords.
+        let mut response = Vec::new();
+        push_wifi_device(&mut response, "02:00:00:00:00:01", 55.6761, 12.5683); // Copenhagen
+        push_wifi_device(&mut response, "02:00:00:00:00:02", 37.3318, -122.0312); // Cupertino
+        push_wifi_device(&mut response, "02:00:00:00:00:03", -33.8688, 151.2093); // Sydney (NOT requested)
+
+        // Ask for #1 and #2 only; #3 is present in the response but unrequested.
+        let requested = vec![
+            "02:00:00:00:00:01".to_string(),
+            "02:00:00:00:00:02".to_string(),
+        ];
+
+        let aps = decode_response(&response, &requested).unwrap();
+
+        // Exactly the two requested-and-present entries survive. If the
+        // `requested_set.contains(&ap.bssid)` filter in decode_response were
+        // removed, BSSID #3 would leak into the result and this length
+        // assertion (and the "not present" assertion below) would fail —
+        // this is what pins the task-0049 filter.
+        assert_eq!(
+            aps.len(),
+            2,
+            "only requested-and-present BSSIDs must be returned, got {:?}",
+            aps.iter().map(|a| &a.bssid).collect::<Vec<_>>()
+        );
+
+        let find = |bssid: &str| aps.iter().find(|a| a.bssid == bssid);
+
+        let ap1 = find("02:00:00:00:00:01").expect("requested BSSID #1 must be present");
+        assert!((ap1.lat - 55.6761).abs() < 1e-4, "lat={}", ap1.lat);
+        assert!((ap1.lon - 12.5683).abs() < 1e-4, "lon={}", ap1.lon);
+        assert!(matches!(ap1.source, crate::db::Source::Apple));
+
+        let ap2 = find("02:00:00:00:00:02").expect("requested BSSID #2 must be present");
+        assert!((ap2.lat - 37.3318).abs() < 1e-4, "lat={}", ap2.lat);
+        assert!((ap2.lon - (-122.0312)).abs() < 1e-4, "lon={}", ap2.lon);
+
+        // The unrequested BSSID must have been dropped.
+        assert!(
+            find("02:00:00:00:00:03").is_none(),
+            "unrequested BSSID #3 must be dropped by the requested_set filter"
+        );
+    }
+
+    /// AC#3 (normalization): decode_response normalizes both the request set
+    /// and the decoded BSSID via scanner::normalize_bssid (trim + uppercase),
+    /// so a lowercase request still matches an uppercase-decoded BSSID.
+    #[test]
+    fn decode_response_matches_bssid_case_insensitively() {
+        let mut response = Vec::new();
+        push_wifi_device(&mut response, "02:00:00:00:00:0A", 40.7128, -74.0060);
+
+        // Request uses lowercase + surrounding whitespace; normalization must
+        // still make it match the uppercase-normalized decoded BSSID.
+        let requested = vec![" 02:00:00:00:00:0a ".to_string()];
+        let aps = decode_response(&response, &requested).unwrap();
+
+        assert_eq!(aps.len(), 1, "case-insensitive match must return the AP");
+        assert_eq!(aps[0].bssid, "02:00:00:00:00:0A");
+    }
+
+    /// AC#4: response->decode round-trip. Build a response for a single BSSID
+    /// and assert decode_response hands it back with the response's own
+    /// coordinates. Deterministic and self-contained (no simulated server /
+    /// network needed — the response bytes ARE the server's contract).
+    #[test]
+    fn decode_response_round_trip_single_bssid() {
+        let (lat, lon) = (51.5074, -0.1278); // London
+        let mut response = Vec::new();
+        push_wifi_device(&mut response, "02:00:00:00:00:01", lat, lon);
+
+        let aps = decode_response(&response, &["02:00:00:00:00:01".to_string()]).unwrap();
+
+        assert_eq!(aps.len(), 1);
+        assert_eq!(aps[0].bssid, "02:00:00:00:00:01");
+        assert!((aps[0].lat - lat).abs() < 1e-4, "lat={}", aps[0].lat);
+        assert!((aps[0].lon - lon).abs() < 1e-4, "lon={}", aps[0].lon);
+    }
 }
 
 // task-0082: Kani bounded-model-checker harnesses. Setup is out-of-band
