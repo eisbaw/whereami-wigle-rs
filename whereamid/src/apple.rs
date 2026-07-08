@@ -192,6 +192,11 @@ pub fn decode_response(data: &[u8], requested: &[String]) -> Result<Vec<ApInfo>>
 }
 
 /// Parse a single WifiDevice protobuf message.
+///
+/// Tolerant of unknown fields: any tag whose field number / wire type is not
+/// one we consume falls through to `skip_field`, so the message decodes
+/// successfully even as Apple's wire format grows new fields (skipped per
+/// protobuf spec). This contract is pinned by tests (task-0107).
 pub fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
     let mut bssid: Option<String> = None;
     let mut lat: Option<i64> = None;
@@ -273,6 +278,11 @@ pub fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
 /// reported as `None` rather than defaulting to 0. Defaulting to 0 would
 /// fabricate a (0,0) Null Island fix that passes the sentinel check and
 /// poisons the cache under Source::Apple (task-0187).
+///
+/// Tolerant of unknown fields: any tag other than lat (field 1) / lon
+/// (field 2) — including an accuracy field Apple's real wire format uses —
+/// falls through to `skip_field` and is skipped per protobuf spec, so the
+/// submessage still decodes. This contract is pinned by tests (task-0107).
 pub fn parse_location(data: &[u8]) -> Result<(Option<i64>, Option<i64>)> {
     let mut lat: Option<i64> = None;
     let mut lon: Option<i64> = None;
@@ -670,6 +680,87 @@ mod tests {
             parse_wifi_device(&wd).unwrap().is_none(),
             "missing longitude must skip the device"
         );
+    }
+
+    // --- Unknown-field tolerance tests (task-0107) ---
+    //
+    // These pin the contract that both decoders tolerate fields we do not
+    // consume, and still decode the known fields. Two distinct tolerance paths
+    // exist and both are covered:
+    //   * parse_location handles an unknown VARINT (wire 0) field via its own
+    //     `_ => {}` match arm, and any unknown NON-varint (wire 1/2/5) field
+    //     via `skip_field`.
+    //   * parse_wifi_device routes every unknown tag through `skip_field`.
+    // Each fixture deliberately CONTAINS the unknown field(s). The
+    // parse_location fixtures include an unknown wire-type-2 field specifically
+    // so that if `skip_field` were changed to bail!() on the unknown tag, the
+    // test would fail — proving the skip path is genuinely exercised, not a
+    // message where the extra field is merely absent. (An unknown varint field
+    // alone would NOT reach skip_field, so it cannot prove that.)
+
+    /// AC#1: parse_location tolerates unknown fields. A valid lat/lon Location
+    /// message with an extra field=3 wire 0 (varint, hits the `_ => {}` arm)
+    /// AND an extra field=4 wire 2 (length-delimited, hits `skip_field`) still
+    /// decodes and returns the expected coordinates — the unknown fields are
+    /// skipped, not treated as errors.
+    #[test]
+    fn parse_location_tolerates_unknown_field() {
+        let mut loc = encode_location_msg(Some(scaled(55.68)), Some(scaled(12.57)));
+        // Unknown accuracy-like field: field=3, wire type 0 (varint).
+        encode_varint_field(&mut loc, 3, 123);
+        // Unknown length-delimited field: field=4, wire type 2 -> skip_field.
+        encode_bytes(&mut loc, 4, b"opaque");
+
+        let (lat, lon) = parse_location(&loc).unwrap();
+        let lat_f =
+            lat.expect("latitude must decode despite trailing unknown fields") as f64 * 1e-8;
+        let lon_f =
+            lon.expect("longitude must decode despite trailing unknown fields") as f64 * 1e-8;
+        assert!((lat_f - 55.68).abs() < 1e-6, "lat={lat_f}");
+        assert!((lon_f - 12.57).abs() < 1e-6, "lon={lon_f}");
+    }
+
+    /// AC#1 (interleaved variant): unknown fields placed BETWEEN the two known
+    /// coordinates must also be skipped, so both lat and lon are still
+    /// recovered. Covers both an unknown varint and an unknown wire-type-2
+    /// field mid-message, exercising both tolerance paths, not only trailing.
+    #[test]
+    fn parse_location_tolerates_unknown_field_between_coords() {
+        let mut loc = Vec::new();
+        encode_varint_field(&mut loc, 1, scaled(55.68) as u64); // lat
+        encode_varint_field(&mut loc, 3, 999); // unknown varint between the knowns
+        encode_bytes(&mut loc, 4, b"blob"); // unknown wire-2 -> skip_field
+        encode_varint_field(&mut loc, 2, scaled(12.57) as u64); // lon
+
+        let (lat, lon) = parse_location(&loc).unwrap();
+        assert!((lat.unwrap() as f64 * 1e-8 - 55.68).abs() < 1e-6);
+        assert!((lon.unwrap() as f64 * 1e-8 - 12.57).abs() < 1e-6);
+    }
+
+    /// AC#2: parse_wifi_device skips unknown sub-fields without erroring.
+    /// The fixture injects unknown fields at BOTH levels and BOTH skip_field
+    /// paths: a device-level field=5 wire 0 (varint skip), a device-level
+    /// field=6 wire 2 (length-delimited skip), and a field=7 wire 0 unknown
+    /// INSIDE the Location submessage. parse_wifi_device must still return
+    /// Ok(Some(ApInfo)) with the expected position — not Err, not None.
+    #[test]
+    fn parse_wifi_device_tolerates_unknown_fields() {
+        // Location submessage carrying an unknown sub-field alongside lat/lon.
+        let mut loc = encode_location_msg(Some(scaled(55.68)), Some(scaled(12.57)));
+        encode_varint_field(&mut loc, 7, 42); // unknown sub-field (varint) in Location
+
+        // WifiDevice: bssid (field 1) + Location (field 2) + unknown extras.
+        let mut dev = encode_wifi_device_msg("02:00:00:00:00:01", Some(&loc));
+        encode_varint_field(&mut dev, 5, 99); // unknown device field, wire 0 (varint)
+        encode_bytes(&mut dev, 6, b"opaque-blob"); // unknown device field, wire 2 (bytes)
+
+        let ap = parse_wifi_device(&dev)
+            .unwrap()
+            .expect("device with unknown fields must still resolve to an ApInfo");
+        assert!((ap.lat - 55.68).abs() < 1e-6, "lat={}", ap.lat);
+        assert!((ap.lon - 12.57).abs() < 1e-6, "lon={}", ap.lon);
+        assert_eq!(ap.bssid, "02:00:00:00:00:01");
+        assert!(matches!(ap.source, crate::db::Source::Apple));
     }
 }
 
