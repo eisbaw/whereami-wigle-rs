@@ -1,9 +1,11 @@
 ---
 id: TASK-0264
 title: 'Reconsider lookup_cached &[Candidate] signature + locate loop single-probe'
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@myself'
 created_date: '2026-07-08 21:52'
+updated_date: '2026-07-08 22:02'
 labels:
   - refactor
   - server
@@ -20,6 +22,18 @@ Follow-up from task-0140 (commit 01f748a). Two deferred items:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Decide lookup_cached signature (keep &[String] or move to &[Candidate]) with rationale recorded
-- [ ] #2 Decide locate loop form (double-probe vs single if-let bind) and apply chosen form
+- [x] #1 Decide lookup_cached signature (keep &[String] or move to &[Candidate]) with rationale recorded
+- [x] #2 Decide locate loop form (double-probe vs single if-let bind) and apply chosen form
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Resolved both deferred decisions from task-0140.
+
+AC#1 (lookup_cached signature): DECISION = keep &[String] (do NOT move to &[Candidate]). Rationale: it would ripple into lookup_cached_readonly and the resolver.rs:1228 autolocate caller, both &[String], for zero readability gain — the cache layer legitimately operates in bssid-string terms. mped-architect endorsed this in the 0140 review. No code change.
+
+AC#2 (locate loop form): DECISION = single if-let bind, APPLIED. The positioned_aps loop now does `if let Some(candidate) = active.get(bssid) { if len < top_n { push(signal_dbm: Some(candidate.signal_dbm)) } }` instead of `contains_key(..) && len<top_n` + a second `active.get(..).map(..)` probe. One hash lookup; states the always-Some invariant honestly. The +1 line (nested if, since edition 2021 lacks let-chains) is accepted for the clarity + single-lookup win.
+
+Verified (orchestrator, behavior-preserving): contains_key ⟺ get.is_some on the same map and the signal was always Some, so identical behavior — dispatch_tests 71/71 unchanged, clippy -D warnings + fmt clean. Commit above.
+<!-- SECTION:FINAL_SUMMARY:END -->
