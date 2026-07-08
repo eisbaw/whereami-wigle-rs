@@ -137,7 +137,7 @@ async fn drain_once(
     //
     // The chain marks not_found only when a provider authoritatively returned
     // NotFound and nothing was genuinely transient (task-0189). When it marks,
-    // delete_pending_on_not_found (task-0052) removes the pending row in the
+    // manage_pending (task-0052) removes the pending row in the
     // same critical section, so this drain replaces the removed
     // drain_cleanup_after_chain.
     let bssids: Vec<String> = pending
@@ -155,8 +155,7 @@ async fn drain_once(
         skip_cached: false,
         skip_not_found: false,
         write_through: true,
-        delete_pending_on_success: true,
-        delete_pending_on_not_found: true,
+        manage_pending: true,
         not_found: NotFoundPolicy::AtChainEnd,
         on_skipped: SkipAction::NextProvider,
         // task-0189: retry accounting is done once per pass below, so a
@@ -210,8 +209,7 @@ mod tests {
             skip_cached: false,
             skip_not_found: false,
             write_through: true,
-            delete_pending_on_success: true,
-            delete_pending_on_not_found: true,
+            manage_pending: true,
             not_found: NotFoundPolicy::AtChainEnd,
             on_skipped: SkipAction::NextProvider,
             on_network_error: NetErrorAction::Ignore,
@@ -223,7 +221,7 @@ mod tests {
     /// provider results in (1) the BSSID being marked not_found in the DB,
     /// AND (2) the BSSID being deleted from pending so it won't retry on
     /// every drain. Both happen inside resolve_chain via the
-    /// delete_pending_on_not_found policy bit (drain_cleanup_after_chain
+    /// manage_pending policy bit (drain_cleanup_after_chain
     /// was collapsed in task-0052).
     #[tokio::test]
     async fn drain_chain_marks_not_found_and_deletes_pending_on_definitive_miss() {

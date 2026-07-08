@@ -155,13 +155,14 @@ pub struct ChainPolicy {
     pub skip_not_found: bool,
     /// Persist successful lookups to the `aps` cache (write-through).
     pub write_through: bool,
-    /// On a successful resolution, delete the BSSID from the pending queue.
-    pub delete_pending_on_success: bool,
-    /// On a definitive end-of-chain not_found mark, also delete the
-    /// pending row for that BSSID (otherwise the drain loop would retry
-    /// every cycle and burn API quota on something every provider just
-    /// said doesn't exist). task-0052 collapses drain_cleanup_after_chain.
-    pub delete_pending_on_not_found: bool,
+    /// true only for the pending-drain chain, which OWNS the pending table —
+    /// it deletes the pending row on a definitive outcome, success or
+    /// not_found. Other chains (interactive/readonly/background) never touch
+    /// pending. Collapsed from delete_pending_on_success +
+    /// delete_pending_on_not_found, which were always equal — the asymmetry
+    /// was unrepresentable-by-design and is now unrepresentable-in-the-type,
+    /// task-0120.
+    pub manage_pending: bool,
     pub not_found: NotFoundPolicy,
     pub on_skipped: SkipAction,
     pub on_network_error: NetErrorAction,
@@ -413,7 +414,7 @@ async fn resolve_chain_inner(
                         if let Some(_privacy) = state.privacy.read(ticket).await {
                             if let Err(e) = state
                                 .db
-                                .cache_resolved_ap(ap.clone(), policy.delete_pending_on_success)
+                                .cache_resolved_ap(ap.clone(), policy.manage_pending)
                                 .await
                             {
                                 warn!("failed to cache AP {} and update pending: {e}", ap.bssid);
@@ -522,7 +523,7 @@ async fn resolve_chain_inner(
     // `not_found` set is honest even for resolve_readonly (Never), which
     // classifies without persisting (task-0092 made table-write and wire-report
     // independent). Only AtChainEnd additionally writes the not_found table and
-    // (under delete_pending_on_not_found) drops the pending row. Everything
+    // (under manage_pending) drops the pending row. Everything
     // that falls through the `continue`s above is left out of result_not_found
     // and therefore reported as "unresolved" on the wire, not not_found.
     let persist = matches!(policy.not_found, NotFoundPolicy::AtChainEnd);
@@ -551,7 +552,7 @@ async fn resolve_chain_inner(
             if let Some(_privacy) = state.privacy.read(ticket).await {
                 if let Err(e) = state
                     .db
-                    .record_not_found(bssid.clone(), policy.delete_pending_on_not_found)
+                    .record_not_found(bssid.clone(), policy.manage_pending)
                     .await
                 {
                     warn!("failed to insert not_found {bssid}: {e}");
@@ -560,7 +561,7 @@ async fn resolve_chain_inner(
             }
             // task-0052: collapse drain_cleanup_after_chain — when the chain
             // marks not_found, also remove the pending row so the drain loop
-            // doesn't retry it every cycle. Only under delete_pending_on_not_found.
+            // doesn't retry it every cycle. Only under manage_pending.
             // `record_not_found` deletes pending in the same transaction when
             // policy requests it.
         }
@@ -581,8 +582,7 @@ fn readonly_policy() -> ChainPolicy {
         skip_cached: true,
         skip_not_found: true,
         write_through: false,
-        delete_pending_on_success: false,
-        delete_pending_on_not_found: false,
+        manage_pending: false,
         // task-0092: never write not_found from the read-only surface.
         not_found: NotFoundPolicy::Never,
         on_skipped: SkipAction::NextProvider,
@@ -638,8 +638,7 @@ pub async fn resolve_background(
         skip_cached: true,
         skip_not_found: true,
         write_through: true,
-        delete_pending_on_success: false,
-        delete_pending_on_not_found: false,
+        manage_pending: false,
         // Don't mark not_found per-provider: Apple may not know it but
         // WiGLE might (and vice versa). Decide at end of chain.
         not_found: NotFoundPolicy::AtChainEnd,
@@ -694,8 +693,7 @@ mod tests {
             skip_cached: true,
             skip_not_found: true,
             write_through: true,
-            delete_pending_on_success: false,
-            delete_pending_on_not_found: false,
+            manage_pending: false,
             not_found: NotFoundPolicy::AtChainEnd,
             on_skipped: SkipAction::NextProvider,
             on_network_error: NetErrorAction::Ignore,
