@@ -131,8 +131,22 @@ Every response includes:
 }
 ```
 
+`accuracy_m` is the weighted spread of the contributing AP positions around the
+centroid, clamped to `[10, 1000]` m. It is a rough dispersion estimate, **not** a
+calibrated 68%/95% confidence radius (contrast W3C Geolocation / Google Maps,
+whose `accuracy` is a confidence radius). Treat it as an order-of-magnitude
+quality hint, not a probabilistic bound.
+
 Conditional fields use omission, not `null` or a false sentinel:
 
+- `fallback` is present with value `true` only when trilateration could not
+  resolve a centroid (diametrically-opposed, equal-weight APs cancel to a
+  near-zero vector sum) and the daemon fell back to the strongest single AP. In
+  that case `accuracy_m` is the fixed `1000` m sentinel rather than a measured
+  spread — read `fallback` before trusting the magnitude. It is omitted from a
+  normal fix; the daemon never emits `"fallback": false`. This keeps the
+  ambiguous case distinguishable from a legitimately-wide fix that also clamps
+  to `1000`.
 - `address` is omitted when unavailable. `--address-approx` enables rounded-cell
   cache lookup and background geocoding, but does not guarantee this field: a
   cache miss schedules work for later and the current response still omits it.

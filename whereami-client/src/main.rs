@@ -306,9 +306,17 @@ fn render_locate(resp: &LocateResponse, color: bool) -> String {
             out.push('\n');
         }
     }
+    // `fallback` marks an antipodal-cancellation fix where ±accuracy_m is a
+    // 1000 m sentinel, not a measured spread — surface it so the ± is not read
+    // as a real radius. Appended only when true, so normal output is unchanged.
+    let fallback_note = if resp.fallback {
+        "  (ambiguous/fallback fix)"
+    } else {
+        ""
+    };
     let coordinate_line = format!(
-        "{:.6}, {:.6}  ±{}m  ({} sources, {})",
-        resp.lat, resp.lon, resp.accuracy_m as i64, resp.sources, resp.confidence
+        "{:.6}, {:.6}  ±{}m  ({} sources, {}){}",
+        resp.lat, resp.lon, resp.accuracy_m as i64, resp.sources, resp.confidence, fallback_note
     );
     if color {
         let style = match resp.confidence {
@@ -1590,6 +1598,7 @@ mod tests {
             stable: 0,
             address: Some("Rådhuspladsen 1, København".to_string()),
             stale: false,
+            fallback: false,
             age_s: None,
             implied_speed_kmh: Some(42.0),
             last_fix_age_secs: Some(60),
@@ -1601,6 +1610,38 @@ mod tests {
         assert_eq!(
             render_locate(&resp, false),
             "Rådhuspladsen 1, København\n55.676098, 12.568337  ±42m  (4 sources, High)\n"
+        );
+    }
+
+    #[test]
+    fn render_locate_marks_antipodal_fallback() {
+        // A fallback fix carries the 1000 m sentinel; the human output must flag
+        // it so the ± is not read as a measured radius. Normal fixes (fallback
+        // false) are covered by the byte-stable test above and gain no suffix.
+        let resp = whereami_client::LocateResponse {
+            ok: true,
+            v: whereami_client::SUPPORTED_PROTOCOL_VERSION,
+            lat: 0.0,
+            lon: 0.0,
+            accuracy_m: 1000.0,
+            sources: 2,
+            cached: 2,
+            visible: 2,
+            stable: 2,
+            address: None,
+            stale: false,
+            fallback: true,
+            age_s: None,
+            implied_speed_kmh: None,
+            last_fix_age_secs: None,
+            inlier_ratio: None,
+            confidence: Confidence::Low,
+            suspect_reason: None,
+            error: None,
+        };
+        assert_eq!(
+            render_locate(&resp, false),
+            "0.000000, 0.000000  ±1000m  (2 sources, Low)  (ambiguous/fallback fix)\n"
         );
     }
 
@@ -1619,6 +1660,7 @@ mod tests {
             // OSC 0 title-set + BEL: the classic terminal-title injection.
             address: Some("Evil St \u{1b}]0;pwned\u{07}".to_string()),
             stale: false,
+            fallback: false,
             age_s: None,
             implied_speed_kmh: None,
             last_fix_age_secs: None,
@@ -1649,6 +1691,7 @@ mod tests {
             stable: 3,
             address: Some("plain address".to_string()),
             stale: false,
+            fallback: false,
             age_s: None,
             implied_speed_kmh: None,
             last_fix_age_secs: None,

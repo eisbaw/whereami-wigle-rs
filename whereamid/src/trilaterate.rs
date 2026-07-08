@@ -104,7 +104,20 @@ pub struct PositionedAp {
 pub struct Position {
     pub lat: f64,
     pub lon: f64,
+    /// Weighted spread of contributing AP positions around the centroid,
+    /// clamped to [10, 1000] m. A rough dispersion estimate, NOT a calibrated
+    /// 68%/95% confidence radius (contrast W3C Geolocation / Google Maps
+    /// `accuracy`). When `fallback` is true this is the 1000 m sentinel, not a
+    /// measured spread — read `fallback` before trusting the magnitude.
+    /// The single-surviving-AP path returns a fixed `100.0` (a nominal
+    /// single-source estimate, likewise not a computed spread).
     pub accuracy_m: f64,
+    /// True iff this position is the antipodal-cancellation fallback
+    /// (strongest-AP, the centroid was ambiguous) — `accuracy_m == 1000` here
+    /// is a sentinel, NOT a measured spread. On every other path this is
+    /// false and `accuracy_m` is the weighted spread of contributing AP
+    /// positions around the centroid, clamped to [10, 1000] m.
+    pub fallback: bool,
 }
 
 /// Map (lat, lon) in degrees to a 3D unit vector on the sphere.
@@ -592,6 +605,7 @@ pub fn trilaterate(aps: &[PositionedAp]) -> Result<Position> {
             lat: aps[0].lat,
             lon: aps[0].lon,
             accuracy_m: 100.0,
+            fallback: false,
         });
     }
 
@@ -627,8 +641,11 @@ pub fn trilaterate(aps: &[PositionedAp]) -> Result<Position> {
         return finite_position(Position {
             lat: strongest.lat,
             lon: strongest.lon,
-            // Inflate accuracy to signal that the centroid was ambiguous.
+            // accuracy_m is an out-of-band sentinel here, not a spread: the
+            // `fallback` flag is the in-protocol signal that the centroid was
+            // ambiguous. See the `fallback` doc-comment on `Position`.
             accuracy_m: 1000.0,
+            fallback: true,
         });
     }
     let (lat, lon) = from_unit_vec(sx, sy, sz);
@@ -640,6 +657,7 @@ pub fn trilaterate(aps: &[PositionedAp]) -> Result<Position> {
         lat,
         lon,
         accuracy_m,
+        fallback: false,
     })
 }
 
@@ -742,6 +760,9 @@ mod tests {
         let pos = trilaterate(&aps).unwrap();
         assert!((pos.lat - 48.8575).abs() < 1e-4);
         assert!((pos.lon - 2.3515).abs() < 1e-4);
+        // A legitimate multi-AP fix is never the antipodal fallback, even
+        // though its clamped accuracy could in principle reach 1000 m.
+        assert!(!pos.fallback, "legit multi-AP fix must not set fallback");
     }
 
     #[test]
@@ -1224,10 +1245,17 @@ mod tests {
     }
 
     #[test]
-    fn antipodal_aps_falls_back_to_strongest() {
-        // Two APs on opposite sides of the planet. Vector sum is zero;
-        // the centroid is undefined. Fallback should pick the stronger AP and
-        // mark accuracy as poor.
+    fn antipodal_aps_unequal_weight_resolve_via_weighted_mean_not_fallback() {
+        // Two APs on opposite sides of the planet with UNEQUAL signal. The
+        // vector sum is (w1-w2)*v, whose magnitude 0.0099 dwarfs the guard
+        // threshold sum_weight*1e-6 (~1e-8), so the antipodal-cancellation
+        // guard does NOT fire — this input resolves through the ordinary
+        // weighted-mean path. The mean coincidentally collapses onto the
+        // stronger AP (0,0) and the wide spread clamps accuracy to 1000. The
+        // guard fires only when the two weights are (near-)equal; see
+        // `antipodal_equal_weight_triggers_fallback`. So `fallback` must be
+        // false here even though accuracy_m == 1000 — exactly the ambiguity
+        // this task removes from the wire.
         let aps = vec![
             PositionedAp {
                 lat: 0.0,
@@ -1243,17 +1271,62 @@ mod tests {
             },
         ];
         let pos = trilaterate(&aps).unwrap();
-        // Strongest is at (0, 0).
         assert!(
             pos.lat.abs() < 1e-6 && pos.lon.abs() < 1e-6,
-            "antipodal fallback should pick strongest AP at (0,0), got ({},{})",
+            "weighted mean should collapse onto the stronger AP at (0,0), got ({},{})",
             pos.lat,
             pos.lon
         );
-        assert!(
-            pos.accuracy_m >= 1000.0,
-            "accuracy should be inflated for ambiguous centroid, got {}",
+        assert_eq!(
+            pos.accuracy_m, 1000.0,
+            "wide spread must clamp to the 1000 m ceiling, got {}",
             pos.accuracy_m
+        );
+        assert!(
+            !pos.fallback,
+            "unequal-weight antipodal input does not trip the guard; fallback must be false \
+             even though accuracy_m clamped to 1000"
+        );
+    }
+
+    #[test]
+    fn antipodal_equal_weight_triggers_fallback() {
+        // AC#5: EQUAL-weight antipodal APs are the only case that fires the
+        // cancellation guard (the vector sum is exactly zero). The result is
+        // the strongest-AP fallback with the out-of-band `fallback` flag set
+        // and accuracy_m at the 1000 m sentinel — distinct on the wire from a
+        // legitimately-wide fix that clamps to 1000 with fallback=false.
+        let aps = vec![
+            PositionedAp {
+                lat: 0.0,
+                lon: 0.0,
+                signal_dbm: Some(-50),
+                is_mobile: false,
+            },
+            PositionedAp {
+                lat: 0.0,
+                lon: 180.0,
+                signal_dbm: Some(-50),
+                is_mobile: false,
+            },
+        ];
+        let pos = trilaterate(&aps).unwrap();
+        assert!(
+            pos.fallback,
+            "equal-weight antipodal input must set fallback=true"
+        );
+        assert_eq!(
+            pos.accuracy_m, 1000.0,
+            "fallback sentinel accuracy must be exactly 1000, got {}",
+            pos.accuracy_m
+        );
+        // The reported point is one of the two (tied) inputs.
+        let on_input = (pos.lat.abs() < 1e-6)
+            && (pos.lon.abs() < 1e-6 || (pos.lon.abs() - 180.0).abs() < 1e-6);
+        assert!(
+            on_input,
+            "fallback must echo one of the antipodal inputs, got ({},{})",
+            pos.lat, pos.lon
         );
     }
 

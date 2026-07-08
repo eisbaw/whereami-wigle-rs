@@ -7,6 +7,18 @@ and the project follows semver.
 
 ### Changed — wire format
 
+- `locate` response gains an optional boolean `fallback` field (task-0127).
+  It is `true` only when trilateration could not resolve a centroid (equal-weight
+  antipodal APs cancel) and the daemon returned the strongest single AP, in which
+  case `accuracy_m` is the fixed `1000` m sentinel rather than a measured spread.
+  Previously that `1000` rode in-band on `accuracy_m`, indistinguishable from a
+  legitimately-wide fix. The `accuracy_m` field is now documented as the weighted
+  spread of contributing AP positions around the centroid, clamped to `[10, 1000]`
+  m — a dispersion estimate, NOT a calibrated confidence radius. The wire name
+  `accuracy_m` is unchanged and the protocol version is not bumped. The addition
+  is backward-compatible: `fallback` is skip-serialized when false (absent from
+  normal responses), old clients ignore the unknown field, and new clients decode
+  its absence as `false` via serde default.
 - `locate` response no longer emits the `fetched` and `pending` integer fields
   (task-0117). Both were dead: they were hardcoded to `0` at every construction
   site because `locate` is cache-only — live fetching and pending-queue drain

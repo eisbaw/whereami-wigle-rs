@@ -259,6 +259,10 @@ pub struct LocateResponse {
     pub lat: f64,
     #[serde(default)]
     pub lon: f64,
+    /// Weighted spread of contributing AP positions around the centroid,
+    /// clamped to [10, 1000] m; a rough dispersion estimate, NOT a calibrated
+    /// 68%/95% confidence radius. When `fallback` is true this is the 1000 m
+    /// antipodal-ambiguity sentinel rather than a measured spread.
     #[serde(default)]
     pub accuracy_m: f64,
     #[serde(default)]
@@ -275,6 +279,12 @@ pub struct LocateResponse {
     /// returning the previous known position. Defaults to false.
     #[serde(default)]
     pub stale: bool,
+    /// True when the reported position is the daemon's antipodal-cancellation
+    /// fallback (the centroid was ambiguous; `accuracy_m` is then the 1000 m
+    /// sentinel, not a measured spread). Omitted by the daemon when false and
+    /// by older daemons entirely, both of which decode to false.
+    #[serde(default)]
+    pub fallback: bool,
     /// Age of the stale fix, in seconds. Only meaningful when `stale`.
     #[serde(default)]
     pub age_s: Option<u64>,
@@ -2002,6 +2012,26 @@ mod daemon_wire_cross_tests {
         assert_eq!(r.confidence, Confidence::Medium);
         assert_eq!(r.suspect_reason.as_deref(), Some("speed"));
         assert!(r.error.is_none());
+        // The daemon skip-serializes `fallback` when false, so the primary
+        // fixture omits it entirely; it must decode to false via serde default.
+        assert!(
+            !r.fallback,
+            "absent fallback field must default to false, not error"
+        );
+    }
+
+    /// Byte-exact daemon `locate` response for the antipodal-cancellation
+    /// fallback: `fallback:true` present and `accuracy_m` at the 1000 m
+    /// sentinel (task-0127). The daemon only emits `fallback` when true.
+    const LOCATE_FALLBACK_FIXTURE: &str = r#"{"ok":true,"v":1,"lat":0.0,"lon":0.0,"accuracy_m":1000.0,"sources":2,"cached":2,"visible":2,"stable":2,"fallback":true,"confidence":"low"}"#;
+
+    #[test]
+    fn locate_fallback_fixture_decodes_fallback_true() {
+        let r: LocateResponse = serde_json::from_slice(LOCATE_FALLBACK_FIXTURE.as_bytes()).unwrap();
+        assert!(r.ok);
+        assert!(r.fallback, "fallback:true on the wire must decode to true");
+        approx(r.accuracy_m, 1000.0);
+        assert!(!r.stale);
     }
 
     #[test]

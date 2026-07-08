@@ -567,6 +567,10 @@ struct LocateResponse {
     v: u32,
     lat: f64,
     lon: f64,
+    /// Weighted spread of contributing AP positions around the centroid,
+    /// clamped to [10, 1000] m; a rough dispersion estimate, NOT a calibrated
+    /// 68%/95% confidence radius. When `fallback` is true this is the 1000 m
+    /// antipodal-ambiguity sentinel rather than a measured spread.
     accuracy_m: f64,
     sources: usize,
     cached: usize,
@@ -577,6 +581,12 @@ struct LocateResponse {
     /// True if this is a stale last-known position (no current fix)
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stale: bool,
+    /// True iff the reported position is the antipodal-cancellation fallback
+    /// (the centroid was ambiguous, so the strongest AP was used and
+    /// `accuracy_m` is the 1000 m sentinel). Emitted only when true, mirroring
+    /// `stale`; absence decodes as false on older/normal responses.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    fallback: bool,
     /// Age of the last-known position in seconds (only set when stale)
     #[serde(skip_serializing_if = "Option::is_none")]
     age_s: Option<u64>,
@@ -2068,7 +2078,7 @@ async fn compute_locate_with_clock(
                 );
             }
 
-            let (lat, lon, accuracy_m, address) = match decision.winner {
+            let (lat, lon, accuracy_m, address, fallback) = match decision.winner {
                 PlausibilityWinner::CurrentTrilat => {
                     let mut new_fix = LastFix {
                         lat: pos.lat,
@@ -2137,7 +2147,7 @@ async fn compute_locate_with_clock(
                         .await;
                         None
                     };
-                    (pos.lat, pos.lon, pos.accuracy_m, address)
+                    (pos.lat, pos.lon, pos.accuracy_m, address, pos.fallback)
                 }
                 PlausibilityWinner::LastFix => {
                     if purpose == LocatePurpose::Autolocate {
@@ -2150,11 +2160,16 @@ async fn compute_locate_with_clock(
                     // already the literal winning observation; refreshing its
                     // timestamp would invent motion evidence, and persisting
                     // the drift-bound accuracy would compound it on every call.
+                    // The reported position is the persisted previous fix, a
+                    // legitimate observation. LastFix does not carry the
+                    // response-only `fallback` signal, so it is always false
+                    // here regardless of the current trilateration's fallback.
                     (
                         previous.lat,
                         previous.lon,
                         previous.accuracy_m + decision.distance_m,
                         previous.address.clone(),
+                        false,
                     )
                 }
             };
@@ -2172,6 +2187,7 @@ async fn compute_locate_with_clock(
                 stable: stable_count,
                 address,
                 stale: false,
+                fallback,
                 age_s: None,
                 implied_speed_kmh: decision.quality.implied_speed_kmh(),
                 last_fix_age_secs: decision.quality.last_fix_age_secs(),
@@ -2237,6 +2253,7 @@ async fn return_last_fix_or_error(
             stable,
             address: fix.address.clone(),
             stale: true,
+            fallback: false,
             age_s: Some(age_s),
             implied_speed_kmh: None,
             last_fix_age_secs: Some(age),
@@ -5009,6 +5026,54 @@ mod dispatch_tests {
                 "cold boot must omit {field}: {response}"
             );
         }
+        // A normal fix is not the antipodal fallback: the skip-when-false field
+        // must be absent (task-0127), decoding to false on the client.
+        assert!(
+            json.get("fallback").is_none(),
+            "normal locate must omit fallback: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn locate_antipodal_cached_aps_report_fallback_true() {
+        // task-0127 AC#5 at the dispatch level: two equal-weight, exactly
+        // antipodal cached APs trip trilaterate's cancellation guard. The wire
+        // response must carry fallback:true and the 1000 m sentinel accuracy,
+        // out-of-band from any legitimately-wide fix.
+        let state = test_state();
+        let mut sample = crate::debounce::ScanSample::new();
+        add_cached_scan_ap(
+            &state,
+            &mut sample,
+            "02:00:00:00:7f:00",
+            0.0,
+            0.0,
+            -50,
+            Some("a"),
+        );
+        add_cached_scan_ap(
+            &state,
+            &mut sample,
+            "02:00:00:00:7f:01",
+            0.0,
+            180.0,
+            -50,
+            Some("b"),
+        );
+        push_stable_scan(&state, sample).await;
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], true, "{response}");
+        assert_eq!(
+            json["fallback"], true,
+            "antipodal cached APs must report fallback=true: {response}"
+        );
+        assert_eq!(
+            json["accuracy_m"].as_f64().unwrap(),
+            1000.0,
+            "fallback sentinel accuracy must be 1000: {response}"
+        );
     }
 
     #[tokio::test]
