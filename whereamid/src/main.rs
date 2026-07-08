@@ -24,6 +24,11 @@ mod server;
 mod trilaterate;
 mod wigle;
 
+// Shared test-only helpers, declared under both crate roots (lib + bin) so
+// `crate::test_support::…` resolves in either test binary (task-0251).
+#[cfg(test)]
+mod test_support;
+
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

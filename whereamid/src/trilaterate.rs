@@ -1589,6 +1589,7 @@ mod tests {
             fn exit(&self, _: &span::Id) {}
         }
 
+        crate::test_support::install_permissive_global_test_subscriber(); // task-0251
         let captured = Captured::default();
         let cloned = captured.clone();
 

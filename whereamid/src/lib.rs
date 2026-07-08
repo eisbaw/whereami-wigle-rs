@@ -9,3 +9,8 @@ pub mod http;
 pub mod quality;
 pub mod scanner;
 pub mod trilaterate;
+
+// Shared test-only helpers, declared under both crate roots (lib + bin) so
+// `crate::test_support::…` resolves in either test binary (task-0251).
+#[cfg(test)]
+mod test_support;

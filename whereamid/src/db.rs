@@ -3502,6 +3502,7 @@ mod tests {
     }
 
     fn capture_events<T>(operation: impl FnOnce() -> T) -> (T, Vec<(tracing::Level, String)>) {
+        crate::test_support::install_permissive_global_test_subscriber(); // task-0251
         let captured = CapturedEvents::default();
         let events = captured.clone();
         let result = subscriber::with_default(captured, operation);
@@ -5872,6 +5873,7 @@ mod tests {
             at_rfc3339: "2026-05-09T00:00:00+00:00".to_string(),
             sources: 1,
         };
+        crate::test_support::install_permissive_global_test_subscriber(); // task-0251
         let captured = CapturedEvents::default();
         let older_events = captured.clone();
         install_commit_marker(&db, &captured);
@@ -5951,6 +5953,7 @@ mod tests {
             sources: 1,
         };
 
+        crate::test_support::install_permissive_global_test_subscriber(); // task-0251
         let captured = CapturedEvents::default();
         let events = captured.clone();
         install_commit_marker(&db, &captured);

@@ -569,6 +569,7 @@ mod tests {
         path: &std::path::Path,
         credentials_directory: Option<&std::path::Path>,
     ) -> (ConfigFile, Vec<(tracing::Level, String)>) {
+        crate::test_support::install_permissive_global_test_subscriber(); // task-0251
         let captured = CapturedEvents::default();
         let events = captured.clone();
         let config = subscriber::with_default(captured, || {
