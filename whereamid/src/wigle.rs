@@ -110,12 +110,19 @@ impl WigleClient {
 
     /// Look up a BSSID via WiGLE API.
     /// Returns Ok(Some(ApInfo)) on success, Ok(None) should not happen (use WigleError::NotFound).
+    ///
+    /// PRECONDITION: the caller must have verified `is_configured()`. Production
+    /// callers go through the `Provider` abstraction (`provider::wigle_lookup`),
+    /// which returns `Skipped` when unconfigured before ever reaching here — so
+    /// the precondition is asserted, not handled. A firing assertion means the
+    /// Provider abstraction was bypassed (task-0144; previously this was a dead
+    /// runtime `WigleError::Network` branch that no caller could reach).
     pub async fn lookup_bssid(&self, bssid: &str) -> std::result::Result<ApInfo, WigleError> {
-        if !self.is_configured() {
-            return Err(WigleError::Network(anyhow::anyhow!(
-                "WiGLE credentials not configured"
-            )));
-        }
+        debug_assert!(
+            self.is_configured(),
+            "WigleClient::lookup_bssid called without configured credentials; \
+             callers must go through the Provider abstraction"
+        );
 
         debug!("WiGLE lookup for {bssid}");
 
