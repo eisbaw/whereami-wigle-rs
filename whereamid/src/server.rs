@@ -2026,6 +2026,13 @@ async fn compute_locate_with_clock(
                         // last_fix (memory + disk) intact and record the
                         // observation in the fixes timeseries only. No geocode: a
                         // sentinel position has no meaningful address.
+                        //
+                        // NOTE: this arm relies on `*last` (the in-memory
+                        // last_fix) NOT being mutated earlier in this CurrentTrilat
+                        // branch — unlike the autolocate arm, it does not
+                        // re-assign `*last = previous`. Do not add a `*last`
+                        // write ahead of this point, or a fallback fix would
+                        // silently overwrite the prior in-memory last_fix.
                         if let Err(error) = state
                             .db
                             .persist_history_only(new_fix, decision.quality.clone())
