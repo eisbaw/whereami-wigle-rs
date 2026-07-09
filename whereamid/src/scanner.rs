@@ -690,6 +690,32 @@ fn nmcli_batch(stdout: &str, confirmed_refresh_started_at: Option<BootTime>) -> 
     }
 }
 
+/// Process-lifetime set of scanner parse warnings already emitted at WARN.
+///
+/// `parse_iw_output` / `parse_nmcli_output` run on EVERY scan cycle in the
+/// long-running daemon, so a chronically-malformed line (a driver that prints
+/// `signal: unknown dBm` for the same AP on every scan) would emit its WARN
+/// forever — steady WARN-level log spam. This set demotes such a line to DEBUG
+/// after its first occurrence: [`malformed_signal_warn_is_first`] returns `true`
+/// exactly once per key, `false` thereafter. Keyed by a source-tagged BSSID
+/// (`"iw:<bssid>"` / `"nmcli:<bssid>"`) so the two parsers do not suppress each
+/// other and so distinct broken APs each get one WARN (task-0256).
+///
+/// The state is process-global and never cleared (a bounded set: at most one
+/// entry per malformed BSSID ever seen). Tests must key on BSSIDs unique to the
+/// test to avoid cross-test contamination of this global set.
+fn malformed_signal_warn_is_first(key: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    // `HashSet::insert` returns true iff the key was newly inserted, i.e. the
+    // first time this process has seen it.
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("scanner malformed-warn set mutex poisoned")
+        .insert(key.to_owned())
+}
+
 /// Parse nmcli terse output. In -t mode, nmcli escapes ':' in field values as '\:'.
 /// The field separator is an unescaped ':'.
 /// Fields: BSSID:SSID:SIGNAL:CHAN:FREQ
@@ -707,6 +733,15 @@ pub fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
         // Split on unescaped ':' (i.e. ':' not preceded by '\')
         let fields = split_nmcli_fields(line);
         if fields.len() < 5 {
+            // A truncated row (e.g. clipped nmcli output) is dropped, same as
+            // before — but log it so the AP does not vanish silently, matching
+            // the malformed-signal observability (task-0256). DEBUG, not WARN:
+            // a chronically-truncated source would otherwise re-spam every scan,
+            // and this is off by default.
+            debug!(
+                "nmcli scan: skipping truncated row with {} of 5 expected fields: {line:?}",
+                fields.len()
+            );
             continue;
         }
 
@@ -725,10 +760,23 @@ pub fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
         let signal_pct: i32 = match fields[2].trim().parse() {
             Ok(v) => v,
             Err(_) => {
-                warn!(
-                    "nmcli scan: unparseable signal {:?}; skipping AP row",
-                    fields[2].trim()
-                );
+                // First occurrence for this BSSID warns; chronic repeats (the
+                // same driver printing a bad signal for the same AP every scan)
+                // are demoted to DEBUG so they cannot spam WARN for the daemon's
+                // lifetime (task-0256).
+                if malformed_signal_warn_is_first(&format!("nmcli:{bssid}")) {
+                    warn!(
+                        "nmcli scan: unparseable signal {:?} for BSSID {bssid}; skipping AP \
+                         row (further repeats for this BSSID log at DEBUG)",
+                        fields[2].trim()
+                    );
+                } else {
+                    debug!(
+                        "nmcli scan: unparseable signal {:?} for BSSID {bssid}; skipping AP \
+                         row (repeat; first occurrence logged at WARN)",
+                        fields[2].trim()
+                    );
+                }
                 continue;
             }
         };
@@ -929,12 +977,24 @@ pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
                 // `current_signal` stays None, so this BSS block is dropped at
                 // the next `BSS ` boundary. Without this warn the AP vanishes
                 // silently and an operator cannot see why. There is one
-                // `signal:` line per BSS block, so this is effectively
-                // once-per-block (no extra rate-limit machinery needed).
-                warn!(
-                    "iw scan: unparseable signal value in {line:?}; the AP is dropped unless \
-                     another signal line in this block parses"
-                );
+                // `signal:` line per BSS block, so this is once-per-block within
+                // ONE parse — but parse runs every scan cycle in the daemon, so
+                // a chronically-broken driver line would spam WARN for the whole
+                // process lifetime. First occurrence per BSS warns; repeats are
+                // demoted to DEBUG (task-0256).
+                let bssid = current_bssid.as_deref().unwrap_or("<unknown>");
+                if malformed_signal_warn_is_first(&format!("iw:{bssid}")) {
+                    warn!(
+                        "iw scan: unparseable signal value in {line:?} for BSS {bssid}; the AP \
+                         is dropped unless another signal line in this block parses (further \
+                         repeats for this BSS log at DEBUG)"
+                    );
+                } else {
+                    debug!(
+                        "iw scan: unparseable signal value in {line:?} for BSS {bssid}; the AP \
+                         is dropped (repeat; first occurrence logged at WARN)"
+                    );
+                }
             }
         } else if let Some(rest) = line.strip_prefix("SSID:") {
             let ssid = rest.trim();
@@ -2558,6 +2618,95 @@ BSS b8:50:01:aa:bb:cc(on wlan0)
                 .iter()
                 .any(|m| m.contains("unparseable signal") && m.contains("notanumber")),
             "expected a warn naming the malformed nmcli signal; got: {events:?}"
+        );
+    }
+
+    /// task-0256 AC#1: a chronically-malformed iw signal line must WARN on the
+    /// FIRST parse and DEBUG (never WARN) on subsequent parses, so a
+    /// permanently-broken driver line cannot spam WARN on every scan for the
+    /// daemon's lifetime.
+    ///
+    /// NON-FLAKY: the already-warned set is process-global and persists across
+    /// tests, so this test uses a BSSID (`02:00:00:00:56:01`) unique to it — no
+    /// sibling test warms that key first, so the first-occurrence WARN is
+    /// deterministic regardless of test order. The two parses run sequentially
+    /// within this one test, so the WARN-then-DEBUG ordering is deterministic.
+    #[test]
+    fn parse_iw_output_malformed_signal_warns_once_then_debug() {
+        let text = "BSS 02:00:00:00:56:01(on wlan-test)\n\
+            freq: 2437\n\
+            signal: unknown dBm\n\
+            SSID: fixture-chronic\n\
+            DS Parameter set: channel 6\n";
+
+        // First scan: exactly one WARN naming the offending line + BSS.
+        let (_first_networks, first) = capture_scanner_events(|| parse_iw_output(text));
+        let first_warns: Vec<&str> = warning_messages(&first)
+            .into_iter()
+            .filter(|m| m.contains("unparseable signal value") && m.contains("56:01"))
+            .collect();
+        assert_eq!(
+            first_warns.len(),
+            1,
+            "first scan of a malformed BSS must WARN exactly once; got: {first:?}"
+        );
+
+        // Second scan of the SAME malformed input: NO WARN (spam guard) —
+        // demoted to a single DEBUG so the drop stays observable at DEBUG.
+        let (_second_networks, second) = capture_scanner_events(|| parse_iw_output(text));
+        let second_warns: Vec<&str> = warning_messages(&second)
+            .into_iter()
+            .filter(|m| m.contains("unparseable signal value") && m.contains("56:01"))
+            .collect();
+        assert!(
+            second_warns.is_empty(),
+            "a repeated malformed BSS must NOT WARN again (spam guard); got: {second:?}"
+        );
+        let second_debugs: Vec<&str> = second
+            .iter()
+            .filter(|(level, message)| {
+                *level == tracing::Level::DEBUG
+                    && message.contains("unparseable signal value")
+                    && message.contains("56:01")
+            })
+            .map(|(_, message)| message.as_str())
+            .collect();
+        assert_eq!(
+            second_debugs.len(),
+            1,
+            "the repeat must be logged once at DEBUG, not dropped silently; got: {second:?}"
+        );
+    }
+
+    /// task-0256 AC#2: a truncated nmcli row (fewer than the 5 expected fields)
+    /// is still dropped, but the drop is now observable via a DEBUG line naming
+    /// the offending row — parity with the malformed-signal observability, so an
+    /// AP no longer vanishes silently on clipped nmcli output. DEBUG (not WARN)
+    /// because a chronically-truncated source would otherwise re-spam every scan.
+    #[test]
+    fn parse_nmcli_output_debug_logs_truncated_short_row() {
+        // Three fields (BSSID:SSID:SIGNAL) — below the 5-field minimum.
+        let text = "02\\:00\\:00\\:00\\:56\\:02:truncated-row:80\n";
+
+        let (networks, events) = capture_scanner_events(|| parse_nmcli_output(text));
+
+        assert!(
+            networks.is_empty(),
+            "a short (truncated) nmcli row must be dropped: {networks:?}"
+        );
+        let short_row_debugs: Vec<&str> = events
+            .iter()
+            .filter(|(level, message)| {
+                *level == tracing::Level::DEBUG
+                    && message.contains("expected fields")
+                    && message.contains("truncated-row")
+            })
+            .map(|(_, message)| message.as_str())
+            .collect();
+        assert_eq!(
+            short_row_debugs.len(),
+            1,
+            "a truncated nmcli row must emit one DEBUG naming the row; got: {events:?}"
         );
     }
 }
