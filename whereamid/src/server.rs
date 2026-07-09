@@ -2997,6 +2997,11 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
         // the WiGLE daily count. Remove in task-0267 once clients read the new
         // field.
         api_calls_today: stats.wigle_lookups_today,
+        wigle_counter_corruption_denials: api_counter_corruption_denials,
+        // Transitional dual-emit (task-0268): mirror the SAME value into the
+        // deprecated api_counter_corruption_denials field so pre-rename clients
+        // keep rendering the WiGLE corruption-denial count. Remove in task-0275
+        // once clients read wigle_counter_corruption_denials.
         api_counter_corruption_denials,
         inflight,
         db_write_failures,
@@ -3159,6 +3164,9 @@ mod stats_tests {
         // same fallback 0 while the counter row is corrupt (task-0130).
         assert_eq!(response["wigle_lookups_today"], 0);
         assert_eq!(response["api_calls_today"], 0);
+        // Transitional dual-emit (task-0268): both the new wigle_ field and the
+        // deprecated api_ mirror carry the same corruption-denial count.
+        assert_eq!(response["wigle_counter_corruption_denials"], 3);
         assert_eq!(response["api_counter_corruption_denials"], 3);
         assert_eq!(response["autolocate_fixes_written"], 4);
         assert_eq!(response["db_read_failures"], 5);

@@ -447,7 +447,10 @@ fn render_stats(resp: &StatsResponse) -> String {
         // the deprecated api_calls_today mirror for one release, but new clients
         // read wigle_lookups_today.
         resp.wigle_lookups_today,
-        resp.api_counter_corruption_denials,
+        // task-0268: render the WiGLE-specific corruption-denial counter. The
+        // daemon still emits the deprecated api_counter_corruption_denials
+        // mirror for one release, but new clients read the wigle_ field.
+        resp.wigle_counter_corruption_denials,
         resp.db_write_failures,
         resp.db_read_failures,
         resp.autolocate_fixes_written,
@@ -1719,6 +1722,7 @@ mod tests {
             db_size_bytes: 49_152,
             wigle_lookups_today: 5,
             api_calls_today: 5,
+            wigle_counter_corruption_denials: 9,
             api_counter_corruption_denials: 9,
             inflight: 6,
             db_write_failures: 7,

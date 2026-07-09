@@ -799,8 +799,16 @@ pub struct StatsResponse {
     #[serde(default)]
     pub api_calls_today: u32,
     /// Executed WiGLE reservations denied since daemon start because the
-    /// same-day persisted API counter was malformed. Distinct from normal
-    /// quota exhaustion and defaults to 0 for older daemons.
+    /// same-day persisted WiGLE counter was malformed. Distinct from normal
+    /// quota exhaustion and defaults to 0 for older daemons. Prefer this field
+    /// over the deprecated `api_counter_corruption_denials` mirror (task-0268).
+    #[serde(default)]
+    pub wigle_counter_corruption_denials: u64,
+    /// DEPRECATED transitional mirror of `wigle_counter_corruption_denials`,
+    /// emitted with the SAME value for one release so pre-rename clients keep
+    /// rendering the WiGLE corruption-denial count (task-0268). Scheduled for
+    /// removal in task-0275 — new clients must read
+    /// `wigle_counter_corruption_denials`.
     #[serde(default)]
     pub api_counter_corruption_denials: u64,
     /// In-flight provider lookups currently coalescing concurrent requests

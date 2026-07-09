@@ -314,6 +314,7 @@ Maximum **256 BSSIDs** per `resolve` request.
     "db_size_bytes": 49152,
     "wigle_lookups_today": 5,
     "api_calls_today": 5,
+    "wigle_counter_corruption_denials": 0,
     "api_counter_corruption_denials": 0,
     "inflight": 0,
     "db_write_failures": 0,
@@ -333,12 +334,19 @@ Maximum **256 BSSIDs** per `resolve` request.
   pre-rename daemon emits only `api_calls_today`, so a new client decoding it
   serde-defaults `wigle_lookups_today` to `0` for that transitional case.
 - `inflight` — provider lookups currently in-flight (the dedup set).
-- `api_counter_corruption_denials` — cumulative executed WiGLE reservation
+- `wigle_counter_corruption_denials` — cumulative executed WiGLE reservation
   attempts denied since daemon start because the same-day persisted
   `wigle_lookups_today` value was malformed. This is distinct from normal quota
   exhaustion and resets on restart. When the counter row is corrupt,
   `wigle_lookups_today` can render its fallback `0` while this denial count is
-  non-zero. This additive field does not change protocol version `v: 1`.
+  non-zero. This additive field does not change protocol version `v: 1`. This is
+  the WiGLE-specific successor to `api_counter_corruption_denials` (task-0268).
+- `api_counter_corruption_denials` — **DEPRECATED transitional mirror** of
+  `wigle_counter_corruption_denials`, emitted with the SAME value for one release
+  so pre-rename clients keep rendering the WiGLE corruption-denial count. New
+  clients must read `wigle_counter_corruption_denials`; this field is scheduled
+  for removal (task-0275). A legacy daemon emits neither field, so a new client
+  serde-defaults both to `0`.
 - `db_write_failures` — cumulative best-effort DB write failures since
   daemon start. Non-zero values indicate silent corruption is being logged
   but not fatal.

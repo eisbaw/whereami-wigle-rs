@@ -204,6 +204,7 @@ mod roundtrip {
             db_size_bytes: 40960,
             wigle_lookups_today: 12,
             api_calls_today: 12,
+            wigle_counter_corruption_denials: 3,
             api_counter_corruption_denials: 3,
             inflight: 2,
             db_write_failures: 1,
@@ -749,7 +750,7 @@ mod daemon_fixtures {
     // task-0123: channel is now the band-prefixed string ("2G/6"), not a bare
     // integer. Channel 6 is 2.4 GHz.
     const SCAN_FIXTURE: &str = r#"{"ok":true,"v":1,"networks":[{"bssid":"02:00:00:00:00:0a","ssid":"home","signal_dbm":-52,"channel":"2G/6"}],"scan_age_ms":1500,"scanned_at":"2026-01-02T03:04:05Z"}"#;
-    const STATS_FIXTURE: &str = r#"{"ok":true,"v":1,"cached_aps":100,"pending_aps":5,"not_found_aps":3,"db_size_bytes":40960,"wigle_lookups_today":12,"api_calls_today":12,"api_counter_corruption_denials":3,"inflight":2,"db_write_failures":1,"db_read_failures":4,"autolocate_fixes_written":7,"orphan_tasks_aborted":0}"#;
+    const STATS_FIXTURE: &str = r#"{"ok":true,"v":1,"cached_aps":100,"pending_aps":5,"not_found_aps":3,"db_size_bytes":40960,"wigle_lookups_today":12,"api_calls_today":12,"wigle_counter_corruption_denials":3,"api_counter_corruption_denials":3,"inflight":2,"db_write_failures":1,"db_read_failures":4,"autolocate_fixes_written":7,"orphan_tasks_aborted":0}"#;
     const DEBUG_FIXTURE: &str = r#"{"ok":true,"v":1,"daemon_rev":"abc1234","scan_age_ms":800,"samples_in_buffer":4,"visible":3,"stable":2,"bssids":[{"bssid":"02:00:00:00:00:aa","signal_dbm":-48,"seen":5,"needed":3,"is_stable":true,"db_status":"cached"},{"bssid":"02:00:00:00:00:bb","signal_dbm":null,"seen":2,"needed":3,"is_stable":false,"db_status":"new"}]}"#;
     const HISTORY_FIXTURE: &str = r#"{"ok":true,"v":1,"from":"2026-01-01T00:00:00Z","to":"2026-01-02T00:00:00Z","segments":[{"start_rfc3339":"2026-01-01T08:00:00Z","end_rfc3339":"2026-01-01T09:30:00Z","duration_secs":5400,"centroid_lat":55.6761,"centroid_lon":12.5683,"mean_accuracy_m":35.0,"n_fixes":42}]}"#;
     const VERSION_FIXTURE: &str = r#"{"ok":true,"v":1,"version":"0.1.0","git_rev":"deadbeef"}"#;
@@ -806,6 +807,11 @@ mod daemon_fixtures {
         // value, so old and new clients both render the WiGLE daily count.
         assert_eq!(st.wigle_lookups_today, 12);
         assert_eq!(st.api_calls_today, 12);
+        // task-0268 transitional dual-emit: a new daemon carries BOTH the new
+        // wigle_counter_corruption_denials and the deprecated
+        // api_counter_corruption_denials with the same value.
+        assert_eq!(st.wigle_counter_corruption_denials, 3);
+        assert_eq!(st.api_counter_corruption_denials, 3);
 
         let d: DebugResponse = serde_json::from_str(DEBUG_FIXTURE).unwrap();
         assert_eq!(d.daemon_rev.as_deref(), Some("abc1234"));
@@ -831,6 +837,10 @@ mod daemon_fixtures {
     fn legacy_stats_defaults_missing_counters_to_zero() {
         let json = r#"{"ok":true,"v":1,"cached_aps":101,"pending_aps":102,"not_found_aps":103,"db_size_bytes":104,"api_calls_today":105,"inflight":106,"db_write_failures":107}"#;
         let st: StatsResponse = serde_json::from_str(json).unwrap();
+        // task-0268 back-compat: a legacy daemon emits neither corruption-denial
+        // field, so serde defaults BOTH the new wigle_ and deprecated api_ mirror
+        // to 0.
+        assert_eq!(st.wigle_counter_corruption_denials, 0);
         assert_eq!(st.api_counter_corruption_denials, 0);
         assert_eq!(st.db_read_failures, 0);
         assert_eq!(st.autolocate_fixes_written, 0);
