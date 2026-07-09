@@ -264,7 +264,6 @@ pub use whereami_protocol::{
 #[derive(Deserialize)]
 struct HistoryFixesShape {
     ok: bool,
-    v: u32,
     #[serde(default)]
     range: Option<JsonObjectPresence>,
     #[serde(default)]
@@ -329,12 +328,6 @@ impl<'de> Deserialize<'de> for JsonArrayPresence {
         }
 
         deserializer.deserialize_seq(ArrayVisitor)
-    }
-}
-
-impl ProtocolResponse for HistoryFixesShape {
-    fn protocol_version(&self) -> u32 {
-        self.v
     }
 }
 
@@ -480,23 +473,6 @@ impl WhereAmIClient {
             );
         }
         Ok(prefix)
-    }
-
-    /// Version-gate a line and decode it into `T` WITHOUT interpreting `ok`.
-    ///
-    /// Used by the raw-history shape validator, which must let an `ok:false`
-    /// error envelope decode (so it can observe `ok` and pass the envelope
-    /// through to the byte-preserving `--json` path) rather than diverting it
-    /// into a [`DaemonError`]. The public typed accessors instead use
-    /// [`Self::parse_response_line`], which dispatches on `ok`.
-    fn decode_versioned<T>(&self, line: &str) -> Result<T>
-    where
-        T: for<'de> Deserialize<'de> + ProtocolResponse,
-    {
-        let prefix = self.check_version(line)?;
-        let response: T = serde_json::from_str(line).context("parsing response JSON")?;
-        debug_assert_eq!(response.protocol_version(), prefix.v);
-        Ok(response)
     }
 
     /// Parse a daemon response line into the typed response `T`, dispatching on
@@ -668,10 +644,24 @@ impl WhereAmIClient {
     }
 
     fn validate_history_fixes_response(&self, line: &str) -> Result<()> {
-        // Non-dispatching decode: an `ok:false` error envelope must reach the
-        // `--json` passthrough byte-for-byte, so it decodes here (with `ok`
-        // false) instead of being diverted into a DaemonError (task-0133).
-        let shape: HistoryFixesShape = self.decode_versioned(line)?;
+        // Non-dispatching, NON-version-gating decode. Two contracts meet here:
+        //
+        // - task-0133: an `ok:false` error envelope must reach the `--json`
+        //   passthrough byte-for-byte, so it decodes here (with `ok` false)
+        //   rather than being diverted into a DaemonError.
+        // - task-0266: `--json` is a pure daemon transport (task-0183), so the
+        //   `--json` path must NOT reject on protocol version for ANY command.
+        //   This decode therefore uses plain `serde_json::from_str` instead of
+        //   `check_version`, matching the pure `*_raw()` passthrough of
+        //   locate/scan: a line advertising `v > SUPPORTED_PROTOCOL_VERSION`
+        //   passes through unchanged. Version-gating lives only on the typed
+        //   (non-json) path, via `parse_response_line` -> `check_version`.
+        //
+        // What remains below is a genuine CAPABILITY check (feature support, not
+        // protocol version): an old daemon that ignored `raw:true` and returned
+        // a SEGMENTED success envelope lacks `range`/`fixes` and is rejected.
+        let shape: HistoryFixesShape =
+            serde_json::from_str(line).context("parsing raw-history response")?;
         if shape.ok && (shape.range.is_none() || shape.fixes.is_none()) {
             bail!(
                 "whereamid returned a successful segmented history response to a raw-fix request; \
@@ -1146,6 +1136,57 @@ mod history_fixes_wire_tests {
                 .parse_response_line::<HistoryFixesResponse>(malformed_fix)
                 .is_err(),
             "typed history must still validate every HistoryFix field"
+        );
+    }
+
+    // task-0266: `--json` is a uniform daemon transport. The raw-history path
+    // (`history_fixes_raw` -> `validate_history_fixes_response`) must NOT reject
+    // a line advertising an unsupported protocol version, matching the pure
+    // `*_raw()` passthrough of locate/scan (whose byte-identical forwarding of a
+    // `v>SUPPORTED` line is pinned by the `json_locate_passes_newer_protocol_
+    // through_byte_identically` integration test in tests/protocol_version.rs).
+    #[test]
+    fn raw_history_json_passthrough_accepts_unsupported_protocol_version() {
+        let unsupported = SUPPORTED_PROTOCOL_VERSION + 1;
+        let line = format!(
+            r#"{{"ok":true,"v":{unsupported},"range":{{"from_rfc3339":"a","to_rfc3339":"b"}},"fixes":[]}}"#
+        );
+
+        // Formerly rejected via decode_versioned -> check_version; now passes.
+        client()
+            .validate_history_fixes_response(&line)
+            .expect("raw-history --json must not version-gate (uniform passthrough)");
+
+        // End-to-end: the byte-preserving accessor forwards the line unchanged.
+        let (tcp_client, _rx) = tcp_daemon_once(line.clone());
+        assert_eq!(
+            tcp_client
+                .history_fixes_raw(Some("24h".to_string()), None, None, None)
+                .unwrap(),
+            line,
+            "unsupported-version raw line must pass through byte-identically"
+        );
+    }
+
+    // task-0266: dropping the version gate must NOT drop the capability check.
+    // An old daemon that ignored `raw:true` returns a SEGMENTED envelope (no
+    // `range`/`fixes`); that is rejected regardless of protocol version, because
+    // it is a FEATURE-support failure, not a protocol-version failure.
+    #[test]
+    fn raw_history_capability_check_bites_independent_of_protocol_version() {
+        let unsupported = SUPPORTED_PROTOCOL_VERSION + 1;
+        // A NEWER daemon that still answered with a segmented body is a genuine
+        // capability mismatch and must bail, even though its `v` is unsupported
+        // (proving the bail is the capability check, not a version rejection).
+        let segmented =
+            format!(r#"{{"ok":true,"v":{unsupported},"from":"a","to":"b","segments":[]}}"#);
+        let error = client()
+            .validate_history_fixes_response(&segmented)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("successful segmented history response"),
+            "capability check must still fire on a segmented success: {error}"
         );
     }
 }

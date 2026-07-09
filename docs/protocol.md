@@ -625,6 +625,16 @@ schema-invalid response with `ok: true` can therefore pass through and exit 0.
 Human mode uses the typed response for that command and can reject the same line
 during deserialization.
 
+This holds **uniformly for every daemon-backed command** (TASK-0266). No command
+version-gates under `--json`: a line advertising a protocol `v` newer than the
+client supports is still passed through byte-for-byte (subject only to the
+valid-JSON and boolean-`ok` checks). Protocol-version gating — rejecting
+`v > SUPPORTED` — lives *only* on the typed (non-`--json`, human) path, via the
+per-command typed parse. `history --raw --json` follows this rule like
+`locate`/`scan`: its client-side validation is a *capability* check (it rejects
+an old daemon that ignored `raw:true` and answered with a segmented body), which
+is independent of protocol version and does not reject on `v` alone.
+
 If no daemon line is available because transport failed, or if the daemon line
 is not valid JSON, the CLI emits its own valid JSON error object and exits 1:
 
