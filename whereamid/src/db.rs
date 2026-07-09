@@ -1574,15 +1574,11 @@ impl DbHandle {
             bssids
                 .into_iter()
                 .map(|bssid| {
-                    let status = if db.get_ap(&bssid)?.is_some() {
-                        DebugDbStatus::Cached
-                    } else if db.is_not_found(&bssid, ttl_days)? {
-                        DebugDbStatus::NotFound
-                    } else if db.is_pending(&bssid)? {
-                        DebugDbStatus::Pending
-                    } else {
-                        DebugDbStatus::New
-                    };
+                    // task-0139: one LEFT-JOIN query per bssid (was three
+                    // SELECTs) inside this single read() lock. classify_bssid
+                    // preserves the exact aps>not_found>pending>new priority and
+                    // ttl-bounded not_found semantics of the former if-else.
+                    let status = db.classify_bssid(&bssid, ttl_days)?;
                     Ok((bssid, status))
                 })
                 .collect()
@@ -2811,6 +2807,12 @@ impl Database {
     // --- aps table ---
 
     /// Look up an AP by BSSID. Returns None if not cached.
+    ///
+    /// task-0139: production classification now goes through `classify_bssid`
+    /// (single LEFT-JOIN query), so the single-row `get_ap` primitive has no
+    /// non-test callers left — the production read path fetches AP payloads in
+    /// batch. Gated to test builds like the sibling single-row helpers.
+    #[cfg(test)]
     pub fn get_ap(&self, bssid: &str) -> Result<Option<ApInfo>> {
         let result = self
             .conn
@@ -3097,6 +3099,11 @@ impl Database {
     /// `get_pending(N).iter().any(...)` — that pattern is O(N) per call and
     /// scans rows we never inspect. For per-BSSID checks (debug rendering,
     /// not_found end-of-chain logic) this is the right primitive.
+    ///
+    /// task-0139: the debug-render caller now uses `classify_bssid`, leaving no
+    /// non-test callers of this single-BSSID probe. Gated to test builds like
+    /// the sibling single-row helpers.
+    #[cfg(test)]
     pub fn is_pending(&self, bssid: &str) -> Result<bool> {
         let exists: Option<i32> = self
             .conn
@@ -3107,6 +3114,52 @@ impl Database {
             )
             .optional()?;
         Ok(exists.is_some())
+    }
+
+    /// Classify a BSSID's DB state in ONE query (task-0139).
+    ///
+    /// Collapses the `get_ap` + `is_not_found` + `is_pending` probe chain into
+    /// a single LEFT JOIN across aps / not_found / pending. Returns only the
+    /// status TAG (`DebugDbStatus`) — NOT the cached `ApInfo` payload — so a
+    /// caller that needs the position (e.g. trilateration) must still call
+    /// `get_ap`.
+    ///
+    /// Priority is byte-identical to the `debug_statuses` if-else chain:
+    /// - aps row present            => `Cached`
+    /// - else not_found within ttl  => `NotFound`
+    /// - else pending present       => `Pending`
+    /// - else                       => `New`
+    ///
+    /// The not_found JOIN carries `checked_at > cutoff` where
+    /// `cutoff = now - ttl_days`, replicating `is_not_found`'s predicate
+    /// EXACTLY: a not_found row older than the ttl is treated as absent and
+    /// classification falls through to pending / new, just as today.
+    ///
+    /// All three tables have `bssid` as PRIMARY KEY, so each LEFT JOIN matches
+    /// at most one row and the base `(SELECT ?1)` row is never multiplied —
+    /// `query_row` sees exactly one row for any input.
+    pub fn classify_bssid(&self, bssid: &str, ttl_days: i64) -> Result<DebugDbStatus> {
+        let cutoff = (Utc::now() - chrono::TimeDelta::days(ttl_days)).to_rfc3339();
+        let tag: i64 = self.conn.query_row(
+            "SELECT CASE
+                        WHEN a.bssid IS NOT NULL THEN 0
+                        WHEN n.bssid IS NOT NULL THEN 1
+                        WHEN p.bssid IS NOT NULL THEN 2
+                        ELSE 3
+                    END
+             FROM (SELECT ?1 AS bssid) q
+             LEFT JOIN aps       a ON a.bssid = q.bssid
+             LEFT JOIN not_found n ON n.bssid = q.bssid AND n.checked_at > ?2
+             LEFT JOIN pending   p ON p.bssid = q.bssid",
+            params![bssid, cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(match tag {
+            0 => DebugDbStatus::Cached,
+            1 => DebugDbStatus::NotFound,
+            2 => DebugDbStatus::Pending,
+            _ => DebugDbStatus::New,
+        })
     }
 
     /// Increment attempts for a pending BSSID.
@@ -3884,6 +3937,92 @@ mod tests {
         )
         .unwrap();
         db.set_metadata("wigle_lookups_today", raw).unwrap();
+    }
+
+    /// task-0139: classify_bssid must be byte-identical to the old
+    /// get_ap/is_not_found/is_pending if-else — same aps-wins priority and same
+    /// ttl-bounded not_found semantics. This test bites on the LEFT-JOIN's
+    /// ordering and ttl predicate: if the JOIN got the CASE order wrong the
+    /// priority asserts fail, and if the `checked_at > cutoff` predicate were
+    /// dropped or inverted the expired-not_found asserts fail (and disagree with
+    /// the reference `is_not_found`).
+    #[test]
+    fn classify_bssid_matches_ifelse_priority_and_ttl() {
+        let db = Database::open_memory().unwrap();
+        let ttl = 14;
+
+        // New: absent from every table.
+        assert!(matches!(
+            db.classify_bssid("absent", ttl).unwrap(),
+            DebugDbStatus::New
+        ));
+
+        // Cached: aps row present.
+        let ap = sample_ap(1);
+        db.upsert_ap(&ap).unwrap();
+        assert!(matches!(
+            db.classify_bssid(&ap.bssid, ttl).unwrap(),
+            DebugDbStatus::Cached
+        ));
+
+        // NotFound: fresh not_found row within ttl.
+        db.insert_not_found("nf").unwrap();
+        assert!(matches!(
+            db.classify_bssid("nf", ttl).unwrap(),
+            DebugDbStatus::NotFound
+        ));
+
+        // Pending: only in the pending queue.
+        db.insert_pending("pend", Some("ssid"), Some(2437), Some(-40))
+            .unwrap();
+        assert!(matches!(
+            db.classify_bssid("pend", ttl).unwrap(),
+            DebugDbStatus::Pending
+        ));
+
+        // PRIORITY: aps wins over a fresh not_found for the SAME bssid.
+        db.insert_not_found(&ap.bssid).unwrap();
+        // The not_found row really is present and fresh (reference agrees)...
+        assert!(db.is_not_found(&ap.bssid, ttl).unwrap());
+        // ...yet classify still returns Cached, matching the if-else order.
+        assert!(
+            matches!(
+                db.classify_bssid(&ap.bssid, ttl).unwrap(),
+                DebugDbStatus::Cached
+            ),
+            "aps must win over not_found, matching the if-else priority"
+        );
+
+        // TTL: a not_found row OLDER than ttl is treated as ABSENT. Backdate a
+        // fresh row well past the cutoff.
+        db.insert_not_found("stale").unwrap();
+        let stale = (Utc::now() - chrono::TimeDelta::days(ttl + 16)).to_rfc3339();
+        db.conn
+            .execute(
+                "UPDATE not_found SET checked_at = ?1 WHERE bssid = 'stale'",
+                params![stale],
+            )
+            .unwrap();
+        // Reference is_not_found agrees the expired row does not count.
+        assert!(!db.is_not_found("stale", ttl).unwrap());
+        // 'stale' lives ONLY in (expired) not_found => falls through to New.
+        assert!(
+            matches!(db.classify_bssid("stale", ttl).unwrap(), DebugDbStatus::New),
+            "expired not_found must fall through, not classify NotFound"
+        );
+
+        // TTL fall-through to Pending: expired not_found + a pending row => the
+        // expired not_found is skipped and pending is reached, exactly as the
+        // if-else chain would.
+        db.insert_pending("stale", Some("ssid"), None, None)
+            .unwrap();
+        assert!(
+            matches!(
+                db.classify_bssid("stale", ttl).unwrap(),
+                DebugDbStatus::Pending
+            ),
+            "expired not_found + pending must classify Pending, matching if-else fall-through"
+        );
     }
 
     #[test]
