@@ -455,8 +455,20 @@ pub struct LocateResponse {
     /// antipodal-ambiguity sentinel rather than a measured spread.
     #[serde(default)]
     pub accuracy_m: f64,
+    /// Number of APs that contributed to this fix's computed position. On a
+    /// fresh fix this equals [`cached`](Self::cached) because `locate` is
+    /// cache-only (task-0117) — every contributing AP is a cache hit. On a
+    /// stale fallback served from the persisted last fix, this is the
+    /// historical fix's source count while `cached` is 0.
     #[serde(default)]
     pub sources: usize,
+    /// Of the contributing APs, how many came from the local cache. Equals
+    /// [`sources`](Self::sources) on a fresh fix (locate never fetches live —
+    /// task-0117) and is 0 on a stale fallback (no current cache AP
+    /// contributed; the position came from the persisted last fix). Audited in
+    /// task-0261: `sources` and `cached` are distinct signals that coincide on
+    /// the common fresh path but diverge on stale fallback, so neither is
+    /// redundant.
     #[serde(default)]
     pub cached: usize,
     #[serde(default)]
