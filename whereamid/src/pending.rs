@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
 
-use crate::provider::Provider;
+use crate::provider::{AppleProvider, Provider, WigleProvider};
 use crate::resolver::{resolve_chain_with_observations, ChainMode, ObservedAp};
 use crate::server::DaemonState;
 
@@ -47,7 +47,7 @@ pub async fn run_pending_drain(state: Arc<DaemonState>) {
             _ = drain_once(
                 &state,
                 max_attempts,
-                &[Provider::Apple, Provider::Wigle],
+                &[&AppleProvider, &WigleProvider],
                 state.privacy.ticket(),
             ) => {}
         }
@@ -57,13 +57,13 @@ pub async fn run_pending_drain(state: Arc<DaemonState>) {
 /// Run one drain pass over the pending queue using `providers` as the chain.
 ///
 /// `providers` is injected (rather than hard-coded) so tests can drive the
-/// pass with `Provider::Mock`s; production passes `[Apple, Wigle]`. The real
-/// Apple provider makes network calls and never returns `Skipped`, so the
+/// pass with `MockProvider`s; production passes `[AppleProvider, WigleProvider]`.
+/// The real Apple provider makes network calls and never returns `Skipped`, so the
 /// all-Skipped fairness/age-out cases below are reachable only under mocks.
 async fn drain_once(
     state: &Arc<DaemonState>,
     max_attempts: i32,
-    providers: &[Provider],
+    providers: &[&dyn Provider],
     ticket: crate::privacy::PrivacyTicket,
 ) {
     // Clean up entries that exceeded max attempts
@@ -259,12 +259,9 @@ mod tests {
             .unwrap();
         assert!(crate::server::lock_db(&state).is_pending(&bssid).unwrap());
 
-        let mock_a = std::sync::Arc::new(MockProvider::new("a", |_| ProviderOutcome::NotFound));
-        let mock_b = std::sync::Arc::new(MockProvider::new("b", |_| ProviderOutcome::NotFound));
-        let providers = [
-            crate::provider::Provider::Mock(std::sync::Arc::clone(&mock_a)),
-            crate::provider::Provider::Mock(std::sync::Arc::clone(&mock_b)),
-        ];
+        let mock_a = MockProvider::new("a", |_| ProviderOutcome::NotFound);
+        let mock_b = MockProvider::new("b", |_| ProviderOutcome::NotFound);
+        let providers: [&dyn Provider; 2] = [&mock_a, &mock_b];
         let _ = resolve_chain(
             std::slice::from_ref(&bssid),
             &state,
@@ -296,14 +293,11 @@ mod tests {
             .insert_pending(&bssid, None, None, None)
             .unwrap();
 
-        let mock_a = std::sync::Arc::new(MockProvider::new("a", |_| ProviderOutcome::NotFound));
-        let mock_b = std::sync::Arc::new(MockProvider::new("b", |_| {
+        let mock_a = MockProvider::new("a", |_| ProviderOutcome::NotFound);
+        let mock_b = MockProvider::new("b", |_| {
             ProviderOutcome::NetworkError(anyhow::anyhow!("simulated"))
-        }));
-        let providers = [
-            crate::provider::Provider::Mock(std::sync::Arc::clone(&mock_a)),
-            crate::provider::Provider::Mock(std::sync::Arc::clone(&mock_b)),
-        ];
+        });
+        let providers: [&dyn Provider; 2] = [&mock_a, &mock_b];
         let _ = resolve_chain(
             std::slice::from_ref(&bssid),
             &state,
@@ -321,8 +315,8 @@ mod tests {
         assert!(pending, "pending row must survive a transient error");
     }
 
-    fn mock(name: &'static str, outcome: fn(&str) -> ProviderOutcome) -> Provider {
-        Provider::Mock(std::sync::Arc::new(MockProvider::new(name, outcome)))
+    fn mock(name: &'static str, outcome: fn(&str) -> ProviderOutcome) -> MockProvider {
+        MockProvider::new(name, outcome)
     }
 
     #[tokio::test]
@@ -351,7 +345,13 @@ mod tests {
             })
         });
 
-        drain_once(&state, 20, &[provider], state.privacy.ticket()).await;
+        drain_once(
+            &state,
+            20,
+            &[&provider as &dyn Provider],
+            state.privacy.ticket(),
+        )
+        .await;
 
         let db = crate::server::lock_db(&state);
         let mobile_ap = db.get_ap(&mobile).unwrap().unwrap();
@@ -380,11 +380,9 @@ mod tests {
             .insert_pending(&bssid, None, None, None)
             .unwrap();
 
-        let apple = std::sync::Arc::new(MockProvider::new("apple", |_| ProviderOutcome::NotFound));
-        let providers = [
-            crate::provider::Provider::Mock(std::sync::Arc::clone(&apple)),
-            mock("wigle", |_| ProviderOutcome::Skipped),
-        ];
+        let apple = MockProvider::new("apple", |_| ProviderOutcome::NotFound);
+        let wigle = mock("wigle", |_| ProviderOutcome::Skipped);
+        let providers: [&dyn Provider; 2] = [&apple, &wigle];
         let _ = resolve_chain(
             std::slice::from_ref(&bssid),
             &state,
@@ -419,10 +417,9 @@ mod tests {
             .insert_pending(&bssid, None, None, None)
             .unwrap();
 
-        let providers = [
-            mock("p1", |_| ProviderOutcome::Skipped),
-            mock("p2", |_| ProviderOutcome::Skipped),
-        ];
+        let p1 = mock("p1", |_| ProviderOutcome::Skipped);
+        let p2 = mock("p2", |_| ProviderOutcome::Skipped);
+        let providers: [&dyn Provider; 2] = [&p1, &p2];
         let _ = resolve_chain(
             std::slice::from_ref(&bssid),
             &state,
@@ -462,13 +459,9 @@ mod tests {
                 .unwrap();
         }
 
-        let wigle = std::sync::Arc::new(MockProvider::new("wigle-429", |_| {
-            ProviderOutcome::HardStop
-        }));
-        let providers = [
-            mock("apple", |_| ProviderOutcome::NotFound),
-            Provider::Mock(std::sync::Arc::clone(&wigle)),
-        ];
+        let apple = mock("apple", |_| ProviderOutcome::NotFound);
+        let wigle = MockProvider::new("wigle-429", |_| ProviderOutcome::HardStop);
+        let providers: [&dyn Provider; 2] = [&apple, &wigle];
         let bssids = [b1.clone(), b2.clone()];
         let _ = resolve_chain(
             &bssids,
@@ -511,11 +504,10 @@ mod tests {
             .insert_pending(&bssid, None, None, None)
             .unwrap();
 
-        let providers = [
-            mock("apple", |_| ProviderOutcome::NotFound),
-            // Stands in for wigle_lookup's quota-exhausted (`!reserved`) branch.
-            mock("wigle-quota-exhausted", |_| ProviderOutcome::Skipped),
-        ];
+        let apple = mock("apple", |_| ProviderOutcome::NotFound);
+        // Stands in for wigle_lookup's quota-exhausted (`!reserved`) branch.
+        let wigle = mock("wigle-quota-exhausted", |_| ProviderOutcome::Skipped);
+        let providers: [&dyn Provider; 2] = [&apple, &wigle];
         let _ = resolve_chain(
             std::slice::from_ref(&bssid),
             &state,
@@ -547,7 +539,8 @@ mod tests {
             .insert_pending(&bssid, None, None, None)
             .unwrap();
 
-        let providers = [mock("skip", |_| ProviderOutcome::Skipped)];
+        let skip = mock("skip", |_| ProviderOutcome::Skipped);
+        let providers: [&dyn Provider; 1] = [&skip];
         // attempts: 0 -> 1 -> 2, then delete_expired removes it at attempts>=2.
         for _ in 0..(max_attempts + 1) {
             drain_once(&state, max_attempts, &providers, state.privacy.ticket()).await;
@@ -578,7 +571,8 @@ mod tests {
             }
         }
 
-        let providers = [mock("skip", |_| ProviderOutcome::Skipped)];
+        let skip = mock("skip", |_| ProviderOutcome::Skipped);
+        let providers: [&dyn Provider; 1] = [&skip];
         // High cap so nothing expires; we are testing rotation, not age-out.
         let max_attempts = 1000;
         drain_once(&state, max_attempts, &providers, state.privacy.ticket()).await;
@@ -632,7 +626,8 @@ mod tests {
         crate::server::lock_db(&state)
             .execute_batch_for_test("DROP TABLE pending;")
             .unwrap();
-        let providers = [mock("m", |_| ProviderOutcome::NotFound)];
+        let m = mock("m", |_| ProviderOutcome::NotFound);
+        let providers: [&dyn Provider; 1] = [&m];
 
         assert_eq!(state.db_read_failures.load(Relaxed), 0);
         drain_once(

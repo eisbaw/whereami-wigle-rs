@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::db::ApInfo;
-use crate::provider::{Provider, ProviderOutcome};
+use crate::provider::{AppleProvider, Provider, ProviderOutcome, WigleProvider};
 use crate::server::DaemonState;
 
 /// RAII guard for an in-flight BSSID claim.
@@ -251,7 +251,7 @@ pub async fn lookup_cached_readonly(
 pub async fn resolve_chain(
     bssids: &[String],
     state: &Arc<DaemonState>,
-    providers: &[Provider],
+    providers: &[&dyn Provider],
     mode: ChainMode,
     ticket: crate::privacy::PrivacyTicket,
 ) -> ResolveResult {
@@ -264,7 +264,7 @@ pub async fn resolve_chain(
 pub(crate) async fn resolve_chain_with_observations(
     bssids: &[String],
     state: &Arc<DaemonState>,
-    providers: &[Provider],
+    providers: &[&dyn Provider],
     mode: ChainMode,
     ticket: crate::privacy::PrivacyTicket,
     observations: &[ObservedAp],
@@ -279,7 +279,7 @@ pub(crate) async fn resolve_chain_with_observations(
 async fn resolve_chain_inner(
     bssids: &[String],
     state: &Arc<DaemonState>,
-    providers: &[Provider],
+    providers: &[&dyn Provider],
     mode: ChainMode,
     ticket: crate::privacy::PrivacyTicket,
     observed_ssids: &std::collections::HashMap<&str, &Option<String>>,
@@ -620,7 +620,7 @@ pub async fn resolve_readonly(
     resolve_chain(
         bssids,
         state,
-        &[Provider::Wigle],
+        &[&WigleProvider],
         ChainMode::ReadOnly,
         ticket,
     )
@@ -644,7 +644,7 @@ pub async fn resolve_background(
     let _ = resolve_chain_with_observations(
         &bssids,
         state,
-        &[Provider::Apple, Provider::Wigle],
+        &[&AppleProvider, &WigleProvider],
         ChainMode::Background,
         ticket,
         observations,
@@ -661,8 +661,8 @@ mod tests {
 
     /// Build a minimal DaemonState backed by an in-memory DB via the single
     /// shared test constructor (task-0230). The Apple/WiGLE/Nominatim clients
-    /// are real but never called when the test uses only Provider::Mock(...) as
-    /// the chain providers.
+    /// are real but never called when the test uses only MockProvider trait
+    /// objects as the chain providers.
     fn test_state() -> Arc<DaemonState> {
         crate::server::test_state()
     }
@@ -688,10 +688,10 @@ mod tests {
         let cached = mk_ap("aa:bb:cc:dd:ee:01", 55.0, 12.0, Source::Apple);
         crate::server::lock_db(&state).upsert_ap(&cached).unwrap();
 
-        let mock = std::sync::Arc::new(MockProvider::new("mock", |_| {
+        let mock = MockProvider::new("mock", |_| {
             ProviderOutcome::Found(mk_ap("zz:zz:zz:zz:zz:zz", 0.0, 0.0, Source::Wigle))
-        }));
-        let providers = [Provider::Mock(std::sync::Arc::clone(&mock))];
+        });
+        let providers: [&dyn Provider; 1] = [&mock];
 
         let result = resolve_chain(
             &["aa:bb:cc:dd:ee:01".to_string()],
@@ -716,16 +716,13 @@ mod tests {
         let state = test_state();
         let target = "aa:bb:cc:dd:ee:02".to_string();
 
-        let mock_a = std::sync::Arc::new(MockProvider::new("a", |bssid| {
+        let mock_a = MockProvider::new("a", |bssid| {
             ProviderOutcome::Found(mk_ap(bssid, 1.0, 2.0, Source::Apple))
-        }));
-        let mock_b = std::sync::Arc::new(MockProvider::new("b", |_| {
+        });
+        let mock_b = MockProvider::new("b", |_| {
             unreachable!("second provider must not be called when first found")
-        }));
-        let providers = [
-            Provider::Mock(std::sync::Arc::clone(&mock_a)),
-            Provider::Mock(std::sync::Arc::clone(&mock_b)),
-        ];
+        });
+        let providers: [&dyn Provider; 2] = [&mock_a, &mock_b];
 
         let result = resolve_chain(
             std::slice::from_ref(&target),
@@ -768,7 +765,7 @@ mod tests {
                 ssid: Some("fixed-home-network".to_owned()),
             },
         ];
-        let mock = std::sync::Arc::new(MockProvider::new("apple-like", |bssid| {
+        let mock = MockProvider::new("apple-like", |bssid| {
             let mut ap = mk_ap(bssid, 55.0, 12.0, Source::Apple);
             // Deliberately contradictory provider metadata. The scanner
             // observation must win in all three cases, including explicit
@@ -778,12 +775,12 @@ mod tests {
                 _ => Some("DSB_Wi-Fi".to_owned()),
             };
             ProviderOutcome::Found(ap)
-        }));
+        });
 
         let result = resolve_chain_with_observations(
             &bssids,
             &state,
-            &[Provider::Mock(mock)],
+            &[&mock as &dyn Provider],
             ChainMode::Background,
             state.privacy.ticket(),
             &observations,
@@ -812,12 +809,9 @@ mod tests {
         let state = test_state();
         let target = "aa:bb:cc:dd:ee:03".to_string();
 
-        let mock_a = std::sync::Arc::new(MockProvider::new("a", |_| ProviderOutcome::NotFound));
-        let mock_b = std::sync::Arc::new(MockProvider::new("b", |_| ProviderOutcome::NotFound));
-        let providers = [
-            Provider::Mock(std::sync::Arc::clone(&mock_a)),
-            Provider::Mock(std::sync::Arc::clone(&mock_b)),
-        ];
+        let mock_a = MockProvider::new("a", |_| ProviderOutcome::NotFound);
+        let mock_b = MockProvider::new("b", |_| ProviderOutcome::NotFound);
+        let providers: [&dyn Provider; 2] = [&mock_a, &mock_b];
 
         let _ = resolve_chain(
             std::slice::from_ref(&target),
@@ -849,14 +843,11 @@ mod tests {
         let state = test_state();
         let target = "aa:bb:cc:dd:ee:04".to_string();
 
-        let mock_a = std::sync::Arc::new(MockProvider::new("a", |_| ProviderOutcome::NotFound));
-        let mock_b = std::sync::Arc::new(MockProvider::new("b", |_| {
+        let mock_a = MockProvider::new("a", |_| ProviderOutcome::NotFound);
+        let mock_b = MockProvider::new("b", |_| {
             ProviderOutcome::NetworkError(anyhow::anyhow!("simulated"))
-        }));
-        let providers = [
-            Provider::Mock(std::sync::Arc::clone(&mock_a)),
-            Provider::Mock(std::sync::Arc::clone(&mock_b)),
-        ];
+        });
+        let providers: [&dyn Provider; 2] = [&mock_a, &mock_b];
 
         let _ = resolve_chain(
             std::slice::from_ref(&target),
@@ -898,10 +889,10 @@ mod tests {
             .unwrap()
             .insert(target.clone(), state.privacy.ticket());
 
-        let mock = std::sync::Arc::new(MockProvider::new("blocked", |_| {
+        let mock = MockProvider::new("blocked", |_| {
             unreachable!("provider must not be called when BSSID is already inflight")
-        }));
-        let providers = [Provider::Mock(std::sync::Arc::clone(&mock))];
+        });
+        let providers: [&dyn Provider; 1] = [&mock];
 
         let result = resolve_chain(
             std::slice::from_ref(&target),
@@ -983,13 +974,13 @@ mod tests {
 
         let target = "aa:bb:cc:dd:ee:ac".to_string();
         let result_bssid = target.clone();
-        let provider = std::sync::Arc::new(MockProvider::new("post-wipe", move |_| {
+        let provider = MockProvider::new("post-wipe", move |_| {
             ProviderOutcome::Found(mk_ap(&result_bssid, 1.0, 2.0, Source::Apple))
-        }));
+        });
         let result = resolve_chain(
             std::slice::from_ref(&target),
             &state,
-            &[Provider::Mock(std::sync::Arc::clone(&provider))],
+            &[&provider as &dyn Provider],
             ChainMode::Background,
             stale,
         )
@@ -1002,7 +993,7 @@ mod tests {
         let result = resolve_chain(
             std::slice::from_ref(&target),
             &state,
-            &[Provider::Mock(std::sync::Arc::clone(&provider))],
+            &[&provider as &dyn Provider],
             ChainMode::Background,
             fresh,
         )
@@ -1035,7 +1026,7 @@ mod tests {
             resolve_chain(
                 &[resolve_target],
                 &resolve_state,
-                &[Provider::Mock(resolve_provider)],
+                &[&*resolve_provider as &dyn Provider],
                 ChainMode::Background,
                 ticket,
             )
@@ -1071,14 +1062,14 @@ mod tests {
         let definitive = "aa:bb:cc:dd:ee:d1".to_string();
         let skipped = "aa:bb:cc:dd:ee:d2".to_string();
 
-        let mock = std::sync::Arc::new(MockProvider::new("p", |b| {
+        let mock = MockProvider::new("p", |b| {
             if b.ends_with("d2") {
                 ProviderOutcome::Skipped
             } else {
                 ProviderOutcome::NotFound
             }
-        }));
-        let providers = [Provider::Mock(std::sync::Arc::clone(&mock))];
+        });
+        let providers: [&dyn Provider; 1] = [&mock];
 
         let result = resolve_chain(
             &[definitive.clone(), skipped.clone()],
@@ -1119,8 +1110,8 @@ mod tests {
 
         // A provider that definitively says NotFound — the case the old
         // PerProvider policy would have persisted.
-        let mock = std::sync::Arc::new(MockProvider::new("wigle", |_| ProviderOutcome::NotFound));
-        let providers = [Provider::Mock(std::sync::Arc::clone(&mock))];
+        let mock = MockProvider::new("wigle", |_| ProviderOutcome::NotFound);
+        let providers: [&dyn Provider; 1] = [&mock];
 
         let result = resolve_chain(
             std::slice::from_ref(&target),
@@ -1241,8 +1232,8 @@ mod tests {
         crate::server::lock_db(&state)
             .execute_batch_for_test("DROP TABLE aps;")
             .unwrap();
-        let mock = std::sync::Arc::new(MockProvider::new("m", |_| ProviderOutcome::NotFound));
-        let providers = [Provider::Mock(std::sync::Arc::clone(&mock))];
+        let mock = MockProvider::new("m", |_| ProviderOutcome::NotFound);
+        let providers: [&dyn Provider; 1] = [&mock];
 
         assert_eq!(state.db_read_failures.load(Relaxed), 0);
         let _ = resolve_chain(
@@ -1272,8 +1263,8 @@ mod tests {
         crate::server::lock_db(&state)
             .execute_batch_for_test("DROP TABLE not_found;")
             .unwrap();
-        let mock = std::sync::Arc::new(MockProvider::new("m", |_| ProviderOutcome::NotFound));
-        let providers = [Provider::Mock(std::sync::Arc::clone(&mock))];
+        let mock = MockProvider::new("m", |_| ProviderOutcome::NotFound);
+        let providers: [&dyn Provider; 1] = [&mock];
 
         assert_eq!(state.db_read_failures.load(Relaxed), 0);
         let _ = resolve_chain(

@@ -9,8 +9,14 @@
 //! pending queue — those side-effects are policy decisions that belong to
 //! the chain orchestrator (see `resolver::resolve_chain`).
 //!
-//! The `Provider` enum gives static dispatch over a fixed set of backends
-//! without pulling in `async_trait` or boxing every call.
+//! `Provider` is a trait dispatched as `&dyn Provider` via `#[async_trait]`.
+//! An earlier version used an enum for static dispatch to avoid boxing, but
+//! `lookup` makes a network call (Apple/WiGLE HTTP), so a per-call boxed
+//! future plus dyn dispatch costs nanoseconds against a millisecond-plus
+//! round trip — negligible. The trait also keeps the test-only mock out of
+//! production dispatch: the production impls (`AppleProvider`, `WigleProvider`)
+//! and the `#[cfg(test)]` `MockProvider` impl no longer share one enum whose
+//! shape diverged between release and test builds.
 
 use std::sync::Arc;
 use tracing::warn;
@@ -37,36 +43,44 @@ pub enum ProviderOutcome {
     NetworkError(anyhow::Error),
 }
 
-/// Static-dispatch enum over the available providers.
-pub enum Provider {
-    Apple,
-    Wigle,
-    /// Test-only mock that returns prebaked outcomes via a closure.
-    /// Allows unit tests of `resolve_chain` to exercise every branch
-    /// without making real network calls.
-    #[cfg(test)]
-    Mock(std::sync::Arc<MockProvider>),
-}
-
-impl Provider {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Provider::Apple => "apple",
-            Provider::Wigle => "wigle",
-            #[cfg(test)]
-            Provider::Mock(m) => m.name,
-        }
-    }
+/// A BSSID -> position backend. Implementors run their own preconditions and
+/// metering; they never touch caches/pending tables (that policy belongs to
+/// the chain orchestrator). Dispatched as `&dyn Provider` by `resolve_chain`.
+#[async_trait::async_trait]
+pub trait Provider: Send + Sync {
+    /// Stable short name for logs/metrics (e.g. "apple", "wigle").
+    fn name(&self) -> &'static str;
 
     /// Look up a single BSSID via this provider. Performs the provider's
     /// own preconditions and metering. Never touches caches/pending tables.
-    pub async fn lookup(&self, state: &Arc<DaemonState>, bssid: &str) -> ProviderOutcome {
-        match self {
-            Provider::Apple => apple_lookup(state, bssid).await,
-            Provider::Wigle => wigle_lookup(state, bssid).await,
-            #[cfg(test)]
-            Provider::Mock(m) => m.lookup(bssid).await,
-        }
+    async fn lookup(&self, state: &Arc<DaemonState>, bssid: &str) -> ProviderOutcome;
+}
+
+/// Apple WPS backend. Holds no data — it dispatches through `state`.
+pub struct AppleProvider;
+
+#[async_trait::async_trait]
+impl Provider for AppleProvider {
+    fn name(&self) -> &'static str {
+        "apple"
+    }
+
+    async fn lookup(&self, state: &Arc<DaemonState>, bssid: &str) -> ProviderOutcome {
+        apple_lookup(state, bssid).await
+    }
+}
+
+/// WiGLE backend. Holds no data — it dispatches through `state`.
+pub struct WigleProvider;
+
+#[async_trait::async_trait]
+impl Provider for WigleProvider {
+    fn name(&self) -> &'static str {
+        "wigle"
+    }
+
+    async fn lookup(&self, state: &Arc<DaemonState>, bssid: &str) -> ProviderOutcome {
+        wigle_lookup(state, bssid).await
     }
 }
 
@@ -93,16 +107,26 @@ impl MockProvider {
         }
     }
 
-    pub async fn lookup(&self, bssid: &str) -> ProviderOutcome {
+    pub fn call_count(&self) -> usize {
+        self.bssids_called.lock().expect("mock mutex").len()
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Provider for MockProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// The chain passes `state`, but a mock's response is state-independent
+    /// (it exists to drive chain control flow offline), so `state` is ignored.
+    async fn lookup(&self, _state: &Arc<DaemonState>, bssid: &str) -> ProviderOutcome {
         self.bssids_called
             .lock()
             .expect("mock mutex")
             .push(bssid.to_string());
         (self.respond)(bssid)
-    }
-
-    pub fn call_count(&self) -> usize {
-        self.bssids_called.lock().expect("mock mutex").len()
     }
 }
 

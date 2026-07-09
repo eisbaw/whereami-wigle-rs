@@ -18,6 +18,11 @@ whereami-build-utils = { path = "../whereami-build-utils" }
 [dependencies]
 whereami-protocol = { path = "../whereami-protocol" }
 tokio = { version = "1", features = ["full"] }
+# Providers are a `#[async_trait]` trait dispatched as `&dyn Provider`. Network
+# I/O dominates each lookup, so the boxed-future cost is negligible. whereamid
+# is the only member using async traits, so this stays a local (not workspace)
+# dependency.
+async-trait = "0.1"
 # CancellationToken lives in tokio-util's ungated `pub mod sync`; there is NO
 # "sync" feature, so default features suffice. Already in the lock graph as a
 # transitive dep (reqwest/hyper), so this only promotes it to a direct dep.
