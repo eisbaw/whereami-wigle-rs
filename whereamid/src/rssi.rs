@@ -41,6 +41,20 @@ pub enum RssiSource {
     NmcliPercentLinearized,
 }
 
+/// Map the daemon-internal [`RssiSource`] to its wire mirror
+/// [`whereami_protocol::RssiSource`] at the `debug`/`scan` wire boundary
+/// (task-0271). The internal enum stays here (it is used widely across the
+/// scanner/debounce/trilateration paths); only the wire surface needs the
+/// protocol type, so we map at the boundary rather than moving the enum.
+impl From<RssiSource> for whereami_protocol::RssiSource {
+    fn from(source: RssiSource) -> Self {
+        match source {
+            RssiSource::IwDbm => whereami_protocol::RssiSource::Iw,
+            RssiSource::NmcliPercentLinearized => whereami_protocol::RssiSource::Nmcli,
+        }
+    }
+}
+
 /// A Wi-Fi signal strength in dBm.
 ///
 /// `#[repr(transparent)]` over a single `i32`, so it has the exact ABI and

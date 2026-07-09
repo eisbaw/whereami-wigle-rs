@@ -250,8 +250,8 @@ struct WipeRequest {
 pub use whereami_protocol::{
     Channel, Confidence, DbStatus, DebugBssid, DebugResponse, ErrorResponse, HistoryFix,
     HistoryFixesResponse, HistoryRange, HistoryResponse, HistorySegment, LocateResponse,
-    NetworkEntry, Provenance, ResolveResponse, ResolveResultEntry, ScanResponse, StatsResponse,
-    VersionResponse, WipeResponse, MAX_RESOLVE_BSSIDS,
+    NetworkEntry, Provenance, ResolveResponse, ResolveResultEntry, RssiSource, ScanResponse,
+    StatsResponse, VersionResponse, WipeResponse, MAX_RESOLVE_BSSIDS,
 };
 
 /// Presence-checking wire view. Public response fields remain defaultable so

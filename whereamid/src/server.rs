@@ -2305,15 +2305,16 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
         Some(sample) => {
             let mut nets: Vec<NetworkEntry> = sample
                 .iter()
-                // Wire boundary: only the raw i32 dBm crosses; `entry.rssi_source`
-                // provenance is deliberately dropped here (task-0126 kept the
-                // wire unchanged). Exposing it on the debug wire is follow-up
-                // task-0271.
+                // Wire boundary: the raw i32 dBm crosses, and task-0271 now also
+                // surfaces `entry.rssi_source` (iw authoritative vs nmcli biased
+                // linearization) as an additive optional wire field so an
+                // operator can tell an authoritative reading from a guess.
                 .map(|(bssid, entry)| NetworkEntry {
                     bssid: bssid.clone(),
                     ssid: entry.ssid.clone(),
                     signal_dbm: entry.signal_dbm,
                     channel: entry.channel,
+                    rssi_source: Some(entry.rssi_source.into()),
                 })
                 .collect();
             nets.sort_by_key(|n| std::cmp::Reverse(n.signal_dbm));
@@ -2332,6 +2333,18 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
     ok_json(&resp)
 }
 
+/// One debug-wire input row assembled before DB status is joined in:
+/// `(bssid, signal_dbm, rssi_source, seen, is_stable)`. `signal_dbm` and
+/// `rssi_source` are `Some` together (a scanned BSSID) or `None` together (a
+/// stable-but-absent BSSID). task-0271 added the provenance element.
+type DebugInputRow = (
+    String,
+    Option<i32>,
+    Option<whereami_protocol::RssiSource>,
+    usize,
+    bool,
+);
+
 async fn handle_debug(state: &Arc<DaemonState>) -> String {
     let debouncer = state.debouncer.lock().await;
     let scan_age_ms = debouncer.latest_scan_age_ms();
@@ -2340,13 +2353,19 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
     let stable_set = debouncer.stable_bssids();
 
     // Collect ALL BSSIDs ever seen in the ring buffer. Signals from the
-    // latest scan are Some(_); stable BSSIDs that fell out of the latest
-    // scan are None (task-0051).
-    let mut all_bssids: std::collections::HashMap<String, Option<i32>> =
-        std::collections::HashMap::new();
+    // latest scan are Some((dbm, source)); stable BSSIDs that fell out of the
+    // latest scan are None (task-0051). task-0271 carries the RSSI provenance
+    // (iw vs nmcli-linearized) alongside the dBm so it can cross the wire.
+    let mut all_bssids: std::collections::HashMap<
+        String,
+        Option<(i32, whereami_protocol::RssiSource)>,
+    > = std::collections::HashMap::new();
     if let Some(scan) = debouncer.latest_scan() {
         for (bssid, entry) in scan {
-            all_bssids.insert(bssid.clone(), Some(entry.signal_dbm));
+            all_bssids.insert(
+                bssid.clone(),
+                Some((entry.signal_dbm, entry.rssi_source.into())),
+            );
         }
     }
     // Also include stable ones not in latest scan with signal=None.
@@ -2356,12 +2375,13 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
 
     let visible = debouncer.latest_scan().map(|s| s.len()).unwrap_or(0);
 
-    let debug_inputs: Vec<(String, Option<i32>, usize, bool)> = all_bssids
+    let debug_inputs: Vec<DebugInputRow> = all_bssids
         .iter()
-        .map(|(bssid, &signal)| {
+        .map(|(bssid, signal)| {
             (
                 bssid.clone(),
-                signal,
+                signal.map(|(dbm, _)| dbm),
+                signal.map(|(_, source)| source),
                 debouncer.count(bssid),
                 stable_set.contains(bssid),
             )
@@ -2389,7 +2409,7 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
     let statuses: std::collections::HashMap<_, _> = statuses.into_iter().collect();
     let mut bssids: Vec<DebugBssid> = debug_inputs
         .into_iter()
-        .map(|(bssid, signal_dbm, seen, is_stable)| {
+        .map(|(bssid, signal_dbm, rssi_source, seen, is_stable)| {
             let db_status = match statuses.get(&bssid).copied() {
                 Some(DebugDbStatus::Cached) => DbStatus::Cached,
                 Some(DebugDbStatus::NotFound) => DbStatus::NotFound,
@@ -2403,6 +2423,7 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
                 needed: threshold,
                 is_stable,
                 db_status,
+                rssi_source,
             }
         })
         .collect();

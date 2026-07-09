@@ -129,6 +129,7 @@ mod roundtrip {
                 ssid: Some("home".to_string()),
                 signal_dbm: -52,
                 channel: Some(Channel::TwoFourGhz(6)),
+                rssi_source: Some(RssiSource::Iw),
             }],
             scan_age_ms: Some(1500),
             scanned_at: Some("2026-01-02T03:04:05Z".to_string()),
@@ -230,6 +231,7 @@ mod roundtrip {
                     needed: 3,
                     is_stable: true,
                     db_status: DbStatus::Cached,
+                    rssi_source: Some(RssiSource::Nmcli),
                 },
                 DebugBssid {
                     bssid: "02:00:00:00:00:bb".to_string(),
@@ -238,9 +240,30 @@ mod roundtrip {
                     needed: 3,
                     is_stable: false,
                     db_status: DbStatus::New,
+                    rssi_source: None,
                 },
             ],
         });
+    }
+
+    /// task-0271: each wire RssiSource variant serializes to its stable token
+    /// and parses back to the SAME variant; an unrecognized future token
+    /// degrades to `Unknown` (forward-compat) rather than aborting the decode.
+    #[test]
+    fn rssi_source_variants_round_trip_and_tolerate_unknown() {
+        for (source, token) in [
+            (RssiSource::Iw, r#""iw""#),
+            (RssiSource::Nmcli, r#""nmcli""#),
+        ] {
+            let json = serde_json::to_string(&source).unwrap();
+            assert_eq!(json, token, "unexpected wire token for {source:?}");
+            let back: RssiSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, source);
+        }
+        // A future token an old client does not know maps to Unknown (no
+        // deny_unknown; #[serde(other)]), not an error.
+        let future: RssiSource = serde_json::from_str(r#""lte""#).unwrap();
+        assert_eq!(future, RssiSource::Unknown);
     }
 
     #[test]
@@ -524,9 +547,35 @@ mod wire_shape {
             needed: 3,
             is_stable: false,
             db_status: DbStatus::New,
+            rssi_source: None,
         })
         .unwrap();
         assert!(json.contains("\"signal_dbm\":null"), "{json}");
+        // task-0271: rssi_source is skip_serializing_if=None, so it is OMITTED
+        // (not `null`) when absent — an old daemon's bytes stay identical.
+        assert!(!json.contains("rssi_source"), "{json}");
+    }
+
+    /// task-0271: when a provenance is present the key is appended with its
+    /// stable token (`iw`/`nmcli`); when absent the key is omitted entirely.
+    #[test]
+    fn debug_bssid_rssi_source_present_and_omitted_byte_shape() {
+        let with = serde_json::to_string(&DebugBssid {
+            bssid: "aa".to_string(),
+            signal_dbm: Some(-48),
+            seen: 5,
+            needed: 3,
+            is_stable: true,
+            db_status: DbStatus::Cached,
+            rssi_source: Some(RssiSource::Iw),
+        })
+        .unwrap();
+        assert_eq!(
+            with,
+            r#"{"bssid":"aa","signal_dbm":-48,"seen":5,"needed":3,"is_stable":true,"db_status":"cached","rssi_source":"iw"}"#
+        );
+        let nmcli = serde_json::to_string(&RssiSource::Nmcli).unwrap();
+        assert_eq!(nmcli, r#""nmcli""#);
     }
 
     #[test]
@@ -535,16 +584,37 @@ mod wire_shape {
         // wire, not an omitted key — a `jq` consumer relies on the key being
         // present. The existing SCAN_FIXTURE has both populated, so this pins the
         // null-emit case the fixtures miss (task-0114 review, LOW).
+        //
+        // task-0271: rssi_source is skip_serializing_if=None, so with None the
+        // bytes are IDENTICAL to the pre-task-0271 shape (no key appended).
         let json = serde_json::to_string(&NetworkEntry {
             bssid: "cc".to_string(),
             ssid: None,
             signal_dbm: -60,
             channel: None,
+            rssi_source: None,
         })
         .unwrap();
         assert_eq!(
             json,
             r#"{"bssid":"cc","ssid":null,"signal_dbm":-60,"channel":null}"#
+        );
+    }
+
+    /// task-0271: NetworkEntry appends `rssi_source` with its token when Some.
+    #[test]
+    fn network_entry_appends_rssi_source_when_present() {
+        let json = serde_json::to_string(&NetworkEntry {
+            bssid: "cc".to_string(),
+            ssid: Some("home".to_string()),
+            signal_dbm: -52,
+            channel: Some(Channel::TwoFourGhz(6)),
+            rssi_source: Some(RssiSource::Nmcli),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"bssid":"cc","ssid":"home","signal_dbm":-52,"channel":"2G/6","rssi_source":"nmcli"}"#
         );
     }
 
@@ -724,6 +794,9 @@ mod daemon_fixtures {
         assert_eq!(s.networks[0].signal_dbm, -52);
         assert_eq!(s.networks[0].channel, Some(Channel::TwoFourGhz(6)));
         assert_eq!(s.scan_age_ms, Some(1500));
+        // task-0271 back-compat: SCAN_FIXTURE omits rssi_source (an older
+        // daemon). serde(default) decodes the absent field as None.
+        assert_eq!(s.networks[0].rssi_source, None);
 
         let st: StatsResponse = serde_json::from_str(STATS_FIXTURE).unwrap();
         assert_eq!(st.cached_aps, 100);
@@ -738,6 +811,10 @@ mod daemon_fixtures {
         assert_eq!(d.daemon_rev.as_deref(), Some("abc1234"));
         assert_eq!(d.bssids[1].signal_dbm, None);
         assert_eq!(d.bssids[1].db_status, DbStatus::New);
+        // task-0271 back-compat: DEBUG_FIXTURE omits rssi_source (an older
+        // daemon); serde(default) decodes every entry's field as None.
+        assert_eq!(d.bssids[0].rssi_source, None);
+        assert_eq!(d.bssids[1].rssi_source, None);
 
         let h: HistoryResponse = serde_json::from_str(HISTORY_FIXTURE).unwrap();
         assert_eq!(h.segments.len(), 1);

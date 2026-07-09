@@ -233,7 +233,7 @@ rather than silently misclassifying a future confidence level.
 ← {
     "ok": true, "v": 1,
     "networks": [
-      {"bssid": "AA:BB:CC:DD:EE:FF", "ssid": "MyWiFi", "signal_dbm": -65, "channel": "2G/6"}
+      {"bssid": "AA:BB:CC:DD:EE:FF", "ssid": "MyWiFi", "signal_dbm": -65, "channel": "2G/6", "rssi_source": "iw"}
     ],
     "scan_age_ms": 3200,
     "scanned_at": "2026-05-10T09:04:38+00:00"
@@ -259,6 +259,13 @@ Presence rules:
 - `scan_age_ms` is always present and is `null` before the first completed scan.
 - `scanned_at` is omitted before the first completed scan; afterward it is an
   RFC3339 string.
+- `rssi_source` (task-0271) records the PROVENANCE of `signal_dbm`: `"iw"` is an
+  authoritative driver dBm, `"nmcli"` is an approximate, systematically biased
+  dBm the daemon linearized from NetworkManager's 0–100 percentage. It is an
+  ADDITIVE OPTIONAL field: the key is OMITTED (not `null`) when unknown, so an
+  old daemon's bytes are unchanged and an old client silently ignores it; a new
+  client decoding an old daemon reads it as absent. No protocol bump (still v1).
+  An unrecognized future token degrades to "unknown" rather than failing decode.
 
 ### `resolve` — look up specific BSSIDs (cache-only + WiGLE fallback)
 
@@ -359,7 +366,7 @@ Maximum **256 BSSIDs** per `resolve` request.
     "stable": 11,
     "bssids": [
       {"bssid": "AA:BB:CC:DD:EE:FF", "signal_dbm": -65, "seen": 5,
-       "needed": 5, "is_stable": true, "db_status": "cached"},
+       "needed": 5, "is_stable": true, "db_status": "cached", "rssi_source": "iw"},
       {"bssid": "11:22:33:44:55:66", "signal_dbm": null, "seen": 5,
        "needed": 5, "is_stable": true, "db_status": "new"}
     ]
@@ -370,6 +377,12 @@ Maximum **256 BSSIDs** per `resolve` request.
   from the most recent scan; the key itself is not omitted.
 - `scan_age_ms` is always present and is `null` before the first completed scan.
 - `db_status` ∈ `{cached, pending, not_found, new}`.
+- `rssi_source` (task-0271) is the PROVENANCE of `signal_dbm`: `"iw"` authoritative
+  driver dBm vs `"nmcli"` biased linearization. ADDITIVE OPTIONAL: the key is
+  OMITTED when absent — always omitted for a stable-but-absent BSSID (whose
+  `signal_dbm` is `null`), and omitted entirely by an old daemon. No protocol bump
+  (still v1); an old client ignores it, a new client decoding an old daemon reads
+  it as absent. An unrecognized future token degrades to "unknown".
 
 ### `version` — daemon version + git revision
 

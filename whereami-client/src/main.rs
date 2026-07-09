@@ -310,14 +310,29 @@ fn render_scan(resp: &ScanResponse, no_scan_time: bool) -> String {
             .map(sanitize)
             .unwrap_or_else(|| "<hidden>".into());
         out.push_str(&format!(
-            "{:17}  {:>4} dBm  {:<7}  {}\n",
+            "{:17}  {:>4} dBm{}  {:<7}  {}\n",
             sanitize(&net.bssid),
             net.signal_dbm,
+            rssi_source_suffix(net.rssi_source),
             channel,
             ssid
         ));
     }
     out
+}
+
+/// Human-readable provenance suffix for a per-AP dBm (task-0271). The value is
+/// a decoded enum, not an untrusted daemon string, so it needs no sanitizing.
+/// `iw` is authoritative; `nmcli` is a biased linearization, marked with `~`.
+/// `None` (an old daemon, or an absent signal) renders empty so byte-shape is
+/// unchanged when the daemon omits the field.
+fn rssi_source_suffix(source: Option<whereami_client::RssiSource>) -> String {
+    match source {
+        Some(whereami_client::RssiSource::Iw) => " (iw)".to_string(),
+        Some(whereami_client::RssiSource::Nmcli) => " (nmcli~)".to_string(),
+        Some(whereami_client::RssiSource::Unknown) => " (?)".to_string(),
+        None => String::new(),
+    }
 }
 
 /// Render a `resolve` response to the human-readable multi-line string (one
@@ -646,7 +661,10 @@ fn run_debug(client: &WhereAmIClient, json: bool) {
             for b in &resp.bssids {
                 let marker = if b.is_stable { "*" } else { " " };
                 let signal = match b.signal_dbm {
-                    Some(s) => format!("{s:>4} dBm"),
+                    // task-0271: append RSSI provenance (iw authoritative vs
+                    // nmcli~ biased) when present. Empty suffix when absent, so
+                    // a stable-but-absent BSSID or an old daemon is byte-stable.
+                    Some(s) => format!("{s:>4} dBm{}", rssi_source_suffix(b.rssi_source)),
                     // task-0051: '-- dBm' marks stable BSSIDs absent
                     // from the latest scan (no current signal).
                     None => "  -- dBm".to_string(),
@@ -1352,6 +1370,7 @@ mod tests {
                 ssid: Some("Free\u{1b}[2KWiFi\u{0d}\u{9b}31m\u{07}😀".to_string()),
                 signal_dbm: -42,
                 channel: Some(whereami_client::Channel::TwoFourGhz(6)),
+                rssi_source: None,
             }],
             scan_age_ms: Some(1000),
             scanned_at: Some("2026-07-02T00:00:00Z".to_string()),
@@ -1384,13 +1403,51 @@ mod tests {
                 ssid: Some("HomeNet".to_string()),
                 signal_dbm: -55,
                 channel: Some(whereami_client::Channel::TwoFourGhz(11)),
+                rssi_source: None,
             }],
             scan_age_ms: None,
             scanned_at: None,
         };
+        // rssi_source: None → suffix empty → byte-identical to the pre-task-0271
+        // layout (guards the additive field against layout drift).
         assert_eq!(
             render_scan(&resp, true),
             "aa:bb:cc:dd:ee:ff   -55 dBm  2G/11    HomeNet\n"
+        );
+    }
+
+    #[test]
+    fn render_scan_shows_rssi_provenance_when_present() {
+        // task-0271: iw renders `(iw)`, nmcli renders `(nmcli~)` right after the
+        // dBm; the channel column follows. Provenance is a decoded enum so it is
+        // rendered without sanitizing.
+        let resp = whereami_client::ScanResponse {
+            ok: true,
+            v: whereami_client::SUPPORTED_PROTOCOL_VERSION,
+            networks: vec![
+                whereami_client::NetworkEntry {
+                    bssid: "aa:bb:cc:dd:ee:ff".to_string(),
+                    ssid: Some("HomeNet".to_string()),
+                    signal_dbm: -55,
+                    channel: Some(whereami_client::Channel::TwoFourGhz(11)),
+                    rssi_source: Some(whereami_client::RssiSource::Iw),
+                },
+                whereami_client::NetworkEntry {
+                    bssid: "aa:bb:cc:dd:ee:00".to_string(),
+                    ssid: Some("Guest".to_string()),
+                    signal_dbm: -70,
+                    channel: Some(whereami_client::Channel::TwoFourGhz(1)),
+                    rssi_source: Some(whereami_client::RssiSource::Nmcli),
+                },
+            ],
+            scan_age_ms: None,
+            scanned_at: None,
+        };
+        let out = render_scan(&resp, true);
+        assert!(out.contains("-55 dBm (iw)"), "iw provenance: {out:?}");
+        assert!(
+            out.contains("-70 dBm (nmcli~)"),
+            "nmcli provenance: {out:?}"
         );
     }
 

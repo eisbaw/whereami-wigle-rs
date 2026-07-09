@@ -381,6 +381,49 @@ impl std::fmt::Display for DbStatus {
     }
 }
 
+/// Provenance of a per-AP RSSI reading on the `debug`/`scan` wire (task-0271).
+///
+/// The daemon measures Wi-Fi signal via two backends whose dBm values are NOT
+/// the same physical quantity measured the same way:
+///
+/// - `iw` reports a raw, driver-supplied dBm — **authoritative**. Wire token
+///   `"iw"`.
+/// - `nmcli` reports a 0–100 percentage that NetworkManager derived from RSSI
+///   by a non-linear, driver-dependent formula; the daemon linearizes it back
+///   to an **approximate, systematically biased** dBm. Wire token `"nmcli"`.
+///
+/// `signal_dbm` stays a bare `i32`; this field lets an operator inspecting
+/// `whereami debug`/`whereami scan` tell an authoritative reading from a
+/// linearized guess. It is the wire mirror of the daemon-internal
+/// `RssiSource` threaded in task-0126; the daemon maps its internal enum to
+/// this via `From` at the wire boundary.
+///
+/// The daemon never constructs [`RssiSource::Unknown`]; the client maps an
+/// unrecognized future token to it (see the module-level asymmetry note).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RssiSource {
+    /// Raw driver dBm from `iw` — authoritative. Wire token `"iw"`.
+    Iw,
+    /// Approximate dBm linearized from nmcli's 0–100 percentage — biased. Wire
+    /// token `"nmcli"`.
+    Nmcli,
+    /// A value a future daemon emitted that this client version does not
+    /// recognise. Forward-compat escape hatch; never constructed by the daemon.
+    #[serde(other)]
+    Unknown,
+}
+
+impl std::fmt::Display for RssiSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RssiSource::Iw => "iw",
+            RssiSource::Nmcli => "nmcli",
+            RssiSource::Unknown => "unknown",
+        })
+    }
+}
+
 // =====================================================================
 // Request types (client -> daemon)
 //
@@ -566,6 +609,12 @@ pub struct NetworkEntry {
     /// [`deserialize_tolerant_channel`]).
     #[serde(default, deserialize_with = "deserialize_tolerant_channel")]
     pub channel: Option<Channel>,
+    /// Provenance of `signal_dbm` (task-0271): `iw` authoritative dBm vs
+    /// `nmcli` biased linearization. Additive optional field — `skip_serializing_if`
+    /// means an old daemon (or a sample with no source) emits byte-identical JSON,
+    /// and an old client tolerates the new key via `#[serde(default)]` → `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rssi_source: Option<RssiSource>,
 }
 
 /// Response from the `scan` command.
@@ -596,6 +645,13 @@ pub struct DebugBssid {
     pub needed: usize,
     pub is_stable: bool,
     pub db_status: DbStatus,
+    /// Provenance of `signal_dbm` (task-0271): `iw` authoritative dBm vs
+    /// `nmcli` biased linearization. `None` when the BSSID has no current
+    /// signal (stable-but-absent, `signal_dbm` is also `null`). Additive
+    /// optional field — `skip_serializing_if` keeps an old daemon's bytes
+    /// identical and an old client tolerates it via `#[serde(default)]` → `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rssi_source: Option<RssiSource>,
 }
 
 /// Response from the `debug` command.
