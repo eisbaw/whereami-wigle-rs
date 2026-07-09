@@ -141,9 +141,17 @@ pub struct Args {
     #[arg(long, default_value_t = 20)]
     pub pending_max_attempts: i32,
 
-    /// Maximum WiGLE API calls per day
-    #[arg(long, default_value_t = 100)]
-    pub daily_limit: u32,
+    /// Maximum WiGLE lookups per day. We optimistically mirror WiGLE's
+    /// server-side daily counter to enforce this ceiling; drift is possible if
+    /// other clients share the same WiGLE credentials, so it is a best-effort
+    /// guard rather than an authoritative balance. The legacy `--daily-limit`
+    /// spelling is accepted as a deprecated alias for one release (task-0130).
+    #[arg(
+        long = "wigle-daily-limit",
+        alias = "daily-limit",
+        default_value_t = 100
+    )]
+    pub wigle_daily_limit: u32,
 
     /// Days before re-checking a not-found BSSID
     #[arg(long, default_value_t = 30)]
@@ -369,6 +377,33 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Was the deprecated `--daily-limit` spelling used on the command line?
+///
+/// clap's `alias` accepts both `--daily-limit` and `--wigle-daily-limit` but
+/// does NOT report which one the user typed, so we scan the raw argv ourselves
+/// to decide whether to emit a one-line deprecation notice. Matches both the
+/// space form (`--daily-limit 50`) and the `=` form (`--daily-limit=50`). Pure
+/// and side-effect-free so it can be unit-tested directly (task-0130).
+pub fn daily_limit_alias_used<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|arg| {
+        let arg = arg.as_ref();
+        arg == "--daily-limit" || arg.starts_with("--daily-limit=")
+    })
+}
+
+/// Emit a one-line deprecation notice to stderr if the process was invoked with
+/// the deprecated `--daily-limit` spelling. Called once at startup, after arg
+/// parsing (the alias still parses; this only nudges users to the new name).
+pub fn warn_if_deprecated_daily_limit() {
+    if daily_limit_alias_used(std::env::args()) {
+        eprintln!("warning: --daily-limit is deprecated; use --wigle-daily-limit");
+    }
+}
+
 /// Load the TOML config file. Returns default if file does not exist.
 pub fn load_config_file(path: &str) -> Result<ConfigFile> {
     let credentials_directory = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
@@ -548,6 +583,33 @@ mod tests {
         let mut argv = vec!["whereamid"];
         argv.extend_from_slice(extra);
         Args::parse_from(argv)
+    }
+
+    #[test]
+    fn wigle_daily_limit_defaults_and_parses_new_spelling() {
+        assert_eq!(parse(&[]).wigle_daily_limit, 100);
+        assert_eq!(parse(&["--wigle-daily-limit", "50"]).wigle_daily_limit, 50);
+        assert_eq!(parse(&["--wigle-daily-limit=7"]).wigle_daily_limit, 7);
+    }
+
+    #[test]
+    fn deprecated_daily_limit_alias_still_parses_to_wigle_daily_limit() {
+        // task-0130: --daily-limit remains accepted for one release via clap
+        // alias, mapping to the same field as --wigle-daily-limit.
+        assert_eq!(parse(&["--daily-limit", "42"]).wigle_daily_limit, 42);
+        assert_eq!(parse(&["--daily-limit=9"]).wigle_daily_limit, 9);
+    }
+
+    #[test]
+    fn daily_limit_alias_used_detects_only_the_deprecated_spelling() {
+        // Space form and = form of the deprecated flag are detected.
+        assert!(daily_limit_alias_used(["--daily-limit", "50"]));
+        assert!(daily_limit_alias_used(["--daily-limit=50"]));
+        // The new spelling and unrelated flags are NOT flagged as deprecated.
+        assert!(!daily_limit_alias_used(["--wigle-daily-limit", "50"]));
+        assert!(!daily_limit_alias_used(["--wigle-daily-limit=50"]));
+        assert!(!daily_limit_alias_used(["--db", "/tmp/x.sqlite"]));
+        assert!(!daily_limit_alias_used(Vec::<String>::new()));
     }
 
     #[test]

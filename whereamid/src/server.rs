@@ -2852,7 +2852,12 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
         pending_aps: stats.pending_aps,
         not_found_aps: stats.not_found_aps,
         db_size_bytes: stats.db_size_bytes,
-        api_calls_today: stats.api_calls_today,
+        wigle_lookups_today: stats.wigle_lookups_today,
+        // Transitional dual-emit (task-0130): mirror the SAME value into the
+        // deprecated api_calls_today field so pre-rename clients keep rendering
+        // the WiGLE daily count. Remove in task-0267 once clients read the new
+        // field.
+        api_calls_today: stats.wigle_lookups_today,
         api_counter_corruption_denials,
         inflight,
         db_write_failures,
@@ -2963,7 +2968,7 @@ mod stats_tests {
             "cumulative executed WiGLE reservation",
             "distinct from normal quota",
             "resets on restart",
-            "api_calls_today` can render its fallback `0`",
+            "wigle_lookups_today` can render its fallback `0`",
             "does not change protocol version `v: 1`",
         ] {
             assert!(
@@ -2995,7 +3000,7 @@ mod stats_tests {
         let state = test_state();
         {
             let db = lock_db(&state);
-            db.set_metadata("api_calls_today", "malformed").unwrap();
+            db.set_metadata("wigle_lookups_today", "malformed").unwrap();
         }
         state
             .api_counter_corruption_denials
@@ -3011,6 +3016,9 @@ mod stats_tests {
             serde_json::from_str(&handle_stats(&state).await).unwrap();
         assert_eq!(response["ok"], true);
         assert_eq!(response["v"], 1);
+        // Transitional dual-emit: both the new and deprecated fields carry the
+        // same fallback 0 while the counter row is corrupt (task-0130).
+        assert_eq!(response["wigle_lookups_today"], 0);
         assert_eq!(response["api_calls_today"], 0);
         assert_eq!(response["api_counter_corruption_denials"], 3);
         assert_eq!(response["autolocate_fixes_written"], 4);

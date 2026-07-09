@@ -16,8 +16,8 @@ use crate::server::DaemonState;
 /// budget; subsequent passes pick up the remaining ones (task-0063).
 const NOT_FOUND_REVIVAL_BATCH: usize = 5;
 /// Maximum number of pending BSSIDs to attempt to resolve per drain pass.
-/// Bounded by --daily-limit and provider rate limits in practice; this
-/// is the structural upper bound on per-cycle API spend (task-0063).
+/// Bounded by --wigle-daily-limit and provider rate limits in practice; this
+/// is the structural upper bound on per-cycle WiGLE spend (task-0063).
 const PENDING_DRAIN_BATCH: usize = 10;
 
 /// Spawn the pending queue drain loop. Runs every `pending_interval` seconds.

@@ -293,6 +293,7 @@ Maximum **256 BSSIDs** per `resolve` request.
     "pending_aps": 0,
     "not_found_aps": 3,
     "db_size_bytes": 49152,
+    "wigle_lookups_today": 5,
     "api_calls_today": 5,
     "api_counter_corruption_denials": 0,
     "inflight": 0,
@@ -302,12 +303,22 @@ Maximum **256 BSSIDs** per `resolve` request.
 }
 ```
 
+- `wigle_lookups_today` — WiGLE lookups spent today against the daily quota.
+  The daemon optimistically mirrors WiGLE's server-side daily counter; drift is
+  possible if other clients share the same WiGLE credentials. This is the
+  WiGLE-specific successor to `api_calls_today` (task-0130).
+- `api_calls_today` — **DEPRECATED transitional mirror** of
+  `wigle_lookups_today`, emitted with the SAME value for one release so
+  pre-rename clients keep rendering the WiGLE daily count. New clients must read
+  `wigle_lookups_today`; this field is scheduled for removal (task-0267). A
+  pre-rename daemon emits only `api_calls_today`, so a new client decoding it
+  serde-defaults `wigle_lookups_today` to `0` for that transitional case.
 - `inflight` — provider lookups currently in-flight (the dedup set).
 - `api_counter_corruption_denials` — cumulative executed WiGLE reservation
   attempts denied since daemon start because the same-day persisted
-  `api_calls_today` value was malformed. This is distinct from normal quota
+  `wigle_lookups_today` value was malformed. This is distinct from normal quota
   exhaustion and resets on restart. When the counter row is corrupt,
-  `api_calls_today` can render its fallback `0` while this denial count is
+  `wigle_lookups_today` can render its fallback `0` while this denial count is
   non-zero. This additive field does not change protocol version `v: 1`.
 - `db_write_failures` — cumulative best-effort DB write failures since
   daemon start. Non-zero values indicate silent corruption is being logged

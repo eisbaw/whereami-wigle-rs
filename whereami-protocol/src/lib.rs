@@ -493,6 +493,16 @@ pub struct StatsResponse {
     pub not_found_aps: i64,
     #[serde(default)]
     pub db_size_bytes: i64,
+    /// WiGLE lookups spent today against the daily quota. We optimistically
+    /// mirror WiGLE's server-side daily counter; drift is possible if other
+    /// clients share the same WiGLE credentials. Prefer this field over the
+    /// deprecated `api_calls_today` mirror.
+    #[serde(default)]
+    pub wigle_lookups_today: u32,
+    /// DEPRECATED transitional mirror of `wigle_lookups_today`, emitted with the
+    /// SAME value for one release so pre-rename clients keep rendering the WiGLE
+    /// daily count (task-0130). Scheduled for removal in task-0267 — new clients
+    /// must read `wigle_lookups_today`.
     #[serde(default)]
     pub api_calls_today: u32,
     /// Executed WiGLE reservations denied since daemon start because the

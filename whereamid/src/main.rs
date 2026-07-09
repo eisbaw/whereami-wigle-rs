@@ -60,6 +60,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    // Nudge users off the deprecated --daily-limit spelling (task-0130). The
+    // clap alias still parses it; this only prints a one-line stderr notice.
+    config::warn_if_deprecated_daily_limit();
     // Cross-field validation runs before any side effects (DB open,
     // signals, threads). Bad combinations produce a clean error message
     // and a non-zero exit, not a runtime assert deep inside Debouncer.
@@ -1662,8 +1665,8 @@ mod shutdown_drain_tests {
         let state = crate::server::test_state();
         let reservation = state
             .db
-            .reserve_api_call(
-                state.args.daily_limit,
+            .reserve_wigle_lookup(
+                state.args.wigle_daily_limit,
                 std::sync::Arc::clone(&state.db_write_failures),
                 std::sync::Arc::clone(&state.api_counter_corruption_denials),
             )
@@ -1674,7 +1677,7 @@ mod shutdown_drain_tests {
             crate::db::QuotaReservation::Exhausted
             | crate::db::QuotaReservation::CounterCorrupt => panic!("quota lease"),
         };
-        assert_eq!(state.db.api_calls_today().await.unwrap(), 1);
+        assert_eq!(state.db.wigle_lookups_today().await.unwrap(), 1);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let named = vec![tokio::spawn(async move {
             let _lease = lease;
@@ -1689,7 +1692,7 @@ mod shutdown_drain_tests {
         // its conditional refund. This FIFO barrier observes that command
         // before main is allowed to stop the DB actors.
         state.db.writer_barrier().await.unwrap();
-        assert_eq!(state.db.api_calls_today().await.unwrap(), 0);
+        assert_eq!(state.db.wigle_lookups_today().await.unwrap(), 0);
     }
 
     /// task-0241 review regression: abort is cooperative. A server task in

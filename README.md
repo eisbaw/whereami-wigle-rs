@@ -104,7 +104,7 @@ Everything else is a CLI flag (see `cargo run --bin whereamid -- --help`):
 --mobile-ssid-denylist <GLOBS>      Comma-separated mobile-SSID globs [built-in list]
 --pending-interval <S>              Pending queue drain interval [300]
 --pending-max-attempts <N>          Give up after N failures [20]
---daily-limit <N>                   Max WiGLE API calls/day [100]
+--wigle-daily-limit <N>             Max WiGLE lookups/day [100] (alias: --daily-limit, deprecated)
 --not-found-ttl-days <N>            Re-check not-found after N days [30]
 --address-approx                    Include street address (OSM Nominatim)
 --address-cache-ttl-days <N>        Reverse-geocode cache TTL [7]

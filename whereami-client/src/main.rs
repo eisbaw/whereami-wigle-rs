@@ -361,7 +361,10 @@ fn render_stats(resp: &StatsResponse) -> String {
         resp.not_found_aps,
         resp.inflight,
         resp.db_size_bytes / 1024,
-        resp.api_calls_today,
+        // task-0130: render the WiGLE-specific counter. The daemon still emits
+        // the deprecated api_calls_today mirror for one release, but new clients
+        // read wigle_lookups_today.
+        resp.wigle_lookups_today,
         resp.api_counter_corruption_denials,
         resp.db_write_failures,
         resp.db_read_failures,
@@ -1560,6 +1563,7 @@ mod tests {
             pending_aps: 3,
             not_found_aps: 4,
             db_size_bytes: 49_152,
+            wigle_lookups_today: 5,
             api_calls_today: 5,
             api_counter_corruption_denials: 9,
             inflight: 6,

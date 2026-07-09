@@ -256,10 +256,10 @@ impl Drop for QuotaLease {
             // actively committing, or had delivered its result. swap(false)
             // makes the conditional refund exactly-once.
             if committed.swap(false, Ordering::AcqRel) {
-                if let Err(error) = db.refund_api_call() {
+                if let Err(error) = db.refund_wigle_lookup() {
                     // Counter corruption already emitted the more accurate,
                     // escaped refund-context warning at the parse boundary.
-                    if error.downcast_ref::<CorruptApiCallsValue>().is_none() {
+                    if error.downcast_ref::<CorruptWigleLookupsValue>().is_none() {
                         tracing::warn!("failed to refund WiGLE quota lease on drop: {error}");
                     }
                     failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -456,7 +456,7 @@ pub struct DbStats {
     pub pending_aps: i64,
     pub not_found_aps: i64,
     pub db_size_bytes: i64,
-    pub api_calls_today: u32,
+    pub wigle_lookups_today: u32,
 }
 
 /// Exact row counts removed by one committed privacy wipe transaction.
@@ -935,13 +935,13 @@ impl DbHandle {
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn reserve_api_call(
+    pub(crate) async fn reserve_wigle_lookup(
         &self,
         daily_limit: u32,
         failures: Arc<std::sync::atomic::AtomicU64>,
         corruption_denials: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<QuotaReservation> {
-        self.reserve_api_call_inner(
+        self.reserve_wigle_lookup_inner(
             daily_limit,
             failures,
             corruption_denials,
@@ -951,7 +951,7 @@ impl DbHandle {
     }
 
     #[allow(dead_code)]
-    async fn reserve_api_call_inner(
+    async fn reserve_wigle_lookup_inner(
         &self,
         daily_limit: u32,
         failures: Arc<std::sync::atomic::AtomicU64>,
@@ -973,7 +973,7 @@ impl DbHandle {
         let reservation = Self::call_cancellable(
             &self.writer,
             move |db| {
-                let decision = db.try_reserve_api_call(daily_limit)?;
+                let decision = db.try_reserve_wigle_lookup(daily_limit)?;
                 if decision == QuotaDecision::CounterCorrupt {
                     // Count the executed denial before publishing its result.
                     // A waiter may disappear after this point, but the actor
@@ -1029,14 +1029,14 @@ impl DbHandle {
     }
 
     #[cfg(test)]
-    async fn reserve_api_call_with_hooks(
+    async fn reserve_wigle_lookup_with_hooks(
         &self,
         daily_limit: u32,
         failures: Arc<std::sync::atomic::AtomicU64>,
         corruption_denials: Arc<std::sync::atomic::AtomicU64>,
         hooks: ReservationTestHooks,
     ) -> Result<QuotaReservation> {
-        self.reserve_api_call_inner(daily_limit, failures, corruption_denials, hooks)
+        self.reserve_wigle_lookup_inner(daily_limit, failures, corruption_denials, hooks)
             .await
     }
 
@@ -1277,15 +1277,15 @@ impl DbHandle {
                 pending_aps: db.pending_ap_count()?,
                 not_found_aps: db.not_found_ap_count()?,
                 db_size_bytes: db.db_size_bytes()?,
-                api_calls_today: db.api_calls_today_for_stats()?,
+                wigle_lookups_today: db.wigle_lookups_today_for_stats()?,
             })
         })
         .await
     }
 
     #[cfg(test)]
-    pub async fn api_calls_today(&self) -> Result<u32> {
-        self.read(|db| db.api_calls_today()).await
+    pub async fn wigle_lookups_today(&self) -> Result<u32> {
+        self.read(|db| db.wigle_lookups_today()).await
     }
 
     pub async fn get_last_fix(&self) -> Result<Option<LastFix>> {
@@ -1570,32 +1570,36 @@ pub enum DebugDbStatus {
     New,
 }
 
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CorruptApiCallsValue {
+struct CorruptWigleLookupsValue {
     raw: String,
 }
 
-impl std::fmt::Display for CorruptApiCallsValue {
+impl std::fmt::Display for CorruptWigleLookupsValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "metadata.api_calls_today is not a valid u32 ({:?})",
+            "metadata.wigle_lookups_today is not a valid u32 ({:?})",
             self.raw
         )
     }
 }
 
-impl std::error::Error for CorruptApiCallsValue {}
+impl std::error::Error for CorruptWigleLookupsValue {}
 
-/// Parse the `metadata.api_calls_today` raw value without logging or applying
-/// caller policy. `None` is the legitimate zero-call state; a malformed value
+/// Parse the `metadata.wigle_lookups_today` raw value without logging or applying
+/// caller policy. `None` is the legitimate zero-lookup state; a malformed value
 /// remains available to the caller for an escaped, context-specific warning.
-fn parse_api_calls_value(raw: Option<String>) -> std::result::Result<u32, CorruptApiCallsValue> {
+fn parse_wigle_lookups_value(
+    raw: Option<String>,
+) -> std::result::Result<u32, CorruptWigleLookupsValue> {
     match raw {
         None => Ok(0),
-        Some(raw) => raw.parse::<u32>().map_err(|_| CorruptApiCallsValue { raw }),
+        Some(raw) => raw
+            .parse::<u32>()
+            .map_err(|_| CorruptWigleLookupsValue { raw }),
     }
 }
 
@@ -2156,6 +2160,12 @@ impl Database {
             version = 7;
         }
 
+        if version < 8 {
+            info!("migrating database v{version} -> v8 (rename api_calls_today -> wigle_lookups_today)");
+            self.migrate_v7_to_v8()?;
+            version = 8;
+        }
+
         if version == SCHEMA_VERSION {
             debug!("database schema is up to date (v{version})");
         } else if version > SCHEMA_VERSION {
@@ -2467,6 +2477,34 @@ impl Database {
             tx.execute(
                 "UPDATE schema_version SET version = ?1 WHERE id = 1",
                 params![7],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// v7 -> v8: rename the WiGLE daily-quota counter metadata key from the
+    /// generic `api_calls_today` to the provider-specific `wigle_lookups_today`
+    /// (task-0130). Only WiGLE is metered (Apple is unmetered), so the generic
+    /// name mis-described a WiGLE-specific counter.
+    ///
+    /// LOSSLESS + IDEMPOTENT-SAFE: this is a pure key rename that PRESERVES the
+    /// value, so a daemon with a live same-day counter keeps its count across
+    /// the upgrade. If the old key is absent (no lookups spent yet) the UPDATE
+    /// matches zero rows — a no-op — and the counter simply starts fresh under
+    /// the new key. The paired `api_calls_date` reset key is intentionally left
+    /// untouched: it is internal, never exposed on the wire, and renaming it is
+    /// out of scope for this task. Re-running is safe: once renamed there is no
+    /// `api_calls_today` row left to match.
+    fn migrate_v7_to_v8(&self) -> Result<()> {
+        self.run_migration(|tx| {
+            tx.execute(
+                "UPDATE metadata SET key = 'wigle_lookups_today' WHERE key = 'api_calls_today'",
+                [],
+            )
+            .context("failed to rename api_calls_today metadata key")?;
+            tx.execute(
+                "UPDATE schema_version SET version = ?1 WHERE id = 1",
+                params![8],
             )?;
             Ok(())
         })
@@ -3033,21 +3071,25 @@ impl Database {
     /// normal daily exhaustion, and fail-closed persisted-counter corruption.
     ///
     /// On any transient failure of the network call afterwards, the caller
-    /// SHOULD call [`Database::refund_api_call`] to give the slot back.
+    /// SHOULD call [`Database::refund_wigle_lookup`] to give the slot back.
     /// Slots that map to actual completed lookups (Found / NotFound) should
     /// not be refunded.
+    ///
+    /// We optimistically mirror WiGLE's server-side daily counter; drift is
+    /// possible if other clients share the same WiGLE credentials, so this
+    /// local ceiling is a best-effort guard, not an authoritative balance.
     #[allow(dead_code)]
-    pub fn try_reserve_api_call(&mut self, daily_limit: u32) -> Result<QuotaDecision> {
+    pub fn try_reserve_wigle_lookup(&mut self, daily_limit: u32) -> Result<QuotaDecision> {
         #[cfg(test)]
-        let result = self.try_reserve_api_call_inner(daily_limit, None);
+        let result = self.try_reserve_wigle_lookup_inner(daily_limit, None);
         #[cfg(not(test))]
-        let result = self.try_reserve_api_call_inner(daily_limit);
+        let result = self.try_reserve_wigle_lookup_inner(daily_limit);
         result
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
-    fn try_reserve_api_call_observing<F>(
+    fn try_reserve_wigle_lookup_observing<F>(
         &mut self,
         daily_limit: u32,
         mut observe_transaction: F,
@@ -3055,10 +3097,10 @@ impl Database {
     where
         F: FnMut(rusqlite::TransactionState),
     {
-        self.try_reserve_api_call_inner(daily_limit, Some(&mut observe_transaction))
+        self.try_reserve_wigle_lookup_inner(daily_limit, Some(&mut observe_transaction))
     }
 
-    fn try_reserve_api_call_inner(
+    fn try_reserve_wigle_lookup_inner(
         &mut self,
         daily_limit: u32,
         #[cfg(test)] observe_transaction: Option<&mut dyn FnMut(rusqlite::TransactionState)>,
@@ -3083,12 +3125,12 @@ impl Database {
         let count: u32 = if stored_date.as_deref() == Some(&today) {
             let raw: Option<String> = tx
                 .query_row(
-                    "SELECT value FROM metadata WHERE key = 'api_calls_today'",
+                    "SELECT value FROM metadata WHERE key = 'wigle_lookups_today'",
                     [],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
-            match parse_api_calls_value(raw) {
+            match parse_wigle_lookups_value(raw) {
                 Ok(v) => v,
                 // task-0097: corrupt counter -> fail closed. Deny the slot and
                 // return WITHOUT writing. Healing the garbage here would reset
@@ -3118,7 +3160,7 @@ impl Database {
         if count >= daily_limit {
             // Persist the date reset (if any) without bumping the counter.
             tx.execute(
-                "INSERT INTO metadata (key, value) VALUES ('api_calls_today', ?1)
+                "INSERT INTO metadata (key, value) VALUES ('wigle_lookups_today', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![count.to_string()],
             )?;
@@ -3128,7 +3170,7 @@ impl Database {
 
         let new_count = count + 1;
         tx.execute(
-            "INSERT INTO metadata (key, value) VALUES ('api_calls_today', ?1)
+            "INSERT INTO metadata (key, value) VALUES ('wigle_lookups_today', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![new_count.to_string()],
         )?;
@@ -3136,11 +3178,13 @@ impl Database {
         Ok(QuotaDecision::Reserved)
     }
 
-    /// Refund a previously reserved API slot. Clamped at 0. Only meaningful
-    /// when called on the same calendar day; if the day has rolled over the
-    /// refund is silently ignored (counter has already been reset to 0).
+    /// Refund a previously reserved WiGLE lookup slot. Clamped at 0. Only
+    /// meaningful when called on the same calendar day; if the day has rolled
+    /// over the refund is silently ignored (counter has already been reset to
+    /// 0). We optimistically mirror WiGLE's server-side daily counter; drift is
+    /// possible if other clients share the same WiGLE credentials.
     #[allow(dead_code)]
-    pub fn refund_api_call(&mut self) -> Result<()> {
+    pub fn refund_wigle_lookup(&mut self) -> Result<()> {
         let today = Utc::now().format("%Y-%m-%d").to_string();
         let tx = self
             .conn
@@ -3159,7 +3203,7 @@ impl Database {
         }
         let raw: Option<String> = tx
             .query_row(
-                "SELECT value FROM metadata WHERE key = 'api_calls_today'",
+                "SELECT value FROM metadata WHERE key = 'wigle_lookups_today'",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -3167,7 +3211,7 @@ impl Database {
         // task-0097: a corrupt counter propagates as Err (tx rolls back, no
         // write). Refunding by healing the garbage to "0" would re-introduce
         // the double-spend heal this task closes, so fail closed here too.
-        let count = match parse_api_calls_value(raw) {
+        let count = match parse_wigle_lookups_value(raw) {
             Ok(count) => count,
             Err(corrupt) => {
                 tracing::warn!(
@@ -3180,7 +3224,7 @@ impl Database {
         };
         let new_count = count.saturating_sub(1);
         tx.execute(
-            "INSERT INTO metadata (key, value) VALUES ('api_calls_today', ?1)
+            "INSERT INTO metadata (key, value) VALUES ('wigle_lookups_today', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![new_count.to_string()],
         )?;
@@ -3188,19 +3232,19 @@ impl Database {
         Ok(())
     }
 
-    /// Get the number of API calls made today.
+    /// Get the number of WiGLE lookups spent today.
     #[cfg(test)]
-    pub fn api_calls_today(&self) -> Result<u32> {
-        parse_api_calls_value(self.get_metadata("api_calls_today")?).map_err(Into::into)
+    pub fn wigle_lookups_today(&self) -> Result<u32> {
+        parse_wigle_lookups_value(self.get_metadata("wigle_lookups_today")?).map_err(Into::into)
     }
 
-    fn api_calls_today_for_stats(&self) -> Result<u32> {
-        let raw = self.get_metadata("api_calls_today")?;
-        match parse_api_calls_value(raw) {
+    fn wigle_lookups_today_for_stats(&self) -> Result<u32> {
+        let raw = self.get_metadata("wigle_lookups_today")?;
+        match parse_wigle_lookups_value(raw) {
             Ok(count) => Ok(count),
             Err(corrupt) => {
                 tracing::warn!(
-                    "{}; stats reports api_calls_today fallback 0 while the \
+                    "{}; stats reports wigle_lookups_today fallback 0 while the \
                      persisted counter remains untouched",
                     corrupt
                 );
@@ -3716,7 +3760,7 @@ mod tests {
             &chrono::Utc::now().format("%Y-%m-%d").to_string(),
         )
         .unwrap();
-        db.set_metadata("api_calls_today", raw).unwrap();
+        db.set_metadata("wigle_lookups_today", raw).unwrap();
     }
 
     #[test]
@@ -3979,7 +4023,7 @@ mod tests {
     fn privacy_wipe_is_atomic_counted_idempotent_and_reusable() {
         let mut db = Database::open_memory().unwrap();
         seed_every_privacy_table(&db);
-        db.set_metadata("api_calls_today", "7").unwrap();
+        db.set_metadata("wigle_lookups_today", "7").unwrap();
         db.set_metadata("api_calls_date", "2026-07-05").unwrap();
         let schema_before = db.get_schema_version();
         let sequence_before: i64 = db
@@ -4010,7 +4054,7 @@ mod tests {
         assert!(db.get_last_fix().unwrap().is_none());
         assert_eq!(db.get_schema_version(), schema_before);
         assert_eq!(
-            db.get_metadata("api_calls_today").unwrap().as_deref(),
+            db.get_metadata("wigle_lookups_today").unwrap().as_deref(),
             Some("7")
         );
         assert_eq!(
@@ -4380,7 +4424,7 @@ mod tests {
         let mut db = Database::open_memory().unwrap();
         let mut observed = None;
         let reserved = db
-            .try_reserve_api_call_observing(1, |state| observed = Some(state))
+            .try_reserve_wigle_lookup_observing(1, |state| observed = Some(state))
             .unwrap();
         assert_eq!(reserved, QuotaDecision::Reserved);
         assert_eq!(observed, Some(rusqlite::TransactionState::Write));
@@ -4673,7 +4717,7 @@ mod tests {
         let reserve_corruption_denials = Arc::clone(&corruption_denials);
         let reservation = tokio::spawn(async move {
             reserve_handle
-                .reserve_api_call_with_hooks(
+                .reserve_wigle_lookup_with_hooks(
                     1,
                     reserve_failures,
                     reserve_corruption_denials,
@@ -4691,7 +4735,7 @@ mod tests {
         blocker.await.unwrap().unwrap();
         handle.writer_barrier().await.unwrap();
 
-        assert_eq!(handle.api_calls_today().await.unwrap(), 0);
+        assert_eq!(handle.wigle_lookups_today().await.unwrap(), 0);
         assert_eq!(failures.load(Ordering::Relaxed), 0);
         assert_eq!(corruption_denials.load(Ordering::Relaxed), 0);
         drop(handle);
@@ -4716,7 +4760,7 @@ mod tests {
         let reserve_corruption_denials = Arc::clone(&corruption_denials);
         let reservation = tokio::spawn(async move {
             reserve_handle
-                .reserve_api_call_with_hooks(
+                .reserve_wigle_lookup_with_hooks(
                     1,
                     reserve_failures,
                     reserve_corruption_denials,
@@ -4734,7 +4778,7 @@ mod tests {
         release_tx.send(()).unwrap();
         handle.writer_barrier().await.unwrap();
 
-        assert_eq!(handle.api_calls_today().await.unwrap(), 0);
+        assert_eq!(handle.wigle_lookups_today().await.unwrap(), 0);
         assert_eq!(
             commits.load(Ordering::SeqCst),
             2,
@@ -4770,7 +4814,7 @@ mod tests {
         let reserve_corruption_denials = Arc::clone(&corruption_denials);
         let reservation = tokio::spawn(async move {
             reserve_handle
-                .reserve_api_call_with_hooks(
+                .reserve_wigle_lookup_with_hooks(
                     100,
                     reserve_failures,
                     reserve_corruption_denials,
@@ -4792,7 +4836,7 @@ mod tests {
         assert_eq!(failures.load(Ordering::Relaxed), 0);
         assert_eq!(
             handle
-                .get_metadata("api_calls_today")
+                .get_metadata("wigle_lookups_today")
                 .await
                 .unwrap()
                 .as_deref(),
@@ -4815,7 +4859,7 @@ mod tests {
         let reserve_corruption_denials = Arc::clone(&corruption_denials);
         let reservation = tokio::spawn(async move {
             reserve_handle
-                .reserve_api_call_with_hooks(
+                .reserve_wigle_lookup_with_hooks(
                     100,
                     reserve_failures,
                     reserve_corruption_denials,
@@ -4843,7 +4887,7 @@ mod tests {
         assert_eq!(failures.load(Ordering::Relaxed), 0);
         assert_eq!(
             handle
-                .get_metadata("api_calls_today")
+                .get_metadata("wigle_lookups_today")
                 .await
                 .unwrap()
                 .as_deref(),
@@ -4861,15 +4905,17 @@ mod tests {
         seed_api_counter_for_today(&legacy, "1");
 
         let exhausted = handle
-            .reserve_api_call(1, Arc::clone(&failures), Arc::clone(&corruption_denials))
+            .reserve_wigle_lookup(1, Arc::clone(&failures), Arc::clone(&corruption_denials))
             .await
             .unwrap();
         assert!(matches!(exhausted, QuotaReservation::Exhausted));
         assert_eq!(corruption_denials.load(Ordering::Relaxed), 0);
 
-        legacy.set_metadata("api_calls_today", "garbage").unwrap();
+        legacy
+            .set_metadata("wigle_lookups_today", "garbage")
+            .unwrap();
         let corrupt = handle
-            .reserve_api_call(100, Arc::clone(&failures), Arc::clone(&corruption_denials))
+            .reserve_wigle_lookup(100, Arc::clone(&failures), Arc::clone(&corruption_denials))
             .await
             .unwrap();
         assert!(matches!(corrupt, QuotaReservation::CounterCorrupt));
@@ -4877,7 +4923,7 @@ mod tests {
         assert_eq!(failures.load(Ordering::Relaxed), 0);
         assert_eq!(
             handle
-                .get_metadata("api_calls_today")
+                .get_metadata("wigle_lookups_today")
                 .await
                 .unwrap()
                 .as_deref(),
@@ -4898,12 +4944,12 @@ mod tests {
         let first_barrier = Arc::clone(&barrier);
         let first_thread = std::thread::spawn(move || {
             first_barrier.wait();
-            first.try_reserve_api_call(1)
+            first.try_reserve_wigle_lookup(1)
         });
         let second_barrier = Arc::clone(&barrier);
         let second_thread = std::thread::spawn(move || {
             second_barrier.wait();
-            second.try_reserve_api_call(1)
+            second.try_reserve_wigle_lookup(1)
         });
         barrier.wait();
         let outcomes = [first_thread.join().unwrap(), second_thread.join().unwrap()];
@@ -5181,6 +5227,23 @@ mod tests {
         db.migrate_v6_to_v7().unwrap();
         assert_eq!(db.get_schema_version(), 7);
         assert!(db.fix_quality_columns_have_expected_shape());
+
+        // --- v7 -> v8: stamp 8, WiGLE counter metadata key renamed ---
+        // Seed the legacy counter first so the rename is observable, not a
+        // vacuous no-op: the value must survive under the new key.
+        db.set_metadata("api_calls_date", "2026-07-09").unwrap();
+        db.set_metadata("api_calls_today", "17").unwrap();
+        db.migrate_v7_to_v8().unwrap();
+        assert_eq!(db.get_schema_version(), 8);
+        assert_eq!(
+            db.get_metadata("wigle_lookups_today").unwrap().as_deref(),
+            Some("17"),
+            "v7->v8 must rename the key preserving the value"
+        );
+        assert!(
+            db.get_metadata("api_calls_today").unwrap().is_none(),
+            "v7->v8 must leave no stale api_calls_today row"
+        );
     }
 
     // --- task-0151: real historical-shape DB files opened via the PUBLIC
@@ -5327,13 +5390,13 @@ mod tests {
     }
 
     /// Build a tempfile DB stamped at exactly historical shape `target`
-    /// (1..=6) and seed it, then close it. Authenticity is guaranteed by
+    /// (1..=7) and seed it, then close it. Authenticity is guaranteed by
     /// constructing the shape ONLY from `create_schema_v1` + the real migrate
     /// fns up to `target` — never hand-written DDL.
     fn build_historical_shape(path: &Path, target: i32) {
         assert!(
-            (1..=6).contains(&target),
-            "historical shapes are v1..=v6; v7 is the current shape"
+            (1..=7).contains(&target),
+            "historical shapes are v1..=v7; v8 is the current shape"
         );
         let db = Database {
             conn: Connection::open(path).unwrap(),
@@ -5354,6 +5417,9 @@ mod tests {
         }
         if target >= 6 {
             db.migrate_v5_to_v6().unwrap();
+        }
+        if target >= 7 {
+            db.migrate_v6_to_v7().unwrap();
         }
         assert_eq!(
             db.get_schema_version(),
@@ -5510,7 +5576,7 @@ mod tests {
         }
     }
 
-    /// AC#1/#2/#4: for each historical stamped shape v in {1,2,3,4,5,6}, build
+    /// AC#1/#2/#4: for each historical stamped shape v in {1,2,3,4,5,6,7}, build
     /// a genuine v-shape tempfile with seed rows, open it through the PUBLIC
     /// `Database::open` cascade, and assert it reaches SCHEMA_VERSION with the
     /// full current shape and every seeded row preserved. Distinct from
@@ -5519,13 +5585,83 @@ mod tests {
     /// `Database::open` on a real historical file.
     #[test]
     fn open_each_historical_shape_cascades_to_current() {
-        for origin in 1..=6 {
+        for origin in 1..=7 {
             let tmp = TempDbDir::new(&format!("task0151-cascade-v{origin}"));
             let path = tmp.db_path();
             build_historical_shape(&path, origin);
             let db = Database::open(&path).unwrap();
             assert_current_shape_and_seed(&db, origin);
         }
+    }
+
+    /// task-0130 AC#1: the v7->v8 WiGLE-counter key rename is lossless across a
+    /// real `Database::open` cascade. Build a genuine v7 file, seed a live
+    /// same-day counter under the OLD key `api_calls_today`, then open (which
+    /// runs migrate_v7_to_v8) and assert the count survives verbatim under the
+    /// NEW key `wigle_lookups_today`, with no stale old-key row left behind and
+    /// the schema stamped at v8. A daemon upgrading mid-day must not lose its
+    /// spent-quota count.
+    #[test]
+    fn open_v7_shape_renames_wigle_counter_key_losslessly() {
+        let tmp = TempDbDir::new("task0130-v7-to-v8");
+        let path = tmp.db_path();
+        build_historical_shape(&path, 7);
+
+        // Seed the legacy same-day counter directly on the closed v7 file via a
+        // raw connection (NOT Database::open, which would migrate immediately).
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute(
+                "INSERT INTO metadata (key, value) VALUES ('api_calls_date', '2026-07-09')",
+                [],
+            )
+            .unwrap();
+            raw.execute(
+                "INSERT INTO metadata (key, value) VALUES ('api_calls_today', '23')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(
+            db.get_schema_version(),
+            SCHEMA_VERSION,
+            "opening a v7 file must cascade to v{SCHEMA_VERSION}"
+        );
+        assert_eq!(
+            db.wigle_lookups_today().unwrap(),
+            23,
+            "v7->v8 must preserve the live counter value under the new key"
+        );
+        assert!(
+            db.get_metadata("api_calls_today").unwrap().is_none(),
+            "v7->v8 must leave no stale api_calls_today row"
+        );
+        // The date key is intentionally NOT renamed by this migration.
+        assert_eq!(
+            db.get_metadata("api_calls_date").unwrap().as_deref(),
+            Some("2026-07-09"),
+            "the paired date key is left untouched by v7->v8"
+        );
+    }
+
+    /// task-0130: v7->v8 on a v7 file with NO prior counter is a clean no-op —
+    /// the new key is simply absent (counter starts fresh at 0), and the open
+    /// still succeeds and stamps v8.
+    #[test]
+    fn open_v7_shape_without_counter_starts_fresh_at_v8() {
+        let tmp = TempDbDir::new("task0130-v7-empty-counter");
+        let path = tmp.db_path();
+        build_historical_shape(&path, 7);
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
+        assert_eq!(
+            db.wigle_lookups_today().unwrap(),
+            0,
+            "absent counter starts fresh at 0 under the new key"
+        );
     }
 
     /// AC#3: the v3 -> v7 path specifically. A v3-shape DB has neither the v4
@@ -5808,9 +5944,13 @@ mod tests {
 
             db.migrate().unwrap();
 
+            // Shape repair resets the stamp down to the true v6 shape, then the
+            // chain re-runs forward all the way to current (rebuilding the v7
+            // quality bundle en route and applying v7->v8). The landing stamp
+            // tracks SCHEMA_VERSION, not the literal v7 this test forced.
             assert_eq!(
                 db.get_schema_version(),
-                7,
+                SCHEMA_VERSION,
                 "failed repair omitting {omitted}"
             );
             assert!(
@@ -6254,39 +6394,42 @@ mod tests {
     #[test]
     fn test_rate_limiting() {
         let mut db = Database::open_memory().unwrap();
-        assert_eq!(db.api_calls_today().unwrap(), 0);
+        assert_eq!(db.wigle_lookups_today().unwrap(), 0);
 
         // First reservation under generous limit succeeds.
         assert_eq!(
-            db.try_reserve_api_call(100).unwrap(),
+            db.try_reserve_wigle_lookup(100).unwrap(),
             QuotaDecision::Reserved
         );
-        assert_eq!(db.api_calls_today().unwrap(), 1);
+        assert_eq!(db.wigle_lookups_today().unwrap(), 1);
 
         // Limit-of-1 path: already at 1, so further reservation denied.
         assert_eq!(
-            db.try_reserve_api_call(1).unwrap(),
+            db.try_reserve_wigle_lookup(1).unwrap(),
             QuotaDecision::Exhausted
         );
         // Counter unchanged after a denied reservation.
-        assert_eq!(db.api_calls_today().unwrap(), 1);
+        assert_eq!(db.wigle_lookups_today().unwrap(), 1);
 
         // Limit-of-2 path: still room for one more.
-        assert_eq!(db.try_reserve_api_call(2).unwrap(), QuotaDecision::Reserved);
-        assert_eq!(db.api_calls_today().unwrap(), 2);
+        assert_eq!(
+            db.try_reserve_wigle_lookup(2).unwrap(),
+            QuotaDecision::Reserved
+        );
+        assert_eq!(db.wigle_lookups_today().unwrap(), 2);
 
         // Refund returns the slot.
-        db.refund_api_call().unwrap();
-        assert_eq!(db.api_calls_today().unwrap(), 1);
+        db.refund_wigle_lookup().unwrap();
+        assert_eq!(db.wigle_lookups_today().unwrap(), 1);
 
         // Refund clamps at 0.
-        db.refund_api_call().unwrap();
-        db.refund_api_call().unwrap();
-        assert_eq!(db.api_calls_today().unwrap(), 0);
+        db.refund_wigle_lookup().unwrap();
+        db.refund_wigle_lookup().unwrap();
+        assert_eq!(db.wigle_lookups_today().unwrap(), 0);
     }
 
-    /// task-0097: a corrupt `api_calls_today` value must fail **closed** —
-    /// `try_reserve_api_call` denies the slot and leaves the garbage row
+    /// task-0097: a corrupt `wigle_lookups_today` value must fail **closed** —
+    /// `try_reserve_wigle_lookup` denies the slot and leaves the garbage row
     /// untouched, rather than healing it to 0 and re-charging the full daily
     /// WiGLE quota on top of whatever was already spent.
     #[test]
@@ -6303,13 +6446,13 @@ mod tests {
             .unwrap();
         db.conn
             .execute(
-                "INSERT INTO metadata (key, value) VALUES ('api_calls_today', 'garbage')",
+                "INSERT INTO metadata (key, value) VALUES ('wigle_lookups_today', 'garbage')",
                 [],
             )
             .unwrap();
 
         // Fail closed: deny the reservation despite a generous limit.
-        let decision = db.try_reserve_api_call(100).unwrap();
+        let decision = db.try_reserve_wigle_lookup(100).unwrap();
         assert_eq!(
             decision,
             QuotaDecision::CounterCorrupt,
@@ -6320,7 +6463,7 @@ mod tests {
         let raw: String = db
             .conn
             .query_row(
-                "SELECT value FROM metadata WHERE key = 'api_calls_today'",
+                "SELECT value FROM metadata WHERE key = 'wigle_lookups_today'",
                 [],
                 |r| r.get(0),
             )
@@ -6333,7 +6476,7 @@ mod tests {
         let raw = "bad\n\u{1b}";
         let escaped = format!("{raw:?}");
 
-        let (_, parse_events) = capture_events(|| parse_api_calls_value(Some(raw.to_owned())));
+        let (_, parse_events) = capture_events(|| parse_wigle_lookups_value(Some(raw.to_owned())));
         assert!(
             parse_events.is_empty(),
             "the parser must remain side-effect-free"
@@ -6342,7 +6485,7 @@ mod tests {
         let mut reservation_db = Database::open_memory().unwrap();
         seed_api_counter_for_today(&reservation_db, raw);
         let (decision, reservation_events) =
-            capture_events(|| reservation_db.try_reserve_api_call(100).unwrap());
+            capture_events(|| reservation_db.try_reserve_wigle_lookup(100).unwrap());
         assert_eq!(decision, QuotaDecision::CounterCorrupt);
         let reservation_warnings = warning_messages(&reservation_events);
         assert_eq!(reservation_warnings.len(), 1);
@@ -6353,7 +6496,7 @@ mod tests {
 
         let mut refund_db = Database::open_memory().unwrap();
         seed_api_counter_for_today(&refund_db, raw);
-        let (refund_result, refund_events) = capture_events(|| refund_db.refund_api_call());
+        let (refund_result, refund_events) = capture_events(|| refund_db.refund_wigle_lookup());
         assert!(refund_result.is_err());
         let refund_warnings = warning_messages(&refund_events);
         assert_eq!(refund_warnings.len(), 1);
@@ -6363,13 +6506,13 @@ mod tests {
         assert!(!refund_warnings[0].contains("stats reports"));
 
         let stats_db = Database::open_memory().unwrap();
-        stats_db.set_metadata("api_calls_today", raw).unwrap();
+        stats_db.set_metadata("wigle_lookups_today", raw).unwrap();
         let (stats_count, stats_events) =
-            capture_events(|| stats_db.api_calls_today_for_stats().unwrap());
+            capture_events(|| stats_db.wigle_lookups_today_for_stats().unwrap());
         assert_eq!(stats_count, 0);
         let stats_warnings = warning_messages(&stats_events);
         assert_eq!(stats_warnings.len(), 1);
-        assert!(stats_warnings[0].contains("stats reports api_calls_today fallback 0"));
+        assert!(stats_warnings[0].contains("stats reports wigle_lookups_today fallback 0"));
         assert!(stats_warnings[0].contains(&escaped));
         assert!(!stats_warnings[0].contains("reservation denied"));
         assert!(!stats_warnings[0].contains("refund skipped"));
@@ -6405,7 +6548,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let ok = {
                     let mut g = db.lock().unwrap();
-                    g.try_reserve_api_call(limit).unwrap()
+                    g.try_reserve_wigle_lookup(limit).unwrap()
                 };
                 if ok == QuotaDecision::Reserved {
                     reserved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6417,7 +6560,7 @@ mod tests {
         }
         let total = reserved.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(total, limit, "total reservations must equal daily_limit");
-        assert_eq!(db.lock().unwrap().api_calls_today().unwrap(), limit);
+        assert_eq!(db.lock().unwrap().wigle_lookups_today().unwrap(), limit);
     }
 
     #[test]

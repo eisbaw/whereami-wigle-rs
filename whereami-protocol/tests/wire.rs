@@ -144,6 +144,7 @@ mod roundtrip {
             pending_aps: 5,
             not_found_aps: 3,
             db_size_bytes: 40960,
+            wigle_lookups_today: 12,
             api_calls_today: 12,
             api_counter_corruption_denials: 3,
             inflight: 2,
@@ -619,7 +620,7 @@ mod daemon_fixtures {
     const LOCATE_FALLBACK_FIXTURE: &str = r#"{"ok":true,"v":1,"lat":0.0,"lon":0.0,"accuracy_m":1000.0,"sources":2,"cached":2,"visible":2,"stable":2,"fallback":true,"confidence":"low"}"#;
     const RESOLVE_FIXTURE: &str = r#"{"ok":true,"v":1,"results":[{"bssid":"02:00:00:00:00:01","lat":55.1,"lon":12.2,"ssid":"cafe","source":"cache"},{"bssid":"02:00:00:00:00:02","lat":null,"lon":null,"ssid":null,"source":"not_found"}]}"#;
     const SCAN_FIXTURE: &str = r#"{"ok":true,"v":1,"networks":[{"bssid":"02:00:00:00:00:0a","ssid":"home","signal_dbm":-52,"channel":6}],"scan_age_ms":1500,"scanned_at":"2026-01-02T03:04:05Z"}"#;
-    const STATS_FIXTURE: &str = r#"{"ok":true,"v":1,"cached_aps":100,"pending_aps":5,"not_found_aps":3,"db_size_bytes":40960,"api_calls_today":12,"api_counter_corruption_denials":3,"inflight":2,"db_write_failures":1,"db_read_failures":4,"autolocate_fixes_written":7,"orphan_tasks_aborted":0}"#;
+    const STATS_FIXTURE: &str = r#"{"ok":true,"v":1,"cached_aps":100,"pending_aps":5,"not_found_aps":3,"db_size_bytes":40960,"wigle_lookups_today":12,"api_calls_today":12,"api_counter_corruption_denials":3,"inflight":2,"db_write_failures":1,"db_read_failures":4,"autolocate_fixes_written":7,"orphan_tasks_aborted":0}"#;
     const DEBUG_FIXTURE: &str = r#"{"ok":true,"v":1,"daemon_rev":"abc1234","scan_age_ms":800,"samples_in_buffer":4,"visible":3,"stable":2,"bssids":[{"bssid":"02:00:00:00:00:aa","signal_dbm":-48,"seen":5,"needed":3,"is_stable":true,"db_status":"cached"},{"bssid":"02:00:00:00:00:bb","signal_dbm":null,"seen":2,"needed":3,"is_stable":false,"db_status":"new"}]}"#;
     const HISTORY_FIXTURE: &str = r#"{"ok":true,"v":1,"from":"2026-01-01T00:00:00Z","to":"2026-01-02T00:00:00Z","segments":[{"start_rfc3339":"2026-01-01T08:00:00Z","end_rfc3339":"2026-01-01T09:30:00Z","duration_secs":5400,"centroid_lat":55.6761,"centroid_lon":12.5683,"mean_accuracy_m":35.0,"n_fixes":42}]}"#;
     const VERSION_FIXTURE: &str = r#"{"ok":true,"v":1,"version":"0.1.0","git_rev":"deadbeef"}"#;
@@ -667,6 +668,11 @@ mod daemon_fixtures {
         let st: StatsResponse = serde_json::from_str(STATS_FIXTURE).unwrap();
         assert_eq!(st.cached_aps, 100);
         assert_eq!(st.orphan_tasks_aborted, 0);
+        // task-0130 transitional dual-emit: a new daemon carries BOTH the new
+        // wigle_lookups_today and the deprecated api_calls_today with the same
+        // value, so old and new clients both render the WiGLE daily count.
+        assert_eq!(st.wigle_lookups_today, 12);
+        assert_eq!(st.api_calls_today, 12);
 
         let d: DebugResponse = serde_json::from_str(DEBUG_FIXTURE).unwrap();
         assert_eq!(d.daemon_rev.as_deref(), Some("abc1234"));
@@ -692,6 +698,12 @@ mod daemon_fixtures {
         assert_eq!(st.db_read_failures, 0);
         assert_eq!(st.autolocate_fixes_written, 0);
         assert_eq!(st.orphan_tasks_aborted, 0);
+        // task-0130 back-compat: a PRE-rename daemon emits only api_calls_today
+        // and no wigle_lookups_today. A new client decoding it gets the deprecated
+        // value verbatim and serde-defaults the new field to 0 for this one
+        // transitional release (acceptable until every daemon emits both).
+        assert_eq!(st.api_calls_today, 105);
+        assert_eq!(st.wigle_lookups_today, 0);
     }
 
     #[test]

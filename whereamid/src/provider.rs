@@ -123,7 +123,7 @@ async fn wigle_lookup(state: &Arc<DaemonState>, bssid: &str) -> ProviderOutcome 
 
     // Atomically acquire a cancellation-owned quota lease BEFORE the network
     // call. This closes the TOCTOU race where concurrent lookups could both
-    // observe count<limit and exceed daily_limit.
+    // observe count<limit and exceed wigle_daily_limit.
     let slot = match reserve_wigle_quota(state).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
@@ -158,8 +158,8 @@ async fn reserve_wigle_quota(
 ) -> std::result::Result<crate::db::QuotaLease, ProviderOutcome> {
     match state
         .db
-        .reserve_api_call(
-            state.args.daily_limit,
+        .reserve_wigle_lookup(
+            state.args.wigle_daily_limit,
             Arc::clone(&state.db_write_failures),
             Arc::clone(&state.api_counter_corruption_denials),
         )
@@ -203,8 +203,8 @@ mod tests {
     async fn reserve(state: &Arc<DaemonState>) -> crate::db::QuotaLease {
         match state
             .db
-            .reserve_api_call(
-                state.args.daily_limit,
+            .reserve_wigle_lookup(
+                state.args.wigle_daily_limit,
                 Arc::clone(&state.db_write_failures),
                 Arc::clone(&state.api_counter_corruption_denials),
             )
@@ -213,14 +213,14 @@ mod tests {
         {
             QuotaReservation::Reserved(slot) => slot,
             QuotaReservation::Exhausted | QuotaReservation::CounterCorrupt => {
-                panic!("reservation must succeed under the default daily limit")
+                panic!("reservation must succeed under the default WiGLE daily limit")
             }
         }
     }
 
     async fn calls_today(state: &Arc<DaemonState>) -> u32 {
         state.db.writer_barrier().await.unwrap();
-        state.db.api_calls_today().await.unwrap()
+        state.db.wigle_lookups_today().await.unwrap()
     }
 
     async fn malformed_json_server() -> (String, tokio::task::JoinHandle<()>) {
@@ -269,7 +269,7 @@ mod tests {
             &chrono::Utc::now().format("%Y-%m-%d").to_string(),
         )
         .unwrap();
-        db.set_metadata("api_calls_today", raw).unwrap();
+        db.set_metadata("wigle_lookups_today", raw).unwrap();
     }
 
     fn denied_outcome(
@@ -307,7 +307,7 @@ mod tests {
         assert_eq!(
             state
                 .db
-                .get_metadata("api_calls_today")
+                .get_metadata("wigle_lookups_today")
                 .await
                 .unwrap()
                 .as_deref(),
@@ -319,7 +319,7 @@ mod tests {
     async fn configured_wigle_normal_exhaustion_skips_without_corruption_count() {
         let state = test_state_with_wigle("configured-user", "configured-key");
         assert!(state.wigle.is_configured());
-        seed_api_counter(&state, &state.args.daily_limit.to_string());
+        seed_api_counter(&state, &state.args.wigle_daily_limit.to_string());
 
         let outcome = denied_outcome(reserve_wigle_quota(&state).await);
         assert!(matches!(outcome, ProviderOutcome::Skipped));
