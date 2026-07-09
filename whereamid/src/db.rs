@@ -1622,8 +1622,9 @@ const V5_TO_V6_TARGET: i32 = 6;
 const V6_TO_V7_TARGET: i32 = 7;
 const V7_TO_V8_TARGET: i32 = 8;
 const V8_TO_V9_TARGET: i32 = 9;
+const V9_TO_V10_TARGET: i32 = 10;
 
-const SCHEMA_VERSION: i32 = V8_TO_V9_TARGET;
+const SCHEMA_VERSION: i32 = V9_TO_V10_TARGET;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CorruptWigleLookupsValue {
@@ -2267,6 +2268,12 @@ impl Database {
             version = V8_TO_V9_TARGET;
         }
 
+        if version < V9_TO_V10_TARGET {
+            info!("migrating database v{version} -> v10 (index not_found.checked_at for prune/revive)");
+            self.migrate_v9_to_v10()?;
+            version = V9_TO_V10_TARGET;
+        }
+
         if version == SCHEMA_VERSION {
             debug!("database schema is up to date (v{version})");
         } else if version > SCHEMA_VERSION {
@@ -2660,6 +2667,37 @@ impl Database {
             tx.execute(
                 "UPDATE schema_version SET version = ?1 WHERE id = 1",
                 params![V8_TO_V9_TARGET],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// v9 -> v10: add `idx_not_found_checked_at` on `not_found(checked_at)`
+    /// (task-0259).
+    ///
+    /// Both `prune_not_found` (`DELETE ... WHERE checked_at < ?`) and
+    /// `revive_expired_not_found` (`SELECT ... WHERE checked_at <= ? LIMIT ?`)
+    /// run on EVERY drain pass under the single-writer `DbHandle.write` lock, on
+    /// the `not_found` negative cache that task-0110 says grows huge. Without an
+    /// index on `checked_at` both are O(N) full-table scans that block every
+    /// other writer in the FIFO. This index makes them O(log N + matches),
+    /// mirroring the `idx_fixes_at` expiry index (migrate_v4_to_v5) and its
+    /// query-plan assertion test.
+    ///
+    /// `CREATE INDEX IF NOT EXISTS` is idempotent, so a re-run (or a
+    /// crash-interrupted retry) is a no-op. The index build and the version
+    /// stamp share one `run_migration` transaction, so a crash mid-migration
+    /// rolls back to v9. No data is touched — only the query plan changes.
+    fn migrate_v9_to_v10(&self) -> Result<()> {
+        self.run_migration(|tx| {
+            tx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_not_found_checked_at ON not_found(checked_at)",
+                [],
+            )
+            .context("failed to create idx_not_found_checked_at index")?;
+            tx.execute(
+                "UPDATE schema_version SET version = ?1 WHERE id = 1",
+                params![V9_TO_V10_TARGET],
             )?;
             Ok(())
         })
@@ -5357,6 +5395,7 @@ mod tests {
             V6_TO_V7_TARGET,
             V7_TO_V8_TARGET,
             V8_TO_V9_TARGET,
+            V9_TO_V10_TARGET,
         ];
         let max_target = all_targets
             .into_iter()
@@ -5663,6 +5702,18 @@ mod tests {
             db.column_exists("aps", "frequency"),
             "v8->v9 must keep the canonical aps.frequency"
         );
+
+        // --- v9 -> v10: stamp 10, idx_not_found_checked_at appears (task-0259) ---
+        assert!(
+            !index_exists(&db, "idx_not_found_checked_at"),
+            "not_found index must NOT exist before v10"
+        );
+        db.migrate_v9_to_v10().unwrap();
+        assert_eq!(db.get_schema_version(), 10);
+        assert!(
+            index_exists(&db, "idx_not_found_checked_at"),
+            "v9->v10 must create idx_not_found_checked_at"
+        );
     }
 
     // --- task-0151: real historical-shape DB files opened via the PUBLIC
@@ -5748,27 +5799,52 @@ mod tests {
 
     /// Seed representative rows into exactly the tables that exist at `version`.
     /// aps/not_found/pending exist from v1; last_fix from v4; fixes from v5.
-    /// The aps INSERT names only v1 columns (source_priority is added at v2,
-    /// is_mobile at v6, both with defaults), so the same statement is valid at
-    /// every version and does not smuggle in a newer column.
+    /// The aps/pending INSERTs name only columns present at `version`:
+    /// source_priority (v2) and is_mobile (v6) have defaults so they need not be
+    /// named, and the redundant `channel` column is dropped at v9 (task-0123).
+    /// Pre-v9 shapes seed a real channel value (so the v8->v9 drop test can
+    /// observe it); v9+ shapes omit the column, since naming a dropped column
+    /// would fail. `frequency` (canonical) is seeded at every version.
     fn seed_sample_rows(db: &Database, version: i32) {
-        db.conn
-            .execute(
-                "INSERT INTO aps
-                    (bssid, ssid, lat, lon, encryption, channel, frequency,
-                     city, country, source, first_seen, last_seen, fetched_at)
-                 VALUES (?1, ?2, ?3, ?4, 'wpa2', 6, 2437, 'Copenhagen', 'DK',
-                         ?5, '2020-01-01T00:00:00Z', '2020-01-02T00:00:00Z',
-                         '2020-01-02T00:00:00Z')",
-                params![
-                    SEED_AP_BSSID,
-                    SEED_AP_SSID,
-                    SEED_AP_LAT,
-                    SEED_AP_LON,
-                    SEED_AP_SOURCE
-                ],
-            )
-            .unwrap();
+        // channel was dropped from aps/pending at v9 (V8_TO_V9_TARGET).
+        let has_channel = version < V8_TO_V9_TARGET;
+        if has_channel {
+            db.conn
+                .execute(
+                    "INSERT INTO aps
+                        (bssid, ssid, lat, lon, encryption, channel, frequency,
+                         city, country, source, first_seen, last_seen, fetched_at)
+                     VALUES (?1, ?2, ?3, ?4, 'wpa2', 6, 2437, 'Copenhagen', 'DK',
+                             ?5, '2020-01-01T00:00:00Z', '2020-01-02T00:00:00Z',
+                             '2020-01-02T00:00:00Z')",
+                    params![
+                        SEED_AP_BSSID,
+                        SEED_AP_SSID,
+                        SEED_AP_LAT,
+                        SEED_AP_LON,
+                        SEED_AP_SOURCE
+                    ],
+                )
+                .unwrap();
+        } else {
+            db.conn
+                .execute(
+                    "INSERT INTO aps
+                        (bssid, ssid, lat, lon, encryption, frequency,
+                         city, country, source, first_seen, last_seen, fetched_at)
+                     VALUES (?1, ?2, ?3, ?4, 'wpa2', 2437, 'Copenhagen', 'DK',
+                             ?5, '2020-01-01T00:00:00Z', '2020-01-02T00:00:00Z',
+                             '2020-01-02T00:00:00Z')",
+                    params![
+                        SEED_AP_BSSID,
+                        SEED_AP_SSID,
+                        SEED_AP_LAT,
+                        SEED_AP_LON,
+                        SEED_AP_SOURCE
+                    ],
+                )
+                .unwrap();
+        }
         db.conn
             .execute(
                 "INSERT INTO not_found (bssid, first_seen, last_seen, checked_at)
@@ -5776,16 +5852,29 @@ mod tests {
                 params![SEED_NOT_FOUND_BSSID, SEED_NOT_FOUND_CHECKED_AT],
             )
             .unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO pending
-                    (bssid, ssid, channel, frequency, signal_dbm,
-                     first_seen, last_seen, attempts)
-                 VALUES (?1, 'pending-net', 11, 2462, -70,
-                         '2020-03-01T00:00:00Z', '2020-03-02T00:00:00Z', ?2)",
-                params![SEED_PENDING_BSSID, SEED_PENDING_ATTEMPTS],
-            )
-            .unwrap();
+        if has_channel {
+            db.conn
+                .execute(
+                    "INSERT INTO pending
+                        (bssid, ssid, channel, frequency, signal_dbm,
+                         first_seen, last_seen, attempts)
+                     VALUES (?1, 'pending-net', 11, 2462, -70,
+                             '2020-03-01T00:00:00Z', '2020-03-02T00:00:00Z', ?2)",
+                    params![SEED_PENDING_BSSID, SEED_PENDING_ATTEMPTS],
+                )
+                .unwrap();
+        } else {
+            db.conn
+                .execute(
+                    "INSERT INTO pending
+                        (bssid, ssid, frequency, signal_dbm,
+                         first_seen, last_seen, attempts)
+                     VALUES (?1, 'pending-net', 2462, -70,
+                             '2020-03-01T00:00:00Z', '2020-03-02T00:00:00Z', ?2)",
+                    params![SEED_PENDING_BSSID, SEED_PENDING_ATTEMPTS],
+                )
+                .unwrap();
+        }
         if version >= 4 {
             db.conn
                 .execute(
@@ -5809,13 +5898,13 @@ mod tests {
     }
 
     /// Build a tempfile DB stamped at exactly historical shape `target`
-    /// (1..=7) and seed it, then close it. Authenticity is guaranteed by
+    /// (1..=9) and seed it, then close it. Authenticity is guaranteed by
     /// constructing the shape ONLY from `create_schema_v1` + the real migrate
     /// fns up to `target` — never hand-written DDL.
     fn build_historical_shape(path: &Path, target: i32) {
         assert!(
-            (1..=8).contains(&target),
-            "historical shapes are v1..=v8; v9 is the current shape"
+            (1..=9).contains(&target),
+            "historical shapes are v1..=v9; v10 is the current shape"
         );
         let db = Database {
             conn: Connection::open(path).unwrap(),
@@ -5842,6 +5931,9 @@ mod tests {
         }
         if target >= 8 {
             db.migrate_v7_to_v8().unwrap();
+        }
+        if target >= 9 {
+            db.migrate_v8_to_v9().unwrap();
         }
         assert_eq!(
             db.get_schema_version(),
@@ -5877,7 +5969,12 @@ mod tests {
                 "table {table} must exist after cascade from v{origin}"
             );
         }
-        for index in ["idx_aps_geo", "idx_aps_last_seen", "idx_fixes_at"] {
+        for index in [
+            "idx_aps_geo",
+            "idx_aps_last_seen",
+            "idx_fixes_at",
+            "idx_not_found_checked_at",
+        ] {
             assert!(
                 index_exists(db, index),
                 "index {index} must exist after cascade from v{origin}"
@@ -6020,16 +6117,16 @@ mod tests {
         }
     }
 
-    /// AC#1/#2/#4: for each historical stamped shape v in {1,2,3,4,5,6,7}, build
-    /// a genuine v-shape tempfile with seed rows, open it through the PUBLIC
-    /// `Database::open` cascade, and assert it reaches SCHEMA_VERSION with the
-    /// full current shape and every seeded row preserved. Distinct from
+    /// AC#1/#2/#4: for each historical stamped shape v in {1,2,3,4,5,6,7,8,9},
+    /// build a genuine v-shape tempfile with seed rows, open it through the
+    /// PUBLIC `Database::open` cascade, and assert it reaches SCHEMA_VERSION with
+    /// the full current shape and every seeded row preserved. Distinct from
     /// `migration_chain_stamps_each_version_in_lockstep`, which steps the
     /// migrate fns directly on one in-memory connection and never exercises
     /// `Database::open` on a real historical file.
     #[test]
     fn open_each_historical_shape_cascades_to_current() {
-        for origin in 1..=8 {
+        for origin in 1..=9 {
             let tmp = TempDbDir::new(&format!("task0151-cascade-v{origin}"));
             let path = tmp.db_path();
             build_historical_shape(&path, origin);
@@ -6087,6 +6184,128 @@ mod tests {
                 .and_then(whereami_protocol::Channel::from_frequency),
             Some(whereami_protocol::Channel::TwoFourGhz(6)),
             "the dropped channel is re-derivable from the surviving frequency"
+        );
+    }
+
+    /// task-0259: a genuine v9 file opens cleanly at v10 with the new
+    /// `idx_not_found_checked_at` index created AND its seeded not_found row (and
+    /// the row's `checked_at` value) preserved. Proves the migration builds the
+    /// index without disturbing data, and that a v9 negative-cache row survives
+    /// the upgrade. The seed writes SEED_NOT_FOUND_BSSID / SEED_NOT_FOUND_CHECKED_AT.
+    #[test]
+    fn open_v9_shape_creates_not_found_index_at_v10() {
+        let tmp = TempDbDir::new("task0259-v9-to-v10");
+        let path = tmp.db_path();
+        build_historical_shape(&path, 9);
+
+        // The genuine v9 file has NO not_found index yet (it arrives at v10).
+        {
+            let raw = Connection::open(&path).unwrap();
+            let has_index: bool = raw
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_not_found_checked_at'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some();
+            assert!(!has_index, "v9 file must NOT carry the not_found index yet");
+        }
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(
+            db.get_schema_version(),
+            SCHEMA_VERSION,
+            "opening a v9 file must cascade to v{SCHEMA_VERSION}"
+        );
+        assert!(
+            index_exists(&db, "idx_not_found_checked_at"),
+            "v9->v10 must create idx_not_found_checked_at"
+        );
+        // PRAGMA index_list('not_found') must also list it (belt-and-braces:
+        // proves the index is attached to the not_found table, not merely a
+        // same-named object in sqlite_master).
+        let listed = {
+            let mut stmt = db.conn.prepare("PRAGMA index_list('not_found')").unwrap();
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            names.iter().any(|n| n == "idx_not_found_checked_at")
+        };
+        assert!(
+            listed,
+            "PRAGMA index_list('not_found') must include idx_not_found_checked_at"
+        );
+
+        // The seeded v9 negative-cache row survived, value intact.
+        let (count, checked_at): (i64, String) = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*), MAX(checked_at) FROM not_found WHERE bssid = ?1",
+                params![SEED_NOT_FOUND_BSSID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "not_found row must survive v9->v10");
+        assert_eq!(
+            checked_at, SEED_NOT_FOUND_CHECKED_AT,
+            "not_found.checked_at value must survive v9->v10"
+        );
+    }
+
+    /// task-0259 AC#2: both the prune DELETE and the revive SELECT must use
+    /// `idx_not_found_checked_at` (SEARCH), not a full-table SCAN. Mirrors the
+    /// `prune_chunk_selection_is_index_search_not_full_scan` test for idx_fixes_at.
+    /// The SQL below is copied verbatim from `prune_not_found` and
+    /// `revive_expired_not_found`; if either production query changes its WHERE
+    /// clause, update these strings to keep the plan assertion meaningful.
+    #[test]
+    fn not_found_prune_and_revive_use_index_not_full_scan() {
+        let db = Database::open_memory().unwrap();
+
+        let explain_details = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Vec<String> {
+            let explain = format!("EXPLAIN QUERY PLAN {sql}");
+            let mut stmt = db.conn.prepare(&explain).unwrap();
+            stmt.query_map(params, |row| row.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+
+        // prune_not_found: DELETE FROM not_found WHERE checked_at < ?1
+        let prune = explain_details(
+            "DELETE FROM not_found WHERE checked_at < ?1",
+            &[&"2020-01-01T00:00:00+00:00"],
+        );
+        assert!(
+            prune
+                .iter()
+                .any(|d| d.contains("SEARCH") && d.contains("idx_not_found_checked_at")),
+            "prune DELETE must SEARCH idx_not_found_checked_at: {prune:?}"
+        );
+        assert!(
+            prune.iter().all(|d| !d.contains("SCAN not_found")),
+            "prune DELETE must never full-scan not_found: {prune:?}"
+        );
+
+        // revive_expired_not_found: SELECT bssid FROM not_found
+        //                           WHERE checked_at <= ?1 LIMIT ?2
+        let revive = explain_details(
+            "SELECT bssid FROM not_found WHERE checked_at <= ?1 LIMIT ?2",
+            &[&"2020-01-01T00:00:00+00:00", &5_i64],
+        );
+        assert!(
+            revive
+                .iter()
+                .any(|d| d.contains("SEARCH") && d.contains("idx_not_found_checked_at")),
+            "revive SELECT must SEARCH idx_not_found_checked_at: {revive:?}"
+        );
+        assert!(
+            revive.iter().all(|d| !d.contains("SCAN not_found")),
+            "revive SELECT must never full-scan not_found: {revive:?}"
         );
     }
 
