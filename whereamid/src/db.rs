@@ -1330,6 +1330,16 @@ impl DbHandle {
             .await
     }
 
+    /// Record a fix observation in the `fixes` timeseries WITHOUT advancing the
+    /// authoritative `last_fix` (task-0263). Used for the antipodal-fallback
+    /// fix so its 1000 m "position unknown" sentinel is never cached as
+    /// last-known and later served on the stale path as `fallback=false`. See
+    /// [`Database::persist_history_only`].
+    pub async fn persist_history_only(&self, fix: LastFix, quality: FixQuality) -> Result<()> {
+        self.write_durable(move |db| db.persist_history_only(&fix, &quality))
+            .await
+    }
+
     /// Persist an autonomous observation and report whether the monotonic
     /// `last_fix` UPSERT accepted its timestamp. The history row commits in
     /// either case; `false` means a newer wall-clock fix remained authoritative.
@@ -1932,6 +1942,36 @@ fn upsert_last_fix(connection: &Connection, fix: &LastFix) -> Result<LastFixUpda
         }
         changed => anyhow::bail!("last_fix UPSERT changed an unexpected {changed} rows"),
     }
+}
+
+/// Append one row to the `fixes` timeseries within an open transaction. Shared
+/// by [`Database::persist_fix_and_history_outcome`] (last_fix + history) and
+/// [`Database::persist_history_only`] (history without advancing last_fix,
+/// task-0263), so both emit an identical history row.
+///
+/// Same RFC3339 marshalling as the UPSERT (invariant in `upsert_last_fix`): the
+/// history row's `at_rfc3339` string is what `get_fixes_in_range`'s lexical
+/// bounds order by.
+fn insert_history_row(connection: &Connection, fix: &LastFix, quality: &FixQuality) -> Result<()> {
+    connection.execute(
+        "INSERT INTO fixes (
+             at_rfc3339, lat, lon, accuracy_m, n_sources,
+             implied_speed_kmh, last_fix_age_secs, inlier_ratio, confidence, suspect_reason
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            fix.at.to_rfc3339(),
+            fix.lat,
+            fix.lon,
+            fix.accuracy_m,
+            fix.sources as i64,
+            quality.implied_speed_kmh(),
+            quality.last_fix_age_secs(),
+            quality.inlier_ratio(),
+            quality.confidence().as_db_str(),
+            quality.suspect_reason(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn warn_if_last_fix_dropped(outcome: LastFixUpdate) {
@@ -3568,29 +3608,26 @@ impl Database {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let outcome = upsert_last_fix(&tx, fix)?;
-        // Same RFC3339 marshalling as the UPSERT (invariant in `upsert_last_fix`):
-        // the history row's `at_rfc3339` string is what `get_fixes_in_range`'s
-        // lexical bounds order by.
-        tx.execute(
-            "INSERT INTO fixes (
-                 at_rfc3339, lat, lon, accuracy_m, n_sources,
-                 implied_speed_kmh, last_fix_age_secs, inlier_ratio, confidence, suspect_reason
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                fix.at.to_rfc3339(),
-                fix.lat,
-                fix.lon,
-                fix.accuracy_m,
-                fix.sources as i64,
-                quality.implied_speed_kmh(),
-                quality.last_fix_age_secs(),
-                quality.inlier_ratio(),
-                quality.confidence().as_db_str(),
-                quality.suspect_reason(),
-            ],
-        )?;
+        insert_history_row(&tx, fix, quality)?;
         tx.commit()?;
         Ok(outcome)
+    }
+
+    /// Record a fix observation in the `fixes` timeseries WITHOUT advancing the
+    /// authoritative `last_fix` (task-0263). Used for the antipodal-cancellation
+    /// fallback fix: its `accuracy_m` is the 1000 m "position unknown" sentinel
+    /// (see the guard in `trilaterate`), so caching it as the last-known fix
+    /// would later be served on the stale path as a ~1000 m position with
+    /// `fallback=false` — re-introducing the in-band ambiguity task-0127 removed.
+    /// The `fixes` timeseries is a raw observation log (separate from `last_fix`)
+    /// and still records the observation.
+    fn persist_history_only(&mut self, fix: &LastFix, quality: &FixQuality) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_history_row(&tx, fix, quality)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Remove all persisted location and observed-network state atomically.

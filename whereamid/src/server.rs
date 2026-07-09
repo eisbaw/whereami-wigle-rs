@@ -1961,19 +1961,43 @@ async fn compute_locate_with_clock(
                             });
                             new_fix.address = cache.get(new_fix.lat, new_fix.lon);
                         }
-                        let last_fix_applied = match state
-                            .db
-                            .persist_autolocate_fix_and_history(
-                                new_fix.clone(),
-                                decision.quality.clone(),
-                            )
-                            .await
-                        {
-                            Ok(applied) => applied,
-                            Err(error) => {
-                                warn!("failed to persist autonomous last_fix and history: {error}");
+                        let last_fix_applied = if pos.fallback {
+                            // task-0263: an antipodal-fallback fix carries the
+                            // accuracy_m=1000 "position unknown" sentinel. Do NOT
+                            // let it overwrite the authoritative last_fix — a later
+                            // stale read would echo ~1000 m with fallback=false,
+                            // re-introducing the in-band ambiguity task-0127
+                            // removed. Still record the observation in the fixes
+                            // timeseries (history is separate from last_fix). Treat
+                            // it as "not applied" so memory realigns to `previous`
+                            // via the shared seam below.
+                            if let Err(error) = state
+                                .db
+                                .persist_history_only(new_fix.clone(), decision.quality.clone())
+                                .await
+                            {
+                                warn!("failed to persist autonomous fallback history: {error}");
                                 state.record_db_failure();
                                 return LocateOutcome::Autolocate(AutolocateOutcome::Failed);
+                            }
+                            false
+                        } else {
+                            match state
+                                .db
+                                .persist_autolocate_fix_and_history(
+                                    new_fix.clone(),
+                                    decision.quality.clone(),
+                                )
+                                .await
+                            {
+                                Ok(applied) => applied,
+                                Err(error) => {
+                                    warn!(
+                                        "failed to persist autonomous last_fix and history: {error}"
+                                    );
+                                    state.record_db_failure();
+                                    return LocateOutcome::Autolocate(AutolocateOutcome::Failed);
+                                }
                             }
                         };
                         // Commit is the publication boundary for autonomous
@@ -1994,7 +2018,24 @@ async fn compute_locate_with_clock(
                         return LocateOutcome::Autolocate(AutolocateOutcome::Written);
                     }
 
-                    let address = if state.args.address_approx {
+                    let address = if pos.fallback {
+                        // task-0263: skip advancing last_fix for a fallback fix.
+                        // Its accuracy_m=1000 sentinel means "position unknown";
+                        // caching it would later be served on the stale path as a
+                        // ~1000 m position with fallback=false. Leave the prior
+                        // last_fix (memory + disk) intact and record the
+                        // observation in the fixes timeseries only. No geocode: a
+                        // sentinel position has no meaningful address.
+                        if let Err(error) = state
+                            .db
+                            .persist_history_only(new_fix, decision.quality.clone())
+                            .await
+                        {
+                            warn!("failed to persist fallback history: {error}");
+                            state.record_db_failure();
+                        }
+                        None
+                    } else if state.args.address_approx {
                         persist_locate_fix_and_schedule_locked(
                             state,
                             ticket,
@@ -5079,6 +5120,87 @@ mod dispatch_tests {
             json["accuracy_m"].as_f64().unwrap(),
             1000.0,
             "fallback sentinel accuracy must be 1000: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn antipodal_fallback_fix_does_not_overwrite_last_fix() {
+        // task-0263: an antipodal-fallback fix (accuracy_m=1000 sentinel) must
+        // NOT become the authoritative last_fix. Otherwise a later stale read
+        // would serve ~1000 m with fallback=false, re-introducing the in-band
+        // ambiguity task-0127 removed. The prior real last_fix must survive
+        // unchanged, while the fixes timeseries still records the observation.
+        let state = test_state();
+
+        // Prior authoritative fix at (0,180) — the strongest-AP the guard echoes
+        // for the antipodal pair below — so the CurrentTrilat fallback wins the
+        // plausibility check (distance 0) and reaches the persist site under test.
+        let previous = previous_row(0.0, 180.0, chrono::Duration::minutes(5));
+        state.db.set_last_fix(previous.clone()).await.unwrap();
+
+        let mut sample = crate::debounce::ScanSample::new();
+        add_cached_scan_ap(
+            &state,
+            &mut sample,
+            "b8:00:00:00:7f:00",
+            0.0,
+            0.0,
+            -50,
+            Some("a"),
+        );
+        add_cached_scan_ap(
+            &state,
+            &mut sample,
+            "b8:00:00:00:7f:01",
+            0.0,
+            180.0,
+            -50,
+            Some("b"),
+        );
+        push_stable_scan(&state, sample).await;
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], true, "{response}");
+        assert_eq!(
+            json["fallback"], true,
+            "the winning fix must be the antipodal fallback: {response}"
+        );
+        assert_eq!(
+            json["accuracy_m"].as_f64().unwrap(),
+            1000.0,
+            "fallback sentinel accuracy must be 1000: {response}"
+        );
+
+        // The authoritative last_fix is the PRIOR real fix, untouched: same
+        // timestamp (no invented motion), same non-sentinel accuracy, same
+        // address/sources. A regression here would cache the 1000 m sentinel.
+        let stored = state.db.get_last_fix().await.unwrap().unwrap();
+        assert_eq!(
+            stored.at, previous.at,
+            "fallback fix must not refresh the last_fix timestamp"
+        );
+        assert_eq!(
+            stored.accuracy_m, previous.accuracy_m,
+            "fallback 1000 m sentinel must not overwrite the prior last_fix accuracy"
+        );
+        assert!((stored.lat - previous.lat).abs() < 1e-12);
+        assert!((stored.lon - previous.lon).abs() < 1e-12);
+        assert_eq!(stored.address, previous.address);
+        assert_eq!(stored.sources, previous.sources);
+
+        // History is a separate raw timeseries and DOES record the fallback
+        // observation. Its presence also proves we took the CurrentTrilat
+        // fallback path (a last_fix winner writes no history).
+        let rows = history_rows(&state).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "fallback observation must be recorded in history"
+        );
+        assert_eq!(
+            rows[0].accuracy_m, 1000.0,
+            "history must record the fallback observation's sentinel accuracy"
         );
     }
 

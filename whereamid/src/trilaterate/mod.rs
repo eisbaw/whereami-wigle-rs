@@ -260,6 +260,20 @@ pub fn trilaterate(aps: &[PositionedAp]) -> Result<Position> {
     // Antipodal-cancellation guard: if the weighted vector sum has near-zero
     // magnitude, the input is fundamentally ambiguous (e.g. two diametrically
     // opposed APs with equal weight). Fall back to the strongest-signal AP.
+    //
+    // task-0262 — this guard (and therefore `fallback=true`) is NEAR-ALWAYS
+    // FALSE in production, by design. The threshold `sum_weight * 1e-6` requires
+    // `|w1-w2|/(w1+w2) < 1e-6` for a two-AP antipodal pair, but vote weights come
+    // from INTEGER dBm, where the smallest 1 dBm gap is a ~5.75% relative weight
+    // difference (>> 1e-6). So for two antipodal APs the guard fires ONLY on
+    // IDENTICAL integer dBm (or two signal-less APs sharing the missing-signal
+    // fallback weight). Combined with the physical improbability of genuinely
+    // antipodal APs in one scan, `fallback` is a rare-but-correct EXACT-antipodal
+    // safety net (preventing a NaN/garbage centroid), NOT a routine
+    // centroid-ambiguity signal. The threshold is deliberately NOT widened:
+    // detecting NEAR-antipodal / near-tie ambiguity (rejected task-0262 options
+    // a/b) is a behavioral change out of scope — this is a numerical guard, not a
+    // confidence heuristic.
     let mag = (sx * sx + sy * sy + sz * sz).sqrt();
     if mag < sum_weight * 1e-6 {
         let strongest = aps

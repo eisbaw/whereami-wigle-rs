@@ -486,6 +486,16 @@ pub struct LocateResponse {
     /// (the centroid was ambiguous, so the strongest AP was used and
     /// `accuracy_m` is the 1000 m sentinel). Emitted only when true, mirroring
     /// `stale`; absence decodes to false.
+    ///
+    /// task-0262 — this field is NEAR-ALWAYS FALSE in production. It flags a
+    /// rare-but-correct EXACT-antipodal safety net, not a routine
+    /// centroid-ambiguity signal: with integer-dBm vote weights the daemon's
+    /// cancellation guard fires only for two antipodal APs of IDENTICAL integer
+    /// dBm (or two signal-less APs), which — combined with the physical
+    /// improbability of genuinely antipodal APs in one scan — makes `true`
+    /// vanishingly rare. Do NOT treat its absence as "the fix is unambiguous",
+    /// and do NOT read a widened confidence meaning into it. See the guard in
+    /// `whereamid`'s `trilaterate`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fallback: bool,
     /// Age of the stale fix, in seconds. Only meaningful when `stale`.
