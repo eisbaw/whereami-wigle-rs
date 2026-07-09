@@ -18,7 +18,12 @@
 }:
 
 let
-  cargoToml = builtins.fromTOML (builtins.readFile ../whereamid/Cargo.toml);
+  # whereamid/Cargo.toml inherits its version from the workspace
+  # (`version.workspace = true`, task-0260), so `cargoToml.package.version`
+  # there parses to the set `{ workspace = true; }`, not a string. The concrete
+  # version lives in the root Cargo.toml `[workspace.package]`. Reading it there
+  # keeps `nix build`/`nix flake check` working (task-0265).
+  workspaceToml = builtins.fromTOML (builtins.readFile ../Cargo.toml);
   # crane's cleanCargoSource keeps only Cargo files and *.rs — which silently
   # DROPS whereamid/tests/proptests.proptest-regressions, the committed
   # proptest counterexample corpus (task-0071). Without it the `test` check
@@ -38,7 +43,7 @@ let
 
   commonArgs = {
     pname = "whereamid";
-    version = cargoToml.package.version;
+    version = workspaceToml.workspace.package.version;
     inherit src;
     strictDeps = true;
 
