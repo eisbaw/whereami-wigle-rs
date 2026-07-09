@@ -9,3 +9,16 @@ resolver = "2"
 [workspace.package]
 version = "0.6.2"
 edition = "2021"
+license = "MIT"
+
+# Single source of truth for dependency versions shared by >=2 members
+# (task-0170). Members reference these with `dep.workspace = true`, so a version
+# bump happens here once instead of drifting across manifests. Members that need
+# extra features layer them on locally (e.g. whereamid's chrono adds "serde").
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+libc = "0.2"

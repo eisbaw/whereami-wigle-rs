@@ -5,7 +5,7 @@ edition.workspace = true
 publish = false
 readme = "README.md"
 description = "Typed Rust client for the whereamid Wi-Fi geolocation daemon."
-license = "MIT"
+license.workspace = true
 
 [[bin]]
 name = "whereami"
@@ -20,12 +20,12 @@ whereami-build-utils = { path = "../whereami-build-utils" }
 
 [dependencies]
 whereami-protocol = { path = "../whereami-protocol" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
 nu-ansi-term = "0.50"
-chrono = "0.4"
+chrono = { workspace = true }
 # Used only to reset the SIGPIPE disposition to SIG_DFL at startup so the
 # CLI behaves like a Unix filter under `| head` (task-0199).
-libc = "0.2"
+libc = { workspace = true }

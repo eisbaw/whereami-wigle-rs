@@ -24,18 +24,18 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 reqwest = { version = "0.12", features = ["json"] }
 rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-chrono = { version = "0.4", features = ["serde"] }
-anyhow = "1"
+chrono = { workspace = true, features = ["serde"] }
+anyhow = { workspace = true }
 # Raw fcntl/getsockopt/umask for the socket-activation fd checks and the
 # self-bind umask tightening (task-0196 review hardening). Already in the lock
 # graph transitively; this only promotes it to a direct dep.
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.11.0"
