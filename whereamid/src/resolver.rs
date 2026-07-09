@@ -90,83 +90,113 @@ pub struct ObservedAp {
     pub ssid: Option<String>,
 }
 
-/// What the orchestrator should do when a provider is `Skipped`
-/// (rate-limited, not configured, etc.) for a given BSSID.
+/// The three real resolution flows. Replaces the former `ChainPolicy`
+/// field-matrix (task-0118): an ~8-field struct whose ~144 syntactically-legal
+/// combinations collapsed to exactly these three semantically-valid modes.
+/// Each mode's behaviour is a fixed point in that space; the boolean
+/// mode-methods below return the exact value the corresponding `ChainPolicy`
+/// field held for that flow, so resolution stays byte-identical.
+///
+/// Behaviour shorthand:
+/// - `ReadOnly` = cache-only. Skips cached + not_found BSSIDs, no write-through,
+///   no pending management, never persists not_found (task-0092: the read-only
+///   `resolve` surface must not mutate daemon state). Used by `resolve_readonly`.
+/// - `Background` = write-through. Skips cached + not_found, caches successes,
+///   marks not_found at chain end, and queues pending on every non-definitive
+///   outcome (skip / network error / hard stop) so a later drain retries.
+///   No pending management (does not own the pending table). Used by
+///   `resolve_background`.
+/// - `Drain` = drain-with-cleanup. Processes every input (no cache/not_found
+///   skip — the pending list IS the work), writes through, marks not_found at
+///   chain end, and OWNS the pending table: on a definitive outcome (success or
+///   not_found) it deletes the pending row in the same critical section. Used by
+///   the pending drain.
 #[derive(Clone, Copy)]
-pub enum SkipAction {
-    /// Move on to the next provider for this BSSID.
-    NextProvider,
-    /// Insert this BSSID into the pending queue (so a later drain retries).
-    QueuePending,
+pub enum ChainMode {
+    ReadOnly,
+    Background,
+    Drain,
 }
 
-/// What the orchestrator should do on a transient network error.
-#[derive(Clone, Copy)]
-pub enum NetErrorAction {
-    /// Log and continue. task-0189 removed the former `IncrementPending`
-    /// variant: the pending drain now bumps attempts once per pass in
-    /// `drain_once` (post-resolve), so per-error increments here would
-    /// double-count.
-    Ignore,
-    /// Insert into the pending queue.
-    QueuePending,
-}
-
-/// What the orchestrator should do when a provider signals `HardStop`
-/// (e.g., WiGLE rate limit hit mid-call). The current provider is
-/// abandoned for the rest of this pass either way.
-#[derive(Clone, Copy)]
-pub enum HardStopAction {
-    /// Just stop using this provider.
-    Stop,
-    /// Stop using this provider, and queue the current BSSID as pending.
-    QueuePendingAndStop,
-}
-
-/// When the chain should record a not_found entry for a missed BSSID.
-/// Replaces the prior pair of booleans (mark_not_found_per_provider +
-/// mark_not_found_at_chain_end) which permitted two illegal combinations
-/// (both true / both false). task-0052.
-#[derive(Clone, Copy)]
-pub enum NotFoundPolicy {
-    /// Mark not_found only when the chain reaches a definitive absence:
-    /// not resolved, not deferred, no genuinely-transient outcome, and at
-    /// least one provider authoritatively returned NotFound (task-0189).
-    /// Used by resolve_background and the pending drain.
-    AtChainEnd,
-    /// Never write to the not_found table. Used by resolve_readonly
-    /// (task-0092): the read-only `resolve` surface must not mutate daemon
-    /// state, so a probe that misses does not block the daemon from
-    /// re-checking that BSSID for the not_found TTL.
-    ///
-    /// task-0092 also removed the former `PerProvider` variant (mark on the
-    /// first provider NotFound): after resolve_readonly moved to `Never`, no
-    /// policy constructed it. Its role — a single-provider chain that marks
-    /// immediately — is equivalent to `AtChainEnd` on a one-provider chain,
-    /// so nothing was lost.
-    Never,
-}
-
-/// Cross-cutting policy that distinguishes the three resolution flows.
-pub struct ChainPolicy {
+impl ChainMode {
     /// Skip BSSIDs already present in the `aps` cache before calling any provider.
-    pub skip_cached: bool,
+    fn skips_cached(self) -> bool {
+        match self {
+            ChainMode::ReadOnly | ChainMode::Background => true,
+            ChainMode::Drain => false,
+        }
+    }
+
     /// Skip BSSIDs present in the not_found table (within TTL).
-    pub skip_not_found: bool,
+    fn skips_not_found(self) -> bool {
+        match self {
+            ChainMode::ReadOnly | ChainMode::Background => true,
+            ChainMode::Drain => false,
+        }
+    }
+
     /// Persist successful lookups to the `aps` cache (write-through).
-    pub write_through: bool,
+    fn writes_through(self) -> bool {
+        match self {
+            ChainMode::ReadOnly => false,
+            ChainMode::Background | ChainMode::Drain => true,
+        }
+    }
+
     /// true only for the pending-drain chain, which OWNS the pending table —
     /// it deletes the pending row on a definitive outcome, success or
-    /// not_found. Other chains (interactive/readonly/background) never touch
-    /// pending. Collapsed from delete_pending_on_success +
-    /// delete_pending_on_not_found, which were always equal — the asymmetry
-    /// was unrepresentable-by-design and is now unrepresentable-in-the-type,
-    /// task-0120.
-    pub manage_pending: bool,
-    pub not_found: NotFoundPolicy,
-    pub on_skipped: SkipAction,
-    pub on_network_error: NetErrorAction,
-    pub on_hard_stop: HardStopAction,
+    /// not_found. Other chains (readonly/background) never touch pending.
+    /// Collapsed from delete_pending_on_success + delete_pending_on_not_found,
+    /// which were always equal (task-0120).
+    fn manages_pending(self) -> bool {
+        match self {
+            ChainMode::ReadOnly | ChainMode::Background => false,
+            ChainMode::Drain => true,
+        }
+    }
+
+    /// Whether the chain persists a not_found entry when it reaches a definitive
+    /// absence (former `NotFoundPolicy::AtChainEnd` vs `Never`). task-0092:
+    /// `ReadOnly` classifies absence without persisting it, so the read-only
+    /// surface never blocks a re-probe for the not_found TTL. The end-of-chain
+    /// classification itself runs for every mode (task-0194); only this gate
+    /// decides whether it also writes the table.
+    fn persists_not_found(self) -> bool {
+        match self {
+            ChainMode::ReadOnly => false,
+            ChainMode::Background | ChainMode::Drain => true,
+        }
+    }
+
+    /// On a `Skipped` provider (unconfigured creds / exhausted quota), queue
+    /// this BSSID as pending so a later drain retries it. Former
+    /// `SkipAction::QueuePending` vs `NextProvider`.
+    fn queues_pending_on_skip(self) -> bool {
+        match self {
+            ChainMode::Background => true,
+            ChainMode::ReadOnly | ChainMode::Drain => false,
+        }
+    }
+
+    /// On a transient `NetworkError`, queue this BSSID as pending. Former
+    /// `NetErrorAction::QueuePending` vs `Ignore`. task-0189 removed the
+    /// per-error attempts increment; the drain bumps attempts once per pass.
+    fn queues_pending_on_network_error(self) -> bool {
+        match self {
+            ChainMode::Background => true,
+            ChainMode::ReadOnly | ChainMode::Drain => false,
+        }
+    }
+
+    /// On a `HardStop` (e.g. WiGLE 429 mid-call), queue this BSSID as pending in
+    /// addition to abandoning the provider. Former
+    /// `HardStopAction::QueuePendingAndStop` vs `Stop`.
+    fn queues_pending_on_hard_stop(self) -> bool {
+        match self {
+            ChainMode::Background => true,
+            ChainMode::ReadOnly | ChainMode::Drain => false,
+        }
+    }
 }
 
 /// Cache-only lookup: returns positions from the aps table, no API calls.
@@ -222,10 +252,10 @@ pub async fn resolve_chain(
     bssids: &[String],
     state: &Arc<DaemonState>,
     providers: &[Provider],
-    policy: &ChainPolicy,
+    mode: ChainMode,
     ticket: crate::privacy::PrivacyTicket,
 ) -> ResolveResult {
-    resolve_chain_with_observations(bssids, state, providers, policy, ticket, &[]).await
+    resolve_chain_with_observations(bssids, state, providers, mode, ticket, &[]).await
 }
 
 /// Resolve with scanner observations attached to provider results before any
@@ -235,7 +265,7 @@ pub(crate) async fn resolve_chain_with_observations(
     bssids: &[String],
     state: &Arc<DaemonState>,
     providers: &[Provider],
-    policy: &ChainPolicy,
+    mode: ChainMode,
     ticket: crate::privacy::PrivacyTicket,
     observations: &[ObservedAp],
 ) -> ResolveResult {
@@ -243,14 +273,14 @@ pub(crate) async fn resolve_chain_with_observations(
         .iter()
         .map(|observation| (observation.bssid.as_str(), &observation.ssid))
         .collect();
-    resolve_chain_inner(bssids, state, providers, policy, ticket, &observed_ssids).await
+    resolve_chain_inner(bssids, state, providers, mode, ticket, &observed_ssids).await
 }
 
 async fn resolve_chain_inner(
     bssids: &[String],
     state: &Arc<DaemonState>,
     providers: &[Provider],
-    policy: &ChainPolicy,
+    mode: ChainMode,
     ticket: crate::privacy::PrivacyTicket,
     observed_ssids: &std::collections::HashMap<&str, &Option<String>>,
 ) -> ResolveResult {
@@ -298,7 +328,7 @@ async fn resolve_chain_inner(
 
     for bssid in bssids {
         // Short-circuit: already in aps cache.
-        if policy.skip_cached {
+        if mode.skips_cached() {
             let cache_hit = match state.privacy.read(ticket).await {
                 Some(_privacy) => match state.db.lookup_cached_touch(vec![bssid.clone()]).await {
                     Ok(mut hits) => hits.pop(),
@@ -324,7 +354,7 @@ async fn resolve_chain_inner(
         }
 
         // Short-circuit: in not_found cache (within TTL).
-        if policy.skip_not_found {
+        if mode.skips_not_found() {
             let is_nf = match state
                 .db
                 .is_not_found(bssid.clone(), state.args.not_found_ttl_days)
@@ -410,11 +440,11 @@ async fn resolve_chain_inner(
                         ap.provider_reported_lat,
                         ap.provider_reported_lon
                     );
-                    if policy.write_through {
+                    if mode.writes_through() {
                         if let Some(_privacy) = state.privacy.read(ticket).await {
                             if let Err(e) = state
                                 .db
-                                .cache_resolved_ap(ap.clone(), policy.manage_pending)
+                                .cache_resolved_ap(ap.clone(), mode.manages_pending())
                                 .await
                             {
                                 warn!("failed to cache AP {} and update pending: {e}", ap.bssid);
@@ -443,32 +473,23 @@ async fn resolve_chain_inner(
                     // abstention (unconfigured creds / exhausted or corrupt
                     // quota), not transient or authoritative evidence. It
                     // feeds neither set; it only drives the per-policy action.
-                    match policy.on_skipped {
-                        SkipAction::NextProvider => {}
-                        SkipAction::QueuePending => {
-                            queue_pending_for_this = true;
-                        }
+                    if mode.queues_pending_on_skip() {
+                        queue_pending_for_this = true;
                     }
                 }
                 ProviderOutcome::HardStop => {
                     warn!("{} hard-stopped", provider.name());
                     stopped[idx] = true;
                     hard_transient.insert(bssid.clone());
-                    match policy.on_hard_stop {
-                        HardStopAction::Stop => {}
-                        HardStopAction::QueuePendingAndStop => {
-                            queue_pending_for_this = true;
-                        }
+                    if mode.queues_pending_on_hard_stop() {
+                        queue_pending_for_this = true;
                     }
                 }
                 ProviderOutcome::NetworkError(e) => {
                     warn!("{} network error for {bssid}: {e}", provider.name());
                     hard_transient.insert(bssid.clone());
-                    match policy.on_network_error {
-                        NetErrorAction::Ignore => {}
-                        NetErrorAction::QueuePending => {
-                            queue_pending_for_this = true;
-                        }
+                    if mode.queues_pending_on_network_error() {
+                        queue_pending_for_this = true;
                     }
                 }
             }
@@ -526,7 +547,7 @@ async fn resolve_chain_inner(
     // (under manage_pending) drops the pending row. Everything
     // that falls through the `continue`s above is left out of result_not_found
     // and therefore reported as "unresolved" on the wire, not not_found.
-    let persist = matches!(policy.not_found, NotFoundPolicy::AtChainEnd);
+    let persist = mode.persists_not_found();
     for bssid in bssids {
         if resolved.contains(bssid) {
             continue;
@@ -552,7 +573,7 @@ async fn resolve_chain_inner(
             if let Some(_privacy) = state.privacy.read(ticket).await {
                 if let Err(e) = state
                     .db
-                    .record_not_found(bssid.clone(), policy.manage_pending)
+                    .record_not_found(bssid.clone(), mode.manages_pending())
                     .await
                 {
                     warn!("failed to insert not_found {bssid}: {e}");
@@ -571,23 +592,6 @@ async fn resolve_chain_inner(
         positioned,
         fetched_bssids,
         not_found: result_not_found,
-    }
-}
-
-/// Policy for the read-only `resolve` surface. Extracted (task-0092) so the
-/// exact policy resolve_readonly uses is a single source of truth that tests
-/// can assert on directly rather than reconstructing.
-fn readonly_policy() -> ChainPolicy {
-    ChainPolicy {
-        skip_cached: true,
-        skip_not_found: true,
-        write_through: false,
-        manage_pending: false,
-        // task-0092: never write not_found from the read-only surface.
-        not_found: NotFoundPolicy::Never,
-        on_skipped: SkipAction::NextProvider,
-        on_network_error: NetErrorAction::Ignore,
-        on_hard_stop: HardStopAction::Stop,
     }
 }
 
@@ -617,7 +621,7 @@ pub async fn resolve_readonly(
         bssids,
         state,
         &[Provider::Wigle],
-        &readonly_policy(),
+        ChainMode::ReadOnly,
         ticket,
     )
     .await
@@ -634,23 +638,14 @@ pub async fn resolve_background(
         .iter()
         .map(|observation| observation.bssid.clone())
         .collect();
-    let policy = ChainPolicy {
-        skip_cached: true,
-        skip_not_found: true,
-        write_through: true,
-        manage_pending: false,
-        // Don't mark not_found per-provider: Apple may not know it but
-        // WiGLE might (and vice versa). Decide at end of chain.
-        not_found: NotFoundPolicy::AtChainEnd,
-        on_skipped: SkipAction::QueuePending,
-        on_network_error: NetErrorAction::QueuePending,
-        on_hard_stop: HardStopAction::QueuePendingAndStop,
-    };
+    // Don't mark not_found per-provider: Apple may not know it but WiGLE might
+    // (and vice versa). Decide at end of chain. ChainMode::Background queues
+    // pending on skip / network error / hard stop so a later drain retries.
     let _ = resolve_chain_with_observations(
         &bssids,
         state,
         &[Provider::Apple, Provider::Wigle],
-        &policy,
+        ChainMode::Background,
         ticket,
         observations,
     )
@@ -687,19 +682,6 @@ mod tests {
         }
     }
 
-    fn permissive_policy() -> ChainPolicy {
-        ChainPolicy {
-            skip_cached: true,
-            skip_not_found: true,
-            write_through: true,
-            manage_pending: false,
-            not_found: NotFoundPolicy::AtChainEnd,
-            on_skipped: SkipAction::NextProvider,
-            on_network_error: NetErrorAction::Ignore,
-            on_hard_stop: HardStopAction::Stop,
-        }
-    }
-
     #[tokio::test]
     async fn resolve_chain_short_circuits_on_cache_hit() {
         let state = test_state();
@@ -715,7 +697,7 @@ mod tests {
             &["aa:bb:cc:dd:ee:01".to_string()],
             &state,
             &providers,
-            &permissive_policy(),
+            ChainMode::Background,
             state.privacy.ticket(),
         )
         .await;
@@ -749,7 +731,7 @@ mod tests {
             std::slice::from_ref(&target),
             &state,
             &providers,
-            &permissive_policy(),
+            ChainMode::Background,
             state.privacy.ticket(),
         )
         .await;
@@ -802,7 +784,7 @@ mod tests {
             &bssids,
             &state,
             &[Provider::Mock(mock)],
-            &permissive_policy(),
+            ChainMode::Background,
             state.privacy.ticket(),
             &observations,
         )
@@ -841,7 +823,7 @@ mod tests {
             std::slice::from_ref(&target),
             &state,
             &providers,
-            &permissive_policy(),
+            ChainMode::Background,
             state.privacy.ticket(),
         )
         .await;
@@ -880,7 +862,7 @@ mod tests {
             std::slice::from_ref(&target),
             &state,
             &providers,
-            &permissive_policy(),
+            ChainMode::Background,
             state.privacy.ticket(),
         )
         .await;
@@ -925,7 +907,7 @@ mod tests {
             std::slice::from_ref(&target),
             &state,
             &providers,
-            &permissive_policy(),
+            ChainMode::Background,
             state.privacy.ticket(),
         )
         .await;
@@ -1008,7 +990,7 @@ mod tests {
             std::slice::from_ref(&target),
             &state,
             &[Provider::Mock(std::sync::Arc::clone(&provider))],
-            &permissive_policy(),
+            ChainMode::Background,
             stale,
         )
         .await;
@@ -1021,7 +1003,7 @@ mod tests {
             std::slice::from_ref(&target),
             &state,
             &[Provider::Mock(std::sync::Arc::clone(&provider))],
-            &permissive_policy(),
+            ChainMode::Background,
             fresh,
         )
         .await;
@@ -1054,7 +1036,7 @@ mod tests {
                 &[resolve_target],
                 &resolve_state,
                 &[Provider::Mock(resolve_provider)],
-                &permissive_policy(),
+                ChainMode::Background,
                 ticket,
             )
             .await
@@ -1102,7 +1084,7 @@ mod tests {
             &[definitive.clone(), skipped.clone()],
             &state,
             &providers,
-            &permissive_policy(),
+            ChainMode::Background,
             state.privacy.ticket(),
         )
         .await;
@@ -1117,12 +1099,12 @@ mod tests {
         );
     }
 
-    /// task-0092 AC#1: the read-only resolve policy must never write not_found.
+    /// task-0092 AC#1: the read-only resolve mode must never write not_found.
     #[test]
     fn resolve_readonly_policy_is_never() {
         assert!(
-            matches!(readonly_policy().not_found, NotFoundPolicy::Never),
-            "resolve_readonly must use NotFoundPolicy::Never (task-0092)"
+            !ChainMode::ReadOnly.persists_not_found(),
+            "resolve_readonly (ChainMode::ReadOnly) must never persist not_found (task-0092)"
         );
     }
 
@@ -1144,7 +1126,7 @@ mod tests {
             std::slice::from_ref(&target),
             &state,
             &providers,
-            &readonly_policy(),
+            ChainMode::ReadOnly,
             state.privacy.ticket(),
         )
         .await;
@@ -1267,7 +1249,7 @@ mod tests {
             &["aa:bb:cc:dd:ee:01".to_string()],
             &state,
             &providers,
-            &permissive_policy(),
+            ChainMode::Background,
             state.privacy.ticket(),
         )
         .await;
@@ -1298,7 +1280,7 @@ mod tests {
             &["aa:bb:cc:dd:ee:02".to_string()],
             &state,
             &providers,
-            &permissive_policy(),
+            ChainMode::Background,
             state.privacy.ticket(),
         )
         .await;

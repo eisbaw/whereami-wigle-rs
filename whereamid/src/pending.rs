@@ -5,10 +5,7 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
 
 use crate::provider::Provider;
-use crate::resolver::{
-    resolve_chain_with_observations, ChainPolicy, HardStopAction, NetErrorAction, NotFoundPolicy,
-    ObservedAp, SkipAction,
-};
+use crate::resolver::{resolve_chain_with_observations, ChainMode, ObservedAp};
 use crate::server::DaemonState;
 
 /// Maximum number of expired not_found entries to revive per drain pass.
@@ -174,21 +171,20 @@ async fn drain_once(
             ssid: pending.ssid.clone(),
         })
         .collect();
-    let policy = ChainPolicy {
-        skip_cached: false,
-        skip_not_found: false,
-        write_through: true,
-        manage_pending: true,
-        not_found: NotFoundPolicy::AtChainEnd,
-        on_skipped: SkipAction::NextProvider,
-        // task-0189: retry accounting is done once per pass below, so a
-        // per-error increment here would double-count. Ignore.
-        on_network_error: NetErrorAction::Ignore,
-        on_hard_stop: HardStopAction::Stop,
-    };
-    let _ =
-        resolve_chain_with_observations(&bssids, state, providers, &policy, ticket, &observations)
-            .await;
+    // ChainMode::Drain owns the pending table: it writes through, marks
+    // not_found at chain end, and deletes the pending row on a definitive
+    // outcome. task-0189: retry accounting is done once per pass below (a
+    // per-error increment would double-count), so Drain does not queue pending
+    // on network errors.
+    let _ = resolve_chain_with_observations(
+        &bssids,
+        state,
+        providers,
+        ChainMode::Drain,
+        ticket,
+        &observations,
+    )
+    .await;
 
     // task-0189: advance the attempts counter once per drain pass for every
     // BSSID we just tried. resolve_chain deletes rows it resolved or
@@ -218,26 +214,11 @@ async fn drain_once(
 mod tests {
     use super::*;
     use crate::provider::{MockProvider, ProviderOutcome};
-    use crate::resolver::{
-        resolve_chain, ChainPolicy, HardStopAction, NetErrorAction, NotFoundPolicy, SkipAction,
-    };
+    use crate::resolver::{resolve_chain, ChainMode};
     use crate::server::DaemonState;
     // task-0230: delegate to the single shared DaemonState constructor.
     fn test_state() -> Arc<DaemonState> {
         crate::server::test_state()
-    }
-
-    fn drain_policy() -> ChainPolicy {
-        ChainPolicy {
-            skip_cached: false,
-            skip_not_found: false,
-            write_through: true,
-            manage_pending: true,
-            not_found: NotFoundPolicy::AtChainEnd,
-            on_skipped: SkipAction::NextProvider,
-            on_network_error: NetErrorAction::Ignore,
-            on_hard_stop: HardStopAction::Stop,
-        }
     }
 
     /// task-0045 + task-0052 end-to-end: definitive NotFound from every
@@ -267,7 +248,7 @@ mod tests {
             std::slice::from_ref(&bssid),
             &state,
             &providers,
-            &drain_policy(),
+            ChainMode::Drain,
             state.privacy.ticket(),
         )
         .await;
@@ -306,7 +287,7 @@ mod tests {
             std::slice::from_ref(&bssid),
             &state,
             &providers,
-            &drain_policy(),
+            ChainMode::Drain,
             state.privacy.ticket(),
         )
         .await;
@@ -387,7 +368,7 @@ mod tests {
             std::slice::from_ref(&bssid),
             &state,
             &providers,
-            &drain_policy(),
+            ChainMode::Drain,
             state.privacy.ticket(),
         )
         .await;
@@ -425,7 +406,7 @@ mod tests {
             std::slice::from_ref(&bssid),
             &state,
             &providers,
-            &drain_policy(),
+            ChainMode::Drain,
             state.privacy.ticket(),
         )
         .await;
@@ -472,7 +453,7 @@ mod tests {
             &bssids,
             &state,
             &providers,
-            &drain_policy(),
+            ChainMode::Drain,
             state.privacy.ticket(),
         )
         .await;
@@ -518,7 +499,7 @@ mod tests {
             std::slice::from_ref(&bssid),
             &state,
             &providers,
-            &drain_policy(),
+            ChainMode::Drain,
             state.privacy.ticket(),
         )
         .await;
