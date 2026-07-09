@@ -480,6 +480,77 @@ mod wire_shape {
         .unwrap();
         assert!(json.contains("\"signal_dbm\":null"), "{json}");
     }
+
+    #[test]
+    fn network_entry_emits_null_ssid_and_channel_when_absent() {
+        // ssid/channel have no skip_serializing_if, so absence is `null` on the
+        // wire, not an omitted key — a `jq` consumer relies on the key being
+        // present. The existing SCAN_FIXTURE has both populated, so this pins the
+        // null-emit case the fixtures miss (task-0114 review, LOW).
+        let json = serde_json::to_string(&NetworkEntry {
+            bssid: "cc".to_string(),
+            ssid: None,
+            signal_dbm: -60,
+            channel: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"bssid":"cc","ssid":null,"signal_dbm":-60,"channel":null}"#
+        );
+    }
+
+    #[test]
+    fn wipe_response_full_shape_and_field_order() {
+        // WipeResponse had no byte-shape pin; a reorder or dropped skip on
+        // `error` would go unnoticed (task-0114 review, MEDIUM).
+        let json = serde_json::to_string(&WipeResponse {
+            ok: true,
+            v: 1,
+            aps_deleted: 3,
+            pending_deleted: 1,
+            not_found_deleted: 2,
+            fixes_deleted: 9,
+            last_fix_deleted: 1,
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"ok":true,"v":1,"aps_deleted":3,"pending_deleted":1,"not_found_deleted":2,"fixes_deleted":9,"last_fix_deleted":1}"#
+        );
+    }
+
+    #[test]
+    fn history_response_full_shape_and_field_order() {
+        // Pins HistoryResponse + HistorySegment field order and skip/emit. Uses
+        // dyadic (exactly representable) floats so re-serialization is
+        // byte-stable despite this workspace's non-round-tripping serde_json
+        // parser (see the FLOAT NOTE at the top) — HISTORY_FIXTURE uses
+        // 55.6761-style non-dyadic values that cannot be byte-pinned safely
+        // (task-0114 review, MEDIUM).
+        let json = serde_json::to_string(&HistoryResponse {
+            ok: true,
+            v: 1,
+            from: "2026-01-01T00:00:00Z".to_string(),
+            to: "2026-01-02T00:00:00Z".to_string(),
+            segments: vec![HistorySegment {
+                start_rfc3339: "2026-01-01T08:00:00Z".to_string(),
+                end_rfc3339: "2026-01-01T09:30:00Z".to_string(),
+                duration_secs: 5400,
+                centroid_lat: 55.5,
+                centroid_lon: 12.25,
+                mean_accuracy_m: 35.0,
+                n_fixes: 42,
+            }],
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"ok":true,"v":1,"from":"2026-01-01T00:00:00Z","to":"2026-01-02T00:00:00Z","segments":[{"start_rfc3339":"2026-01-01T08:00:00Z","end_rfc3339":"2026-01-01T09:30:00Z","duration_secs":5400,"centroid_lat":55.5,"centroid_lon":12.25,"mean_accuracy_m":35.0,"n_fixes":42}]}"#
+        );
+    }
 }
 
 /// Client -> daemon request byte shapes. Requests are outbound-only (the client
@@ -657,5 +728,52 @@ mod daemon_fixtures {
             LOCATE_FIXTURE.replace(r#""accuracy_m":42.5"#, r#""accuracy_meters":42.5"#);
         let r: LocateResponse = serde_json::from_str(&renamed_defaulted).unwrap();
         assert_eq!(r.accuracy_m, 0.0);
+    }
+
+    #[test]
+    fn float_free_fixtures_reserialize_byte_identical() {
+        // Closes the review's MEDIUM gap: every other test here is decode-only,
+        // so serde would happily accept a field REORDER or a dropped
+        // `skip_serializing_if` on a full-shape response. Re-serializing the
+        // decoded value and comparing to the fixture pins field order + skip/emit
+        // for the daemon's full-shape emit path. Restricted to the
+        // integer/string fixtures: this workspace's serde_json is built without
+        // `float_roundtrip` (see the FLOAT NOTE at the top), so re-encoding a
+        // non-dyadic float fixture is not guaranteed byte-stable. History/locate
+        // field order is pinned with dyadic floats in `wire_shape` instead.
+        macro_rules! pin_reser {
+            ($ty:ty, $fixture:ident) => {{
+                let decoded: $ty = serde_json::from_str($fixture).unwrap();
+                assert_eq!(
+                    serde_json::to_string(&decoded).unwrap(),
+                    $fixture,
+                    concat!(
+                        stringify!($ty),
+                        " re-serialization drifted from ",
+                        stringify!($fixture),
+                        " (field reorder or skip_serializing_if change?)"
+                    )
+                );
+            }};
+        }
+        pin_reser!(StatsResponse, STATS_FIXTURE);
+        pin_reser!(DebugResponse, DEBUG_FIXTURE);
+        pin_reser!(VersionResponse, VERSION_FIXTURE);
+    }
+
+    #[test]
+    fn unknown_object_fields_are_ignored_on_decode() {
+        // Forward-compat guarantee (protocol.md "Versioning"): a newer daemon may
+        // emit fields an older client doesn't know. No type sets
+        // `deny_unknown_fields`, so extra keys must decode without error. This
+        // guard was lost when the client's fixture-with-"future" suite was
+        // consolidated into this file (task-0114 review, LOW).
+        let with_extra = LOCATE_FIXTURE.replace(
+            r#""confidence":"medium""#,
+            r#""confidence":"medium","future_field":{"nested":true}"#,
+        );
+        let r: LocateResponse = serde_json::from_str(&with_extra).unwrap();
+        assert_eq!(r.confidence, Confidence::Medium);
+        assert_eq!(r.suspect_reason.as_deref(), Some("speed"));
     }
 }
