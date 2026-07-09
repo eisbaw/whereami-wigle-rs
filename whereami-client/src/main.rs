@@ -22,8 +22,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use nu_ansi_term::{Color, Style};
 use std::{io::IsTerminal, process, time::Duration};
 use whereami_client::{
-    Confidence, DaemonError, HistoryFixesResponse, LocateResponse, ScanResponse, StatsResponse,
-    WhereAmIClient, WipeConfirmation, WipeResponse, DEFAULT_SOCKET_IO_TIMEOUT,
+    Confidence, DaemonError, HistoryFixesResponse, LocateResponse, Provenance, ResolveResponse,
+    ScanResponse, StatsResponse, WhereAmIClient, WipeConfirmation, WipeResponse,
+    DEFAULT_SOCKET_IO_TIMEOUT, MAX_RESOLVE_BSSIDS,
 };
 
 const DEFAULT_RAW_HISTORY_MAX_FIXES: u64 = 1_000;
@@ -94,6 +95,18 @@ enum Command {
         /// `whereami scan --scan-time=no` still works.
         #[arg(long, value_enum, default_value_t = YesNo::Yes)]
         scan_time: YesNo,
+    },
+
+    /// Look up specific BSSIDs: print each one's position + provenance.
+    ///
+    /// Ephemeral cache-only lookup with a provider fallback; does not alter
+    /// the daemon's cache. Accepts 1..=256 BSSIDs as positional arguments.
+    /// Exits nonzero if the daemon reports an error (e.g. a malformed BSSID).
+    #[command(alias = "r")]
+    Resolve {
+        /// One or more BSSIDs (MAC addresses) to resolve.
+        #[arg(required = true, num_args = 1.., value_name = "BSSID")]
+        bssids: Vec<String>,
     },
 
     /// Cache/rate counters and tasks aborted at the last clean shutdown.
@@ -307,6 +320,54 @@ fn render_scan(resp: &ScanResponse, no_scan_time: bool) -> String {
     out
 }
 
+/// Render a `resolve` response to the human-readable multi-line string (one
+/// line per requested BSSID, trailing newline per line). Every daemon-sourced
+/// string — the BSSID and SSID of each entry — is sanitized against
+/// terminal-escape injection (task-0198). Pure, so it is directly
+/// unit-testable.
+///
+/// A positioned result (both `lat` and `lon` present) renders its coordinates,
+/// SSID and provenance (`api`/`cache`). An unpositioned result renders a status
+/// word chosen by provenance, keeping the task-0194 distinction intact:
+/// `not_found` is authoritative absence ("not found"), whereas `unresolved`
+/// means absence was NOT established (deferred / WiGLE unconfigured / quota
+/// exhausted / transient) and the caller should retry — it is deliberately NOT
+/// printed as "not found".
+fn render_resolve(resp: &ResolveResponse) -> String {
+    let mut out = String::new();
+    for entry in &resp.results {
+        let bssid = sanitize(&entry.bssid);
+        match (entry.lat, entry.lon) {
+            (Some(lat), Some(lon)) => {
+                let ssid = entry
+                    .ssid
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(sanitize)
+                    .unwrap_or_else(|| "<no ssid>".into());
+                out.push_str(&format!(
+                    "{bssid}  {lat:.6}, {lon:.6}  {ssid}  ({})\n",
+                    entry.provenance
+                ));
+            }
+            // No coordinates: the status word carries the meaning, and the
+            // provenance token is appended for machine-parseable clarity.
+            _ => {
+                let status = match entry.provenance {
+                    Provenance::NotFound => "not found".to_string(),
+                    Provenance::Unresolved => "unresolved (retry later)".to_string(),
+                    // Api/Cache without coordinates shouldn't happen, and a
+                    // future Unknown provenance is surfaced verbatim rather than
+                    // guessed at.
+                    other => format!("no position ({other})"),
+                };
+                out.push_str(&format!("{bssid}  {status}\n"));
+            }
+        }
+    }
+    out
+}
+
 /// Render a `locate` response's stdout body (optional address line plus
 /// the coordinate line). The daemon-sourced address is sanitized against
 /// terminal-escape injection (task-0198); the stale banner is written to
@@ -481,6 +542,7 @@ fn main() {
     match command {
         Command::Locate => run_locate(&client, json),
         Command::Scan { scan_time } => run_scan(&client, json, scan_time == YesNo::No),
+        Command::Resolve { bssids } => run_resolve(&client, json, bssids),
         Command::Stats => run_stats(&client, json),
         Command::Debug => run_debug(&client, json),
         Command::History {
@@ -523,6 +585,34 @@ fn run_scan(client: &WhereAmIClient, json: bool, no_scan_time: bool) {
     } else {
         dispatch(client.scan(), |resp| {
             print!("{}", render_scan(resp, no_scan_time));
+        });
+    }
+}
+
+/// Client-side pre-flight for the `resolve` count limit (task-0215). Returns
+/// the fail-fast message when the request exceeds [`MAX_RESOLVE_BSSIDS`], else
+/// `None`. The daemon enforces the identical bound server-side (single shared
+/// const), but checking here means an oversized request never opens a socket or
+/// touches finite provider quota. The wording mirrors the daemon's so the two
+/// error paths read identically. Pure, so it is unit-testable without a socket.
+fn resolve_limit_error(count: usize) -> Option<String> {
+    (count > MAX_RESOLVE_BSSIDS).then(|| {
+        format!("resolve accepts at most {MAX_RESOLVE_BSSIDS} BSSIDs per request (got {count})")
+    })
+}
+
+fn run_resolve(client: &WhereAmIClient, json: bool, bssids: Vec<String>) {
+    // Fail fast BEFORE any socket connect or provider lookup (task-0215). This
+    // is a client usage error, so — like history's --from/--to pairing check —
+    // it goes to stderr with exit 1 in both modes (TASK-0228), not stdout JSON.
+    if let Some(msg) = resolve_limit_error(bssids.len()) {
+        fatal(&msg);
+    }
+    if json {
+        emit_json(client.resolve_raw(bssids));
+    } else {
+        dispatch(client.resolve(bssids), |resp| {
+            print!("{}", render_resolve(resp));
         });
     }
 }
@@ -1761,5 +1851,145 @@ mod tests {
     fn sanitize_is_identity_on_printable_and_multibyte() {
         assert_eq!(sanitize("plain ascii 123"), "plain ascii 123");
         assert_eq!(sanitize("café 北京 😀"), "café 北京 😀");
+    }
+
+    // --- task-0215: resolve subcommand ---
+
+    fn resolve_entry(
+        bssid: &str,
+        lat: Option<f64>,
+        lon: Option<f64>,
+        ssid: Option<&str>,
+        provenance: Provenance,
+    ) -> whereami_client::ResolveResultEntry {
+        whereami_client::ResolveResultEntry {
+            bssid: bssid.to_string(),
+            lat,
+            lon,
+            ssid: ssid.map(str::to_string),
+            provenance,
+        }
+    }
+
+    fn resolve_response(results: Vec<whereami_client::ResolveResultEntry>) -> ResolveResponse {
+        ResolveResponse {
+            ok: true,
+            v: whereami_client::SUPPORTED_PROTOCOL_VERSION,
+            results,
+        }
+    }
+
+    #[test]
+    fn resolve_subcommand_parses_one_or_more_positional_bssids() {
+        let cli = Cli::try_parse_from([
+            "whereami",
+            "resolve",
+            "AA:BB:CC:DD:EE:FF",
+            "11:22:33:44:55:66",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Resolve { bssids }) => {
+                assert_eq!(bssids, ["AA:BB:CC:DD:EE:FF", "11:22:33:44:55:66"]);
+            }
+            other => panic!("expected Resolve, got {other:?}"),
+        }
+        // The `r` alias resolves to the same subcommand.
+        let aliased = Cli::try_parse_from(["whereami", "r", "AA:BB:CC:DD:EE:FF"]).unwrap();
+        assert!(matches!(aliased.command, Some(Command::Resolve { .. })));
+    }
+
+    #[test]
+    fn resolve_requires_at_least_one_bssid() {
+        // A bare `resolve` must fail at parse time (before target resolution or
+        // any socket), mirroring the daemon's non-empty-array rejection.
+        assert!(Cli::try_parse_from(["whereami", "resolve"]).is_err());
+    }
+
+    #[test]
+    fn render_resolve_positioned_shows_coords_ssid_and_provenance() {
+        // Both cache- and api-sourced positioned entries render coordinates,
+        // SSID and the parenthesised provenance token. A null/empty SSID falls
+        // back to the <no ssid> placeholder rather than an empty column.
+        let out = render_resolve(&resolve_response(vec![
+            resolve_entry(
+                "aa:bb:cc:dd:ee:ff",
+                Some(48.857),
+                Some(2.351),
+                Some("MyWiFi"),
+                Provenance::Cache,
+            ),
+            resolve_entry(
+                "11:22:33:44:55:66",
+                Some(1.5),
+                Some(2.5),
+                None,
+                Provenance::Api,
+            ),
+        ]));
+        assert_eq!(
+            out,
+            "aa:bb:cc:dd:ee:ff  48.857000, 2.351000  MyWiFi  (cache)\n\
+             11:22:33:44:55:66  1.500000, 2.500000  <no ssid>  (api)\n"
+        );
+    }
+
+    #[test]
+    fn render_resolve_not_found_and_unresolved_are_distinct() {
+        // task-0194 regression guard: unresolved (absence NOT established, retry)
+        // must NOT collapse to "not found" (authoritative absence). The two
+        // unpositioned statuses must read differently.
+        let out = render_resolve(&resolve_response(vec![
+            resolve_entry("aa:aa:aa:aa:aa:aa", None, None, None, Provenance::NotFound),
+            resolve_entry(
+                "bb:bb:bb:bb:bb:bb",
+                None,
+                None,
+                None,
+                Provenance::Unresolved,
+            ),
+        ]));
+        assert_eq!(
+            out,
+            "aa:aa:aa:aa:aa:aa  not found\n\
+             bb:bb:bb:bb:bb:bb  unresolved (retry later)\n"
+        );
+        // Explicit: the unresolved line is not mislabeled as "not found".
+        let unresolved_line = out.lines().nth(1).unwrap();
+        assert!(unresolved_line.contains("unresolved"));
+        assert!(!unresolved_line.contains("not found"));
+    }
+
+    #[test]
+    fn render_resolve_sanitizes_control_bytes_in_bssid_and_ssid() {
+        // task-0198: both daemon-sourced strings printed by the resolver — the
+        // BSSID and the SSID — are escaped, while legitimate UTF-8 survives.
+        let out = render_resolve(&resolve_response(vec![resolve_entry(
+            "aa\u{1b}[2Jbb",
+            Some(1.0),
+            Some(2.0),
+            Some("Evil\u{07}SSID😀"),
+            Provenance::Api,
+        )]));
+        assert_no_raw_control_bytes(&out);
+        assert!(out.contains(r"aa\u{1b}[2Jbb"), "BSSID ESC must be escaped");
+        assert!(out.contains(r"Evil\u{7}SSID"), "SSID BEL must be escaped");
+        assert!(out.contains('😀'), "legitimate emoji must survive");
+    }
+
+    #[test]
+    fn resolve_limit_error_fires_above_256_but_not_at_boundary() {
+        // The client-side guard (task-0215) must reject a 257-BSSID request
+        // BEFORE any socket connect. Constructing the vector and asserting the
+        // message proves the guard is pure and never touches the network.
+        let too_many: Vec<String> = (0..257).map(|i| format!("bssid-{i}")).collect();
+        let msg = resolve_limit_error(too_many.len()).expect("257 must exceed the limit");
+        assert_eq!(
+            msg,
+            "resolve accepts at most 256 BSSIDs per request (got 257)"
+        );
+        // The boundary (exactly 256) and smaller requests are accepted.
+        assert!(resolve_limit_error(256).is_none());
+        assert!(resolve_limit_error(1).is_none());
     }
 }

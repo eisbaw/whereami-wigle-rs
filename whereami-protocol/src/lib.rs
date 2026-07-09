@@ -291,6 +291,17 @@ impl std::fmt::Display for Confidence {
     }
 }
 
+/// Maximum number of BSSIDs accepted in a single `resolve` request.
+///
+/// Single source of truth (task-0215): both the daemon (which rejects an
+/// oversized request server-side) and the `whereami` CLI (which fails fast
+/// client-side before opening a socket) reference this one constant, so the
+/// limit and its error wording can never drift between the two sides.
+/// `MAX_REQUEST_BYTES` (64 KiB) bounds the wire size, but a 64 KiB JSON of
+/// 6-byte BSSIDs is ~7000 entries; resolve enqueues DB work per BSSID, so an
+/// unbounded count would let one hostile request starve the daemon (task-0053).
+pub const MAX_RESOLVE_BSSIDS: usize = 256;
+
 /// Provenance of a single `resolve` result (task-0062).
 ///
 /// Distinct from the data-`Source` enum (apple/wigle/beacondb/manual/unknown)

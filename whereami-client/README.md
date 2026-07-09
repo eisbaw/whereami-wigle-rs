@@ -103,6 +103,7 @@ fn handle<T: whereami_client::DaemonResponse>(r: &T) {
 ```bash
 whereami locate                          # default subcommand
 whereami scan                            # currently visible Wi-Fi
+whereami resolve AA:BB:CC:DD:EE:FF …     # look up specific BSSIDs (position + provenance, max 256)
 whereami stats                           # cache + observability counters
 whereami debug                           # daemon debug snapshot
 whereami history 7d                      # stay-point segments

@@ -30,6 +30,7 @@ use whereami_protocol::{
     DbStatus, DebugBssid, DebugResponse, ErrorResponse, HistoryFix, HistoryFixesResponse,
     HistoryRange, HistoryResponse, LocateResponse, NetworkEntry, Provenance, ResolveResponse,
     ResolveResultEntry, ScanResponse, StatsResponse, VersionResponse, WipeResponse,
+    MAX_RESOLVE_BSSIDS,
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,12 +40,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BYTES: u64 = 64 * 1024; // 64 KiB max request size
 
-/// Maximum number of BSSIDs accepted in a single `resolve` request.
-/// MAX_REQUEST_BYTES bounds the wire size, but a 64 KiB JSON of 6-byte
-/// BSSIDs is ~7000 entries; resolve_chain enqueues DB work per BSSID,
-/// so an unbounded count would let one hostile request starve the rest
-/// of the daemon. task-0053.
-const MAX_RESOLVE_BSSIDS: usize = 256;
+// MAX_RESOLVE_BSSIDS now lives in whereami-protocol as the single source of
+// truth shared with the client's fail-fast guard (task-0215); imported above.
 const DEFAULT_RAW_HISTORY_MAX_FIXES: u64 = 1_000;
 const MAX_RAW_HISTORY_FIXES: u64 = 10_000;
 

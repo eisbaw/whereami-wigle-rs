@@ -45,6 +45,7 @@ The `whereami` binary speaks the daemon's socket protocol so you don't have to.
 ```bash
 whereami locate              # where am I?
 whereami scan                # currently visible Wi-Fi networks
+whereami resolve AA:BB:CC:DD:EE:FF …  # look up specific BSSIDs: position + provenance (max 256)
 whereami stats               # cache size, API quota, in-flight count
 whereami debug               # per-BSSID debounce + DB classification
 whereami history 24h         # stay-point segments over the last 24 hours
