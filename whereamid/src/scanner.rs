@@ -960,7 +960,8 @@ pub fn normalize_bssid(bssid: &str) -> String {
 /// (fail loud, never silently). A locally-administered (randomized) MAC is a
 /// valid unicast address and is KEPT here — a phone hotspot still belongs in a
 /// raw scan; the randomized-MAC exclusion happens later, at the trilateration
-/// boundary (`bssid::is_trilateration_eligible`), not at capture.
+/// boundary — the inline `Bssid::is_locally_administered()` skip in
+/// `server::solve_locate_from_cache` — not at capture.
 fn push_validated(
     networks: &mut Vec<ScannedNetwork>,
     bssid: &str,
