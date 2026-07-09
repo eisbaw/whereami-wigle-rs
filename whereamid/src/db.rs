@@ -5664,6 +5664,40 @@ mod tests {
         );
     }
 
+    /// task-0130 review hardening: prove the v7->v8 rename FAILS LOUD rather than
+    /// silently mis-counting the WiGLE quota if a v7 file somehow already carries
+    /// BOTH the old `api_calls_today` and the new `wigle_lookups_today` keys (only
+    /// reachable by manual tampering or a downgrade->upgrade flip that wrote the
+    /// new key under an old binary). The rename UPDATE would collide with the
+    /// existing `wigle_lookups_today` row on `metadata.key`'s PRIMARY KEY, so the
+    /// migration transaction must error and `Database::open` must refuse to start
+    /// — picking one value silently would under/over-count the daily quota.
+    #[test]
+    fn open_v7_shape_with_both_counter_keys_fails_loud_not_silent() {
+        let tmp = TempDbDir::new("task0130-v7-both-keys");
+        let path = tmp.db_path();
+        build_historical_shape(&path, 7);
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute(
+                "INSERT INTO metadata (key, value) VALUES ('api_calls_today', '5')",
+                [],
+            )
+            .unwrap();
+            raw.execute(
+                "INSERT INTO metadata (key, value) VALUES ('wigle_lookups_today', '9')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let opened = Database::open(&path);
+        assert!(
+            opened.is_err(),
+            "v7->v8 must fail loud on a key collision, not silently pick a counter value"
+        );
+    }
+
     /// AC#3: the v3 -> v7 path specifically. A v3-shape DB has neither the v4
     /// last_fix table, the v5 fixes table, the v6 aps.is_mobile column, nor the
     /// v7 fixes quality columns. Opening it must run migrate_v3_to_v4 /
