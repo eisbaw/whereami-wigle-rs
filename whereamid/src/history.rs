@@ -346,6 +346,13 @@ mod tests {
     use proptest::prelude::*;
 
     fn fix(ts: &str, lat: f64, lon: f64, acc: f64) -> Fix {
+        fix_ns(ts, lat, lon, acc, 3)
+    }
+
+    /// Like [`fix`] but with an explicit `n_sources`, so a test can build a
+    /// segment whose per-fix source counts differ and assert a fractional
+    /// `mean_n_sources` (task-0132).
+    fn fix_ns(ts: &str, lat: f64, lon: f64, acc: f64, n_sources: i64) -> Fix {
         Fix {
             at: chrono::DateTime::parse_from_rfc3339(ts)
                 .expect("test fix timestamp must be valid RFC3339")
@@ -353,7 +360,7 @@ mod tests {
             lat,
             lon,
             accuracy_m: acc,
-            n_sources: 3,
+            n_sources,
             quality: None,
         }
     }
@@ -394,6 +401,25 @@ mod tests {
         assert!((s.centroid_lon - 12.5541).abs() < 1e-3);
         // task-0132: every `fix()` carries n_sources=3, so the mean is 3.0.
         assert_eq!(s.mean_n_sources, 3.0);
+    }
+
+    #[test]
+    fn segment_mean_n_sources_is_fractional_not_integer_truncated() {
+        // task-0132 review hardening: the uniform-3 test above cannot catch a
+        // regression to integer division (15/5 == 3 either way). A segment
+        // mixing n_sources 3 and 4 must average to the fractional 3.5 — proving
+        // `mean_n_sources` is a genuine f64/f64 divide, not truncated to 3.
+        let fixes = vec![
+            fix_ns("2026-05-09T12:00:00+00:00", 55.6684, 12.5541, 30.0, 3),
+            fix_ns("2026-05-09T12:02:30+00:00", 55.6685, 12.5542, 30.0, 4),
+        ];
+        let segs = segment_fixes(&fixes, 100.0, 60);
+        assert_eq!(segs.len(), 1, "expected 1 stay-point segment, got {segs:?}");
+        assert_eq!(segs[0].n_fixes, 2);
+        assert_eq!(
+            segs[0].mean_n_sources, 3.5,
+            "mean of n_sources [3,4] must be 3.5, not integer-truncated to 3"
+        );
     }
 
     #[test]
