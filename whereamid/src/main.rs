@@ -303,12 +303,13 @@ async fn main() -> Result<()> {
 
     // The server is special-cased for task-0195. On the failure path the
     // select arm already consumed its output, so touching it again would be a
-    // second poll. On a signal, select only observed Pending: request abort of
-    // the accept loop (it has no state to flush), then move the handle into the
-    // SAME bounded drain as every other task. Tokio abort is cooperative, so
-    // awaiting it here without the drain timeout would make SIGTERM unbounded.
+    // second poll. On a signal, select only observed Pending: the accept loop
+    // now exits cooperatively (task-0143) — the cancel() above propagates to its
+    // biased select! and it returns Ok at the next await boundary — so we do NOT
+    // abort it. We move the handle into the SAME bounded drain as every other
+    // task so the drain AWAITS its clean exit. The drain still force-aborts it as
+    // a backstop if it somehow exceeds the budget, keeping SIGTERM bounded.
     let server_to_drain = if server_failure.is_none() {
-        server_handle.abort();
         Some(server_handle)
     } else {
         None

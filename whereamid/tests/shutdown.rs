@@ -420,6 +420,22 @@ fn sigterm_exits_within_drain_budget() {
         elapsed < Duration::from_secs(4),
         "SIGTERM shutdown took {elapsed:?}, expected < 4s (drain should be near-instant)"
     );
+    // task-0143: the accept loop must exit COOPERATIVELY via the cancel token,
+    // not be force-aborted. run_server logs this clean-exit line only on the
+    // cooperative `break` path; its presence proves the shutdown.cancelled()
+    // branch fired and run_server returned Ok before the drain reaped it.
+    assert!(
+        stderr.contains("accept loop stopped (cooperative shutdown)"),
+        "accept loop must exit cooperatively via the cancel token (clean-exit log \
+         missing); stderr:\n{stderr}"
+    );
+    // The bounded drain's force-abort backstop must NOT have fired for a healthy
+    // near-instant shutdown — that would mean the cooperative exit did not work.
+    assert!(
+        !stderr.contains("did not drain within"),
+        "cooperative shutdown must not trip the drain's force-abort backstop; \
+         stderr:\n{stderr}"
+    );
     // Graceful path returns Ok(()) -> exit 0 (the signal is handled, not fatal).
     assert_eq!(
         status.code(),

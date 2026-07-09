@@ -895,11 +895,25 @@ async fn run_server_inner(
     }
 
     loop {
-        let permit = Arc::clone(&connection_slots)
-            .acquire_owned()
-            .await
-            .context("connection admission semaphore closed")?;
+        // task-0143: cooperative shutdown. Both await points in this iteration
+        // (the admission-permit acquire below and the accept select! after it)
+        // race `state.shutdown.cancelled()` so a SIGTERM/SIGINT cancel breaks the
+        // loop at whichever boundary it is parked on — instead of main.rs
+        // force-aborting the accept task. `biased` makes a pending cancellation
+        // win over a ready permit/accept. Connections already spawned via
+        // spawn_handler are their own tracked tasks and drain separately; this
+        // only stops accepting NEW connections. On break, run_server returns
+        // Ok(()) and the bounded shutdown drain reaps the finished handle.
+        let permit = tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => break,
+            p = Arc::clone(&connection_slots).acquire_owned() => {
+                p.context("connection admission semaphore closed")?
+            }
+        };
         let accepted = tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => break,
             r = unix.accept() => Accepted::Unix(r),
             r = async {
                 match &tcp {
@@ -942,6 +956,12 @@ async fn run_server_inner(
             },
         }
     }
+
+    // task-0143: reached only via a cooperative `break` on shutdown.cancelled().
+    // In-flight connections keep draining as their own tracked tasks; this task
+    // returns Ok so the bounded shutdown drain reaps it cleanly (no force-abort).
+    info!("control channel: accept loop stopped (cooperative shutdown)");
+    Ok(())
 }
 
 /// Spawn a per-connection handler generic over the stream type. Tracking is
