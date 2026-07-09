@@ -1599,7 +1599,25 @@ pub enum DebugDbStatus {
     New,
 }
 
-const SCHEMA_VERSION: i32 = 9;
+// Per-migration target versions. Each `migrate_vN_to_vM` stamps schema_version
+// with its OWN target const (inside its own atomic transaction — task-0130), and
+// the migration ladder in `migrate()` gates + advances `version` using the SAME
+// const. Sourcing the number once per migration makes a copy-paste that forgets
+// to bump the number a compile-visible contradiction (the stamp and the guard
+// would name different consts). SCHEMA_VERSION is anchored to the highest target
+// (task-0182): bumping the schema = add the new migration + its const and point
+// the anchor at it. `schema_version_equals_highest_migration_target` pins the
+// anchor == max(targets) invariant.
+const V1_TO_V2_TARGET: i32 = 2;
+const V2_TO_V3_TARGET: i32 = 3;
+const V3_TO_V4_TARGET: i32 = 4;
+const V4_TO_V5_TARGET: i32 = 5;
+const V5_TO_V6_TARGET: i32 = 6;
+const V6_TO_V7_TARGET: i32 = 7;
+const V7_TO_V8_TARGET: i32 = 8;
+const V8_TO_V9_TARGET: i32 = 9;
+
+const SCHEMA_VERSION: i32 = V8_TO_V9_TARGET;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CorruptWigleLookupsValue {
@@ -2165,52 +2183,52 @@ impl Database {
             version = 1;
         }
 
-        if version < 2 {
+        if version < V1_TO_V2_TARGET {
             info!("migrating database v{version} -> v2 (add aps.source_priority)");
             self.migrate_v1_to_v2()?;
-            version = 2;
+            version = V1_TO_V2_TARGET;
         }
 
-        if version < 3 {
+        if version < V2_TO_V3_TARGET {
             info!("migrating database v{version} -> v3 (single-row schema_version)");
             self.migrate_v2_to_v3()?;
-            version = 3;
+            version = V2_TO_V3_TARGET;
         }
 
-        if version < 4 {
+        if version < V3_TO_V4_TARGET {
             info!("migrating database v{version} -> v4 (last_fix table)");
             self.migrate_v3_to_v4()?;
-            version = 4;
+            version = V3_TO_V4_TARGET;
         }
 
-        if version < 5 {
+        if version < V4_TO_V5_TARGET {
             info!("migrating database v{version} -> v5 (fixes timeseries table)");
             self.migrate_v4_to_v5()?;
-            version = 5;
+            version = V4_TO_V5_TARGET;
         }
 
-        if version < 6 {
+        if version < V5_TO_V6_TARGET {
             info!("migrating database v{version} -> v6 (mobile AP classification)");
             self.migrate_v5_to_v6()?;
-            version = 6;
+            version = V5_TO_V6_TARGET;
         }
 
-        if version < 7 {
+        if version < V6_TO_V7_TARGET {
             info!("migrating database v{version} -> v7 (fix quality metadata)");
             self.migrate_v6_to_v7()?;
-            version = 7;
+            version = V6_TO_V7_TARGET;
         }
 
-        if version < 8 {
+        if version < V7_TO_V8_TARGET {
             info!("migrating database v{version} -> v8 (rename api_calls_today -> wigle_lookups_today)");
             self.migrate_v7_to_v8()?;
-            version = 8;
+            version = V7_TO_V8_TARGET;
         }
 
-        if version < 9 {
+        if version < V8_TO_V9_TARGET {
             info!("migrating database v{version} -> v9 (drop redundant aps/pending.channel; frequency canonical)");
             self.migrate_v8_to_v9()?;
-            version = 9;
+            version = V8_TO_V9_TARGET;
         }
 
         if version == SCHEMA_VERSION {
@@ -2295,10 +2313,17 @@ impl Database {
             )?;
 
             // Bump schema_version. Multi-row shape (no id PK yet). Update if
-            // a row exists, otherwise insert.
-            let updated = tx.execute("UPDATE schema_version SET version = 2", [])?;
+            // a row exists, otherwise insert. Target sourced from the shared
+            // const (task-0182) so this stamp and the ladder guard cannot drift.
+            let updated = tx.execute(
+                "UPDATE schema_version SET version = ?1",
+                params![V1_TO_V2_TARGET],
+            )?;
             if updated == 0 {
-                tx.execute("INSERT INTO schema_version (version) VALUES (2)", [])?;
+                tx.execute(
+                    "INSERT INTO schema_version (version) VALUES (?1)",
+                    params![V1_TO_V2_TARGET],
+                )?;
             }
             Ok(())
         })
@@ -2343,12 +2368,12 @@ impl Database {
             // later migration already advanced (if this path is ever reached
             // out of order), and never error on a pre-existing row.
             self.conn.execute(
-                "INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 3)",
-                [],
+                "INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, ?1)",
+                params![V2_TO_V3_TARGET],
             )?;
             self.conn.execute(
-                "UPDATE schema_version SET version = 3 WHERE id = 1 AND version < 3",
-                [],
+                "UPDATE schema_version SET version = ?1 WHERE id = 1 AND version < ?1",
+                params![V2_TO_V3_TARGET],
             )?;
             return Ok(());
         }
@@ -2378,8 +2403,8 @@ impl Database {
         // SCHEMA_VERSION here was the original defect: a crash before the
         // v3->v4 commit left a final-version stamp on disk with no later tables.
         tx.execute(
-            "UPDATE schema_version SET version = 3 WHERE id = 1 AND version < 3",
-            [],
+            "UPDATE schema_version SET version = ?1 WHERE id = 1 AND version < ?1",
+            params![V2_TO_V3_TARGET],
         )?;
         tx.commit()?;
         Ok(())
@@ -2405,7 +2430,7 @@ impl Database {
             .context("failed to create last_fix table")?;
             tx.execute(
                 "UPDATE schema_version SET version = ?1 WHERE id = 1",
-                params![4],
+                params![V3_TO_V4_TARGET],
             )?;
             Ok(())
         })
@@ -2431,7 +2456,7 @@ impl Database {
             .context("failed to create fixes table")?;
             tx.execute(
                 "UPDATE schema_version SET version = ?1 WHERE id = 1",
-                params![5],
+                params![V4_TO_V5_TARGET],
             )?;
             Ok(())
         })
@@ -2465,7 +2490,7 @@ impl Database {
             }
             tx.execute(
                 "UPDATE schema_version SET version = ?1 WHERE id = 1",
-                params![6],
+                params![V5_TO_V6_TARGET],
             )?;
             Ok(())
         })
@@ -2523,7 +2548,7 @@ impl Database {
 
             tx.execute(
                 "UPDATE schema_version SET version = ?1 WHERE id = 1",
-                params![7],
+                params![V6_TO_V7_TARGET],
             )?;
             Ok(())
         })
@@ -2551,7 +2576,7 @@ impl Database {
             .context("failed to rename api_calls_today metadata key")?;
             tx.execute(
                 "UPDATE schema_version SET version = ?1 WHERE id = 1",
-                params![8],
+                params![V7_TO_V8_TARGET],
             )?;
             Ok(())
         })
@@ -2598,7 +2623,7 @@ impl Database {
             }
             tx.execute(
                 "UPDATE schema_version SET version = ?1 WHERE id = 1",
-                params![9],
+                params![V8_TO_V9_TARGET],
             )?;
             Ok(())
         })
@@ -5069,6 +5094,35 @@ mod tests {
         assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
     }
 
+    /// task-0182: SCHEMA_VERSION is the anchor the whole binary compares against;
+    /// it must equal the highest per-migration target const so "added a migration
+    /// but forgot to bump the SCHEMA_VERSION anchor" (and the reverse) is a test
+    /// failure rather than a runtime shape mismatch. The list below mirrors the
+    /// migration ladder's guards one-to-one; adding a migration means adding its
+    /// TARGET const here too, and this test catches an anchor left behind.
+    #[test]
+    fn schema_version_equals_highest_migration_target() {
+        let all_targets = [
+            V1_TO_V2_TARGET,
+            V2_TO_V3_TARGET,
+            V3_TO_V4_TARGET,
+            V4_TO_V5_TARGET,
+            V5_TO_V6_TARGET,
+            V6_TO_V7_TARGET,
+            V7_TO_V8_TARGET,
+            V8_TO_V9_TARGET,
+        ];
+        let max_target = all_targets
+            .into_iter()
+            .max()
+            .expect("at least one migration target must exist");
+        assert_eq!(
+            SCHEMA_VERSION, max_target,
+            "SCHEMA_VERSION must equal the highest migration target; \
+             bump the anchor when adding a migration (task-0182)"
+        );
+    }
+
     /// Helper: how many rows exist in schema_version, regardless of shape.
     fn schema_version_row_count(db: &Database) -> i64 {
         db.conn
@@ -5437,6 +5491,7 @@ mod tests {
     const SEED_AP_LON: f64 = 12.5683;
     const SEED_AP_SOURCE: &str = "wigle";
     const SEED_NOT_FOUND_BSSID: &str = "11:22:33:44:55:66";
+    const SEED_NOT_FOUND_CHECKED_AT: &str = "2020-02-02T00:00:00Z";
     const SEED_PENDING_BSSID: &str = "99:88:77:66:55:44";
     const SEED_PENDING_ATTEMPTS: i64 = 2;
     const SEED_LAST_FIX_LAT: f64 = 55.0;
@@ -5471,9 +5526,8 @@ mod tests {
         db.conn
             .execute(
                 "INSERT INTO not_found (bssid, first_seen, last_seen, checked_at)
-                 VALUES (?1, '2020-02-01T00:00:00Z', '2020-02-02T00:00:00Z',
-                         '2020-02-02T00:00:00Z')",
-                params![SEED_NOT_FOUND_BSSID],
+                 VALUES (?1, '2020-02-01T00:00:00Z', '2020-02-02T00:00:00Z', ?2)",
+                params![SEED_NOT_FOUND_BSSID, SEED_NOT_FOUND_CHECKED_AT],
             )
             .unwrap();
         db.conn
@@ -5640,18 +5694,26 @@ mod tests {
             "aps.source preserved (origin v{origin})"
         );
 
-        // not_found + pending survived.
-        let not_found_count: i64 = db
+        // not_found survived — assert the row exists AND a column VALUE is
+        // intact (task-0257 AC#1), symmetric with the aps/pending/last_fix/fixes
+        // value checks. COUNT==1 alone would pass a hypothetical future migration
+        // that rebuilt not_found preserving the bssid PK but corrupting the
+        // timestamps; querying checked_at back makes such corruption a failure.
+        let (not_found_count, not_found_checked_at): (i64, String) = db
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM not_found WHERE bssid = ?1",
+                "SELECT COUNT(*), MAX(checked_at) FROM not_found WHERE bssid = ?1",
                 params![SEED_NOT_FOUND_BSSID],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(
             not_found_count, 1,
             "not_found row preserved (origin v{origin})"
+        );
+        assert_eq!(
+            not_found_checked_at, SEED_NOT_FOUND_CHECKED_AT,
+            "not_found.checked_at value preserved (origin v{origin})"
         );
         let pending_attempts: i64 = db
             .conn
