@@ -57,46 +57,92 @@ proptest! {
         );
     }
 
-    /// Trilateration result lies within the spherical convex hull of input APs:
-    /// its haversine distance to every input AP is bounded by the diameter of
-    /// the input cluster.
+    /// The PUBLIC trilaterate() rejects a raw outlier and keeps its result
+    /// inside the tight cluster's spherical convex hull.
     ///
-    /// This is the spherically-correct version of "within the bounding box".
-    /// The lat/lon bounding-box property is wrong on a sphere — a great-circle
-    /// arc between two points can extend to higher latitudes than either
-    /// endpoint (think a flight London→Tokyo passing over Siberia).
+    /// task-0153: this test feeds RAW, outlier-laden input straight to
+    /// `trilaterate` — it does NOT pre-apply `filter_outliers`. Because
+    /// `trilaterate` runs `filter_outliers` internally (mod.rs:207), pre-
+    /// filtering in the test would only exercise the inner centroid math and
+    /// a refactor disabling the internal filter would still pass. Feeding the
+    /// outlier straight in makes the internal filter load-bearing: if it is
+    /// removed, the far outlier pulls the centroid far outside the cluster
+    /// diameter and this test fails (verified by mutation, see task notes).
+    ///
+    /// Generation guarantees (so the invariant holds for EVERY input and the
+    /// test never flakes):
+    ///   * A TIGHT cluster of ≥3 APs: a center in a safe mid-latitude/-longitude
+    ///     range (no pole/antimeridian degeneracy) plus ±0.004° (~≤450 m)
+    ///     jitter per AP. Max intra-cluster pairwise distance stays well under
+    ///     `NEIGHBOR_RADIUS_M` (2000 m) at every latitude in range, so stage-1
+    ///     `drop_isolated` KEEPS the whole cluster and the "every AP isolated"
+    ///     bypass never fires.
+    ///   * ONE outlier ~5° (~555 km) away in latitude — far beyond 2000 m from
+    ///     every cluster AP, so it is isolated and dropped by the internal
+    ///     `filter_outliers`.
+    ///
+    /// The bound (dist(centroid, any cluster AP) ≤ cluster diameter) is the
+    /// spherically-correct version of "within the bounding box": on a sphere a
+    /// great-circle arc between two points can reach higher latitudes than
+    /// either endpoint, so a lat/lon box bound is wrong. The centroid lies in
+    /// the spherical convex hull of the surviving APs (a subset of the
+    /// cluster), hence within the full cluster's diameter.
     #[test]
     fn trilaterate_within_cluster_diameter(
-        coords in prop::collection::vec((40.0f64..60.0, 5.0f64..20.0), 2..10)
+        center_lat in -80.0f64..80.0,
+        center_lon in -170.0f64..170.0,
+        // ≥3 cluster APs, each a small jitter offset from the center.
+        jitters in prop::collection::vec((-0.004f64..0.004, -0.004f64..0.004), 3..8),
     ) {
-        let aps: Vec<PositionedAp> = coords
+        // Tight cluster: center + per-AP jitter. All within ~1.3 km of each
+        // other, so mutually within NEIGHBOR_RADIUS_M (2000 m).
+        let cluster_aps: Vec<PositionedAp> = jitters
             .iter()
-            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60), rssi_source: RssiSource::IwDbm, is_mobile: false })
+            .map(|&(dlat, dlon)| PositionedAp {
+                lat: center_lat + dlat,
+                lon: center_lon + dlon,
+                signal_dbm: Some(-60),
+                rssi_source: RssiSource::IwDbm,
+                is_mobile: false,
+            })
             .collect();
 
-        // Only test with APs that survive outlier filtering
-        let filtered = filter_outliers(&aps);
-        if filtered.len() < 2 {
-            return Ok(());
-        }
+        // One far outlier ~5° north of the center (~555 km): isolated, so the
+        // internal filter_outliers drops it. center_lat ≤ 80 → outlier ≤ 85,
+        // still finite and far from the pole.
+        let outlier = PositionedAp {
+            lat: center_lat + 5.0,
+            lon: center_lon,
+            signal_dbm: Some(-60),
+            rssi_source: RssiSource::IwDbm,
+            is_mobile: false,
+        };
 
-        let result = trilaterate(&filtered).unwrap();
+        // RAW input handed to the PUBLIC API — no pre-filtering.
+        let mut raw_aps = cluster_aps.clone();
+        raw_aps.push(outlier);
 
-        // Compute the diameter of the input cluster (max pairwise haversine).
+        let result = trilaterate(&raw_aps).unwrap();
+
+        // Diameter of the CLUSTER only (max pairwise haversine), excluding the
+        // outlier. If the internal filter fails to drop the outlier, the
+        // centroid is pulled ~toward it and blows past this bound.
         let mut diameter = 0.0_f64;
-        for i in 0..filtered.len() {
-            for j in (i + 1)..filtered.len() {
-                let d = haversine_m_test(filtered[i].lat, filtered[i].lon, filtered[j].lat, filtered[j].lon);
+        for i in 0..cluster_aps.len() {
+            for j in (i + 1)..cluster_aps.len() {
+                let d = haversine_m_test(cluster_aps[i].lat, cluster_aps[i].lon, cluster_aps[j].lat, cluster_aps[j].lon);
                 if d > diameter { diameter = d; }
             }
         }
 
-        // The centroid is no farther from any AP than the cluster diameter
-        // (with 1m slack for floating-point). This is a tight spherical-convex-hull bound.
-        for ap in &filtered {
+        // The centroid is no farther from any cluster AP than the cluster
+        // diameter (with a few metres of slack for floating-point noise only —
+        // NOT enough to absorb an undropped 555 km outlier, whose pull is tens
+        // to hundreds of km). This is the tight spherical-convex-hull bound.
+        for ap in &cluster_aps {
             let d = haversine_m_test(result.lat, result.lon, ap.lat, ap.lon);
-            prop_assert!(d <= diameter + 1.0,
-                "centroid->AP haversine {:.3}m exceeds cluster diameter {:.3}m", d, diameter);
+            prop_assert!(d <= diameter + 2.0,
+                "centroid->cluster-AP haversine {:.3}m exceeds cluster diameter {:.3}m (outlier not dropped by internal filter?)", d, diameter);
         }
     }
 
