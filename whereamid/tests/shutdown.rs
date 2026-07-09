@@ -43,8 +43,10 @@ fn make_tempdir(tag: &str) -> PathBuf {
 /// Spawn the daemon with an explicit unix `--socket`, an optional TCP `--bind`,
 /// and hermetic flags (throwaway DB, explicit config, bogus interface). Both
 /// stdout and stderr are captured to files: the tracing subscriber writes
-/// lifecycle logs to STDOUT, while panics and a `main`-returned error go to
-/// STDERR, so a test may need either. Passing an explicit `--socket` keeps the
+/// lifecycle logs to STDERR (task-0240), and panics plus a `main`-returned
+/// error also land on STDERR; stdout stays empty for this daemon. Tests read
+/// the combined streams (`read_output`) so they observe a lifecycle line
+/// regardless of which stream it uses. Passing an explicit `--socket` keeps the
 /// daemon off the default socket path (task-0196 hermeticity).
 fn spawn_daemon(bind: Option<&str>, socket: &Path, config: &Path, dir: &Path) -> Child {
     let out = std::fs::File::create(dir.join("stdout.log")).expect("create stdout.log");
@@ -76,8 +78,9 @@ fn read_stderr(dir: &Path) -> String {
 }
 
 /// Combined daemon output (stdout ++ stderr). The tracing subscriber logs to
-/// stdout while panics / a `main`-returned error land on stderr, so a test
-/// observing a lifecycle log line or a warning must read both streams.
+/// stderr (task-0240) and panics / a `main`-returned error also land on stderr;
+/// reading both streams keeps a test robust to which stream any given line uses
+/// (this daemon leaves stdout empty, but combining is future-proof).
 fn read_output(dir: &Path) -> String {
     let mut s = String::new();
     if let Ok(mut f) = std::fs::File::open(dir.join("stdout.log")) {

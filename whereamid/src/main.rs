@@ -59,6 +59,13 @@ async fn main() -> Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        // Log to STDERR, not tracing's default STDOUT (task-0240). A daemon's
+        // diagnostic stream is conventionally stderr so stdout is free to carry
+        // data; harmless under systemd where both are captured to the journal.
+        // Only the destination stream changes here — log content and levels are
+        // unchanged. tests/shutdown.rs observes lifecycle lines via a combined
+        // stdout+stderr reader, so it is unaffected by the move.
+        .with_writer(std::io::stderr)
         .init();
 
     let args = Args::parse();
