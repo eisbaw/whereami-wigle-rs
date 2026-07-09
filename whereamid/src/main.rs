@@ -7,6 +7,7 @@
 
 mod apple;
 mod boot_clock;
+mod bssid;
 mod config;
 mod db;
 mod debounce;
@@ -1098,7 +1099,7 @@ mod autolocate_loop_tests {
     ) {
         let mut sample = crate::debounce::ScanSample::new();
         for index in 0..3 {
-            let bssid = format!("02:00:00:00:96:{index:02x}");
+            let bssid = format!("b8:00:00:00:96:{index:02x}");
             crate::server::lock_db(state)
                 .upsert_ap(&crate::db::ApInfo {
                     bssid: bssid.clone(),

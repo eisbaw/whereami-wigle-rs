@@ -131,11 +131,29 @@ impl WigleClient {
 
         debug!("WiGLE lookup for {bssid}");
 
-        let url = format!("{}?netid={}", self.search_url, bssid);
+        // task-0122 AC#10: build the query from a validated Bssid. Parsing here
+        // is belt-and-suspenders behind handle_resolve's boundary check
+        // (AC#9): a Bssid can only hold six hex-derived octets, so `& # ? /`,
+        // whitespace, or `../` can never reach the outbound URL. Reject a
+        // malformed value BEFORE the HTTP call rather than interpolating it.
+        let canonical = bssid
+            .parse::<crate::bssid::Bssid>()
+            .map_err(|e| {
+                WigleError::Network(anyhow::anyhow!(
+                    "refusing to query WiGLE with malformed BSSID {bssid:?}: {e}"
+                ))
+            })?
+            .to_string();
+
+        // `Url::parse_with_params` percent-encodes the value, so even a future
+        // caller passing an unexpected string cannot inject extra query
+        // parameters — the netid is always a single, encoded parameter.
+        let url = reqwest::Url::parse_with_params(&self.search_url, &[("netid", &canonical)])
+            .map_err(|e| WigleError::Network(e.into()))?;
 
         let response = self
             .client
-            .get(&url)
+            .get(url)
             .basic_auth(&self.api_user, Some(&self.api_key))
             .send()
             .await
@@ -239,9 +257,48 @@ fn looks_like_quota(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bssid::Bssid;
 
     fn parse(body: &str) -> WigleSearchResponse {
         serde_json::from_str(body).expect("valid WiGLE JSON")
+    }
+
+    /// task-0122 AC#10: the outbound WiGLE query is built from a validated
+    /// Bssid via `Url::parse_with_params`, so it carries exactly one `netid`
+    /// parameter and nothing an attacker could smuggle in. The would-be
+    /// injecting strings never parse as a Bssid, so they can never reach the
+    /// URL builder in the first place.
+    #[test]
+    fn wigle_query_cannot_be_injection_altered() {
+        // A validated BSSID yields a single netid parameter.
+        let bssid: Bssid = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let url =
+            reqwest::Url::parse_with_params(WIGLE_SEARCH_URL, &[("netid", &bssid.to_string())])
+                .unwrap();
+        let params: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            params,
+            vec![("netid".to_string(), "AA:BB:CC:DD:EE:FF".to_string())],
+            "exactly one netid parameter, no injected extras"
+        );
+
+        // Injection-shaped strings never become a Bssid, so the lookup path's
+        // `bssid.parse::<Bssid>()` rejects them before any URL is built.
+        for evil in [
+            "aa&x=1",
+            "../",
+            "AA:BB:CC:DD:EE:FF&netid=evil",
+            "aa bb cc dd ee ff",
+            "aa:bb:cc:dd:ee:f#",
+        ] {
+            assert!(
+                evil.parse::<Bssid>().is_err(),
+                "injection-shaped {evil:?} must fail Bssid parse before URL construction"
+            );
+        }
     }
 
     /// A quota-style success:false maps to RateLimited, which provider.rs

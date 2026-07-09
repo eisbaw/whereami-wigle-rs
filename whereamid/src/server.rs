@@ -1574,6 +1574,38 @@ fn solve_locate_from_cache(
             continue;
         }
 
+        // task-0122 AC#4/#6: exclude locally-administered (randomized client)
+        // MACs and any malformed BSSID BEFORE the consensus tally and the
+        // outlier pipeline (drop_isolated). A randomized MAC seen in three
+        // cities is three devices wearing one address, not a moving AP; letting
+        // a cluster of them reach drop_isolated would let them vouch for one
+        // another as a fake stay. Placed here (not inside filter_outliers,
+        // which operates on bssid-less PositionedAp) so a poisoner never
+        // becomes solver membership OR a consensus denominator entry. This
+        // subsumes the task-0093 SSID denylist.
+        //
+        // We parse the stored `String` bssid here at the use site rather than
+        // storing a `Bssid`: making db::ApInfo.bssid a `Bssid` is the deferred
+        // follow-up task-0269, which would let this become an infallible field
+        // read instead of a `.parse()`.
+        match ap.bssid.parse::<crate::bssid::Bssid>() {
+            Ok(b) if b.is_locally_administered() => {
+                debug!(
+                    "skipping AP {}: locally-administered (randomized) MAC excluded from trilateration",
+                    ap.bssid
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    "skipping AP {}: malformed BSSID ({e}); excluded from trilateration",
+                    ap.bssid
+                );
+                continue;
+            }
+        }
+
         // Consensus deliberately ignores stability, RSSI, top-N and eventual
         // outlier-filter survival. Every eligible unique BSSID in the latest
         // scanner snapshot contributes exactly one denominator entry.
@@ -2093,6 +2125,27 @@ async fn return_last_fix_or_error(
     }
 }
 
+/// Normalize and validate the BSSIDs of a resolve request (task-0122 AC#9).
+///
+/// Returns the canonical BSSID strings on success, or an error message naming
+/// the first malformed entry. Pure and network-free so the "no malformed BSSID
+/// reaches a provider" guarantee is unit-testable without a `DaemonState`.
+/// Locally-administered MACs are well-formed and accepted here — resolving an
+/// individual randomized MAC is a valid (if rarely useful) query; the
+/// randomized-MAC exclusion is a trilateration concern, not a resolve concern.
+fn validate_resolve_bssids(bssids: &[String]) -> Result<Vec<String>, String> {
+    bssids
+        .iter()
+        .map(|b| {
+            let normalized = crate::scanner::normalize_bssid(b);
+            normalized
+                .parse::<crate::bssid::Bssid>()
+                .map(|_| normalized)
+                .map_err(|e| format!("malformed BSSID {b:?}: {e}"))
+        })
+        .collect()
+}
+
 async fn handle_resolve(
     bssids: &[String],
     state: &Arc<DaemonState>,
@@ -2110,10 +2163,13 @@ async fn handle_resolve(
         ));
     }
 
-    let normalized: Vec<String> = bssids
-        .iter()
-        .map(|b| crate::scanner::normalize_bssid(b))
-        .collect();
+    // task-0122 AC#9: reject any BSSID that is not a well-formed 6-octet MAC
+    // BEFORE any provider/network call, so a malformed value can never reach a
+    // provider or the outbound WiGLE/Apple request.
+    let normalized = match validate_resolve_bssids(bssids) {
+        Ok(normalized) => normalized,
+        Err(msg) => return error_json(&msg),
+    };
 
     let result = resolver::resolve_readonly(&normalized, state, ticket).await;
 
@@ -3387,7 +3443,12 @@ mod dispatch_tests {
             .into_iter()
             .enumerate()
         {
-            let bssid = format!("02:00:00:{prefix:02x}:02:{index:02x}");
+            // Universally-administered (U/L bit clear) so these are the only
+            // trilateration-eligible rows: the MOVIA :00: rows are persisted
+            // mobile and the :01: rows are non-finite, both excluded by earlier
+            // guards; keeping THESE locally-administered would (correctly, per
+            // task-0122) drop them from the solve too, defeating the fixture.
+            let bssid = format!("b8:00:00:{prefix:02x}:02:{index:02x}");
             let ssid = format!("fixed-home-{index}");
             lock_db(state)
                 .upsert_ap(&crate::db::ApInfo {
@@ -3512,7 +3573,7 @@ mod dispatch_tests {
             add_cached_scan_ap(
                 state,
                 &mut sample,
-                &format!("02:00:00:00:{prefix:02x}:{index:02x}"),
+                &format!("b8:00:00:00:{prefix:02x}:{index:02x}"),
                 lat,
                 lon,
                 -40 - index,
@@ -3777,7 +3838,7 @@ mod dispatch_tests {
             add_cached_scan_ap(
                 &state,
                 &mut sample,
-                &format!("02:00:00:00:84:{index:02x}"),
+                &format!("b8:00:00:00:84:{index:02x}"),
                 CURRENT.0,
                 CURRENT.1,
                 -40 - index,
@@ -3787,7 +3848,7 @@ mod dispatch_tests {
         add_cached_scan_ap(
             &state,
             &mut sample,
-            "02:00:00:00:84:ff",
+            "b8:00:00:00:84:ff",
             PREVIOUS.0,
             PREVIOUS.1,
             -80,
@@ -3822,7 +3883,7 @@ mod dispatch_tests {
         let state = test_state();
         seed_autolocate_cluster(&state, 0x71, 55.6761, 12.5683).await;
         let bssids: Vec<String> = (0..3)
-            .map(|index| format!("02:00:00:00:71:{index:02x}"))
+            .map(|index| format!("b8:00:00:00:71:{index:02x}"))
             .collect();
         const OLD_LAST_SEEN: &str = "2000-01-01T00:00:00+00:00";
         state
@@ -3983,7 +4044,7 @@ mod dispatch_tests {
     #[tokio::test]
     async fn autolocate_skip_order_has_no_provider_pending_or_geocode_effects() {
         let state = test_state();
-        let bssid = "02:00:00:00:74:00";
+        let bssid = "b8:00:00:00:74:00";
         let mut sample = crate::debounce::ScanSample::new();
         sample.insert(
             bssid.to_string(),
@@ -4343,7 +4404,7 @@ mod dispatch_tests {
             add_cached_scan_ap(
                 &state,
                 &mut sample,
-                &format!("02:00:00:00:3c:{index:02x}"),
+                &format!("b8:00:00:00:3c:{index:02x}"),
                 lat,
                 lon,
                 -50 - index as i32,
@@ -4471,7 +4532,7 @@ mod dispatch_tests {
     async fn autolocate_task0094_previous_winner_writes_nothing() {
         const PREVIOUS: (f64, f64) = (55.7047, 12.5900);
         const BRAZIL: (f64, f64) = (-12.8940, -38.2920);
-        const OUTLIER: &str = "02:00:00:00:79:ff";
+        const OUTLIER: &str = "b8:00:00:00:79:ff";
         let mut state = test_state();
         Arc::get_mut(&mut state)
             .expect("state must be uniquely owned")
@@ -4504,7 +4565,7 @@ mod dispatch_tests {
             add_cached_scan_ap(
                 &state,
                 &mut sample,
-                &format!("02:00:00:00:79:{index:02x}"),
+                &format!("b8:00:00:00:79:{index:02x}"),
                 PREVIOUS.0 + index as f64 / 100_000.0,
                 PREVIOUS.1 + index as f64 / 100_000.0,
                 -60 - index,
@@ -4726,18 +4787,18 @@ mod dispatch_tests {
     #[test]
     fn locate_kernel_returns_expected_position_from_synthetic_rows() {
         let cluster = [
-            ("02:00:00:00:60:00", 55.6760, 12.5680),
-            ("02:00:00:00:60:01", 55.6761, 12.5682),
-            ("02:00:00:00:60:02", 55.6759, 12.5681),
+            ("b8:00:00:00:60:00", 55.6760, 12.5680),
+            ("b8:00:00:00:60:01", 55.6761, 12.5682),
+            ("b8:00:00:00:60:02", 55.6759, 12.5681),
         ];
         let cached_aps: Vec<crate::db::ApInfo> = cluster
             .iter()
             .map(|(bssid, lat, lon)| kernel_ap(bssid, *lat, *lon, false))
             .collect();
         let candidates = kernel_candidates(&[
-            ("02:00:00:00:60:00", -50),
-            ("02:00:00:00:60:01", -51),
-            ("02:00:00:00:60:02", -52),
+            ("b8:00:00:00:60:00", -50),
+            ("b8:00:00:00:60:01", -51),
+            ("b8:00:00:00:60:02", -52),
         ]);
         let active = active_index(&candidates);
 
@@ -4775,22 +4836,22 @@ mod dispatch_tests {
     #[test]
     fn locate_kernel_filters_ineligible_rows_and_respects_top_n() {
         let cached_aps = vec![
-            kernel_ap("02:00:00:00:61:00", 55.6760, 12.5680, false),
-            kernel_ap("02:00:00:00:61:01", 55.6761, 12.5682, false),
+            kernel_ap("b8:00:00:00:61:00", 55.6760, 12.5680, false),
+            kernel_ap("b8:00:00:00:61:01", 55.6761, 12.5682, false),
             // Present in the scan-consensus cache but NOT an active candidate:
             // contributes to visible_cached only.
-            kernel_ap("02:00:00:00:61:02", 55.6759, 12.5681, false),
+            kernel_ap("b8:00:00:00:61:02", 55.6759, 12.5681, false),
             // Non-finite and persisted-mobile rows: excluded everywhere.
-            kernel_ap("02:00:00:00:61:03", f64::INFINITY, 12.5680, false),
-            kernel_ap("02:00:00:00:61:04", 55.6762, 12.5683, true),
+            kernel_ap("b8:00:00:00:61:03", f64::INFINITY, 12.5680, false),
+            kernel_ap("b8:00:00:00:61:04", 55.6762, 12.5683, true),
         ];
         let candidates = kernel_candidates(&[
-            ("02:00:00:00:61:00", -50),
-            ("02:00:00:00:61:01", -51),
+            ("b8:00:00:00:61:00", -50),
+            ("b8:00:00:00:61:01", -51),
             // 61:03 / 61:04 are active too, proving the row-level (not
             // candidate-level) eligibility guard rejects them.
-            ("02:00:00:00:61:03", -40),
-            ("02:00:00:00:61:04", -39),
+            ("b8:00:00:00:61:03", -40),
+            ("b8:00:00:00:61:04", -39),
         ]);
         let active = active_index(&candidates);
 
@@ -4812,13 +4873,112 @@ mod dispatch_tests {
 
         // With no eligible cache hit at all, the kernel reports NoPositions and
         // leaves the cold-start policy to the caller.
-        let barren = vec![kernel_ap("02:00:00:00:61:03", f64::NAN, 12.5680, false)];
+        let barren = vec![kernel_ap("00:00:00:00:61:03", f64::NAN, 12.5680, false)];
         assert!(
             matches!(
                 solve_locate_from_cache(&barren, &active, 8),
                 LocateKernel::NoPositions
             ),
             "a non-finite-only cache must yield NoPositions"
+        );
+    }
+
+    /// task-0122 AC#6: a tight cluster of Brazil-in-Copenhagen poisoners
+    /// (locally-administered / randomized MACs, F6 first octet) is excluded
+    /// from the solve entirely — BEFORE the outlier pipeline — so the kernel
+    /// reports NoPositions instead of trilaterating a fake stay. It also never
+    /// counts toward the consensus denominator.
+    #[test]
+    fn locate_kernel_excludes_locally_administered_poisoner_cluster() {
+        let poisoners = [
+            ("F6:B1:9C:0A:3A:60", 55.6760, 12.5680),
+            ("F6:B1:9C:0A:3A:61", 55.6761, 12.5682),
+            ("F6:B1:9C:0A:3A:62", 55.6759, 12.5681),
+        ];
+        let cached_aps: Vec<crate::db::ApInfo> = poisoners
+            .iter()
+            .map(|(bssid, lat, lon)| kernel_ap(bssid, *lat, *lon, false))
+            .collect();
+        let candidates = kernel_candidates(&[
+            ("F6:B1:9C:0A:3A:60", -50),
+            ("F6:B1:9C:0A:3A:61", -51),
+            ("F6:B1:9C:0A:3A:62", -52),
+        ]);
+        let active = active_index(&candidates);
+
+        assert!(
+            matches!(
+                solve_locate_from_cache(&cached_aps, &active, 8),
+                LocateKernel::NoPositions
+            ),
+            "a cluster of randomized-MAC poisoners must be excluded before \
+             drop_isolated, yielding NoPositions — never a trilaterated fix"
+        );
+    }
+
+    /// task-0122 AC#7: universally-administered infrastructure BSSIDs (TP-Link
+    /// OUI B8:50:01, U/L bit clear) are NOT excluded — the kernel trilaterates
+    /// them exactly as before. Guards against the filter over-reaching into
+    /// legitimate APs.
+    #[test]
+    fn locate_kernel_keeps_universally_administered_infra() {
+        let infra = [
+            ("B8:50:01:00:00:60", 55.6760, 12.5680),
+            ("B8:50:01:00:00:61", 55.6761, 12.5682),
+            ("B8:50:01:00:00:62", 55.6759, 12.5681),
+        ];
+        let cached_aps: Vec<crate::db::ApInfo> = infra
+            .iter()
+            .map(|(bssid, lat, lon)| kernel_ap(bssid, *lat, *lon, false))
+            .collect();
+        let candidates = kernel_candidates(&[
+            ("B8:50:01:00:00:60", -50),
+            ("B8:50:01:00:00:61", -51),
+            ("B8:50:01:00:00:62", -52),
+        ]);
+        let active = active_index(&candidates);
+
+        let LocateKernel::Solved(solved) = solve_locate_from_cache(&cached_aps, &active, 8) else {
+            panic!("universally-administered infra APs must still solve");
+        };
+        let pos = solved.result.expect("infra cluster must trilaterate");
+        assert!(
+            (pos.lat - 55.6760).abs() < 0.01 && (pos.lon - 12.5681).abs() < 0.01,
+            "infra position {pos:?} must land on the seeded cluster"
+        );
+        assert_eq!(solved.source_count, 3, "all three infra rows solve");
+    }
+
+    /// task-0122 AC#9: malformed BSSIDs are rejected before any provider or
+    /// network call; well-formed ones (including locally-administered) are
+    /// accepted and normalized to canonical uppercase.
+    #[test]
+    fn validate_resolve_bssids_rejects_malformed_accepts_wellformed() {
+        for bad in [
+            "00:00:00:00:00:00", // all zeros
+            "ff:ff:ff:ff:ff:ff", // broadcast
+            "01:00:5e:00:00:01", // multicast
+            "aa:bb:cc:dd:ee",    // too short
+            "zz:bb:cc:dd:ee:ff", // non-hex
+            "aa&x=1",            // injection-shaped
+            "../",               // path traversal
+        ] {
+            assert!(
+                validate_resolve_bssids(&[bad.to_string()]).is_err(),
+                "malformed BSSID {bad:?} must be rejected before any network call"
+            );
+        }
+
+        // Well-formed inputs pass and are canonicalized. A locally-administered
+        // MAC is well-formed and accepted for resolve (the randomized-MAC
+        // exclusion is a trilateration concern, not a resolve one).
+        assert_eq!(
+            validate_resolve_bssids(&["aa:bb:cc:dd:ee:ff".to_string()]).unwrap(),
+            vec!["AA:BB:CC:DD:EE:FF".to_string()]
+        );
+        assert!(
+            validate_resolve_bssids(&["f6:b1:9c:0a:3a:60".to_string()]).is_ok(),
+            "a well-formed locally-administered MAC is a valid resolve target"
         );
     }
 
@@ -4833,7 +4993,7 @@ mod dispatch_tests {
             add_cached_scan_ap(
                 &state,
                 &mut sample,
-                &format!("02:00:00:00:60:{index:02x}"),
+                &format!("b8:00:00:00:60:{index:02x}"),
                 lat,
                 lon,
                 -50 - index as i32,
@@ -4872,7 +5032,7 @@ mod dispatch_tests {
         add_cached_scan_ap(
             &state,
             &mut sample,
-            "02:00:00:00:7f:00",
+            "b8:00:00:00:7f:00",
             0.0,
             0.0,
             -50,
@@ -4881,7 +5041,7 @@ mod dispatch_tests {
         add_cached_scan_ap(
             &state,
             &mut sample,
-            "02:00:00:00:7f:01",
+            "b8:00:00:00:7f:01",
             0.0,
             180.0,
             -50,
@@ -4920,7 +5080,7 @@ mod dispatch_tests {
         add_cached_scan_ap(
             &state,
             &mut sample,
-            "02:00:00:00:61:ff",
+            "b8:00:00:00:61:ff",
             BRAZIL.0,
             BRAZIL.1,
             -20,
@@ -4930,7 +5090,7 @@ mod dispatch_tests {
             add_cached_scan_ap(
                 &state,
                 &mut sample,
-                &format!("02:00:00:00:61:{index:02x}"),
+                &format!("b8:00:00:00:61:{index:02x}"),
                 PREVIOUS.0 + index as f64 / 100_000.0,
                 PREVIOUS.1 + index as f64 / 100_000.0,
                 -60 - index,
@@ -5021,7 +5181,7 @@ mod dispatch_tests {
             add_cached_scan_ap(
                 &state,
                 &mut sample,
-                &format!("02:00:00:00:65:{index:02x}"),
+                &format!("b8:00:00:00:65:{index:02x}"),
                 CURRENT.0,
                 CURRENT.1,
                 -40 - index,
@@ -5031,7 +5191,7 @@ mod dispatch_tests {
         add_cached_scan_ap(
             &state,
             &mut sample,
-            "02:00:00:00:65:ff",
+            "b8:00:00:00:65:ff",
             PREVIOUS.0,
             PREVIOUS.1,
             -80,
@@ -5113,7 +5273,7 @@ mod dispatch_tests {
             add_cached_scan_ap(
                 &state,
                 &mut sample,
-                &format!("02:00:00:00:62:{index:02x}"),
+                &format!("b8:00:00:00:62:{index:02x}"),
                 COPENHAGEN.0 + index as f64 / 100_000.0,
                 COPENHAGEN.1 + index as f64 / 100_000.0,
                 -50 - index,
@@ -5163,7 +5323,7 @@ mod dispatch_tests {
             add_cached_scan_ap(
                 &state,
                 &mut sample,
-                &format!("02:00:00:00:63:{index:02x}"),
+                &format!("b8:00:00:00:63:{index:02x}"),
                 55.6761 + index as f64 / 100_000.0,
                 12.5683 + index as f64 / 100_000.0,
                 -50 - index,
@@ -5226,7 +5386,7 @@ mod dispatch_tests {
             add_cached_scan_ap(
                 &state,
                 &mut sample,
-                &format!("02:00:00:00:64:{index:02x}"),
+                &format!("b8:00:00:00:64:{index:02x}"),
                 train_coords[index].0,
                 train_coords[index].1,
                 -50,
@@ -6012,7 +6172,7 @@ mod dispatch_tests {
         );
         assert_eq!(state.args.top_n, 10, "test requires all ten APs selected");
         let bssids: Vec<String> = (0..10)
-            .map(|index| format!("02:00:00:00:10:{index:02x}"))
+            .map(|index| format!("b8:00:00:00:10:{index:02x}"))
             .collect();
         for (index, bssid) in bssids.iter().enumerate() {
             cache_ap(
@@ -6090,11 +6250,11 @@ mod dispatch_tests {
     async fn locate_excludes_mobile_cache_rows_and_reports_only_fixed_sources() {
         let state = test_state();
         let rows = [
-            ("02:00:00:00:30:01", "home-a", 55.6760, 12.5680),
-            ("02:00:00:00:30:02", "home-b", 55.6761, 12.5682),
-            ("02:00:00:00:30:03", "home-c", 55.6759, 12.5681),
-            ("02:00:00:00:30:04", "MOVIA_BUS_42", 55.7390, 12.5500),
-            ("02:00:00:00:30:05", "DSB_Wi-Fi", 55.7391, 12.5501),
+            ("b8:00:00:00:30:01", "home-a", 55.6760, 12.5680),
+            ("b8:00:00:00:30:02", "home-b", 55.6761, 12.5682),
+            ("b8:00:00:00:30:03", "home-c", 55.6759, 12.5681),
+            ("b8:00:00:00:30:04", "MOVIA_BUS_42", 55.7390, 12.5500),
+            ("b8:00:00:00:30:05", "DSB_Wi-Fi", 55.7391, 12.5501),
         ];
         let mut sample = crate::debounce::ScanSample::new();
         for (index, (bssid, ssid, lat, lon)) in rows.iter().enumerate() {
@@ -6156,7 +6316,7 @@ mod dispatch_tests {
         // Eleven stronger mobile APs exceed top_n by themselves. Filtering
         // after truncation would therefore leave no fixed candidate at all.
         for index in 0..11 {
-            let bssid = format!("02:00:00:00:40:{index:02x}");
+            let bssid = format!("b8:00:00:00:40:{index:02x}");
             let ssid = format!("MOVIA_BUS_{index}");
             lock_db(&state)
                 .upsert_ap(&crate::db::ApInfo {
@@ -6186,7 +6346,7 @@ mod dispatch_tests {
             .into_iter()
             .enumerate()
         {
-            let bssid = format!("02:00:00:00:41:{index:02x}");
+            let bssid = format!("b8:00:00:00:41:{index:02x}");
             let ssid = format!("fixed-home-{index}");
             lock_db(&state)
                 .upsert_ap(&crate::db::ApInfo {
@@ -6258,7 +6418,7 @@ mod dispatch_tests {
         // `cargo test` load. See install_permissive_global_test_subscriber.
         crate::test_support::install_permissive_global_test_subscriber();
 
-        const POISONED_BSSID: &str = "02:00:00:00:52:ff";
+        const POISONED_BSSID: &str = "b8:00:00:00:52:ff";
         let state = test_state();
         assert_eq!(state.args.top_n, 10);
 
@@ -6276,7 +6436,7 @@ mod dispatch_tests {
             .into_iter()
             .enumerate()
         {
-            let bssid = format!("02:00:00:00:52:{index:02x}");
+            let bssid = format!("b8:00:00:00:52:{index:02x}");
             cache_ap(&state, &bssid, lat, lon);
             sample.insert(
                 bssid,
@@ -6355,7 +6515,7 @@ mod dispatch_tests {
         assert!(state.args.debounce_threshold > 1);
         let mut sample = crate::debounce::ScanSample::new();
         for index in 0..3 {
-            let bssid = format!("02:00:00:00:42:{index:02x}");
+            let bssid = format!("b8:00:00:00:42:{index:02x}");
             let ssid = format!("MOVIA_BUS_{index}");
             lock_db(&state)
                 .upsert_ap(&crate::db::ApInfo {
@@ -6418,7 +6578,7 @@ mod dispatch_tests {
             Some(&serde_json::Value::Null)
         );
 
-        let bssid = "02:00:00:00:20:01";
+        let bssid = "b8:00:00:00:20:01";
         let mut sample = crate::debounce::ScanSample::new();
         sample.insert(
             bssid.to_string(),
@@ -6461,7 +6621,7 @@ mod dispatch_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn debug_releases_debouncer_before_waiting_for_db_reader() {
         let state = test_state();
-        let bssid = "02:00:00:00:20:02";
+        let bssid = "b8:00:00:00:20:02";
         let mut sample = crate::debounce::ScanSample::new();
         sample.insert(
             bssid.to_string(),

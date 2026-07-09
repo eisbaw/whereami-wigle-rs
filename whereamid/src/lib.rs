@@ -2,6 +2,7 @@
 
 pub mod apple;
 pub mod boot_clock;
+pub mod bssid;
 pub mod db;
 pub mod debounce;
 pub mod geo;

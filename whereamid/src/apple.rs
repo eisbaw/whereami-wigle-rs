@@ -171,9 +171,16 @@ pub fn decode_response(data: &[u8], requested: &[String]) -> Result<Vec<ApInfo>>
             pos = new_pos;
 
             if let Some(ap) = parse_wifi_device(msg_data)? {
-                // Only accept BSSIDs we actually asked for. parse_wifi_device
-                // already normalizes via scanner::normalize_bssid.
-                if requested_set.contains(&ap.bssid) {
+                // task-0122 AC#3: reject any provider-returned BSSID that is not
+                // a well-formed IEEE-802 MAC BEFORE it can enter the cache under
+                // the top-priority Source::Apple. A malformed value cannot be
+                // one we requested anyway; this is defense in depth behind the
+                // requested_set filter.
+                if ap.bssid.parse::<crate::bssid::Bssid>().is_err() {
+                    debug!("Apple returned malformed BSSID {}; dropping", ap.bssid);
+                } else if requested_set.contains(&ap.bssid) {
+                    // Only accept BSSIDs we actually asked for. parse_wifi_device
+                    // already normalizes via scanner::normalize_bssid.
                     results.push(ap);
                 } else {
                     debug!(

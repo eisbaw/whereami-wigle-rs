@@ -737,13 +737,7 @@ pub fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
         // is the authoritative source when accuracy matters.
         let signal_dbm = -90 + ((signal_pct as f64 * 60.0 / 100.0) as i32);
 
-        networks.push(ScannedNetwork {
-            bssid: normalize_bssid(&bssid),
-            ssid,
-            signal_dbm,
-            channel,
-            frequency: freq,
-        });
+        push_validated(&mut networks, &bssid, ssid, signal_dbm, channel, freq);
     }
     networks
 }
@@ -884,13 +878,14 @@ pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
         if let Some(rest) = line.strip_prefix("BSS ") {
             // Save previous entry
             if let (Some(bssid), Some(signal)) = (current_bssid.take(), current_signal.take()) {
-                networks.push(ScannedNetwork {
-                    bssid: normalize_bssid(&bssid),
-                    ssid: current_ssid.take(),
-                    signal_dbm: signal,
-                    channel: current_channel.take(),
-                    frequency: current_freq.take(),
-                });
+                push_validated(
+                    &mut networks,
+                    &bssid,
+                    current_ssid.take(),
+                    signal,
+                    current_channel.take(),
+                    current_freq.take(),
+                );
             } else {
                 current_ssid = None;
                 current_channel = None;
@@ -940,13 +935,14 @@ pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
 
     // Don't forget the last entry
     if let (Some(bssid), Some(signal)) = (current_bssid, current_signal) {
-        networks.push(ScannedNetwork {
-            bssid: normalize_bssid(&bssid),
-            ssid: current_ssid,
-            signal_dbm: signal,
-            channel: current_channel,
-            frequency: current_freq,
-        });
+        push_validated(
+            &mut networks,
+            &bssid,
+            current_ssid,
+            signal,
+            current_channel,
+            current_freq,
+        );
     }
 
     networks
@@ -955,6 +951,35 @@ pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
 /// Normalize BSSID to uppercase, colon-separated.
 pub fn normalize_bssid(bssid: &str) -> String {
     bssid.trim().to_uppercase()
+}
+
+/// Push a scanned network only if its BSSID is a well-formed IEEE-802 MAC
+/// (task-0122 AC#3). A malformed / multicast / broadcast / all-zero BSSID is
+/// not a real infrastructure AP; storing it would let garbage propagate into
+/// the cache and the trilateration solver, so it is dropped with a warning
+/// (fail loud, never silently). A locally-administered (randomized) MAC is a
+/// valid unicast address and is KEPT here — a phone hotspot still belongs in a
+/// raw scan; the randomized-MAC exclusion happens later, at the trilateration
+/// boundary (`bssid::is_trilateration_eligible`), not at capture.
+fn push_validated(
+    networks: &mut Vec<ScannedNetwork>,
+    bssid: &str,
+    ssid: Option<String>,
+    signal_dbm: i32,
+    channel: Option<i32>,
+    frequency: Option<i32>,
+) {
+    let normalized = normalize_bssid(bssid);
+    match normalized.parse::<crate::bssid::Bssid>() {
+        Ok(_) => networks.push(ScannedNetwork {
+            bssid: normalized,
+            ssid,
+            signal_dbm,
+            channel,
+            frequency,
+        }),
+        Err(e) => warn!("scan: dropping AP with malformed BSSID {bssid:?}: {e}"),
+    }
 }
 
 /// Convert Wi-Fi frequency (MHz) to channel number.
@@ -2169,7 +2194,7 @@ mod tests {
 	signal: -65.00 dBm
 	SSID: TestWiFi
 	DS Parameter set: channel 6
-BSS 11:22:33:44:55:66(on wlan0)
+BSS 10:22:33:44:55:66(on wlan0)
 	freq: 5180
 	signal: -78.00 dBm
 	SSID: eduroam
@@ -2182,8 +2207,38 @@ BSS 11:22:33:44:55:66(on wlan0)
         assert_eq!(networks[0].channel, Some(6));
         assert_eq!(networks[0].frequency, Some(2437));
 
-        assert_eq!(networks[1].bssid, "11:22:33:44:55:66");
+        // 10:… is a universally-administered unicast MAC (task-0122). The
+        // former 11:… fixture was multicast (0x01 bit set) and is now rejected
+        // at the scanner boundary, so it would silently vanish from the scan.
+        assert_eq!(networks[1].bssid, "10:22:33:44:55:66");
         assert_eq!(networks[1].signal_dbm, -78);
+    }
+
+    /// task-0122 AC#3: a malformed / multicast / broadcast / all-zero BSSID is
+    /// dropped at the scanner boundary rather than stored, while the
+    /// well-formed AP in the same output survives.
+    #[test]
+    fn parse_iw_drops_malformed_bssid_keeps_valid() {
+        let output = r#"BSS ff:ff:ff:ff:ff:ff(on wlan0)
+	freq: 2437
+	signal: -50.00 dBm
+	SSID: Broadcast
+BSS 00:00:00:00:00:00(on wlan0)
+	freq: 2437
+	signal: -55.00 dBm
+	SSID: Zeros
+BSS b8:50:01:aa:bb:cc(on wlan0)
+	freq: 2437
+	signal: -60.00 dBm
+	SSID: RealAP
+"#;
+        let networks = parse_iw_output(output);
+        assert_eq!(
+            networks.len(),
+            1,
+            "broadcast and all-zero BSSIDs must be dropped, got {networks:?}"
+        );
+        assert_eq!(networks[0].bssid, "B8:50:01:AA:BB:CC");
     }
 
     #[test]
