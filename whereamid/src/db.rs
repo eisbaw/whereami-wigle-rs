@@ -1625,6 +1625,13 @@ pub fn retention_cutoff(retention_days: i64) -> Result<Option<String>> {
 /// successful locate response so the daemon can answer "where was I N days
 /// ago" queries by grouping fixes into stay-point segments.
 ///
+/// TERMINOLOGY (task-0131): "fix" here is a **Wi-Fi-trilateration-derived
+/// position estimate, NOT a GPS fix**. This daemon never sees GNSS/satellite
+/// data — every position is inferred from the geolocation of visible Wi-Fi
+/// APs. In particular `accuracy_m` is a trilateration confidence radius, not a
+/// GPS HDOP-derived value (task-0127); a reader from a GPS background must not
+/// assume satellite semantics.
+///
 /// task-0134: this is a DOMAIN type — the DB layer owns the on-disk RFC3339
 /// string and hands callers an already-parsed `at: DateTime<Utc>`. History
 /// segmentation therefore never re-parses a timestamp per iteration, and a
@@ -1740,6 +1747,11 @@ pub(crate) struct CappedFixRows {
 /// an on-disk `LastFixRow` + an in-memory `server::LastFix`). The DB layer owns
 /// the RFC3339<->`DateTime<Utc>` marshalling so callers never hand-marshal, and
 /// wall-clock age across restarts is computed directly on `at`.
+///
+/// TERMINOLOGY (task-0131): like [`Fix`], this "fix" is a
+/// **Wi-Fi-trilateration-derived position estimate, NOT a GPS fix** — the
+/// daemon has no GNSS input. `accuracy_m` is a trilateration confidence radius,
+/// not a GPS HDOP-derived value (task-0127).
 ///
 /// task-0238 non-finite guard: a persisted row with a non-finite coordinate or
 /// accuracy, or an unparseable timestamp, is rejected at read time by
