@@ -70,9 +70,9 @@ mod roundtrip {
             inlier_ratio: Some(0.75),
             confidence: Confidence::Medium,
             suspect_reason: Some("speed".to_string()),
-            error: None,
         });
-        // Minimal / error envelope: every optional absent.
+        // Minimal ok:false body: every optional absent (task-0133 removed the
+        // in-band `error` field; failures ride ErrorResponse instead).
         round_trip(&LocateResponse {
             ok: false,
             v: 1,
@@ -92,7 +92,6 @@ mod roundtrip {
             inlier_ratio: None,
             confidence: Confidence::High,
             suspect_reason: None,
-            error: Some("trilateration failed".to_string()),
         });
     }
 
@@ -117,7 +116,6 @@ mod roundtrip {
                     provenance: Provenance::NotFound,
                 },
             ],
-            error: None,
         });
     }
 
@@ -134,7 +132,6 @@ mod roundtrip {
             }],
             scan_age_ms: Some(1500),
             scanned_at: Some("2026-01-02T03:04:05Z".to_string()),
-            error: None,
         });
     }
 
@@ -154,7 +151,6 @@ mod roundtrip {
             db_read_failures: 4,
             autolocate_fixes_written: 7,
             orphan_tasks_aborted: 0,
-            error: None,
         });
     }
 
@@ -186,7 +182,6 @@ mod roundtrip {
                     db_status: DbStatus::New,
                 },
             ],
-            error: None,
         });
     }
 
@@ -197,7 +192,6 @@ mod roundtrip {
             v: 1,
             version: Some("0.1.0".to_string()),
             git_rev: Some("deadbeef".to_string()),
-            error: None,
         });
     }
 
@@ -226,7 +220,6 @@ mod roundtrip {
                 mean_accuracy_m: 35.0,
                 n_fixes: 42,
             }],
-            error: None,
         });
     }
 
@@ -269,7 +262,6 @@ mod roundtrip {
                 suspect_reason: Some("exact".to_string()),
             }],
             elided: Some(2),
-            error: None,
         });
     }
 
@@ -283,7 +275,6 @@ mod roundtrip {
             not_found_deleted: 3,
             fixes_deleted: 2,
             last_fix_deleted: 1,
-            error: None,
         });
     }
 }
@@ -373,7 +364,6 @@ mod wire_shape {
             inlier_ratio: None,
             confidence: Confidence::High,
             suspect_reason: None,
-            error: None,
         }
     }
 
@@ -436,7 +426,6 @@ mod wire_shape {
             networks: vec![],
             scan_age_ms: None,
             scanned_at: None,
-            error: None,
         })
         .unwrap();
         assert!(json.contains("\"scan_age_ms\":null"), "{json}");
@@ -458,7 +447,6 @@ mod wire_shape {
             },
             fixes: vec![],
             elided: None,
-            error: None,
         })
         .unwrap();
         assert_eq!(
@@ -512,7 +500,6 @@ mod wire_shape {
             not_found_deleted: 2,
             fixes_deleted: 9,
             last_fix_deleted: 1,
-            error: None,
         })
         .unwrap();
         assert_eq!(
@@ -543,7 +530,6 @@ mod wire_shape {
                 mean_accuracy_m: 35.0,
                 n_fixes: 42,
             }],
-            error: None,
         })
         .unwrap();
         assert_eq!(
@@ -650,7 +636,6 @@ mod daemon_fixtures {
         assert_eq!(r.age_s, Some(120));
         assert_eq!(r.confidence, Confidence::Medium);
         assert_eq!(r.suspect_reason.as_deref(), Some("speed"));
-        assert!(r.error.is_none());
     }
 
     #[test]
@@ -704,14 +689,26 @@ mod daemon_fixtures {
     }
 
     #[test]
-    fn error_envelope_decodes_into_any_typed_response() {
+    fn error_envelope_decodes_into_error_response_not_a_typed_body() {
+        // task-0133: the error envelope is its own type. The typed response
+        // structs no longer carry an `error` field, so the daemon's failure
+        // string is only recoverable via ErrorResponse — the client dispatches
+        // on `ok` to decode this type (the DaemonError surfacing is proven in
+        // whereami-client's daemon_error_dispatch_tests). This is the wire-side
+        // half: the envelope decodes cleanly into ErrorResponse.
+        let envelope: ErrorResponse = serde_json::from_str(ERROR_FIXTURE).unwrap();
+        assert!(!envelope.ok);
+        assert_eq!(envelope.v, 1);
+        assert_eq!(envelope.error, "unknown command");
+
+        // A typed body still *decodes* an ok:false line (no deny_unknown_fields,
+        // so the stray `error` key is ignored), but it can NO LONGER capture the
+        // error string — exactly why the client must dispatch on `ok` rather
+        // than coincidence-match the envelope into a defaulted typed struct.
         let locate: LocateResponse = serde_json::from_str(ERROR_FIXTURE).unwrap();
         assert!(!locate.ok);
-        assert_eq!(locate.error.as_deref(), Some("unknown command"));
-
-        let scan: ScanResponse = serde_json::from_str(ERROR_FIXTURE).unwrap();
-        assert!(!scan.ok);
-        assert!(scan.networks.is_empty());
+        assert_eq!(locate.lat, 0.0);
+        assert_eq!(locate.sources, 0);
     }
 
     #[test]

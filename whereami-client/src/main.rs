@@ -22,7 +22,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use nu_ansi_term::{Color, Style};
 use std::{io::IsTerminal, process, time::Duration};
 use whereami_client::{
-    Confidence, DaemonResponse, HistoryFixesResponse, LocateResponse, ScanResponse, StatsResponse,
+    Confidence, DaemonError, HistoryFixesResponse, LocateResponse, ScanResponse, StatsResponse,
     WhereAmIClient, WipeConfirmation, WipeResponse, DEFAULT_SOCKET_IO_TIMEOUT,
 };
 
@@ -160,19 +160,26 @@ fn fatal(msg: &str) -> ! {
     process::exit(1);
 }
 
-/// Human-mode dispatch ladder: ok=false fatals with the daemon's error,
-/// ok=true delegates to render, transport error fatals. The `--json` path
-/// is now handled separately by `emit_json` (task-0183), so this no longer
-/// branches on json and never re-serializes the parsed struct.
-fn dispatch<T: DaemonResponse>(result: Result<T>, render: impl FnOnce(&T)) {
+/// Human-mode dispatch ladder: a successful response renders; any error
+/// fatals. The daemon-error and transport-error cases now arrive on the SAME
+/// `Err` arm (task-0133): the typed client returns `Err(DaemonError)` for an
+/// `ok:false` envelope instead of an `ok=false` struct with an in-band
+/// `error` field. We downcast to keep the two messages byte-identical to the
+/// previous ladder — a daemon error prints its verbatim string, a transport
+/// error keeps the `error: ` prefix. Both exit 1. The `--json` path is handled
+/// separately by `emit_json` (task-0183), so this never branches on json and
+/// never re-serializes the parsed struct.
+fn dispatch<T>(result: Result<T>, render: impl FnOnce(&T)) {
     match result {
-        // Sanitize the daemon-sourced error too: it can echo attacker
-        // input and is printed straight to the terminal (task-0198).
-        Ok(resp) if !resp.is_ok() => fatal(&sanitize(resp.error().unwrap_or("unknown error"))),
         Ok(resp) => render(&resp),
-        // Transport errors are CLI/OS-origin today, but sanitize anyway in
-        // case a future error variant embeds daemon-controlled bytes.
-        Err(e) => fatal(&sanitize(&format!("error: {e}"))),
+        // Sanitize both origins: the daemon error can echo attacker input and
+        // is printed straight to the terminal (task-0198); transport errors
+        // are CLI/OS-origin today but are sanitized anyway in case a future
+        // variant embeds daemon-controlled bytes.
+        Err(e) => match e.downcast_ref::<DaemonError>() {
+            Some(daemon) => fatal(&sanitize(&daemon.error)),
+            None => fatal(&sanitize(&format!("error: {e}"))),
+        },
     }
 }
 
@@ -791,15 +798,6 @@ fn run_daemon_version(client: &WhereAmIClient, json: bool) {
         let cli_version = env!("CARGO_PKG_VERSION");
         let cli_rev = env!("GIT_REV");
         match client.version() {
-            Ok(resp) if !resp.ok => {
-                println!("cli:    {cli_version} ({cli_rev})");
-                // Daemon-sourced error string; sanitize before printing (task-0198).
-                eprintln!(
-                    "daemon: {}",
-                    sanitize(resp.error.as_deref().unwrap_or("unknown error"))
-                );
-                process::exit(1);
-            }
             Ok(resp) => {
                 let daemon_version = resp.version.as_deref().unwrap_or("?");
                 let daemon_rev = resp.git_rev.as_deref().unwrap_or("?");
@@ -811,11 +809,21 @@ fn run_daemon_version(client: &WhereAmIClient, json: bool) {
                     sanitize(daemon_rev)
                 );
             }
+            // A daemon `ok:false` envelope now arrives here as a DaemonError
+            // (task-0133) rather than an `ok=false` VersionResponse; both it
+            // and a transport error print the same `daemon: ...` lines the
+            // previous two arms did. `daemon: {error}` for a daemon-reported
+            // failure (verbatim, sanitized), `daemon: error: {e}` for a
+            // transport/protocol failure.
             Err(e) => {
                 println!("cli:    {cli_version} ({cli_rev})");
-                // CLI/OS-origin today; sanitized for the same reason as
-                // dispatch's transport-error arm.
-                eprintln!("daemon: error: {}", sanitize(&e.to_string()));
+                match e.downcast_ref::<DaemonError>() {
+                    // Daemon-sourced error string; sanitize before printing (task-0198).
+                    Some(daemon) => eprintln!("daemon: {}", sanitize(&daemon.error)),
+                    // CLI/OS-origin today; sanitized for the same reason as
+                    // dispatch's transport-error arm.
+                    None => eprintln!("daemon: error: {}", sanitize(&e.to_string())),
+                }
                 process::exit(1);
             }
         }
@@ -1055,7 +1063,6 @@ mod tests {
             not_found_deleted: 3,
             fixes_deleted: 2,
             last_fix_deleted: 1,
-            error: None,
         });
         assert_eq!(
             output,
@@ -1247,7 +1254,6 @@ mod tests {
             }],
             scan_age_ms: Some(1000),
             scanned_at: Some("2026-07-02T00:00:00Z".to_string()),
-            error: None,
         };
         let out = render_scan(&resp, false);
         assert_no_raw_control_bytes(&out);
@@ -1280,7 +1286,6 @@ mod tests {
             }],
             scan_age_ms: None,
             scanned_at: None,
-            error: None,
         };
         assert_eq!(
             render_scan(&resp, true),
@@ -1301,7 +1306,6 @@ mod tests {
             },
             fixes,
             elided,
-            error: None,
         }
     }
 
@@ -1562,7 +1566,6 @@ mod tests {
             db_read_failures: 11,
             autolocate_fixes_written: 10,
             orphan_tasks_aborted: 8,
-            error: None,
         };
 
         assert_eq!(
@@ -1605,7 +1608,6 @@ mod tests {
             inlier_ratio: Some(0.75),
             confidence: Confidence::High,
             suspect_reason: None,
-            error: None,
         };
         assert_eq!(
             render_locate(&resp, false),
@@ -1637,7 +1639,6 @@ mod tests {
             inlier_ratio: None,
             confidence: Confidence::Low,
             suspect_reason: None,
-            error: None,
         };
         assert_eq!(
             render_locate(&resp, false),
@@ -1667,7 +1668,6 @@ mod tests {
             inlier_ratio: None,
             confidence: Confidence::Low,
             suspect_reason: None,
-            error: None,
         };
         let out = render_locate(&resp, false);
         assert_no_raw_control_bytes(&out);
@@ -1698,7 +1698,6 @@ mod tests {
             inlier_ratio: Some(1.0),
             confidence,
             suspect_reason: None,
-            error: None,
         }
     }
 

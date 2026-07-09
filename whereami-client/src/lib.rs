@@ -152,13 +152,37 @@ impl Transport for UnixStream {
     }
 }
 
-/// Common shape of every daemon response (ok flag + optional error). Used
-/// by CLI dispatchers to handle the ok/error/json triage uniformly
-/// (task-0058).
-pub trait DaemonResponse {
-    fn is_ok(&self) -> bool;
-    fn error(&self) -> Option<&str>;
+/// A typed daemon-side error (task-0133).
+///
+/// The daemon reports every failed command as the dedicated
+/// `{"ok":false,"v":_,"error":_}` envelope ([`whereami_protocol::ErrorResponse`]),
+/// never as an `error` field on a success struct. The client dispatches on the
+/// `ok` bool in [`WhereAmIClient::parse_response_line`]: an `ok:false` line is
+/// decoded as an error and surfaced as this type rather than as a typed
+/// response with defaulted fields — removing the previous fragile
+/// coincidence-matching (a success struct that also carried `error`).
+///
+/// The typed accessors keep returning [`anyhow::Result`] so transport and
+/// protocol errors retain full fidelity; a daemon error is wrapped as
+/// `Err(DaemonError { .. }.into())`. Callers can recover the typed error via
+/// `err.downcast_ref::<DaemonError>()`. Its [`Display`](std::fmt::Display) is
+/// exactly the daemon's error string (no prefix), so existing `{:#}`/context
+/// rendering of the daemon message is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonError {
+    /// Daemon protocol version from the error envelope.
+    pub v: u32,
+    /// The daemon's error message, preserved verbatim.
+    pub error: String,
 }
+
+impl std::fmt::Display for DaemonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
+impl std::error::Error for DaemonError {}
 
 /// Highest daemon protocol version understood by this typed client. A
 /// response advertising a higher `v` is rejected by the version gate. Also
@@ -168,12 +192,19 @@ pub trait DaemonResponse {
 /// (`whereamid::WIRE_VERSION`; unified under task-0114).
 pub const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
-/// Required prefix shared by every daemon response. Decode this before a
-/// command-specific response so a newer protocol cannot be mistaken for a
-/// valid response whose defaultable fields happen to be absent.
+/// Required prefix shared by every daemon response: the protocol version and
+/// the `ok` flag. Decoded before the command-specific body so (a) a newer
+/// protocol cannot be mistaken for a valid response whose defaultable fields
+/// happen to be absent, and (b) the client can dispatch on `ok` to decode an
+/// error envelope as [`ErrorResponse`] rather than coincidence-matching it
+/// into a typed response (task-0133). `ok` is `Option` so a malformed line
+/// that omits it still surfaces the version-gate/decode error rather than a
+/// deserialize failure on this probe.
 #[derive(Deserialize)]
-struct ResponseVersion {
+struct ResponsePrefix {
     v: u32,
+    #[serde(default)]
+    ok: Option<bool>,
 }
 
 /// Private typed-response contract used by the common version gate.
@@ -213,8 +244,9 @@ struct WipeRequest {
 // Every response, the shared enums, and `HistoryFix`/`HistoryRange`/
 // `HistorySegment`/`NetworkEntry`/`ResolveResultEntry` are re-exported from
 // `whereami-protocol` (task-0114), the single source of truth the daemon also
-// links. This crate adds only client behavior (the `DaemonResponse`/
-// `ProtocolResponse` trait impls below and the raw-history presence validator).
+// links. This crate adds only client behavior (the `ProtocolResponse` trait
+// impls below, the `ok`-dispatching `DaemonError` surface, and the raw-history
+// presence validator).
 pub use whereami_protocol::{
     Confidence, DbStatus, DebugBssid, DebugResponse, ErrorResponse, HistoryFix,
     HistoryFixesResponse, HistoryRange, HistoryResponse, HistorySegment, LocateResponse,
@@ -427,36 +459,78 @@ impl WhereAmIClient {
         Ok(response_line.trim().to_string())
     }
 
-    /// Parse a daemon response line into the typed response `T`.
-    ///
-    /// Every typed accessor fetches its raw line via the matching
-    /// `*_raw()` method (which builds the request struct and calls
-    /// `raw_command`) and parses it here. That keeps the typed path and
-    /// the `--json` passthrough on a single source of truth for both the
-    /// request bytes and the transport (task-0183): they can no longer
-    /// drift because there is exactly one place each request is built.
-    fn parse_response_line<T>(&self, line: &str) -> Result<T>
-    where
-        T: for<'de> Deserialize<'de> + ProtocolResponse,
-    {
+    /// Empty-check a response line and enforce the protocol version gate,
+    /// returning the decoded prefix (`v` + `ok`). Shared first step for both
+    /// the typed dispatch and the raw-history shape validator: the version
+    /// gate must run before any `ok` interpretation so an error envelope
+    /// advertising an unsupported `v` is still rejected as unsupported.
+    fn check_version(&self, line: &str) -> Result<ResponsePrefix> {
         if line.is_empty() {
             bail!("empty response from daemon");
         }
-        let version: ResponseVersion =
-            serde_json::from_str(line).context("parsing response JSON")?;
-        if version.v > SUPPORTED_PROTOCOL_VERSION {
+        let prefix: ResponsePrefix = serde_json::from_str(line).context("parsing response JSON")?;
+        if prefix.v > SUPPORTED_PROTOCOL_VERSION {
             bail!(
                 "whereamid at {} uses unsupported protocol v{}; this client supports through v{}; \
                  upgrade the whereami client or connect to a daemon using supported protocol v{}",
                 self.target.description(),
-                version.v,
+                prefix.v,
                 SUPPORTED_PROTOCOL_VERSION,
                 SUPPORTED_PROTOCOL_VERSION,
             );
         }
+        Ok(prefix)
+    }
 
+    /// Version-gate a line and decode it into `T` WITHOUT interpreting `ok`.
+    ///
+    /// Used by the raw-history shape validator, which must let an `ok:false`
+    /// error envelope decode (so it can observe `ok` and pass the envelope
+    /// through to the byte-preserving `--json` path) rather than diverting it
+    /// into a [`DaemonError`]. The public typed accessors instead use
+    /// [`Self::parse_response_line`], which dispatches on `ok`.
+    fn decode_versioned<T>(&self, line: &str) -> Result<T>
+    where
+        T: for<'de> Deserialize<'de> + ProtocolResponse,
+    {
+        let prefix = self.check_version(line)?;
         let response: T = serde_json::from_str(line).context("parsing response JSON")?;
-        debug_assert_eq!(response.protocol_version(), version.v);
+        debug_assert_eq!(response.protocol_version(), prefix.v);
+        Ok(response)
+    }
+
+    /// Parse a daemon response line into the typed response `T`, dispatching on
+    /// the `ok` bool (task-0133).
+    ///
+    /// After the version gate, an `ok:false` line is decoded as
+    /// [`ErrorResponse`] and returned as `Err(DaemonError { .. }.into())`; only
+    /// an `ok:true` (or `ok`-absent, which then fails `T`'s required `ok`
+    /// field) line is decoded into `T`. This replaces the previous in-band
+    /// union where every typed struct also carried `error: Option<String>` and
+    /// an error envelope coincidence-matched into a fully defaulted `T`.
+    ///
+    /// Every typed accessor fetches its raw line via the matching `*_raw()`
+    /// method (which builds the request struct and calls `raw_command`) and
+    /// parses it here. That keeps the typed path and the `--json` passthrough
+    /// on a single source of truth for both the request bytes and the
+    /// transport (task-0183): they can no longer drift because there is exactly
+    /// one place each request is built.
+    fn parse_response_line<T>(&self, line: &str) -> Result<T>
+    where
+        T: for<'de> Deserialize<'de> + ProtocolResponse,
+    {
+        let prefix = self.check_version(line)?;
+        if prefix.ok == Some(false) {
+            let envelope: ErrorResponse =
+                serde_json::from_str(line).context("parsing daemon error response")?;
+            return Err(DaemonError {
+                v: envelope.v,
+                error: envelope.error,
+            }
+            .into());
+        }
+        let response: T = serde_json::from_str(line).context("parsing response JSON")?;
+        debug_assert_eq!(response.protocol_version(), prefix.v);
         Ok(response)
     }
 
@@ -594,7 +668,10 @@ impl WhereAmIClient {
     }
 
     fn validate_history_fixes_response(&self, line: &str) -> Result<()> {
-        let shape: HistoryFixesShape = self.parse_response_line(line)?;
+        // Non-dispatching decode: an `ok:false` error envelope must reach the
+        // `--json` passthrough byte-for-byte, so it decodes here (with `ok`
+        // false) instead of being diverted into a DaemonError (task-0133).
+        let shape: HistoryFixesShape = self.decode_versioned(line)?;
         if shape.ok && (shape.range.is_none() || shape.fixes.is_none()) {
             bail!(
                 "whereamid returned a successful segmented history response to a raw-fix request; \
@@ -819,19 +896,13 @@ mod socket_timeout_tests {
     }
 }
 
-// task-0058: trait impls for every response so CLIs can dispatch
-// uniformly via `if !resp.is_ok() { fatal(resp.error()) }`.
-macro_rules! impl_daemon_response {
+// The common version gate needs each response's `v`. task-0133 removed the
+// former `DaemonResponse` (is_ok/error) trait: with the `error` field gone
+// from the typed structs and `ok:false` now surfaced as a `DaemonError` by
+// the dispatch, the ok/error accessors were dead. The CLI reads the daemon
+// error off the `DaemonError` in the `Err` arm instead.
+macro_rules! impl_protocol_response {
     ($t:ty) => {
-        impl DaemonResponse for $t {
-            fn is_ok(&self) -> bool {
-                self.ok
-            }
-            fn error(&self) -> Option<&str> {
-                self.error.as_deref()
-            }
-        }
-
         impl ProtocolResponse for $t {
             fn protocol_version(&self) -> u32 {
                 self.v
@@ -839,15 +910,15 @@ macro_rules! impl_daemon_response {
         }
     };
 }
-impl_daemon_response!(LocateResponse);
-impl_daemon_response!(ResolveResponse);
-impl_daemon_response!(ScanResponse);
-impl_daemon_response!(StatsResponse);
-impl_daemon_response!(DebugResponse);
-impl_daemon_response!(VersionResponse);
-impl_daemon_response!(HistoryResponse);
-impl_daemon_response!(HistoryFixesResponse);
-impl_daemon_response!(WipeResponse);
+impl_protocol_response!(LocateResponse);
+impl_protocol_response!(ResolveResponse);
+impl_protocol_response!(ScanResponse);
+impl_protocol_response!(StatsResponse);
+impl_protocol_response!(DebugResponse);
+impl_protocol_response!(VersionResponse);
+impl_protocol_response!(HistoryResponse);
+impl_protocol_response!(HistoryFixesResponse);
+impl_protocol_response!(WipeResponse);
 
 #[cfg(test)]
 mod history_fixes_wire_tests {
@@ -1027,16 +1098,22 @@ mod history_fixes_wire_tests {
             "{error}"
         );
 
+        // An error envelope still validates (so the raw `--json` path passes it
+        // through byte-for-byte), but the TYPED dispatch now surfaces it as a
+        // DaemonError carrying the verbatim string rather than a defaulted
+        // HistoryFixesResponse with `ok:false` (task-0133).
         let error_line = r#"{"ok":false,"v":1,"error":"history: busy; retry later"}"#;
         client()
             .validate_history_fixes_response(error_line)
             .unwrap();
-        let response: HistoryFixesResponse = client().parse_response_line(error_line).unwrap();
-        assert!(!response.ok);
-        assert_eq!(
-            response.error.as_deref(),
-            Some("history: busy; retry later")
-        );
+        let err = client()
+            .parse_response_line::<HistoryFixesResponse>(error_line)
+            .unwrap_err();
+        let daemon = err
+            .downcast_ref::<DaemonError>()
+            .expect("ok:false must dispatch to a DaemonError");
+        assert_eq!(daemon.v, 1);
+        assert_eq!(daemon.error, "history: busy; retry later");
     }
 
     #[test]
@@ -1105,12 +1182,133 @@ mod wipe_wire_tests {
         assert_eq!(success.aps_deleted, 5);
         assert_eq!(success.last_fix_deleted, 1);
 
-        let error: WipeResponse = client()
-            .parse_response_line(r#"{"ok":false,"v":1,"error":"wipe refused"}"#)
+        // ok:false now surfaces as a typed DaemonError (task-0133), not a
+        // WipeResponse with defaulted counters and an in-band error field.
+        let err = client()
+            .parse_response_line::<WipeResponse>(r#"{"ok":false,"v":1,"error":"wipe refused"}"#)
+            .unwrap_err();
+        let daemon = err
+            .downcast_ref::<DaemonError>()
+            .expect("ok:false must dispatch to a DaemonError");
+        assert_eq!(daemon.error, "wipe refused");
+        // Its Display is exactly the daemon string, so context rendering is
+        // unchanged for the CLI.
+        assert_eq!(daemon.to_string(), "wipe refused");
+    }
+}
+
+/// task-0133: the `ok`-dispatch surface — every typed accessor decodes a
+/// success line into its response and an `ok:false` line into a `DaemonError`,
+/// while the version gate still fires before either. One representative decode
+/// per response shape (the daemon fixtures in
+/// `whereami-protocol/tests/wire.rs` already pin the full success byte shapes).
+#[cfg(test)]
+mod daemon_error_dispatch_tests {
+    use super::*;
+
+    fn client() -> WhereAmIClient {
+        WhereAmIClient::unix("/test/whereamid.sock")
+    }
+
+    /// Every response shape's success line decodes into its typed body.
+    #[test]
+    fn success_lines_decode_into_typed_responses() {
+        let l: LocateResponse = client()
+            .parse_response_line(r#"{"ok":true,"v":1,"lat":55.5,"lon":12.25,"sources":3}"#)
             .unwrap();
-        assert!(!error.ok);
-        assert_eq!(error.error.as_deref(), Some("wipe refused"));
-        assert_eq!(error.fixes_deleted, 0);
+        assert!(l.ok);
+        assert_eq!(l.sources, 3);
+
+        let r: ResolveResponse = client()
+            .parse_response_line(r#"{"ok":true,"v":1,"results":[]}"#)
+            .unwrap();
+        assert!(r.results.is_empty());
+
+        let s: ScanResponse = client()
+            .parse_response_line(r#"{"ok":true,"v":1,"networks":[],"scan_age_ms":null}"#)
+            .unwrap();
+        assert!(s.networks.is_empty());
+
+        let st: StatsResponse = client()
+            .parse_response_line(r#"{"ok":true,"v":1,"cached_aps":7}"#)
+            .unwrap();
+        assert_eq!(st.cached_aps, 7);
+
+        let d: DebugResponse = client()
+            .parse_response_line(r#"{"ok":true,"v":1,"samples_in_buffer":2}"#)
+            .unwrap();
+        assert_eq!(d.samples_in_buffer, 2);
+
+        let ver: VersionResponse = client()
+            .parse_response_line(r#"{"ok":true,"v":1,"version":"0.1.0","git_rev":"abc"}"#)
+            .unwrap();
+        assert_eq!(ver.version.as_deref(), Some("0.1.0"));
+
+        let h: HistoryResponse = client()
+            .parse_response_line(r#"{"ok":true,"v":1,"from":"a","to":"b","segments":[]}"#)
+            .unwrap();
+        assert_eq!(h.from, "a");
+
+        let hf: HistoryFixesResponse = client()
+            .parse_response_line(
+                r#"{"ok":true,"v":1,"range":{"from_rfc3339":"a","to_rfc3339":"b"},"fixes":[]}"#,
+            )
+            .unwrap();
+        assert!(hf.fixes.is_empty());
+
+        let w: WipeResponse = client()
+            .parse_response_line(r#"{"ok":true,"v":1,"aps_deleted":1}"#)
+            .unwrap();
+        assert_eq!(w.aps_deleted, 1);
+    }
+
+    /// An `ok:false` envelope dispatches to a DaemonError for EVERY target
+    /// response type, carrying the daemon's verbatim string.
+    #[test]
+    fn error_envelope_dispatches_to_daemon_error_for_each_shape() {
+        let line = r#"{"ok":false,"v":1,"error":"unknown command"}"#;
+        macro_rules! assert_daemon_error {
+            ($ty:ty) => {{
+                let err = client().parse_response_line::<$ty>(line).unwrap_err();
+                let daemon = err.downcast_ref::<DaemonError>().expect(concat!(
+                    stringify!($ty),
+                    ": ok:false must yield a DaemonError"
+                ));
+                assert_eq!(daemon.v, 1);
+                assert_eq!(daemon.error, "unknown command");
+            }};
+        }
+        assert_daemon_error!(LocateResponse);
+        assert_daemon_error!(ResolveResponse);
+        assert_daemon_error!(ScanResponse);
+        assert_daemon_error!(StatsResponse);
+        assert_daemon_error!(DebugResponse);
+        assert_daemon_error!(VersionResponse);
+        assert_daemon_error!(HistoryResponse);
+        assert_daemon_error!(HistoryFixesResponse);
+        assert_daemon_error!(WipeResponse);
+    }
+
+    /// The version gate fires before the `ok` dispatch, so an error envelope
+    /// advertising an unsupported protocol is rejected as unsupported (not
+    /// surfaced as a DaemonError).
+    #[test]
+    fn version_gate_precedes_ok_dispatch_on_error_envelope() {
+        let err = client()
+            .parse_response_line::<LocateResponse>(r#"{"ok":false,"v":2,"error":"nope"}"#)
+            .unwrap_err();
+        assert!(err.downcast_ref::<DaemonError>().is_none());
+        assert!(err.to_string().contains("unsupported protocol v2"), "{err}");
+    }
+
+    /// An empty line is still a transport-style error, never a DaemonError.
+    #[test]
+    fn empty_line_is_not_a_daemon_error() {
+        let err = client()
+            .parse_response_line::<LocateResponse>("")
+            .unwrap_err();
+        assert!(err.downcast_ref::<DaemonError>().is_none());
+        assert_eq!(err.to_string(), "empty response from daemon");
     }
 }
 

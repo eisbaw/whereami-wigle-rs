@@ -20,10 +20,14 @@
 //!   it only lets an old daemon's absent field decode to the type default.
 //! - A field the daemon skipped when empty/false keeps
 //!   `#[serde(default, skip_serializing_if = "...")]` with the exact predicate.
-//! - The `error` field on the response envelopes did NOT exist on the daemon's
-//!   response structs (the daemon emits errors via [`ErrorResponse`]); it is
-//!   therefore `skip_serializing_if = "Option::is_none"` so a daemon that builds
-//!   the type with `error: None` produces byte-identical output to today.
+//! - The typed response structs carry NO `error` field: the daemon emits
+//!   failures exclusively as the dedicated [`ErrorResponse`] envelope
+//!   (`{"ok":false,"v":_,"error":_}`), never as an `error` key on a success
+//!   struct. The client dispatches on the `ok` bool and decodes an `ok:false`
+//!   line as [`ErrorResponse`] (task-0133), so an `error` field on the typed
+//!   structs would only be dead weight and an in-band collision hazard. It was
+//!   always `error: None` at every daemon construction site, so its removal
+//!   keeps success-response bytes byte-identical to today.
 //!
 //! The wire bytes (field names, casing, order, null-vs-omitted, enum tokens) are
 //! intentionally byte-identical to the pre-extraction protocol. This crate is a
@@ -292,10 +296,6 @@ pub struct LocateResponse {
     pub confidence: Confidence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suspect_reason: Option<String>,
-    /// Present only on an `ok:false` envelope; the daemon skips it otherwise, so
-    /// a successful response is byte-identical to the pre-extraction wire.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// A single result from the `resolve` command.
@@ -320,8 +320,6 @@ pub struct ResolveResponse {
     pub v: u32,
     #[serde(default)]
     pub results: Vec<ResolveResultEntry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// A single network from the `scan` command.
@@ -347,8 +345,6 @@ pub struct ScanResponse {
     /// RFC 3339 timestamp of the most recent scan, if any. Omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scanned_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// One BSSID's debug state, as the daemon returns it under `bssids`.
@@ -382,8 +378,6 @@ pub struct DebugResponse {
     pub stable: usize,
     #[serde(default)]
     pub bssids: Vec<DebugBssid>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// Response from the `version` command.
@@ -395,8 +389,6 @@ pub struct VersionResponse {
     pub version: Option<String>,
     #[serde(default)]
     pub git_rev: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// One stay-point segment in a `history` response.
@@ -432,8 +424,6 @@ pub struct HistoryResponse {
     /// Stay-point segments in ascending time order.
     #[serde(default)]
     pub segments: Vec<HistorySegment>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// Normalized inclusive bounds returned by raw history.
@@ -481,8 +471,6 @@ pub struct HistoryFixesResponse {
     /// pre-extraction raw-history response shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elided: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// Response from the `stats` command.
@@ -528,8 +516,6 @@ pub struct StatsResponse {
     /// for older daemons (task-0102).
     #[serde(default)]
     pub orphan_tasks_aborted: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// Response from a confirmed privacy wipe.
@@ -547,6 +533,4 @@ pub struct WipeResponse {
     pub fixes_deleted: usize,
     #[serde(default)]
     pub last_fix_deleted: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }

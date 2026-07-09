@@ -2020,7 +2020,6 @@ async fn compute_locate_with_clock(
                 inlier_ratio: decision.quality.inlier_ratio(),
                 confidence: decision.quality.confidence(),
                 suspect_reason: decision.quality.suspect_reason().map(str::to_owned),
-                error: None,
             };
             LocateOutcome::Interactive(ok_json(&resp))
         }
@@ -2087,7 +2086,6 @@ async fn return_last_fix_or_error(
             inlier_ratio: None,
             confidence: Confidence::Low,
             suspect_reason: None,
-            error: None,
         };
         ok_json(&resp)
     } else {
@@ -2181,7 +2179,6 @@ async fn handle_resolve(
         ok: true,
         v: WIRE_VERSION,
         results,
-        error: None,
     };
     ok_json(&resp)
 }
@@ -2213,7 +2210,6 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
         networks,
         scan_age_ms,
         scanned_at,
-        error: None,
     };
     ok_json(&resp)
 }
@@ -2309,7 +2305,6 @@ async fn handle_debug(state: &Arc<DaemonState>) -> String {
         visible,
         stable: stable_count,
         bssids,
-        error: None,
     };
     ok_json(&resp)
 }
@@ -2320,7 +2315,6 @@ fn handle_version() -> String {
         v: WIRE_VERSION,
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
         git_rev: Some(env!("GIT_REV").to_string()),
-        error: None,
     };
     ok_json(&resp)
 }
@@ -2477,7 +2471,6 @@ where
                 from,
                 to,
                 segments,
-                error: None,
             }),
             HistoryBody::Raw { fixes, elided } => ok_json(&HistoryFixesResponse {
                 ok: true,
@@ -2488,7 +2481,6 @@ where
                 },
                 fixes,
                 elided,
-                error: None,
             }),
         }
     });
@@ -2808,7 +2800,6 @@ async fn handle_wipe_observing_enqueue(
                 not_found_deleted: counts.not_found_deleted,
                 fixes_deleted: counts.fixes_deleted,
                 last_fix_deleted: counts.last_fix_deleted,
-                error: None,
             }),
             lease,
             admission,
@@ -2868,7 +2859,6 @@ async fn handle_stats(state: &Arc<DaemonState>) -> String {
         db_read_failures,
         autolocate_fixes_written,
         orphan_tasks_aborted,
-        error: None,
     };
     ok_json(&resp)
 }
