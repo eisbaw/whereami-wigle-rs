@@ -248,7 +248,7 @@ struct WipeRequest {
 // impls below, the `ok`-dispatching `DaemonError` surface, and the raw-history
 // presence validator).
 pub use whereami_protocol::{
-    Confidence, DbStatus, DebugBssid, DebugResponse, ErrorResponse, HistoryFix,
+    Channel, Confidence, DbStatus, DebugBssid, DebugResponse, ErrorResponse, HistoryFix,
     HistoryFixesResponse, HistoryRange, HistoryResponse, HistorySegment, LocateResponse,
     NetworkEntry, Provenance, ResolveResponse, ResolveResultEntry, ScanResponse, StatsResponse,
     VersionResponse, WipeResponse,

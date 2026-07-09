@@ -3129,7 +3129,7 @@ mod stats_tests {
                 crate::debounce::ScanEntry {
                     signal_dbm: -50,
                     ssid: None,
-                    channel: Some(1),
+                    channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
                 },
             );
             deb.push_scan(sample);
@@ -3363,7 +3363,6 @@ mod dispatch_tests {
             lat,
             lon,
             encryption: None,
-            channel: None,
             frequency: None,
             city: None,
             country: None,
@@ -3392,7 +3391,6 @@ mod dispatch_tests {
                     lat: 55.7390 + index as f64 / 100_000.0,
                     lon: 12.5500,
                     encryption: None,
-                    channel: None,
                     frequency: None,
                     city: None,
                     country: None,
@@ -3407,7 +3405,7 @@ mod dispatch_tests {
                     // Exercise both scanner-hidden and currently nonmatching
                     // observations. Neither can reclassify the persisted row.
                     ssid: (index % 2 != 0).then(|| format!("ordinary-{index}")),
-                    channel: Some(1),
+                    channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
                 },
             );
         }
@@ -3421,7 +3419,6 @@ mod dispatch_tests {
                     lat: f64::INFINITY,
                     lon: 12.56,
                     encryption: None,
-                    channel: None,
                     frequency: None,
                     city: None,
                     country: None,
@@ -3434,7 +3431,7 @@ mod dispatch_tests {
                 crate::debounce::ScanEntry {
                     signal_dbm: -30 - index,
                     ssid: Some(format!("poisoned-fixed-{index}")),
-                    channel: Some(1),
+                    channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
                 },
             );
         }
@@ -3457,7 +3454,6 @@ mod dispatch_tests {
                     lat,
                     lon,
                     encryption: None,
-                    channel: None,
                     frequency: None,
                     city: None,
                     country: None,
@@ -3470,7 +3466,7 @@ mod dispatch_tests {
                 crate::debounce::ScanEntry {
                     signal_dbm: -80 - index as i32,
                     ssid: Some(ssid),
-                    channel: Some(1),
+                    channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
                 },
             );
         }
@@ -3533,7 +3529,7 @@ mod dispatch_tests {
             crate::debounce::ScanEntry {
                 signal_dbm,
                 ssid: ssid.map(str::to_owned),
-                channel: Some(1),
+                channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
             },
         );
     }
@@ -4051,7 +4047,7 @@ mod dispatch_tests {
             crate::debounce::ScanEntry {
                 signal_dbm: -45,
                 ssid: Some("uncached-fixed".to_string()),
-                channel: Some(1),
+                channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
             },
         );
         let refresh_started_at = BootTime::now().expect("tests require Linux CLOCK_BOOTTIME");
@@ -4754,7 +4750,6 @@ mod dispatch_tests {
             lat,
             lon,
             encryption: None,
-            channel: None,
             frequency: None,
             city: None,
             country: None,
@@ -5486,7 +5481,7 @@ mod dispatch_tests {
         cache_ap(state, "aa:bb:cc:dd:ee:01", 55.0, 12.0);
         {
             let db = lock_db(state);
-            db.insert_pending("pending", Some("private-ssid"), None, None, Some(-40))
+            db.insert_pending("pending", Some("private-ssid"), None, Some(-40))
                 .unwrap();
             db.insert_not_found("not-found").unwrap();
             db.insert_fix("2026-01-01T00:00:00+00:00", 55.0, 12.0, 5.0, 1)
@@ -5509,7 +5504,7 @@ mod dispatch_tests {
             crate::debounce::ScanEntry {
                 signal_dbm: -40,
                 ssid: Some("private-ssid".to_string()),
-                channel: Some(6),
+                channel: Some(whereami_protocol::Channel::TwoFourGhz(6)),
             },
         );
         state.debouncer.lock().await.push_scan(sample);
@@ -5656,7 +5651,6 @@ mod dispatch_tests {
                 lat: 55.0,
                 lon: 12.0,
                 encryption: None,
-                channel: None,
                 frequency: None,
                 city: None,
                 country: None,
@@ -5664,7 +5658,7 @@ mod dispatch_tests {
                 source: crate::db::Source::Manual,
             })
             .unwrap();
-            db.insert_pending("pending", Some("private-ssid"), None, None, Some(-40))
+            db.insert_pending("pending", Some("private-ssid"), None, Some(-40))
                 .unwrap();
             db.insert_not_found("not-found").unwrap();
             db.insert_fix("2026-01-01T00:00:00+00:00", 55.0, 12.0, 5.0, 1)
@@ -6197,7 +6191,7 @@ mod dispatch_tests {
                     crate::debounce::ScanEntry {
                         signal_dbm: -30 - index as i32,
                         ssid: None,
-                        channel: Some(1),
+                        channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
                     },
                 )
             })
@@ -6265,7 +6259,6 @@ mod dispatch_tests {
                     lat: *lat,
                     lon: *lon,
                     encryption: None,
-                    channel: None,
                     frequency: None,
                     city: None,
                     country: None,
@@ -6278,7 +6271,7 @@ mod dispatch_tests {
                 crate::debounce::ScanEntry {
                     signal_dbm: -50 - index as i32,
                     ssid: Some((*ssid).to_owned()),
-                    channel: Some(1),
+                    channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
                 },
             );
         }
@@ -6325,7 +6318,6 @@ mod dispatch_tests {
                     lat: 55.7390 + index as f64 / 100_000.0,
                     lon: 12.5500,
                     encryption: None,
-                    channel: None,
                     frequency: None,
                     city: None,
                     country: None,
@@ -6338,7 +6330,7 @@ mod dispatch_tests {
                 crate::debounce::ScanEntry {
                     signal_dbm: -20 - index,
                     ssid: Some(ssid),
-                    channel: Some(1),
+                    channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
                 },
             );
         }
@@ -6355,7 +6347,6 @@ mod dispatch_tests {
                     lat,
                     lon,
                     encryption: None,
-                    channel: None,
                     frequency: None,
                     city: None,
                     country: None,
@@ -6368,7 +6359,7 @@ mod dispatch_tests {
                 crate::debounce::ScanEntry {
                     signal_dbm: -80 - index as i32,
                     ssid: Some(ssid),
-                    channel: Some(1),
+                    channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
                 },
             );
         }
@@ -6429,7 +6420,7 @@ mod dispatch_tests {
             crate::debounce::ScanEntry {
                 signal_dbm: -20,
                 ssid: Some("poisoned-fixed".to_owned()),
-                channel: Some(1),
+                channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
             },
         );
         for (index, (lat, lon)) in [(55.6760, 12.5680), (55.6761, 12.5682), (55.6759, 12.5681)]
@@ -6443,7 +6434,7 @@ mod dispatch_tests {
                 crate::debounce::ScanEntry {
                     signal_dbm: -60 - index as i32,
                     ssid: Some(format!("fixed-home-{index}")),
-                    channel: Some(1),
+                    channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
                 },
             );
         }
@@ -6524,7 +6515,6 @@ mod dispatch_tests {
                     lat: 55.7,
                     lon: 12.5,
                     encryption: None,
-                    channel: None,
                     frequency: None,
                     city: None,
                     country: None,
@@ -6537,7 +6527,7 @@ mod dispatch_tests {
                 crate::debounce::ScanEntry {
                     signal_dbm: -20 - index,
                     ssid: Some(ssid),
-                    channel: Some(1),
+                    channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
                 },
             );
         }
@@ -6628,7 +6618,7 @@ mod dispatch_tests {
             crate::debounce::ScanEntry {
                 signal_dbm: -48,
                 ssid: Some("debug-lock-scope".to_string()),
-                channel: Some(11),
+                channel: Some(whereami_protocol::Channel::TwoFourGhz(11)),
             },
         );
         state.debouncer.lock().await.push_scan(sample);
@@ -7848,7 +7838,6 @@ mod transport_tests {
             lat: 55.0,
             lon: 12.0,
             encryption: None,
-            channel: None,
             frequency: None,
             city: None,
             country: None,
@@ -7892,7 +7881,6 @@ mod transport_tests {
             lat: 55.0,
             lon: 12.0,
             encryption: None,
-            channel: None,
             frequency: None,
             city: None,
             country: None,
@@ -7935,7 +7923,6 @@ mod transport_tests {
             lat: 55.0,
             lon: 12.0,
             encryption: None,
-            channel: None,
             frequency: None,
             city: None,
             country: None,

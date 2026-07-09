@@ -679,7 +679,6 @@ mod tests {
             lat,
             lon,
             encryption: None,
-            channel: None,
             frequency: None,
             city: None,
             country: None,

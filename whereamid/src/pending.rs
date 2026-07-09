@@ -253,7 +253,7 @@ mod tests {
 
         // Seed: BSSID is in pending.
         crate::server::lock_db(&state)
-            .insert_pending(&bssid, None, None, None, None)
+            .insert_pending(&bssid, None, None, None)
             .unwrap();
         assert!(crate::server::lock_db(&state).is_pending(&bssid).unwrap());
 
@@ -291,7 +291,7 @@ mod tests {
         let bssid = "aa:bb:cc:dd:ee:f2".to_string();
 
         crate::server::lock_db(&state)
-            .insert_pending(&bssid, None, None, None, None)
+            .insert_pending(&bssid, None, None, None)
             .unwrap();
 
         let mock_a = std::sync::Arc::new(MockProvider::new("a", |_| ProviderOutcome::NotFound));
@@ -330,9 +330,9 @@ mod tests {
         let hidden = "b8:50:01:aa:bb:cc".to_owned();
         {
             let db = crate::server::lock_db(&state);
-            db.insert_pending(&mobile, Some("MOVIA_BUS_42"), None, None, None)
+            db.insert_pending(&mobile, Some("MOVIA_BUS_42"), None, None)
                 .unwrap();
-            db.insert_pending(&hidden, None, None, None, None).unwrap();
+            db.insert_pending(&hidden, None, None, None).unwrap();
         }
         let provider = mock("apple-like", |bssid| {
             ProviderOutcome::Found(crate::db::ApInfo {
@@ -341,7 +341,6 @@ mod tests {
                 lat: 55.0,
                 lon: 12.0,
                 encryption: None,
-                channel: None,
                 frequency: None,
                 city: None,
                 country: None,
@@ -376,7 +375,7 @@ mod tests {
         let state = test_state();
         let bssid = "aa:bb:cc:dd:ee:a1".to_string();
         crate::server::lock_db(&state)
-            .insert_pending(&bssid, None, None, None, None)
+            .insert_pending(&bssid, None, None, None)
             .unwrap();
 
         let apple = std::sync::Arc::new(MockProvider::new("apple", |_| ProviderOutcome::NotFound));
@@ -415,7 +414,7 @@ mod tests {
         let state = test_state();
         let bssid = "aa:bb:cc:dd:ee:a2".to_string();
         crate::server::lock_db(&state)
-            .insert_pending(&bssid, None, None, None, None)
+            .insert_pending(&bssid, None, None, None)
             .unwrap();
 
         let providers = [
@@ -457,7 +456,7 @@ mod tests {
         let b2 = "aa:bb:cc:dd:ee:a8".to_string();
         for b in [&b1, &b2] {
             crate::server::lock_db(&state)
-                .insert_pending(b, None, None, None, None)
+                .insert_pending(b, None, None, None)
                 .unwrap();
         }
 
@@ -507,7 +506,7 @@ mod tests {
         let state = test_state();
         let bssid = "aa:bb:cc:dd:ee:a4".to_string();
         crate::server::lock_db(&state)
-            .insert_pending(&bssid, None, None, None, None)
+            .insert_pending(&bssid, None, None, None)
             .unwrap();
 
         let providers = [
@@ -543,7 +542,7 @@ mod tests {
         let max_attempts = 2;
         let bssid = "aa:bb:cc:dd:ee:a3".to_string();
         crate::server::lock_db(&state)
-            .insert_pending(&bssid, None, None, None, None)
+            .insert_pending(&bssid, None, None, None)
             .unwrap();
 
         let providers = [mock("skip", |_| ProviderOutcome::Skipped)];
@@ -573,7 +572,7 @@ mod tests {
         {
             let db = crate::server::lock_db(&state);
             for b in &bssids {
-                db.insert_pending(b, None, None, None, None).unwrap();
+                db.insert_pending(b, None, None, None).unwrap();
             }
         }
 

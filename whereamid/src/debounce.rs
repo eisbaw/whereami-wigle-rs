@@ -6,6 +6,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
+use whereami_protocol::Channel;
+
 use crate::boot_clock::BootTime;
 
 /// Per-AP info stored in each scan sample.
@@ -13,7 +15,7 @@ use crate::boot_clock::BootTime;
 pub struct ScanEntry {
     pub signal_dbm: i32,
     pub ssid: Option<String>,
-    pub channel: Option<i32>,
+    pub channel: Option<Channel>,
 }
 
 /// A single scan sample: maps BSSID -> scan entry.
@@ -345,7 +347,7 @@ mod tests {
             ScanEntry {
                 signal_dbm: -45,
                 ssid: Some("MOVIA_BUS_42".to_owned()),
-                channel: Some(6),
+                channel: Some(Channel::TwoFourGhz(6)),
             },
         );
         d.push_scan(first);

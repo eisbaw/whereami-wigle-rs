@@ -128,11 +128,68 @@ mod roundtrip {
                 bssid: "02:00:00:00:00:0a".to_string(),
                 ssid: Some("home".to_string()),
                 signal_dbm: -52,
-                channel: Some(6),
+                channel: Some(Channel::TwoFourGhz(6)),
             }],
             scan_age_ms: Some(1500),
             scanned_at: Some("2026-01-02T03:04:05Z".to_string()),
         });
+    }
+
+    /// task-0123 AC#5: every band variant serializes to its band-prefixed
+    /// string and parses back to the SAME variant — proving the band survives
+    /// the wire (a bare number would have erased it).
+    #[test]
+    fn channel_variants_round_trip_as_band_prefixed_strings() {
+        for (channel, wire) in [
+            (Channel::TwoFourGhz(1), r#""2G/1""#),
+            (Channel::TwoFourGhz(6), r#""2G/6""#),
+            (Channel::FiveGhz(36), r#""5G/36""#),
+            (Channel::SixGhz(1), r#""6G/1""#),
+            (Channel::SixGhz(37), r#""6G/37""#),
+            (Channel::SixGhz(233), r#""6G/233""#),
+        ] {
+            let json = serde_json::to_string(&channel).unwrap();
+            assert_eq!(json, wire, "unexpected wire bytes for {channel}");
+            let back: Channel = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, channel, "round-trip changed {channel}");
+            round_trip(&channel);
+        }
+    }
+
+    /// AC#2: Display is band-prefixed and FromStr is its exact inverse.
+    #[test]
+    fn channel_display_and_from_str_are_inverses() {
+        use std::str::FromStr;
+        assert_eq!(Channel::TwoFourGhz(1).to_string(), "2G/1");
+        assert_eq!(Channel::FiveGhz(36).to_string(), "5G/36");
+        assert_eq!(Channel::SixGhz(37).to_string(), "6G/37");
+        for c in [
+            Channel::TwoFourGhz(14),
+            Channel::FiveGhz(177),
+            Channel::SixGhz(233),
+        ] {
+            assert_eq!(Channel::from_str(&c.to_string()).unwrap(), c);
+        }
+        assert!(Channel::from_str("7G/1").is_err(), "unknown band rejected");
+        assert!(Channel::from_str("2G").is_err(), "missing number rejected");
+        assert!(Channel::from_str("2G/x").is_err(), "non-numeric rejected");
+    }
+
+    /// task-0123 robustness: an OLD daemon's bare-integer channel decodes to
+    /// `None` instead of aborting the whole ScanResponse decode (documented:
+    /// a band-less number cannot be reconstructed into a Channel).
+    #[test]
+    fn network_entry_tolerates_legacy_integer_channel() {
+        let legacy = r#"{"bssid":"cc","ssid":"x","signal_dbm":-40,"channel":6}"#;
+        let entry: NetworkEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            entry.channel, None,
+            "a legacy band-less integer degrades to None, not an error"
+        );
+        // A present band-prefixed string still decodes normally.
+        let modern = r#"{"bssid":"cc","ssid":"x","signal_dbm":-40,"channel":"6G/37"}"#;
+        let entry: NetworkEntry = serde_json::from_str(modern).unwrap();
+        assert_eq!(entry.channel, Some(Channel::SixGhz(37)));
     }
 
     #[test]
@@ -619,7 +676,9 @@ mod daemon_fixtures {
     const LOCATE_FIXTURE: &str = r#"{"ok":true,"v":1,"lat":55.6761,"lon":12.5683,"accuracy_m":42.5,"sources":7,"cached":5,"visible":9,"stable":6,"address":"Copenhagen, Denmark","stale":true,"age_s":120,"implied_speed_kmh":13.5,"last_fix_age_secs":30,"inlier_ratio":0.75,"confidence":"medium","suspect_reason":"speed"}"#;
     const LOCATE_FALLBACK_FIXTURE: &str = r#"{"ok":true,"v":1,"lat":0.0,"lon":0.0,"accuracy_m":1000.0,"sources":2,"cached":2,"visible":2,"stable":2,"fallback":true,"confidence":"low"}"#;
     const RESOLVE_FIXTURE: &str = r#"{"ok":true,"v":1,"results":[{"bssid":"02:00:00:00:00:01","lat":55.1,"lon":12.2,"ssid":"cafe","source":"cache"},{"bssid":"02:00:00:00:00:02","lat":null,"lon":null,"ssid":null,"source":"not_found"}]}"#;
-    const SCAN_FIXTURE: &str = r#"{"ok":true,"v":1,"networks":[{"bssid":"02:00:00:00:00:0a","ssid":"home","signal_dbm":-52,"channel":6}],"scan_age_ms":1500,"scanned_at":"2026-01-02T03:04:05Z"}"#;
+    // task-0123: channel is now the band-prefixed string ("2G/6"), not a bare
+    // integer. Channel 6 is 2.4 GHz.
+    const SCAN_FIXTURE: &str = r#"{"ok":true,"v":1,"networks":[{"bssid":"02:00:00:00:00:0a","ssid":"home","signal_dbm":-52,"channel":"2G/6"}],"scan_age_ms":1500,"scanned_at":"2026-01-02T03:04:05Z"}"#;
     const STATS_FIXTURE: &str = r#"{"ok":true,"v":1,"cached_aps":100,"pending_aps":5,"not_found_aps":3,"db_size_bytes":40960,"wigle_lookups_today":12,"api_calls_today":12,"api_counter_corruption_denials":3,"inflight":2,"db_write_failures":1,"db_read_failures":4,"autolocate_fixes_written":7,"orphan_tasks_aborted":0}"#;
     const DEBUG_FIXTURE: &str = r#"{"ok":true,"v":1,"daemon_rev":"abc1234","scan_age_ms":800,"samples_in_buffer":4,"visible":3,"stable":2,"bssids":[{"bssid":"02:00:00:00:00:aa","signal_dbm":-48,"seen":5,"needed":3,"is_stable":true,"db_status":"cached"},{"bssid":"02:00:00:00:00:bb","signal_dbm":null,"seen":2,"needed":3,"is_stable":false,"db_status":"new"}]}"#;
     const HISTORY_FIXTURE: &str = r#"{"ok":true,"v":1,"from":"2026-01-01T00:00:00Z","to":"2026-01-02T00:00:00Z","segments":[{"start_rfc3339":"2026-01-01T08:00:00Z","end_rfc3339":"2026-01-01T09:30:00Z","duration_secs":5400,"centroid_lat":55.6761,"centroid_lon":12.5683,"mean_accuracy_m":35.0,"n_fixes":42}]}"#;
@@ -663,6 +722,7 @@ mod daemon_fixtures {
     fn scan_stats_debug_history_version_fixtures_decode() {
         let s: ScanResponse = serde_json::from_str(SCAN_FIXTURE).unwrap();
         assert_eq!(s.networks[0].signal_dbm, -52);
+        assert_eq!(s.networks[0].channel, Some(Channel::TwoFourGhz(6)));
         assert_eq!(s.scan_age_ms, Some(1500));
 
         let st: StatsResponse = serde_json::from_str(STATS_FIXTURE).unwrap();

@@ -281,6 +281,8 @@ fn render_scan(resp: &ScanResponse, no_scan_time: bool) -> String {
         out.push('\n');
     }
     for net in &resp.networks {
+        // Channel is now band-qualified (task-0123): Display already renders it
+        // as e.g. `6G/37`, so the old `ch` prefix is redundant and dropped.
         let channel = net
             .channel
             .map(|c| c.to_string())
@@ -291,7 +293,7 @@ fn render_scan(resp: &ScanResponse, no_scan_time: bool) -> String {
             .map(sanitize)
             .unwrap_or_else(|| "<hidden>".into());
         out.push_str(&format!(
-            "{:17}  {:>4} dBm  ch{:<3}  {}\n",
+            "{:17}  {:>4} dBm  {:<7}  {}\n",
             sanitize(&net.bssid),
             net.signal_dbm,
             channel,
@@ -1254,7 +1256,7 @@ mod tests {
                 bssid: "aa:bb:cc:dd:ee:ff".to_string(),
                 ssid: Some("Free\u{1b}[2KWiFi\u{0d}\u{9b}31m\u{07}😀".to_string()),
                 signal_dbm: -42,
-                channel: Some(6),
+                channel: Some(whereami_client::Channel::TwoFourGhz(6)),
             }],
             scan_age_ms: Some(1000),
             scanned_at: Some("2026-07-02T00:00:00Z".to_string()),
@@ -1286,14 +1288,14 @@ mod tests {
                 bssid: "aa:bb:cc:dd:ee:ff".to_string(),
                 ssid: Some("HomeNet".to_string()),
                 signal_dbm: -55,
-                channel: Some(11),
+                channel: Some(whereami_client::Channel::TwoFourGhz(11)),
             }],
             scan_age_ms: None,
             scanned_at: None,
         };
         assert_eq!(
             render_scan(&resp, true),
-            "aa:bb:cc:dd:ee:ff   -55 dBm  ch11   HomeNet\n"
+            "aa:bb:cc:dd:ee:ff   -55 dBm  2G/11    HomeNet\n"
         );
     }
 

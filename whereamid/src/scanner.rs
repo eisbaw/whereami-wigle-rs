@@ -8,6 +8,8 @@ use tokio::process::Command;
 use tokio::time::{sleep, timeout, timeout_at, Duration, Instant as TokioInstant};
 use tracing::{debug, warn};
 
+use whereami_protocol::Channel;
+
 use crate::boot_clock::BootTime;
 
 const SCAN_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -98,7 +100,7 @@ pub struct ScannedNetwork {
     pub bssid: String,
     pub ssid: Option<String>,
     pub signal_dbm: i32,
-    pub channel: Option<i32>,
+    pub channel: Option<Channel>,
     #[allow(dead_code)]
     pub frequency: Option<i32>,
 }
@@ -725,8 +727,9 @@ pub fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
                 continue;
             }
         };
-        let channel: Option<i32> = fields[3].parse().ok();
+        let explicit_channel: Option<i32> = fields[3].parse().ok();
         let freq = parse_nmcli_frequency(&fields[4]);
+        let channel = resolve_channel(freq, explicit_channel);
 
         // Convert signal percentage (0-100) to approximate dBm:
         // 100 ≈ -30 dBm, 0 ≈ -90 dBm via the linear map below.
@@ -869,7 +872,10 @@ pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
     let mut current_bssid: Option<String> = None;
     let mut current_ssid: Option<String> = None;
     let mut current_signal: Option<i32> = None;
-    let mut current_channel: Option<i32> = None;
+    // Raw "DS Parameter set: channel N" number (2.4 GHz in practice), kept only
+    // as a fallback for when the frequency line is absent; frequency is
+    // canonical for band-qualified derivation (task-0123).
+    let mut current_ds_channel: Option<i32> = None;
     let mut current_freq: Option<i32> = None;
 
     for line in output.lines() {
@@ -878,17 +884,18 @@ pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
         if let Some(rest) = line.strip_prefix("BSS ") {
             // Save previous entry
             if let (Some(bssid), Some(signal)) = (current_bssid.take(), current_signal.take()) {
+                let freq = current_freq.take();
                 push_validated(
                     &mut networks,
                     &bssid,
                     current_ssid.take(),
                     signal,
-                    current_channel.take(),
-                    current_freq.take(),
+                    resolve_channel(freq, current_ds_channel.take()),
+                    freq,
                 );
             } else {
                 current_ssid = None;
-                current_channel = None;
+                current_ds_channel = None;
                 current_freq = None;
             }
 
@@ -920,15 +927,11 @@ pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
             }
         } else if let Some(rest) = line.strip_prefix("DS Parameter set: channel") {
             if let Ok(ch) = rest.trim().parse::<i32>() {
-                current_channel = Some(ch);
+                current_ds_channel = Some(ch);
             }
         } else if let Some(rest) = line.strip_prefix("freq:") {
             if let Ok(freq) = rest.trim().parse::<i32>() {
                 current_freq = Some(freq);
-                // Derive channel from frequency if not explicitly set
-                if current_channel.is_none() {
-                    current_channel = freq_to_channel(freq);
-                }
             }
         }
     }
@@ -940,7 +943,7 @@ pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
             &bssid,
             current_ssid,
             signal,
-            current_channel,
+            resolve_channel(current_freq, current_ds_channel),
             current_freq,
         );
     }
@@ -967,7 +970,7 @@ fn push_validated(
     bssid: &str,
     ssid: Option<String>,
     signal_dbm: i32,
-    channel: Option<i32>,
+    channel: Option<Channel>,
     frequency: Option<i32>,
 ) {
     let normalized = normalize_bssid(bssid);
@@ -983,36 +986,20 @@ fn push_validated(
     }
 }
 
-/// Convert Wi-Fi frequency (MHz) to channel number.
+/// Resolve a band-qualified [`Channel`] for one scanned AP.
 ///
-/// Covers 2.4 GHz (channels 1-14), 5 GHz (channels ~36-177), and Wi-Fi 6E /
-/// 6 GHz (channels 1-233 starting at 5955 MHz). Per IEEE 802.11ax/be the 6 GHz
-/// channels use formula `(freq - 5950) / 5` over `5955..=7115` MHz, except for
-/// channel 2 at 5935 MHz, which is the single special case.
-fn freq_to_channel(freq: i32) -> Option<i32> {
-    match freq {
-        2412 => Some(1),
-        2417 => Some(2),
-        2422 => Some(3),
-        2427 => Some(4),
-        2432 => Some(5),
-        2437 => Some(6),
-        2442 => Some(7),
-        2447 => Some(8),
-        2452 => Some(9),
-        2457 => Some(10),
-        2462 => Some(11),
-        2467 => Some(12),
-        2472 => Some(13),
-        2484 => Some(14),
-        // 6 GHz (Wi-Fi 6E / 7) — checked BEFORE the 5 GHz formula so that
-        // any future widening of the 5 GHz range cannot silently shadow it.
-        5935 => Some(2),
-        f if (5955..=7115).contains(&f) => Some((f - 5950) / 5),
-        // 5 GHz: channel = (freq - 5000) / 5. Range 5180-5885 covers UNII-1/2/3.
-        // The gap 5895-5945 (UNII-4 / DSRC) stays None except for 5935 MHz
-        // above, the isolated 6 GHz channel-2 special case.
-        f if (5180..=5885).contains(&f) => Some((f - 5000) / 5),
+/// FREQUENCY IS CANONICAL (task-0123): when present it fully determines
+/// `(band, channel)` via [`Channel::from_frequency`], so any scanner-reported
+/// bare channel number is ignored in its favour. The explicit number is used
+/// ONLY as a fallback when the frequency is absent — and only in the 2.4 GHz
+/// range `1..=14`, the one band where a bare number is unambiguous (6 GHz reuses
+/// 1.. so a band-less number there cannot be trusted). Outside that, no channel.
+fn resolve_channel(frequency: Option<i32>, explicit_channel: Option<i32>) -> Option<Channel> {
+    if let Some(freq) = frequency {
+        return Channel::from_frequency(freq);
+    }
+    match explicit_channel {
+        Some(n @ 1..=14) => u8::try_from(n).ok().map(Channel::TwoFourGhz),
         _ => None,
     }
 }
@@ -2205,7 +2192,7 @@ BSS 10:22:33:44:55:66(on wlan0)
         assert_eq!(networks[0].bssid, "AA:BB:CC:DD:EE:FF");
         assert_eq!(networks[0].ssid, Some("TestWiFi".to_string()));
         assert_eq!(networks[0].signal_dbm, -65);
-        assert_eq!(networks[0].channel, Some(6));
+        assert_eq!(networks[0].channel, Some(Channel::TwoFourGhz(6)));
         assert_eq!(networks[0].frequency, Some(2437));
 
         // 10:… is a universally-administered unicast MAC (task-0122). The
@@ -2250,13 +2237,13 @@ BSS b8:50:01:aa:bb:cc(on wlan0)
         assert_eq!(networks.len(), 2);
         assert_eq!(networks[0].bssid, "AA:BB:CC:DD:EE:01");
         assert_eq!(networks[0].ssid, Some("TestNet_2G".to_string()));
-        assert_eq!(networks[0].channel, Some(11));
+        assert_eq!(networks[0].channel, Some(Channel::TwoFourGhz(11)));
         assert_eq!(networks[0].frequency, Some(2462));
         // signal: 65% -> -90 + (65*60/100) = -90 + 39 = -51
         assert_eq!(networks[0].signal_dbm, -51);
         assert_eq!(networks[1].bssid, "AA:BB:CC:DD:EE:02");
         assert_eq!(networks[1].ssid, Some("TestNet_5G".to_string()));
-        assert_eq!(networks[1].channel, Some(100));
+        assert_eq!(networks[1].channel, Some(Channel::FiveGhz(100)));
         assert_eq!(networks[1].frequency, Some(5500));
     }
 
@@ -2339,44 +2326,49 @@ BSS b8:50:01:aa:bb:cc(on wlan0)
     }
 
     #[test]
-    fn freq_to_channel_band_boundaries() {
+    fn from_frequency_band_boundaries() {
+        // Ported from the pre-enum `freq_to_channel_band_boundaries` (task-0123):
+        // the boundary logic is now `Channel::from_frequency`, and the expected
+        // values carry the BAND, so a misclassification (e.g. a 6 GHz frequency
+        // decoded as 5 GHz) fails here rather than silently erasing the band.
+        use Channel::{FiveGhz, SixGhz, TwoFourGhz};
         let cases = [
             // 2.4 GHz: frequencies are discrete rather than a continuous range.
             (2407, None, "below 2.4 GHz"),
             (2411, None, "immediately below 2.4 GHz"),
-            (2412, Some(1), "first 2.4 GHz channel"),
-            (2437, Some(6), "interior 2.4 GHz channel"),
-            (2484, Some(14), "last 2.4 GHz channel"),
+            (2412, Some(TwoFourGhz(1)), "first 2.4 GHz channel"),
+            (2437, Some(TwoFourGhz(6)), "interior 2.4 GHz channel"),
+            (2484, Some(TwoFourGhz(14)), "last 2.4 GHz channel"),
             (2485, None, "immediately above 2.4 GHz"),
             (2489, None, "above 2.4 GHz"),
             // Pin the first two 5 GHz channels so moving the lower guard from
             // 5180 to 5185 cannot slip through as an off-by-one regression.
             (5175, None, "below 5 GHz"),
             (5179, None, "immediately below 5 GHz"),
-            (5180, Some(36), "first 5 GHz channel"),
-            (5185, Some(37), "second 5 GHz channel"),
-            (5825, Some(165), "interior 5 GHz channel"),
-            (5885, Some(177), "last 5 GHz channel"),
+            (5180, Some(FiveGhz(36)), "first 5 GHz channel"),
+            (5185, Some(FiveGhz(37)), "second 5 GHz channel"),
+            (5825, Some(FiveGhz(165)), "interior 5 GHz channel"),
+            (5885, Some(FiveGhz(177)), "last 5 GHz channel"),
             (5886, None, "immediately above 5 GHz"),
             (5890, None, "above 5 GHz"),
             (5905, None, "UNII-4 gap"),
             // 6 GHz / Wi-Fi 6E. Channel 2 at 5935 MHz is isolated from the
             // formula-based range that starts with channel 1 at 5955 MHz.
             (5934, None, "immediately below special-case channel 2"),
-            (5935, Some(2), "special-case 6 GHz channel 2"),
+            (5935, Some(SixGhz(2)), "special-case 6 GHz channel 2"),
             (5936, None, "immediately above special-case channel 2"),
             (5950, None, "below 6 GHz"),
             (5954, None, "immediately below 6 GHz"),
-            (5955, Some(1), "first 6 GHz channel"),
-            (6105, Some(31), "interior 6 GHz channel"),
-            (7115, Some(233), "last 6 GHz channel"),
+            (5955, Some(SixGhz(1)), "first 6 GHz channel"),
+            (6105, Some(SixGhz(31)), "interior 6 GHz channel"),
+            (7115, Some(SixGhz(233)), "last 6 GHz channel"),
             (7116, None, "immediately above 6 GHz"),
             (7120, None, "above 6 GHz"),
         ];
 
         for (frequency, expected, description) in cases {
             assert_eq!(
-                freq_to_channel(frequency),
+                Channel::from_frequency(frequency),
                 expected,
                 "unexpected mapping at {description} ({frequency} MHz)"
             );
@@ -2384,14 +2376,18 @@ BSS b8:50:01:aa:bb:cc(on wlan0)
     }
 
     #[test]
-    fn freq_to_channel_outputs_are_valid_channels() {
+    fn from_frequency_outputs_are_valid_channels() {
         // Frequencies are parsed as MHz. Exhausting u16 covers the complete
         // practical non-negative domain and every branch that can return Some,
         // while keeping this regression property deterministic and fast.
         for frequency in 0..=u16::MAX {
-            if let Some(channel) = freq_to_channel(i32::from(frequency)) {
+            if let Some(channel) = Channel::from_frequency(i32::from(frequency)) {
+                let number = match channel {
+                    Channel::TwoFourGhz(n) => u16::from(n),
+                    Channel::FiveGhz(n) | Channel::SixGhz(n) => n,
+                };
                 assert!(
-                    (1..=233).contains(&channel),
+                    (1..=233).contains(&number),
                     "{frequency} MHz mapped to invalid channel {channel}"
                 );
             }
@@ -2498,13 +2494,13 @@ BSS b8:50:01:aa:bb:cc(on wlan0)
 mod kani_proofs {
     use super::*;
 
-    /// `freq_to_channel` is a total function — every i32 must produce
+    /// `Channel::from_frequency` is a total function — every i32 must produce
     /// either Some or None, never panic. Kani exhaustively explores the
     /// branch / range guards (no loops, no unwind needed).
     #[kani::proof]
-    fn freq_to_channel_total() {
+    fn from_frequency_total() {
         let freq: i32 = kani::any();
-        let _ = freq_to_channel(freq);
+        let _ = Channel::from_frequency(freq);
     }
 
     /// `split_nmcli_fields` walks bytes once, handling backslash escapes.

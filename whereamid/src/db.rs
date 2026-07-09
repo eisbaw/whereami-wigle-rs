@@ -20,7 +20,11 @@ pub struct ApInfo {
     pub lat: f64,
     pub lon: f64,
     pub encryption: Option<String>,
-    pub channel: Option<i32>,
+    /// Wi-Fi frequency in MHz — the CANONICAL physical identifier. The old
+    /// band-less `channel` column was redundant (a pure function of frequency,
+    /// and ambiguous once 6 GHz reuses low channel numbers) and was dropped at
+    /// schema v9 (task-0123). Consumers that need a channel derive it on the fly
+    /// via `whereami_protocol::Channel::from_frequency(frequency)`.
     pub frequency: Option<i32>,
     pub city: Option<String>,
     pub country: Option<String>,
@@ -1570,7 +1574,7 @@ pub enum DebugDbStatus {
     New,
 }
 
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CorruptWigleLookupsValue {
@@ -2178,6 +2182,12 @@ impl Database {
             version = 8;
         }
 
+        if version < 9 {
+            info!("migrating database v{version} -> v9 (drop redundant aps/pending.channel; frequency canonical)");
+            self.migrate_v8_to_v9()?;
+            version = 9;
+        }
+
         if version == SCHEMA_VERSION {
             debug!("database schema is up to date (v{version})");
         } else if version > SCHEMA_VERSION {
@@ -2522,6 +2532,53 @@ impl Database {
         })
     }
 
+    /// v8 -> v9: DROP the redundant `channel` column from `aps` and `pending`
+    /// (task-0123).
+    ///
+    /// `(band, channel)` is a pure function of `frequency`, which both tables
+    /// already store, so the bare `channel` number carried no information the
+    /// frequency did not — and, worse, was AMBIGUOUS once Wi-Fi 6E/7 made 6 GHz
+    /// reuse the low channel numbers (ch1@2412MHz != ch1@5955MHz). Frequency is
+    /// canonical; consumers derive the band-qualified
+    /// `whereami_protocol::Channel` on read. This mirrors task-0122's
+    /// compute-on-read / single-source-of-truth philosophy.
+    ///
+    /// LOSSLESS for the data that matters: only the derived, redundant column is
+    /// removed; `frequency` and every other column survive untouched. A v8 DB
+    /// with live rows opens cleanly at v9 with its frequencies intact.
+    ///
+    /// Mechanism: `ALTER TABLE ... DROP COLUMN`, supported by SQLite >= 3.35
+    /// (2021); rusqlite's bundled SQLite is newer. Each drop is guarded by a
+    /// `PRAGMA table_info` probe so the migration is idempotent and a no-op on
+    /// a table that never had the column (e.g. a re-run, or a hypothetical fresh
+    /// shape that already omitted it). The drop and the version stamp share one
+    /// `run_migration` transaction, so a crash mid-migration rolls back to v8.
+    fn migrate_v8_to_v9(&self) -> Result<()> {
+        self.run_migration(|tx| {
+            let has_channel = |table: &str| -> Result<bool> {
+                let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    if row.get::<_, String>(1)? == "channel" {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            };
+            for table in ["aps", "pending"] {
+                if has_channel(table)? {
+                    tx.execute(&format!("ALTER TABLE {table} DROP COLUMN channel"), [])
+                        .with_context(|| format!("failed to drop {table}.channel column"))?;
+                }
+            }
+            tx.execute(
+                "UPDATE schema_version SET version = ?1 WHERE id = 1",
+                params![9],
+            )?;
+            Ok(())
+        })
+    }
+
     fn get_schema_version(&self) -> i32 {
         // Table may not exist yet
         let result: Result<i32, _> =
@@ -2625,6 +2682,14 @@ impl Database {
         false
     }
 
+    /// Create the genuine v1 shape. This is the FROZEN historical v1 DDL, NOT
+    /// the current shape: a fresh DB runs this and then the full migration
+    /// cascade (e.g. v8->v9 drops `aps`/`pending.channel`). The `channel`
+    /// columns are deliberately RETAINED here even though v9 removes them —
+    /// v1 authentically had them, and `build_historical_shape` reconstructs real
+    /// pre-v9 databases solely from this DDL plus the real migrate fns. Editing
+    /// v1 to omit `channel` would make those historical shapes lie and would rob
+    /// the v8->v9 drop test of a real column to drop (task-0123).
     fn create_schema_v1(&self) -> Result<()> {
         self.conn
             .execute_batch(
@@ -2700,22 +2765,21 @@ impl Database {
         let result = self
             .conn
             .query_row(
-                "SELECT bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, is_mobile
+                "SELECT bssid, ssid, lat, lon, encryption, frequency, city, country, source, is_mobile
                  FROM aps WHERE bssid = ?1",
                 params![bssid],
                 |row| {
-                    let source_str: String = row.get(9)?;
+                    let source_str: String = row.get(8)?;
                     Ok(ApInfo {
                         bssid: row.get(0)?,
                         ssid: row.get(1)?,
                         lat: row.get(2)?,
                         lon: row.get(3)?,
                         encryption: row.get(4)?,
-                        channel: row.get(5)?,
-                        frequency: row.get(6)?,
-                        city: row.get(7)?,
-                        country: row.get(8)?,
-                        is_mobile: row.get::<_, i64>(10)? != 0,
+                        frequency: row.get(5)?,
+                        city: row.get(6)?,
+                        country: row.get(7)?,
+                        is_mobile: row.get::<_, i64>(9)? != 0,
                         source: Source::from_db_str(&source_str),
                     })
                 },
@@ -2750,15 +2814,14 @@ impl Database {
             mobile_ssid_denylist,
         ));
         conn.execute(
-            "INSERT INTO aps (bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, source_priority, is_mobile, first_seen, last_seen, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?13)
+            "INSERT INTO aps (bssid, ssid, lat, lon, encryption, frequency, city, country, source, source_priority, is_mobile, first_seen, last_seen, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?12)
              ON CONFLICT(bssid) DO UPDATE SET
                 ssid       = excluded.ssid,
                 is_mobile  = excluded.is_mobile,
                 lat        = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.lat        ELSE aps.lat        END,
                 lon        = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.lon        ELSE aps.lon        END,
                 encryption = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.encryption ELSE aps.encryption END,
-                channel    = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.channel    ELSE aps.channel    END,
                 frequency  = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.frequency  ELSE aps.frequency  END,
                 city       = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.city       ELSE aps.city       END,
                 country    = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.country    ELSE aps.country    END,
@@ -2766,7 +2829,7 @@ impl Database {
                 source_priority  = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.source_priority  ELSE aps.source_priority  END,
                 fetched_at       = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.fetched_at       ELSE aps.fetched_at       END,
                 last_seen  = excluded.last_seen",
-            params![ap.bssid, ap.ssid, ap.lat, ap.lon, ap.encryption, ap.channel, ap.frequency, ap.city, ap.country, source_str, priority, is_mobile, now],
+            params![ap.bssid, ap.ssid, ap.lat, ap.lon, ap.encryption, ap.frequency, ap.city, ap.country, source_str, priority, is_mobile, now],
         )?;
         Ok(())
     }
@@ -2796,22 +2859,21 @@ impl Database {
         for bssid in bssids {
             let ap = tx
                 .query_row(
-                    "SELECT bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, is_mobile
+                    "SELECT bssid, ssid, lat, lon, encryption, frequency, city, country, source, is_mobile
                      FROM aps WHERE bssid = ?1",
                     params![bssid],
                     |row| {
-                        let source_str: String = row.get(9)?;
+                        let source_str: String = row.get(8)?;
                         Ok(ApInfo {
                             bssid: row.get(0)?,
                             ssid: row.get(1)?,
                             lat: row.get(2)?,
                             lon: row.get(3)?,
                             encryption: row.get(4)?,
-                            channel: row.get(5)?,
-                            frequency: row.get(6)?,
-                            city: row.get(7)?,
-                            country: row.get(8)?,
-                            is_mobile: row.get::<_, i64>(10)? != 0,
+                            frequency: row.get(5)?,
+                            city: row.get(6)?,
+                            country: row.get(7)?,
+                            is_mobile: row.get::<_, i64>(9)? != 0,
                             source: Source::from_db_str(&source_str),
                         })
                     },
@@ -2839,22 +2901,21 @@ impl Database {
         for bssid in bssids {
             let ap = tx
                 .query_row(
-                    "SELECT bssid, ssid, lat, lon, encryption, channel, frequency, city, country, source, is_mobile
+                    "SELECT bssid, ssid, lat, lon, encryption, frequency, city, country, source, is_mobile
                      FROM aps WHERE bssid = ?1",
                     params![bssid],
                     |row| {
-                        let source_str: String = row.get(9)?;
+                        let source_str: String = row.get(8)?;
                         Ok(ApInfo {
                             bssid: row.get(0)?,
                             ssid: row.get(1)?,
                             lat: row.get(2)?,
                             lon: row.get(3)?,
                             encryption: row.get(4)?,
-                            channel: row.get(5)?,
-                            frequency: row.get(6)?,
-                            city: row.get(7)?,
-                            country: row.get(8)?,
-                            is_mobile: row.get::<_, i64>(10)? != 0,
+                            frequency: row.get(5)?,
+                            city: row.get(6)?,
+                            country: row.get(7)?,
+                            is_mobile: row.get::<_, i64>(9)? != 0,
                             source: Source::from_db_str(&source_str),
                         })
                     },
@@ -2918,30 +2979,31 @@ impl Database {
         &self,
         bssid: &str,
         ssid: Option<&str>,
-        channel: Option<i32>,
         frequency: Option<i32>,
         signal_dbm: Option<i32>,
     ) -> Result<()> {
-        Self::insert_pending_on(&self.conn, bssid, ssid, channel, frequency, signal_dbm)
+        Self::insert_pending_on(&self.conn, bssid, ssid, frequency, signal_dbm)
     }
 
     fn insert_pending_on(
         conn: &Connection,
         bssid: &str,
         ssid: Option<&str>,
-        channel: Option<i32>,
         frequency: Option<i32>,
         signal_dbm: Option<i32>,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        // pending.channel was dropped at schema v9 (task-0123): frequency is the
+        // canonical physical identifier, so the redundant band-less number is no
+        // longer stored.
         conn.execute(
-            "INSERT INTO pending (bssid, ssid, channel, frequency, signal_dbm, first_seen, last_seen, attempts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0)
+            "INSERT INTO pending (bssid, ssid, frequency, signal_dbm, first_seen, last_seen, attempts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0)
              ON CONFLICT(bssid) DO UPDATE SET
                 ssid = excluded.ssid,
                 last_seen = excluded.last_seen,
                 signal_dbm = CASE WHEN excluded.signal_dbm > pending.signal_dbm THEN excluded.signal_dbm ELSE pending.signal_dbm END",
-            params![bssid, ssid, channel, frequency, signal_dbm, now],
+            params![bssid, ssid, frequency, signal_dbm, now],
         )?;
         Ok(())
     }
@@ -2951,7 +3013,7 @@ impl Database {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (bssid, ssid) in observations {
-            Self::insert_pending_on(&tx, bssid, ssid.as_deref(), None, None, None)?;
+            Self::insert_pending_on(&tx, bssid, ssid.as_deref(), None, None)?;
         }
         tx.commit()?;
         Ok(())
@@ -3757,7 +3819,6 @@ mod tests {
             lat: 55.67 + index as f64 / 10_000.0,
             lon: 12.56,
             encryption: None,
-            channel: Some(1),
             frequency: Some(2_412),
             city: None,
             country: None,
@@ -4015,7 +4076,7 @@ mod tests {
 
     fn seed_every_privacy_table(db: &Database) {
         db.upsert_ap(&sample_ap(1)).unwrap();
-        db.insert_pending("pending", Some("ssid"), Some(6), Some(2437), Some(-40))
+        db.insert_pending("pending", Some("ssid"), Some(2437), Some(-40))
             .unwrap();
         db.insert_not_found("not-found").unwrap();
         db.insert_fix("2026-01-01T00:00:00+00:00", 1.0, 2.0, 3.0, 4)
@@ -5256,6 +5317,27 @@ mod tests {
             db.get_metadata("api_calls_today").unwrap().is_none(),
             "v7->v8 must leave no stale api_calls_today row"
         );
+
+        // --- v8 -> v9: stamp 9, redundant channel columns dropped (task-0123) ---
+        assert!(
+            db.column_exists("aps", "channel"),
+            "channel present before v9 (fresh v1 DDL carried it)"
+        );
+        assert!(db.column_exists("pending", "channel"));
+        db.migrate_v8_to_v9().unwrap();
+        assert_eq!(db.get_schema_version(), 9);
+        assert!(
+            !db.column_exists("aps", "channel"),
+            "v8->v9 must drop aps.channel"
+        );
+        assert!(
+            !db.column_exists("pending", "channel"),
+            "v8->v9 must drop pending.channel"
+        );
+        assert!(
+            db.column_exists("aps", "frequency"),
+            "v8->v9 must keep the canonical aps.frequency"
+        );
     }
 
     // --- task-0151: real historical-shape DB files opened via the PUBLIC
@@ -5407,8 +5489,8 @@ mod tests {
     /// fns up to `target` — never hand-written DDL.
     fn build_historical_shape(path: &Path, target: i32) {
         assert!(
-            (1..=7).contains(&target),
-            "historical shapes are v1..=v7; v8 is the current shape"
+            (1..=8).contains(&target),
+            "historical shapes are v1..=v8; v9 is the current shape"
         );
         let db = Database {
             conn: Connection::open(path).unwrap(),
@@ -5432,6 +5514,9 @@ mod tests {
         }
         if target >= 7 {
             db.migrate_v6_to_v7().unwrap();
+        }
+        if target >= 8 {
+            db.migrate_v7_to_v8().unwrap();
         }
         assert_eq!(
             db.get_schema_version(),
@@ -5492,6 +5577,20 @@ mod tests {
         assert!(
             db.column_exists("aps", "is_mobile"),
             "aps.is_mobile (v6) must exist after cascade from v{origin}"
+        );
+        // v9 dropped the redundant band-less channel column from both tables
+        // (task-0123); frequency is canonical and must survive.
+        assert!(
+            !db.column_exists("aps", "channel"),
+            "aps.channel (v9 drop) must be gone after cascade from v{origin}"
+        );
+        assert!(
+            !db.column_exists("pending", "channel"),
+            "pending.channel (v9 drop) must be gone after cascade from v{origin}"
+        );
+        assert!(
+            db.column_exists("aps", "frequency"),
+            "aps.frequency (canonical) must survive after cascade from v{origin}"
         );
         // v7 nullable quality bundle on fixes.
         assert!(
@@ -5597,13 +5696,91 @@ mod tests {
     /// `Database::open` on a real historical file.
     #[test]
     fn open_each_historical_shape_cascades_to_current() {
-        for origin in 1..=7 {
+        for origin in 1..=8 {
             let tmp = TempDbDir::new(&format!("task0151-cascade-v{origin}"));
             let path = tmp.db_path();
             build_historical_shape(&path, origin);
             let db = Database::open(&path).unwrap();
             assert_current_shape_and_seed(&db, origin);
         }
+    }
+
+    /// task-0123 (AC#4 + invariant #1): a genuine v8 aps row carrying BOTH a
+    /// channel value and a frequency opens cleanly at v9 with the redundant
+    /// channel column DROPPED and the canonical frequency intact — proving the
+    /// migration is lossless for the data that matters and that `DROP COLUMN`
+    /// works on the bundled SQLite (not just a fresh-DB no-op). The seed
+    /// (`seed_sample_rows`) writes channel 6 / frequency 2437 into the aps row.
+    #[test]
+    fn open_v8_shape_drops_channel_column_at_v9() {
+        let tmp = TempDbDir::new("task0123-v8-to-v9");
+        let path = tmp.db_path();
+        build_historical_shape(&path, 8);
+
+        // The v8 file genuinely carries the channel column with a live value.
+        {
+            let raw = Connection::open(&path).unwrap();
+            let channel: Option<i64> = raw
+                .query_row(
+                    "SELECT channel FROM aps WHERE bssid = ?1",
+                    params![SEED_AP_BSSID],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(channel, Some(6), "v8 seed must carry a real channel value");
+        }
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(
+            db.get_schema_version(),
+            SCHEMA_VERSION,
+            "opening a v8 file must cascade to v{SCHEMA_VERSION}"
+        );
+        assert!(
+            !db.column_exists("aps", "channel"),
+            "v8->v9 must drop the aps.channel column"
+        );
+        assert!(
+            !db.column_exists("pending", "channel"),
+            "v8->v9 must drop the pending.channel column"
+        );
+
+        // The canonical frequency survived, and the band-qualified Channel is
+        // re-derivable from it on read (channel 6 == 2.4 GHz channel 6).
+        let ap = db.get_ap(SEED_AP_BSSID).unwrap().unwrap();
+        assert_eq!(ap.frequency, Some(2437), "frequency must survive the drop");
+        assert_eq!(
+            ap.frequency
+                .and_then(whereami_protocol::Channel::from_frequency),
+            Some(whereami_protocol::Channel::TwoFourGhz(6)),
+            "the dropped channel is re-derivable from the surviving frequency"
+        );
+    }
+
+    /// task-0123 AC#6: a frequency round-trips through the normal aps read path
+    /// and yields the correct band-qualified Channel on read. 5955 MHz is 6 GHz
+    /// channel 1 — the case that a bare-number column could not have
+    /// disambiguated from 2.4 GHz channel 1.
+    #[test]
+    fn aps_frequency_roundtrip_derives_band_qualified_channel() {
+        let db = Database::open_memory().unwrap();
+        let mut ap = sample_ap(1);
+        ap.frequency = Some(5955);
+        db.upsert_ap(&ap).unwrap();
+
+        let stored = db.get_ap(&ap.bssid).unwrap().unwrap();
+        assert_eq!(
+            stored.frequency,
+            Some(5955),
+            "frequency round-trips verbatim"
+        );
+        assert_eq!(
+            stored
+                .frequency
+                .and_then(whereami_protocol::Channel::from_frequency),
+            Some(whereami_protocol::Channel::SixGhz(1)),
+            "5955 MHz derives 6 GHz channel 1 on read"
+        );
     }
 
     /// task-0130 AC#1: the v7->v8 WiGLE-counter key rename is lossless across a
@@ -6111,7 +6288,6 @@ mod tests {
             lat: 55.6684,
             lon: 12.5541,
             encryption: None,
-            channel: Some(6),
             frequency: Some(2437),
             city: None,
             country: None,
@@ -6177,7 +6353,6 @@ mod tests {
             lat,
             lon: 12.5541,
             encryption: None,
-            channel: Some(6),
             frequency: Some(2437),
             city: None,
             country: None,
@@ -6389,14 +6564,8 @@ mod tests {
     #[test]
     fn test_pending() {
         let db = Database::open_memory().unwrap();
-        db.insert_pending(
-            "AA:BB:CC:DD:EE:FF",
-            Some("Test"),
-            Some(6),
-            Some(2437),
-            Some(-65),
-        )
-        .unwrap();
+        db.insert_pending("AA:BB:CC:DD:EE:FF", Some("Test"), Some(2437), Some(-65))
+            .unwrap();
         let pending = db.get_pending(10).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].bssid, "AA:BB:CC:DD:EE:FF");
@@ -6427,7 +6596,7 @@ mod tests {
         assert!(!db.is_pending(other).unwrap());
 
         // After insert: only the inserted one is pending.
-        db.insert_pending(bssid, Some("Test"), Some(6), Some(2437), Some(-65))
+        db.insert_pending(bssid, Some("Test"), Some(2437), Some(-65))
             .unwrap();
         assert!(db.is_pending(bssid).unwrap());
         assert!(!db.is_pending(other).unwrap());

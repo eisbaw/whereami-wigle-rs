@@ -1107,7 +1107,6 @@ mod autolocate_loop_tests {
                     lat: 55.6761,
                     lon: 12.5683,
                     encryption: None,
-                    channel: None,
                     frequency: None,
                     city: None,
                     country: None,
@@ -1120,7 +1119,7 @@ mod autolocate_loop_tests {
                 crate::debounce::ScanEntry {
                     signal_dbm: -40 - index,
                     ssid: Some("loop-fixed-ap".to_string()),
-                    channel: Some(1),
+                    channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
                 },
             );
         }
@@ -1450,7 +1449,6 @@ mod retention_tests {
             lat: 55.0,
             lon: 12.0,
             encryption: None,
-            channel: None,
             frequency: None,
             city: None,
             country: None,

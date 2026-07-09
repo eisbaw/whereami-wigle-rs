@@ -52,11 +52,210 @@
 //! to the historic optimistic `High`. History uses `Option<Confidence>`, where
 //! absence is legacy-unknown (`None`), never `High`.
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 // =====================================================================
 // Shared wire enums
 // =====================================================================
+
+/// A Wi-Fi channel qualified by its frequency band (task-0123).
+///
+/// A bare channel NUMBER is ambiguous once 6 GHz (Wi-Fi 6E/7) is in play: 6 GHz
+/// channel numbers restart at 1 and overlap 2.4 GHz, so `1@2412MHz` (2.4 GHz)
+/// and `1@5955MHz` (6 GHz) are DIFFERENT physical channels. The physical
+/// identifier is `(band, channel)`, which is a pure function of the frequency —
+/// so the daemon carries frequency as canonical and derives this enum via
+/// [`Channel::from_frequency`], never storing a band-less number.
+///
+/// Wire format: the band-prefixed string produced by [`Display`] (`2G/1`,
+/// `5G/36`, `6G/37`). Serialization is that string; deserialization parses it
+/// back via [`FromStr`]. Adding a band is a wire-protocol change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// 2.4 GHz band (channels 1-14).
+    TwoFourGhz(u8),
+    /// 5 GHz band (channels ~36-177).
+    FiveGhz(u16),
+    /// 6 GHz band (Wi-Fi 6E/7, channels 1-233, numbering restarts at 1).
+    SixGhz(u16),
+}
+
+impl Channel {
+    /// Derive the band-qualified channel from a Wi-Fi frequency in MHz.
+    ///
+    /// This carries the EXACT IEEE 802.11 boundary logic (task-0123): the
+    /// discrete 2.4 GHz table, the isolated 6 GHz channel-2 special case at
+    /// 5935 MHz, and — CRITICALLY — the 6 GHz formula range `5955..=7115`
+    /// checked BEFORE the 5 GHz formula range `5180..=5885`, so no future
+    /// widening of the 5 GHz arm can silently shadow a 6 GHz frequency. Any
+    /// reordering here misclassifies the band, which is the whole bug this
+    /// type exists to prevent. Returns `None` for frequencies outside every
+    /// recognised range (e.g. the UNII-4/DSRC gap, apart from 5935 MHz).
+    pub fn from_frequency(freq: i32) -> Option<Channel> {
+        match freq {
+            2412 => Some(Channel::TwoFourGhz(1)),
+            2417 => Some(Channel::TwoFourGhz(2)),
+            2422 => Some(Channel::TwoFourGhz(3)),
+            2427 => Some(Channel::TwoFourGhz(4)),
+            2432 => Some(Channel::TwoFourGhz(5)),
+            2437 => Some(Channel::TwoFourGhz(6)),
+            2442 => Some(Channel::TwoFourGhz(7)),
+            2447 => Some(Channel::TwoFourGhz(8)),
+            2452 => Some(Channel::TwoFourGhz(9)),
+            2457 => Some(Channel::TwoFourGhz(10)),
+            2462 => Some(Channel::TwoFourGhz(11)),
+            2467 => Some(Channel::TwoFourGhz(12)),
+            2472 => Some(Channel::TwoFourGhz(13)),
+            2484 => Some(Channel::TwoFourGhz(14)),
+            // 6 GHz (Wi-Fi 6E / 7) — checked BEFORE the 5 GHz formula so that
+            // any future widening of the 5 GHz range cannot silently shadow it.
+            5935 => Some(Channel::SixGhz(2)),
+            f if (5955..=7115).contains(&f) => Some(Channel::SixGhz(((f - 5950) / 5) as u16)),
+            // 5 GHz: channel = (freq - 5000) / 5. Range 5180-5885 covers
+            // UNII-1/2/3. The gap 5895-5945 (UNII-4 / DSRC) stays None except
+            // for 5935 MHz above, the isolated 6 GHz channel-2 special case.
+            f if (5180..=5885).contains(&f) => Some(Channel::FiveGhz(((f - 5000) / 5) as u16)),
+            _ => None,
+        }
+    }
+
+    /// The band prefix used by [`Display`] and [`FromStr`].
+    fn band_prefix(&self) -> &'static str {
+        match self {
+            Channel::TwoFourGhz(_) => "2G",
+            Channel::FiveGhz(_) => "5G",
+            Channel::SixGhz(_) => "6G",
+        }
+    }
+
+    /// The channel number within the band.
+    fn number(&self) -> u16 {
+        match self {
+            Channel::TwoFourGhz(n) => u16::from(*n),
+            Channel::FiveGhz(n) | Channel::SixGhz(n) => *n,
+        }
+    }
+}
+
+impl std::fmt::Display for Channel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.band_prefix(), self.number())
+    }
+}
+
+/// Error returned when a band-prefixed channel string cannot be parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelParseError(String);
+
+impl std::fmt::Display for ChannelParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid channel {:?}: expected e.g. \"2G/6\", \"5G/36\", \"6G/37\"",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ChannelParseError {}
+
+impl std::str::FromStr for Channel {
+    type Err = ChannelParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ChannelParseError(s.to_string());
+        let (band, num) = s.split_once('/').ok_or_else(err)?;
+        match band {
+            "2G" => num
+                .parse::<u8>()
+                .map(Channel::TwoFourGhz)
+                .map_err(|_| err()),
+            "5G" => num.parse::<u16>().map(Channel::FiveGhz).map_err(|_| err()),
+            "6G" => num.parse::<u16>().map(Channel::SixGhz).map_err(|_| err()),
+            _ => Err(err()),
+        }
+    }
+}
+
+impl Serialize for Channel {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Channel {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(de::Error::custom)
+    }
+}
+
+/// Field deserializer for `NetworkEntry.channel` that tolerates a legacy bare
+/// integer on the wire (task-0123).
+///
+/// Scan output is display-only and the client ships in lockstep with the
+/// daemon, so a band-qualified string is the sole supported representation.
+/// For robustness across a mixed-version scan, though, an OLD daemon's bare
+/// `"channel": 6` (no band) decodes to `None` rather than aborting the whole
+/// `ScanResponse` decode: a band-less number cannot be reconstructed into a
+/// `(band, channel)` identifier, so it is dropped best-effort. A present
+/// band-prefixed string decodes normally; JSON `null` and an absent field both
+/// yield `None`.
+fn deserialize_tolerant_channel<'de, D>(deserializer: D) -> Result<Option<Channel>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptVisitor;
+
+    impl<'de> de::Visitor<'de> for OptVisitor {
+        type Value = Option<Channel>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("null, a band-prefixed channel string like \"6G/37\", or a legacy integer")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(InnerVisitor)
+        }
+    }
+
+    struct InnerVisitor;
+
+    impl de::Visitor<'_> for InnerVisitor {
+        type Value = Option<Channel>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a band-prefixed channel string or a legacy integer")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            v.parse::<Channel>().map(Some).map_err(de::Error::custom)
+        }
+
+        // Legacy band-less integers (an older daemon) carry no band and cannot
+        // be reconstructed into a Channel, so they degrade to None (documented).
+        fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_option(OptVisitor)
+}
 
 /// Plausibility confidence attached to every successful `locate` response and
 /// to each persisted history fix.
@@ -328,7 +527,12 @@ pub struct NetworkEntry {
     pub bssid: String,
     pub ssid: Option<String>,
     pub signal_dbm: i32,
-    pub channel: Option<i32>,
+    /// Band-qualified channel (task-0123). Serialized as the band-prefixed
+    /// string (`"6G/37"`), or JSON `null` when absent. Decoding tolerates a
+    /// legacy bare integer from an older daemon by mapping it to `None` (see
+    /// [`deserialize_tolerant_channel`]).
+    #[serde(default, deserialize_with = "deserialize_tolerant_channel")]
+    pub channel: Option<Channel>,
 }
 
 /// Response from the `scan` command.

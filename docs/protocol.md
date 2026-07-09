@@ -233,7 +233,7 @@ rather than silently misclassifying a future confidence level.
 ← {
     "ok": true, "v": 1,
     "networks": [
-      {"bssid": "AA:BB:CC:DD:EE:FF", "ssid": "MyWiFi", "signal_dbm": -65, "channel": 6}
+      {"bssid": "AA:BB:CC:DD:EE:FF", "ssid": "MyWiFi", "signal_dbm": -65, "channel": "2G/6"}
     ],
     "scan_age_ms": 3200,
     "scanned_at": "2026-05-10T09:04:38+00:00"
@@ -244,6 +244,18 @@ Presence rules:
 
 - Each network always contains `ssid` and `channel`; either value is `null` when
   the scanner did not supply it.
+- `channel` is a BAND-QUALIFIED string (task-0123), not a bare integer: the band
+  prefix (`2G` / `5G` / `6G`) plus the channel number, e.g. `"2G/6"`, `"5G/36"`,
+  `"6G/37"`. A bare number is ambiguous now that Wi-Fi 6E/7 makes 6 GHz reuse the
+  low channel numbers (2.4 GHz channel 1 and 6 GHz channel 1 are different
+  physical channels). The value is derived from the AP's frequency, which is the
+  canonical physical identifier.
+- Cross-version note: scan output is display-only and the client ships in
+  lockstep with the daemon, so the string form is the sole supported
+  representation. For robustness across a mixed-version scan, a client tolerates
+  an OLD daemon's bare-integer `channel` by decoding it to `null` (a band-less
+  number cannot be reconstructed into a band-qualified channel) rather than
+  failing the whole response.
 - `scan_age_ms` is always present and is `null` before the first completed scan.
 - `scanned_at` is omitted before the first completed scan; afterward it is an
   RFC3339 string.

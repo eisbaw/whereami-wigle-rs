@@ -65,7 +65,9 @@ struct WigleResult {
     trilat: Option<f64>,
     trilong: Option<f64>,
     encryption: Option<String>,
-    channel: Option<i32>,
+    // WiGLE also returns a bare `channel`, but it is redundant with `frequency`
+    // (band+channel are derivable from it) and band-ambiguous, so it is not
+    // parsed: the daemon carries frequency as canonical (task-0123).
     frequency: Option<i32>,
     city: Option<String>,
     country: Option<String>,
@@ -234,7 +236,6 @@ fn interpret_response(body: WigleSearchResponse, bssid: &str) -> Result<ApInfo, 
         lat,
         lon,
         encryption: r.encryption.clone(),
-        channel: r.channel,
         frequency: r.frequency,
         city: r.city.clone(),
         country: r.country.clone(),
@@ -419,8 +420,14 @@ mod tests {
         assert_eq!(ap.lat, 55.7);
         assert_eq!(ap.lon, 12.5);
         assert_eq!(ap.encryption.as_deref(), Some("wpa2"));
-        assert_eq!(ap.channel, Some(44));
         assert_eq!(ap.frequency, Some(5220));
+        // The band-qualified channel is derived from the canonical frequency
+        // (task-0123): 5220 MHz == 5 GHz channel 44.
+        assert_eq!(
+            ap.frequency
+                .and_then(whereami_protocol::Channel::from_frequency),
+            Some(whereami_protocol::Channel::FiveGhz(44)),
+        );
         assert_eq!(ap.city.as_deref(), Some("Copenhagen"));
         assert_eq!(ap.country.as_deref(), Some("DK"));
         assert!(matches!(ap.source, crate::db::Source::Wigle));

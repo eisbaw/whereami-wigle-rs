@@ -266,7 +266,6 @@ pub fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
                 lat: lat_f,
                 lon: lon_f,
                 encryption: None,
-                channel: None,
                 frequency: None,
                 city: None,
                 country: None,
