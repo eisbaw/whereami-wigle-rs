@@ -13,12 +13,37 @@ use tracing::{debug, info};
 use crate::quality::{Confidence, ConfidenceDb, FixQuality};
 
 /// Information about a resolved access point.
+///
+/// # Two distinct notions of "where this AP is"
+///
+/// `provider_reported_lat`/`provider_reported_lon` are the geolocation
+/// **provider's reported centroid** for this BSSID — where WiGLE/Apple's
+/// sniffers last triangulated it. This is emphatically NOT necessarily where
+/// the AP physically is right now: for a mobile AP (a phone hotspot, a train,
+/// a bus) the provider returns wildly different coordinates per sample, each
+/// reflecting wherever their sniffer happened to see that BSSID.
+///
+/// Contrast this with the **locally-observed** position — where our own
+/// trilateration consensus places the AP from the signals we measured. That
+/// notion (`locally_observed_lat`/`locally_observed_lon`) does not exist on
+/// this struct yet; task-0272 will add it alongside the structural
+/// mobile-detection that compares the two to flag movers. Until then, this
+/// struct carries only the provider-reported centroid, now named so no reader
+/// mistakes it for a physical fix.
 #[derive(Debug, Clone)]
 pub struct ApInfo {
     pub bssid: String,
     pub ssid: Option<String>,
-    pub lat: f64,
-    pub lon: f64,
+    /// The geolocation provider's reported centroid latitude for this BSSID —
+    /// where their sniffers last saw it, NOT (for a mobile AP) its current
+    /// physical location. Contrast the forthcoming locally-observed position
+    /// from our own trilateration consensus (task-0272).
+    pub provider_reported_lat: f64,
+    /// The geolocation provider's reported centroid longitude for this BSSID —
+    /// where their sniffers last saw it, NOT (for a mobile AP) its current
+    /// physical location. Contrast the forthcoming locally-observed position
+    /// from our own trilateration consensus (task-0272).
+    pub provider_reported_lon: f64,
     pub encryption: Option<String>,
     /// Wi-Fi frequency in MHz — the CANONICAL physical identifier. The old
     /// band-less `channel` column was redundant (a pure function of frequency,
@@ -2773,8 +2798,8 @@ impl Database {
                     Ok(ApInfo {
                         bssid: row.get(0)?,
                         ssid: row.get(1)?,
-                        lat: row.get(2)?,
-                        lon: row.get(3)?,
+                        provider_reported_lat: row.get(2)?,
+                        provider_reported_lon: row.get(3)?,
                         encryption: row.get(4)?,
                         frequency: row.get(5)?,
                         city: row.get(6)?,
@@ -2829,7 +2854,7 @@ impl Database {
                 source_priority  = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.source_priority  ELSE aps.source_priority  END,
                 fetched_at       = CASE WHEN excluded.source_priority >= aps.source_priority THEN excluded.fetched_at       ELSE aps.fetched_at       END,
                 last_seen  = excluded.last_seen",
-            params![ap.bssid, ap.ssid, ap.lat, ap.lon, ap.encryption, ap.frequency, ap.city, ap.country, source_str, priority, is_mobile, now],
+            params![ap.bssid, ap.ssid, ap.provider_reported_lat, ap.provider_reported_lon, ap.encryption, ap.frequency, ap.city, ap.country, source_str, priority, is_mobile, now],
         )?;
         Ok(())
     }
@@ -2867,8 +2892,8 @@ impl Database {
                         Ok(ApInfo {
                             bssid: row.get(0)?,
                             ssid: row.get(1)?,
-                            lat: row.get(2)?,
-                            lon: row.get(3)?,
+                            provider_reported_lat: row.get(2)?,
+                            provider_reported_lon: row.get(3)?,
                             encryption: row.get(4)?,
                             frequency: row.get(5)?,
                             city: row.get(6)?,
@@ -2909,8 +2934,8 @@ impl Database {
                         Ok(ApInfo {
                             bssid: row.get(0)?,
                             ssid: row.get(1)?,
-                            lat: row.get(2)?,
-                            lon: row.get(3)?,
+                            provider_reported_lat: row.get(2)?,
+                            provider_reported_lon: row.get(3)?,
                             encryption: row.get(4)?,
                             frequency: row.get(5)?,
                             city: row.get(6)?,
@@ -3816,8 +3841,8 @@ mod tests {
         ApInfo {
             bssid: format!("02:00:00:00:00:{index:02x}"),
             ssid: Some(format!("ap-{index}")),
-            lat: 55.67 + index as f64 / 10_000.0,
-            lon: 12.56,
+            provider_reported_lat: 55.67 + index as f64 / 10_000.0,
+            provider_reported_lon: 12.56,
             encryption: None,
             frequency: Some(2_412),
             city: None,
@@ -6285,8 +6310,8 @@ mod tests {
         let ap = ApInfo {
             bssid: "AA:BB:CC:DD:EE:FF".to_string(),
             ssid: Some("TestWiFi".to_string()),
-            lat: 55.6684,
-            lon: 12.5541,
+            provider_reported_lat: 55.6684,
+            provider_reported_lon: 12.5541,
             encryption: None,
             frequency: Some(2437),
             city: None,
@@ -6297,7 +6322,7 @@ mod tests {
         db.upsert_ap(&ap).unwrap();
         let got = db.get_ap("AA:BB:CC:DD:EE:FF").unwrap().unwrap();
         assert_eq!(got.ssid, Some("TestWiFi".to_string()));
-        assert!((got.lat - 55.6684).abs() < 1e-6);
+        assert!((got.provider_reported_lat - 55.6684).abs() < 1e-6);
         assert_eq!(got.source, Source::Wigle);
     }
 
@@ -6350,8 +6375,8 @@ mod tests {
         ApInfo {
             bssid: "AA:BB:CC:DD:EE:FF".to_string(),
             ssid: Some(format!("ssid-{}", source.as_str())),
-            lat,
-            lon: 12.5541,
+            provider_reported_lat: lat,
+            provider_reported_lon: 12.5541,
             encryption: None,
             frequency: Some(2437),
             city: None,
@@ -6376,13 +6401,16 @@ mod tests {
         db.upsert_ap(&ap_with(Source::Wigle, 1.0)).unwrap();
         let got = db.get_ap(bssid).unwrap().unwrap();
         assert_eq!(got.source, Source::Wigle);
-        assert!((got.lat - 1.0).abs() < 1e-9);
+        assert!((got.provider_reported_lat - 1.0).abs() < 1e-9);
 
         // 2. Lower-priority manual write must NOT overwrite.
         db.upsert_ap(&ap_with(Source::Manual, 2.0)).unwrap();
         let got = db.get_ap(bssid).unwrap().unwrap();
         assert_eq!(got.source, Source::Wigle, "manual must not overwrite wigle");
-        assert!((got.lat - 1.0).abs() < 1e-9, "lat must not change");
+        assert!(
+            (got.provider_reported_lat - 1.0).abs() < 1e-9,
+            "lat must not change"
+        );
 
         // 3. Lower-priority beacondb write must NOT overwrite wigle either.
         db.upsert_ap(&ap_with(Source::BeaconDb, 3.0)).unwrap();
@@ -6395,16 +6423,16 @@ mod tests {
         let got = db.get_ap(bssid).unwrap().unwrap();
         assert_eq!(got.source, Source::Wigle);
         assert!(
-            (got.lat - 4.0).abs() < 1e-9,
+            (got.provider_reported_lat - 4.0).abs() < 1e-9,
             "same-source rewrite should update lat, got {}",
-            got.lat
+            got.provider_reported_lat
         );
 
         // 5. Higher-priority apple write SHOULD overwrite.
         db.upsert_ap(&ap_with(Source::Apple, 5.0)).unwrap();
         let got = db.get_ap(bssid).unwrap().unwrap();
         assert_eq!(got.source, Source::Apple);
-        assert!((got.lat - 5.0).abs() < 1e-9);
+        assert!((got.provider_reported_lat - 5.0).abs() < 1e-9);
 
         // 6. Subsequent lower-priority writes (wigle, beacondb, manual,
         //    unknown) must NOT overwrite apple.
@@ -6422,7 +6450,7 @@ mod tests {
                 "{:?} must not overwrite apple",
                 src
             );
-            assert!((got.lat - 5.0).abs() < 1e-9);
+            assert!((got.provider_reported_lat - 5.0).abs() < 1e-9);
         }
     }
 
@@ -6439,7 +6467,10 @@ mod tests {
 
         let stored = db.get_ap(&apple.bssid).unwrap().unwrap();
         assert_eq!(stored.source, Source::Apple);
-        assert_eq!(stored.lat, 55.0, "lower-priority position must not win");
+        assert_eq!(
+            stored.provider_reported_lat, 55.0,
+            "lower-priority position must not win"
+        );
         assert_eq!(stored.ssid.as_deref(), Some("MOVIA_BUS_42"));
         assert!(stored.is_mobile);
     }

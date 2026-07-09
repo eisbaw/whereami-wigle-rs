@@ -338,8 +338,8 @@ mod tests {
             ProviderOutcome::Found(crate::db::ApInfo {
                 bssid: bssid.to_owned(),
                 ssid: Some("DSB_Wi-Fi".to_owned()),
-                lat: 55.0,
-                lon: 12.0,
+                provider_reported_lat: 55.0,
+                provider_reported_lon: 12.0,
                 encryption: None,
                 frequency: None,
                 city: None,

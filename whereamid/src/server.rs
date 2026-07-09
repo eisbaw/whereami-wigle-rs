@@ -1567,10 +1567,10 @@ fn solve_locate_from_cache(
         // `mag > 0` guards are false-on-NaN -> a "successful" (NaN, NaN) fix.
         // Skip such rows here and name the offending bssid so the poisoned
         // cache row is traceable.
-        if !ap.lat.is_finite() || !ap.lon.is_finite() {
+        if !ap.provider_reported_lat.is_finite() || !ap.provider_reported_lon.is_finite() {
             warn!(
                 "skipping AP {}: non-finite cached position ({}, {})",
-                ap.bssid, ap.lat, ap.lon
+                ap.bssid, ap.provider_reported_lat, ap.provider_reported_lon
             );
             continue;
         }
@@ -1613,7 +1613,7 @@ fn solve_locate_from_cache(
         // Consensus deliberately ignores stability, RSSI, top-N and eventual
         // outlier-filter survival. Every eligible unique BSSID in the latest
         // scanner snapshot contributes exactly one denominator entry.
-        visible_cached.push((ap.lat, ap.lon));
+        visible_cached.push((ap.provider_reported_lat, ap.provider_reported_lon));
         // Single lookup (task-0264): membership and the signal come from the
         // same `active` entry, so `signal_dbm: Some(candidate.signal_dbm)` states
         // the always-present invariant honestly. Edition 2021 has no let-chains,
@@ -1621,8 +1621,8 @@ fn solve_locate_from_cache(
         if let Some(candidate) = active.get(ap.bssid.as_str()) {
             if positioned_aps.len() < top_n {
                 positioned_aps.push(PositionedAp {
-                    lat: ap.lat,
-                    lon: ap.lon,
+                    lat: ap.provider_reported_lat,
+                    lon: ap.provider_reported_lon,
                     signal_dbm: Some(candidate.signal_dbm),
                     // Provenance threaded from the scanner (task-0126); the dBm
                     // value itself is unchanged.
@@ -2185,17 +2185,22 @@ async fn handle_resolve(
         .iter()
         .map(|bssid| {
             match result.positioned.iter().find(|a| &a.bssid == bssid) {
-                Some(ap) if ap.lat.is_finite() && ap.lon.is_finite() => ResolveResultEntry {
-                    bssid: bssid.clone(),
-                    lat: Some(ap.lat),
-                    lon: Some(ap.lon),
-                    ssid: ap.ssid.clone(),
-                    provenance: if result.fetched_bssids.contains(bssid) {
-                        Provenance::Api
-                    } else {
-                        Provenance::Cache
-                    },
-                },
+                Some(ap)
+                    if ap.provider_reported_lat.is_finite()
+                        && ap.provider_reported_lon.is_finite() =>
+                {
+                    ResolveResultEntry {
+                        bssid: bssid.clone(),
+                        lat: Some(ap.provider_reported_lat),
+                        lon: Some(ap.provider_reported_lon),
+                        ssid: ap.ssid.clone(),
+                        provenance: if result.fetched_bssids.contains(bssid) {
+                            Provenance::Api
+                        } else {
+                            Provenance::Cache
+                        },
+                    }
+                }
                 // task-0238: fail closed at the protocol boundary. A poisoned
                 // cache row is not authoritative absence, so classify it as
                 // unresolved (retryable), never not_found. This guard also
@@ -2204,7 +2209,7 @@ async fn handle_resolve(
                 Some(ap) => {
                     warn!(
                         "discarding resolve position for {}: non-finite coordinates ({}, {})",
-                        ap.bssid, ap.lat, ap.lon
+                        ap.bssid, ap.provider_reported_lat, ap.provider_reported_lon
                     );
                     ResolveResultEntry {
                         bssid: bssid.clone(),
@@ -3373,8 +3378,8 @@ mod dispatch_tests {
         let ap = crate::db::ApInfo {
             bssid: bssid.to_string(),
             ssid: Some("test-ap".to_string()),
-            lat,
-            lon,
+            provider_reported_lat: lat,
+            provider_reported_lon: lon,
             encryption: None,
             frequency: None,
             city: None,
@@ -3401,8 +3406,8 @@ mod dispatch_tests {
                 .upsert_ap(&crate::db::ApInfo {
                     bssid: bssid.clone(),
                     ssid: Some(format!("MOVIA_PERSISTED_{index}")),
-                    lat: 55.7390 + index as f64 / 100_000.0,
-                    lon: 12.5500,
+                    provider_reported_lat: 55.7390 + index as f64 / 100_000.0,
+                    provider_reported_lon: 12.5500,
                     encryption: None,
                     frequency: None,
                     city: None,
@@ -3430,8 +3435,8 @@ mod dispatch_tests {
                 .upsert_ap(&crate::db::ApInfo {
                     bssid: bssid.clone(),
                     ssid: Some(format!("poisoned-fixed-{index}")),
-                    lat: f64::INFINITY,
-                    lon: 12.56,
+                    provider_reported_lat: f64::INFINITY,
+                    provider_reported_lon: 12.56,
                     encryption: None,
                     frequency: None,
                     city: None,
@@ -3466,8 +3471,8 @@ mod dispatch_tests {
                 .upsert_ap(&crate::db::ApInfo {
                     bssid: bssid.clone(),
                     ssid: Some(ssid.clone()),
-                    lat,
-                    lon,
+                    provider_reported_lat: lat,
+                    provider_reported_lon: lon,
                     encryption: None,
                     frequency: None,
                     city: None,
@@ -4765,8 +4770,8 @@ mod dispatch_tests {
         crate::db::ApInfo {
             bssid: bssid.to_string(),
             ssid: Some("kernel-ap".to_string()),
-            lat,
-            lon,
+            provider_reported_lat: lat,
+            provider_reported_lon: lon,
             encryption: None,
             frequency: None,
             city: None,
@@ -5670,8 +5675,8 @@ mod dispatch_tests {
             db.upsert_ap(&crate::db::ApInfo {
                 bssid: "aa:bb:cc:dd:ee:ff".to_string(),
                 ssid: Some("private-ssid".to_string()),
-                lat: 55.0,
-                lon: 12.0,
+                provider_reported_lat: 55.0,
+                provider_reported_lon: 12.0,
                 encryption: None,
                 frequency: None,
                 city: None,
@@ -6279,8 +6284,8 @@ mod dispatch_tests {
                 .upsert_ap(&crate::db::ApInfo {
                     bssid: (*bssid).to_owned(),
                     ssid: Some((*ssid).to_owned()),
-                    lat: *lat,
-                    lon: *lon,
+                    provider_reported_lat: *lat,
+                    provider_reported_lon: *lon,
                     encryption: None,
                     frequency: None,
                     city: None,
@@ -6339,8 +6344,8 @@ mod dispatch_tests {
                 .upsert_ap(&crate::db::ApInfo {
                     bssid: bssid.clone(),
                     ssid: Some(ssid.clone()),
-                    lat: 55.7390 + index as f64 / 100_000.0,
-                    lon: 12.5500,
+                    provider_reported_lat: 55.7390 + index as f64 / 100_000.0,
+                    provider_reported_lon: 12.5500,
                     encryption: None,
                     frequency: None,
                     city: None,
@@ -6369,8 +6374,8 @@ mod dispatch_tests {
                 .upsert_ap(&crate::db::ApInfo {
                     bssid: bssid.clone(),
                     ssid: Some(ssid.clone()),
-                    lat,
-                    lon,
+                    provider_reported_lat: lat,
+                    provider_reported_lon: lon,
                     encryption: None,
                     frequency: None,
                     city: None,
@@ -6540,8 +6545,8 @@ mod dispatch_tests {
                 .upsert_ap(&crate::db::ApInfo {
                     bssid: bssid.clone(),
                     ssid: Some(ssid.clone()),
-                    lat: 55.7,
-                    lon: 12.5,
+                    provider_reported_lat: 55.7,
+                    provider_reported_lon: 12.5,
                     encryption: None,
                     frequency: None,
                     city: None,
@@ -7866,8 +7871,8 @@ mod transport_tests {
         let ap = crate::db::ApInfo {
             bssid: "aa:bb:cc:dd:ee:01".to_string(),
             ssid: Some("private".to_string()),
-            lat: 55.0,
-            lon: 12.0,
+            provider_reported_lat: 55.0,
+            provider_reported_lon: 12.0,
             encryption: None,
             frequency: None,
             city: None,
@@ -7909,8 +7914,8 @@ mod transport_tests {
         let ap = crate::db::ApInfo {
             bssid: "aa:bb:cc:dd:ee:02".to_string(),
             ssid: Some("private".to_string()),
-            lat: 55.0,
-            lon: 12.0,
+            provider_reported_lat: 55.0,
+            provider_reported_lon: 12.0,
             encryption: None,
             frequency: None,
             city: None,
@@ -7951,8 +7956,8 @@ mod transport_tests {
         let ap = crate::db::ApInfo {
             bssid: "aa:bb:cc:dd:ee:03".to_string(),
             ssid: Some("private".to_string()),
-            lat: 55.0,
-            lon: 12.0,
+            provider_reported_lat: 55.0,
+            provider_reported_lon: 12.0,
             encryption: None,
             frequency: None,
             city: None,

@@ -185,7 +185,7 @@ pub fn decode_response(data: &[u8], requested: &[String]) -> Result<Vec<ApInfo>>
                 } else {
                     debug!(
                         "Apple returned unrequested BSSID {} -> ({}, {}); dropping",
-                        ap.bssid, ap.lat, ap.lon
+                        ap.bssid, ap.provider_reported_lat, ap.provider_reported_lon
                     );
                 }
             }
@@ -263,8 +263,8 @@ pub fn parse_wifi_device(data: &[u8]) -> Result<Option<ApInfo>> {
             Ok(Some(ApInfo {
                 bssid: crate::scanner::normalize_bssid(&b),
                 ssid: None,
-                lat: lat_f,
-                lon: lon_f,
+                provider_reported_lat: lat_f,
+                provider_reported_lon: lon_f,
                 encryption: None,
                 frequency: None,
                 city: None,
@@ -620,8 +620,16 @@ mod tests {
         let ap = parse_wifi_device(&wd)
             .unwrap()
             .expect("valid coordinate must resolve to an ApInfo");
-        assert!((ap.lat - 55.68).abs() < 1e-6, "lat={}", ap.lat);
-        assert!((ap.lon - 12.57).abs() < 1e-6, "lon={}", ap.lon);
+        assert!(
+            (ap.provider_reported_lat - 55.68).abs() < 1e-6,
+            "lat={}",
+            ap.provider_reported_lat
+        );
+        assert!(
+            (ap.provider_reported_lon - 12.57).abs() < 1e-6,
+            "lon={}",
+            ap.provider_reported_lon
+        );
         assert!(matches!(ap.source, crate::db::Source::Apple));
     }
 
@@ -636,8 +644,16 @@ mod tests {
         let ap = parse_wifi_device(&wd)
             .unwrap()
             .expect("antimeridian AP must resolve, not be swallowed by the not-found gate");
-        assert!((ap.lat - (-16.8)).abs() < 1e-6, "lat={}", ap.lat);
-        assert!((ap.lon - (-179.9)).abs() < 1e-6, "lon={}", ap.lon);
+        assert!(
+            (ap.provider_reported_lat - (-16.8)).abs() < 1e-6,
+            "lat={}",
+            ap.provider_reported_lat
+        );
+        assert!(
+            (ap.provider_reported_lon - (-179.9)).abs() < 1e-6,
+            "lon={}",
+            ap.provider_reported_lon
+        );
     }
 
     /// The (-180, -180) sentinel remains not-found: regression guard that
@@ -763,8 +779,16 @@ mod tests {
         let ap = parse_wifi_device(&dev)
             .unwrap()
             .expect("device with unknown fields must still resolve to an ApInfo");
-        assert!((ap.lat - 55.68).abs() < 1e-6, "lat={}", ap.lat);
-        assert!((ap.lon - 12.57).abs() < 1e-6, "lon={}", ap.lon);
+        assert!(
+            (ap.provider_reported_lat - 55.68).abs() < 1e-6,
+            "lat={}",
+            ap.provider_reported_lat
+        );
+        assert!(
+            (ap.provider_reported_lon - 12.57).abs() < 1e-6,
+            "lon={}",
+            ap.provider_reported_lon
+        );
         assert_eq!(ap.bssid, "02:00:00:00:00:01");
         assert!(matches!(ap.source, crate::db::Source::Apple));
     }
@@ -819,13 +843,29 @@ mod tests {
         let find = |bssid: &str| aps.iter().find(|a| a.bssid == bssid);
 
         let ap1 = find("02:00:00:00:00:01").expect("requested BSSID #1 must be present");
-        assert!((ap1.lat - 55.6761).abs() < 1e-4, "lat={}", ap1.lat);
-        assert!((ap1.lon - 12.5683).abs() < 1e-4, "lon={}", ap1.lon);
+        assert!(
+            (ap1.provider_reported_lat - 55.6761).abs() < 1e-4,
+            "lat={}",
+            ap1.provider_reported_lat
+        );
+        assert!(
+            (ap1.provider_reported_lon - 12.5683).abs() < 1e-4,
+            "lon={}",
+            ap1.provider_reported_lon
+        );
         assert!(matches!(ap1.source, crate::db::Source::Apple));
 
         let ap2 = find("02:00:00:00:00:02").expect("requested BSSID #2 must be present");
-        assert!((ap2.lat - 37.3318).abs() < 1e-4, "lat={}", ap2.lat);
-        assert!((ap2.lon - (-122.0312)).abs() < 1e-4, "lon={}", ap2.lon);
+        assert!(
+            (ap2.provider_reported_lat - 37.3318).abs() < 1e-4,
+            "lat={}",
+            ap2.provider_reported_lat
+        );
+        assert!(
+            (ap2.provider_reported_lon - (-122.0312)).abs() < 1e-4,
+            "lon={}",
+            ap2.provider_reported_lon
+        );
 
         // The unrequested BSSID must have been dropped.
         assert!(
@@ -865,8 +905,16 @@ mod tests {
 
         assert_eq!(aps.len(), 1);
         assert_eq!(aps[0].bssid, "02:00:00:00:00:01");
-        assert!((aps[0].lat - lat).abs() < 1e-4, "lat={}", aps[0].lat);
-        assert!((aps[0].lon - lon).abs() < 1e-4, "lon={}", aps[0].lon);
+        assert!(
+            (aps[0].provider_reported_lat - lat).abs() < 1e-4,
+            "lat={}",
+            aps[0].provider_reported_lat
+        );
+        assert!(
+            (aps[0].provider_reported_lon - lon).abs() < 1e-4,
+            "lon={}",
+            aps[0].provider_reported_lon
+        );
     }
 }
 

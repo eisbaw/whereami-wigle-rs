@@ -407,8 +407,8 @@ async fn resolve_chain_inner(
                         "{} resolved {} -> ({}, {})",
                         provider.name(),
                         ap.bssid,
-                        ap.lat,
-                        ap.lon
+                        ap.provider_reported_lat,
+                        ap.provider_reported_lon
                     );
                     if policy.write_through {
                         if let Some(_privacy) = state.privacy.read(ticket).await {
@@ -676,8 +676,8 @@ mod tests {
         ApInfo {
             bssid: bssid.to_string(),
             ssid: None,
-            lat,
-            lon,
+            provider_reported_lat: lat,
+            provider_reported_lon: lon,
             encryption: None,
             frequency: None,
             city: None,
@@ -726,7 +726,7 @@ mod tests {
             0,
             "provider must not be called on cache hit"
         );
-        assert!((result.positioned[0].lat - 55.0).abs() < 1e-9);
+        assert!((result.positioned[0].provider_reported_lat - 55.0).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -1183,8 +1183,8 @@ mod tests {
         .await;
 
         assert_eq!(result.positioned.len(), 1, "cached BSSID must be returned");
-        assert!((result.positioned[0].lat - 55.5).abs() < 1e-9);
-        assert!((result.positioned[0].lon - 12.5).abs() < 1e-9);
+        assert!((result.positioned[0].provider_reported_lat - 55.5).abs() < 1e-9);
+        assert!((result.positioned[0].provider_reported_lon - 12.5).abs() < 1e-9);
         assert!(
             result.fetched_bssids.is_empty(),
             "a cache hit is not a fetch"
@@ -1193,7 +1193,10 @@ mod tests {
         let db = crate::server::lock_db(&state);
         // Position row still present and unchanged.
         let ap = db.get_ap(&target).unwrap().expect("aps row must survive");
-        assert!((ap.lat - 55.5).abs() < 1e-9 && (ap.lon - 12.5).abs() < 1e-9);
+        assert!(
+            (ap.provider_reported_lat - 55.5).abs() < 1e-9
+                && (ap.provider_reported_lon - 12.5).abs() < 1e-9
+        );
         // No not_found write, no pending enqueue.
         assert!(!db
             .is_not_found(&target, state.args.not_found_ttl_days)

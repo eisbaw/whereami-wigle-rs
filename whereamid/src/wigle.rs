@@ -233,8 +233,8 @@ fn interpret_response(body: WigleSearchResponse, bssid: &str) -> Result<ApInfo, 
     Ok(ApInfo {
         bssid: bssid.to_string(),
         ssid: r.ssid.clone(),
-        lat,
-        lon,
+        provider_reported_lat: lat,
+        provider_reported_lon: lon,
         encryption: r.encryption.clone(),
         frequency: r.frequency,
         city: r.city.clone(),
@@ -361,8 +361,8 @@ mod tests {
             r#"{"success":true,"totalResults":1,"results":[{"netid":"AA:BB:CC:DD:EE:FF","ssid":"net","trilat":12.34,"trilong":56.78}]}"#,
         );
         let ap = interpret_response(body, "aa:bb:cc:dd:ee:ff").expect("should resolve");
-        assert_eq!(ap.lat, 12.34);
-        assert_eq!(ap.lon, 56.78);
+        assert_eq!(ap.provider_reported_lat, 12.34);
+        assert_eq!(ap.provider_reported_lon, 56.78);
         assert!(matches!(ap.source, crate::db::Source::Wigle));
     }
 
@@ -417,8 +417,8 @@ mod tests {
 
         assert_eq!(ap.bssid, "aa:bb:cc:dd:ee:ff");
         assert_eq!(ap.ssid.as_deref(), Some("positioned"));
-        assert_eq!(ap.lat, 55.7);
-        assert_eq!(ap.lon, 12.5);
+        assert_eq!(ap.provider_reported_lat, 55.7);
+        assert_eq!(ap.provider_reported_lon, 12.5);
         assert_eq!(ap.encryption.as_deref(), Some("wpa2"));
         assert_eq!(ap.frequency, Some(5220));
         // The band-qualified channel is derived from the canonical frequency
@@ -448,7 +448,10 @@ mod tests {
         let ap = interpret_response(body, "aa:bb:cc:dd:ee:ff").expect("should resolve");
 
         assert_eq!(ap.ssid.as_deref(), Some("complete"));
-        assert_eq!((ap.lat, ap.lon), (55.7, 12.5));
+        assert_eq!(
+            (ap.provider_reported_lat, ap.provider_reported_lon),
+            (55.7, 12.5)
+        );
     }
 
     #[test]

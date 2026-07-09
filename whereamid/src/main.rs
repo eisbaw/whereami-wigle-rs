@@ -1105,8 +1105,8 @@ mod autolocate_loop_tests {
                 .upsert_ap(&crate::db::ApInfo {
                     bssid: bssid.clone(),
                     ssid: Some("loop-fixed-ap".to_string()),
-                    lat: 55.6761,
-                    lon: 12.5683,
+                    provider_reported_lat: 55.6761,
+                    provider_reported_lon: 12.5683,
                     encryption: None,
                     frequency: None,
                     city: None,
@@ -1448,8 +1448,8 @@ mod retention_tests {
         let ap = ApInfo {
             bssid: format!("expired-{suffix}"),
             ssid: Some("private-ssid".to_string()),
-            lat: 55.0,
-            lon: 12.0,
+            provider_reported_lat: 55.0,
+            provider_reported_lon: 12.0,
             encryption: None,
             frequency: None,
             city: None,
