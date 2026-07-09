@@ -7,6 +7,7 @@
 //! is mapped to a unit 3-vector, vectors are weighted-summed and normalized,
 //! then mapped back to (lat, lon) via atan2/asin.
 
+use crate::rssi::{Rssi, RssiSource};
 use anyhow::{bail, Result};
 use std::fmt;
 
@@ -83,17 +84,27 @@ impl fmt::Display for GeoMedianResult {
 
 /// Input for trilateration: a positioned AP with optional signal.
 ///
-/// `Copy` (task-0086): every field is itself `Copy` (f64, f64, Option<i32>, bool),
-/// so cloning is already a bitwise memcpy. Deriving `Copy` removes the
-/// ergonomic noise of explicit `.clone()` calls. Caveat: this is a soft
-/// promise to consumers — if a future field is non-Copy (e.g. an owning
-/// SSID `String` or a `Source` enum), reverting forces every by-value call
-/// site to clone or take a reference.
+/// `Copy` (task-0086): every field is itself `Copy` (f64, f64, Option<i32>,
+/// bool, and the `Copy` `RssiSource` enum), so cloning is already a bitwise
+/// memcpy. Deriving `Copy` removes the ergonomic noise of explicit `.clone()`
+/// calls. Caveat: this is a soft promise to consumers — if a future field is
+/// non-Copy (e.g. an owning SSID `String`), reverting forces every by-value
+/// call site to clone or take a reference.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PositionedAp {
     pub lat: f64,
     pub lon: f64,
+    /// Raw signal strength in dBm (still an `i32` because the cache/debounce
+    /// path it arrives through is `i32`). Pair with `rssi_source` to know how
+    /// this value was obtained.
     pub signal_dbm: Option<i32>,
+    /// Provenance of `signal_dbm`: iw authoritative raw dBm vs nmcli's biased
+    /// percentage-linearization (see [`crate::rssi`]). Threaded from the
+    /// scanner so trilateration knows the measurement source. The current
+    /// vote-weight math ignores it (weights are source-agnostic); it exists so
+    /// a future task MAY down-weight or refuse to mix sources — task-0126 does
+    /// NOT change any weighting behavior.
+    pub rssi_source: crate::rssi::RssiSource,
     /// Persisted scanner-SSID mobility classification. Mobile APs are never
     /// allowed to participate in outlier clustering or centroid math.
     pub is_mobile: bool,
@@ -509,8 +520,16 @@ const NOMINAL_MISSING_DBM: f64 = -75.0;
 /// A missing signal uses `fallback_dbm` (see `missing_signal_dbm`) rather than
 /// a fixed constant, so a signal-less AP cannot dominate a set of weaker
 /// measured APs. task-0186.
-fn vote_weight(signal_dbm: Option<i32>, fallback_dbm: f64) -> f64 {
-    let dbm = signal_dbm.map(|d| d as f64).unwrap_or(fallback_dbm);
+///
+/// task-0126: the parameter is a typed [`Rssi`] rather than a bare `i32`, so
+/// the caller cannot accidentally pass some other integer. The math is
+/// UNCHANGED — `10^(clamp(dbm)/20)` on `rssi.dbm()` — and therefore returns
+/// bit-for-bit the same weight as before for any given input. The measurement
+/// source (iw vs nmcli) is deliberately NOT consulted here: vote weight stays
+/// source-agnostic; provenance is tracked on `PositionedAp.rssi_source` for a
+/// possible future down-weighting policy, not applied today.
+fn vote_weight(rssi: Option<Rssi>, fallback_dbm: f64) -> f64 {
+    let dbm = rssi.map(|r| r.dbm() as f64).unwrap_or(fallback_dbm);
     10f64.powf(dbm.clamp(DBM_MIN, DBM_MAX) / 20.0)
 }
 
@@ -609,6 +628,25 @@ pub fn trilaterate(aps: &[PositionedAp]) -> Result<Position> {
         });
     }
 
+    // Observability only (task-0126): surface how many contributing APs carry
+    // authoritative iw dBm vs nmcli's biased linearization. A fix dominated by
+    // nmcli-sourced APs has systematically skewed weights; logging the mix lets
+    // an operator see that WITHOUT changing any weight — the vote-weight math
+    // remains source-agnostic. This also anchors `rssi_source` as genuinely
+    // read, not a dead field.
+    let nmcli_sourced = aps
+        .iter()
+        .filter(|ap| ap.rssi_source == RssiSource::NmcliPercentLinearized)
+        .count();
+    if nmcli_sourced > 0 {
+        tracing::debug!(
+            target: "whereamid::trilaterate",
+            n = aps.len(),
+            nmcli_linearized = nmcli_sourced,
+            "trilaterating with nmcli-linearized (biased) signal sources present; weights are not source-adjusted"
+        );
+    }
+
     // Weighted spherical mean: sum(w_i * v_i) on the unit sphere, then normalize.
     let mut sx = 0.0;
     let mut sy = 0.0;
@@ -617,7 +655,10 @@ pub fn trilaterate(aps: &[PositionedAp]) -> Result<Position> {
 
     let fallback_dbm = missing_signal_dbm(aps);
     for ap in aps {
-        let weight = vote_weight(ap.signal_dbm, fallback_dbm);
+        // `from_iw_dbm` is the identity re-wrap of the already-resolved dBm;
+        // vote weight is source-agnostic so this changes no numeric result
+        // (task-0126). True provenance lives on `ap.rssi_source`.
+        let weight = vote_weight(ap.signal_dbm.map(Rssi::from_iw_dbm), fallback_dbm);
         let (x, y, z) = to_unit_vec(ap.lat, ap.lon);
         sx += weight * x;
         sy += weight * y;
@@ -673,7 +714,7 @@ fn estimate_accuracy(aps: &[PositionedAp], center_lat: f64, center_lon: f64) -> 
 
     let fallback_dbm = missing_signal_dbm(aps);
     for ap in aps {
-        let weight = vote_weight(ap.signal_dbm, fallback_dbm);
+        let weight = vote_weight(ap.signal_dbm.map(Rssi::from_iw_dbm), fallback_dbm);
         let dist = haversine_m(center_lat, center_lon, ap.lat, ap.lon);
         sum_dist += weight * dist;
         sum_weight += weight;
@@ -732,6 +773,7 @@ mod tests {
             lat: 55.6684,
             lon: 12.5541,
             signal_dbm: Some(-65),
+            rssi_source: crate::rssi::RssiSource::IwDbm,
             is_mobile: false,
         }];
         let pos = trilaterate(&aps).unwrap();
@@ -748,12 +790,14 @@ mod tests {
                 lat: 48.8570,
                 lon: 2.3510,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 48.8580,
                 lon: 2.3520,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];
@@ -772,12 +816,14 @@ mod tests {
                 lat: 55.0,
                 lon: 12.0,
                 signal_dbm: Some(-40), // very strong
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 56.0,
                 lon: 13.0,
                 signal_dbm: Some(-80), // weak
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];
@@ -792,6 +838,21 @@ mod tests {
         assert!(trilaterate(&[]).is_err());
     }
 
+    /// task-0126 AC#5: a stronger (closer-to-0) dBm yields a larger vote
+    /// weight. Uses the typed `Rssi` constructor; the fallback is irrelevant
+    /// because both inputs are `Some`. Guards the `10^(dbm/20)` monotonicity
+    /// through the newtype refactor.
+    #[test]
+    fn stronger_rssi_has_greater_vote_weight() {
+        let fb = -75.0;
+        let strong = vote_weight(Some(Rssi::from_iw_dbm(-60)), fb);
+        let weak = vote_weight(Some(Rssi::from_iw_dbm(-80)), fb);
+        assert!(
+            strong > weak,
+            "stronger -60 dBm weight {strong} must exceed weaker -80 dBm weight {weak}"
+        );
+    }
+
     #[test]
     fn mobile_aps_are_removed_before_filtering_and_trilateration() {
         let aps = vec![
@@ -799,18 +860,21 @@ mod tests {
                 lat: 55.6760,
                 lon: 12.5680,
                 signal_dbm: Some(-60),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.6761,
                 lon: 12.5682,
                 signal_dbm: Some(-60),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.6759,
                 lon: 12.5681,
                 signal_dbm: Some(-60),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             // A coherent train cluster kilometers away. It must be removed
@@ -820,12 +884,14 @@ mod tests {
                 lat: 55.7390,
                 lon: 12.5500,
                 signal_dbm: Some(-30),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: true,
             },
             PositionedAp {
                 lat: 55.7391,
                 lon: 12.5501,
                 signal_dbm: Some(-30),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: true,
             },
         ];
@@ -847,6 +913,7 @@ mod tests {
             lat: 55.6761,
             lon: 12.5683,
             signal_dbm: Some(-80),
+            rssi_source: crate::rssi::RssiSource::IwDbm,
             is_mobile: false,
         };
         let aps = vec![
@@ -855,12 +922,14 @@ mod tests {
                 lat: 10.0,
                 lon: 20.0,
                 signal_dbm: Some(-20),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: true,
             },
             PositionedAp {
                 lat: 10.1,
                 lon: 20.1,
                 signal_dbm: Some(-20),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: true,
             },
         ];
@@ -878,12 +947,14 @@ mod tests {
                 lat: 55.0,
                 lon: 12.0,
                 signal_dbm: Some(-40),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: true,
             },
             PositionedAp {
                 lat: 55.1,
                 lon: 12.1,
                 signal_dbm: Some(-50),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: true,
             },
         ];
@@ -913,24 +984,27 @@ mod tests {
                 lat: 0.0,
                 lon: 0.0,
                 signal_dbm: Some(-80),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 0.0,
                 lon: 0.0,
                 signal_dbm: Some(-90),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 0.0,
                 lon: 0.0,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];
         let fb = missing_signal_dbm(&aps);
         let none_w = vote_weight(None, fb);
-        let strongest_w = vote_weight(Some(-80), fb); // strongest measured
+        let strongest_w = vote_weight(Some(Rssi::from_iw_dbm(-80)), fb); // strongest measured
         assert!(
             none_w <= strongest_w,
             "None weight {none_w} must be <= strongest measured weight {strongest_w}"
@@ -956,18 +1030,21 @@ mod tests {
                 lat: 55.700,
                 lon: 12.580,
                 signal_dbm: Some(i32::MAX),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.701,
                 lon: 12.581,
                 signal_dbm: Some(i32::MIN),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.700,
                 lon: 12.585,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];
@@ -992,6 +1069,7 @@ mod tests {
                 lat: bad,
                 lon: 12.5,
                 signal_dbm: Some(-60),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             }];
             assert!(
@@ -1002,6 +1080,7 @@ mod tests {
                 lat: 55.6,
                 lon: bad,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             }];
             assert!(
@@ -1025,18 +1104,21 @@ mod tests {
                     lat: bad,
                     lon: bad,
                     signal_dbm: Some(-30),
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     is_mobile: false,
                 },
                 PositionedAp {
                     lat: 55.700,
                     lon: 12.580,
                     signal_dbm: Some(-60),
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     is_mobile: false,
                 },
                 PositionedAp {
                     lat: 55.701,
                     lon: 12.581,
                     signal_dbm: Some(-65),
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     is_mobile: false,
                 },
             ];
@@ -1074,36 +1156,42 @@ mod tests {
                 lat: 48.857,
                 lon: 2.351,
                 signal_dbm: Some(-60),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 48.857,
                 lon: 2.352,
                 signal_dbm: Some(-65),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 48.858,
                 lon: 2.351,
                 signal_dbm: Some(-70),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 48.856,
                 lon: 2.352,
                 signal_dbm: Some(-75),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 48.857,
                 lon: 2.350,
                 signal_dbm: Some(-68),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: -12.894,
                 lon: -38.292,
                 signal_dbm: Some(-60),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             }, // distant outlier
         ];
@@ -1120,30 +1208,35 @@ mod tests {
                 lat: 48.857,
                 lon: 2.351,
                 signal_dbm: Some(-60),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 48.857,
                 lon: 2.352,
                 signal_dbm: Some(-65),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 48.858,
                 lon: 2.351,
                 signal_dbm: Some(-70),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 48.857,
                 lon: 2.350,
                 signal_dbm: Some(-68),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 48.875,
                 lon: 2.325,
                 signal_dbm: Some(-62),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             }, // ~2km away
         ];
@@ -1160,12 +1253,14 @@ mod tests {
                 lat: 0.0,
                 lon: 179.0,
                 signal_dbm: Some(-50),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 0.0,
                 lon: -179.0,
                 signal_dbm: Some(-50),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];
@@ -1186,18 +1281,21 @@ mod tests {
                 lat: 0.0,
                 lon: 179.99,
                 signal_dbm: Some(-60),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 0.0,
                 lon: -179.99,
                 signal_dbm: Some(-60),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 0.001,
                 lon: 180.0_f64.copysign(1.0),
                 signal_dbm: Some(-60),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];
@@ -1220,12 +1318,14 @@ mod tests {
                 lat: 89.0,
                 lon: 0.0,
                 signal_dbm: Some(-50),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 89.0,
                 lon: 180.0,
                 signal_dbm: Some(-50),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];
@@ -1261,12 +1361,14 @@ mod tests {
                 lat: 0.0,
                 lon: 0.0,
                 signal_dbm: Some(-40),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 0.0,
                 lon: 180.0,
                 signal_dbm: Some(-80),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];
@@ -1301,12 +1403,14 @@ mod tests {
                 lat: 0.0,
                 lon: 0.0,
                 signal_dbm: Some(-50),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 0.0,
                 lon: 180.0,
                 signal_dbm: Some(-50),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];
@@ -1339,18 +1443,21 @@ mod tests {
                 lat: 55.707,
                 lon: 12.585,
                 signal_dbm: Some(-70),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.708,
                 lon: 12.585,
                 signal_dbm: Some(-72),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.706,
                 lon: 12.586,
                 signal_dbm: Some(-74),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             // Brazil — no neighbor within NEIGHBOR_RADIUS_M.
@@ -1358,6 +1465,7 @@ mod tests {
                 lat: -12.894,
                 lon: -38.292,
                 signal_dbm: Some(-49),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];
@@ -1398,18 +1506,21 @@ mod tests {
                 lat: 55.0,
                 lon: 12.0,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.5,
                 lon: 12.5,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 56.0,
                 lon: 13.0,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];
@@ -1433,30 +1544,35 @@ mod tests {
                 lat: 55.700,
                 lon: 12.580,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.701,
                 lon: 12.581,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.699,
                 lon: 12.579,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.700,
                 lon: 12.582,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.702,
                 lon: 12.580,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             // 4 outliers on 4 different continents
@@ -1464,24 +1580,28 @@ mod tests {
                 lat: -33.87,
                 lon: 151.21,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             }, // Sydney
             PositionedAp {
                 lat: 35.68,
                 lon: 139.69,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             }, // Tokyo
             PositionedAp {
                 lat: -12.89,
                 lon: -38.29,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             }, // Salvador
             PositionedAp {
                 lat: 40.71,
                 lon: -74.00,
                 signal_dbm: None,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             }, // NYC
         ];
@@ -1632,18 +1752,21 @@ mod tests {
                     lat: 0.0,
                     lon: 0.0,
                     signal_dbm: Some(-60),
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     is_mobile: false,
                 },
                 PositionedAp {
                     lat: 0.0,
                     lon: 0.0001,
                     signal_dbm: Some(-60),
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     is_mobile: false,
                 },
                 PositionedAp {
                     lat: 0.0,
                     lon: 180.0,
                     signal_dbm: Some(-60),
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     is_mobile: false,
                 },
             ];
@@ -1666,24 +1789,28 @@ mod tests {
                     lat: 0.0,
                     lon: 0.0,
                     signal_dbm: Some(-60),
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     is_mobile: false,
                 },
                 PositionedAp {
                     lat: 0.0,
                     lon: 0.0,
                     signal_dbm: Some(-60),
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     is_mobile: false,
                 },
                 PositionedAp {
                     lat: 0.0,
                     lon: 180.0,
                     signal_dbm: Some(-60),
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     is_mobile: false,
                 },
                 PositionedAp {
                     lat: 0.0,
                     lon: 180.0,
                     signal_dbm: Some(-60),
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     is_mobile: false,
                 },
             ];
@@ -1739,36 +1866,42 @@ mod tests {
                 lat: 55.70696,
                 lon: 12.58566,
                 signal_dbm: Some(-76),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.70709,
                 lon: 12.58565,
                 signal_dbm: Some(-72),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.70735,
                 lon: 12.58569,
                 signal_dbm: Some(-73),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.70714,
                 lon: 12.58544,
                 signal_dbm: Some(-73),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.70713,
                 lon: 12.58544,
                 signal_dbm: Some(-73),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 55.70662,
                 lon: 12.58570,
                 signal_dbm: Some(-77),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             // 1 Brazilian outlier — STRONGEST signal, so without filtering
@@ -1777,6 +1910,7 @@ mod tests {
                 lat: -12.89422,
                 lon: -38.29226,
                 signal_dbm: Some(-49),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];
@@ -1821,18 +1955,21 @@ mod tests {
                 lat: 48.8570,
                 lon: 2.3510,
                 signal_dbm: Some(-60),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 48.8571,
                 lon: 2.3515,
                 signal_dbm: Some(-65),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
             PositionedAp {
                 lat: 48.8569,
                 lon: 2.3512,
                 signal_dbm: Some(-70),
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 is_mobile: false,
             },
         ];

@@ -5,6 +5,7 @@ use proptest::prelude::*;
 // Pull in the library code
 use whereamid::debounce::{Debouncer, ScanEntry, ScanSample};
 use whereamid::geo::haversine_m as haversine_m_test;
+use whereamid::rssi::RssiSource;
 use whereamid::scanner::{normalize_bssid, parse_iw_output, split_nmcli_fields};
 use whereamid::trilaterate::{filter_outliers, trilaterate, PositionedAp};
 // task-0081: haversine consolidated into whereamid::geo. We re-import as
@@ -20,7 +21,7 @@ proptest! {
     ) {
         let aps: Vec<PositionedAp> = coords
             .iter()
-            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60), is_mobile: false })
+            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60), rssi_source: RssiSource::IwDbm, is_mobile: false })
             .collect();
         let filtered = filter_outliers(&aps);
         prop_assert!(!filtered.is_empty(), "filter_outliers returned empty for {} APs", aps.len());
@@ -70,7 +71,7 @@ proptest! {
     ) {
         let aps: Vec<PositionedAp> = coords
             .iter()
-            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60), is_mobile: false })
+            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60), rssi_source: RssiSource::IwDbm, is_mobile: false })
             .collect();
 
         // Only test with APs that survive outlier filtering
@@ -113,7 +114,7 @@ proptest! {
     ) {
         let aps: Vec<PositionedAp> = coords
             .iter()
-            .map(|&(lat, lon, sig)| PositionedAp { lat, lon, signal_dbm: sig, is_mobile: false })
+            .map(|&(lat, lon, sig)| PositionedAp { lat, lon, signal_dbm: sig, rssi_source: RssiSource::IwDbm, is_mobile: false })
             .collect();
 
         let filtered = filter_outliers(&aps);
@@ -160,14 +161,14 @@ proptest! {
     ) {
         let mut aps: Vec<PositionedAp> = coords
             .iter()
-            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60), is_mobile: false })
+            .map(|&(lat, lon)| PositionedAp { lat, lon, signal_dbm: Some(-60), rssi_source: RssiSource::IwDbm, is_mobile: false })
             .collect();
         // One poisoned AP with a strong signal (-30 dBm) that WOULD dominate
         // the weighted centroid if it reached the math.
         let poisoned = if bad_in_lat {
-            PositionedAp { lat: bad, lon: 12.0, signal_dbm: Some(-30), is_mobile: false }
+            PositionedAp { lat: bad, lon: 12.0, signal_dbm: Some(-30), rssi_source: RssiSource::IwDbm, is_mobile: false }
         } else {
-            PositionedAp { lat: 55.0, lon: bad, signal_dbm: Some(-30), is_mobile: false }
+            PositionedAp { lat: 55.0, lon: bad, signal_dbm: Some(-30), rssi_source: RssiSource::IwDbm, is_mobile: false }
         };
         aps.push(poisoned);
 
@@ -200,12 +201,14 @@ proptest! {
             lat: lat_a,
             lon: lon_a,
             signal_dbm: Some(strong),
+            rssi_source: RssiSource::IwDbm,
             is_mobile: false,
         };
         let weak_ap = PositionedAp {
             lat: lat_a + offset_lat,
             lon: lon_a + offset_lon,
             signal_dbm: Some(weak),
+            rssi_source: RssiSource::IwDbm,
             is_mobile: false,
         };
         let aps = vec![strong_ap, weak_ap];
@@ -322,7 +325,7 @@ proptest! {
         for _ in 0..(threshold - 1) {
             let mut sample: ScanSample = std::collections::HashMap::new();
             for i in 0..num_aps {
-                sample.insert(format!("AP-{i}"), ScanEntry { signal_dbm: -60, ssid: None, channel: None });
+                sample.insert(format!("AP-{i}"), ScanEntry { signal_dbm: -60, rssi_source: RssiSource::IwDbm, ssid: None, channel: None });
             }
             d.push_scan(sample);
         }
@@ -335,7 +338,7 @@ proptest! {
         // One more scan crosses the threshold — every AP must be stable now.
         let mut sample: ScanSample = std::collections::HashMap::new();
         for i in 0..num_aps {
-            sample.insert(format!("AP-{i}"), ScanEntry { signal_dbm: -60, ssid: None, channel: None });
+            sample.insert(format!("AP-{i}"), ScanEntry { signal_dbm: -60, rssi_source: RssiSource::IwDbm, ssid: None, channel: None });
         }
         d.push_scan(sample);
 
@@ -363,7 +366,7 @@ proptest! {
         // Fill with one AP
         for _ in 0..window {
             let mut sample: ScanSample = std::collections::HashMap::new();
-            sample.insert("AP-1".to_string(), ScanEntry { signal_dbm: -50, ssid: None, channel: None });
+            sample.insert("AP-1".to_string(), ScanEntry { signal_dbm: -50, rssi_source: RssiSource::IwDbm, ssid: None, channel: None });
             d.push_scan(sample);
         }
         prop_assert!(!d.stable_bssids().is_empty());

@@ -1082,6 +1082,10 @@ async fn dispatch_command_for_transport(
 struct Candidate {
     bssid: String,
     signal_dbm: i32,
+    /// Provenance of `signal_dbm`, carried from the debounce sample so it
+    /// reaches `PositionedAp`/trilateration (task-0126). `signal_dbm` is still
+    /// the value used on the wire and in DB.
+    rssi_source: crate::rssi::RssiSource,
     ssid: Option<String>,
 }
 
@@ -1620,6 +1624,9 @@ fn solve_locate_from_cache(
                     lat: ap.lat,
                     lon: ap.lon,
                     signal_dbm: Some(candidate.signal_dbm),
+                    // Provenance threaded from the scanner (task-0126); the dBm
+                    // value itself is unchanged.
+                    rssi_source: candidate.rssi_source,
                     is_mobile: ap.is_mobile,
                 });
             }
@@ -1728,6 +1735,7 @@ async fn compute_locate_with_clock(
                 .map(|(bssid, entry)| Candidate {
                     bssid: bssid.clone(),
                     signal_dbm: entry.signal_dbm,
+                    rssi_source: entry.rssi_source,
                     ssid: entry.ssid.clone(),
                 })
                 .collect()
@@ -2247,6 +2255,10 @@ async fn handle_scan(state: &Arc<DaemonState>) -> String {
         Some(sample) => {
             let mut nets: Vec<NetworkEntry> = sample
                 .iter()
+                // Wire boundary: only the raw i32 dBm crosses; `entry.rssi_source`
+                // provenance is deliberately dropped here (task-0126 kept the
+                // wire unchanged). Exposing it on the debug wire is follow-up
+                // task-0271.
                 .map(|(bssid, entry)| NetworkEntry {
                     bssid: bssid.clone(),
                     ssid: entry.ssid.clone(),
@@ -3127,6 +3139,7 @@ mod stats_tests {
             sample.insert(
                 "aa:bb:cc:dd:ee:01".to_string(),
                 crate::debounce::ScanEntry {
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     signal_dbm: -50,
                     ssid: None,
                     channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
@@ -3401,6 +3414,7 @@ mod dispatch_tests {
             sample.insert(
                 bssid,
                 crate::debounce::ScanEntry {
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     signal_dbm: -10 - index,
                     // Exercise both scanner-hidden and currently nonmatching
                     // observations. Neither can reclassify the persisted row.
@@ -3429,6 +3443,7 @@ mod dispatch_tests {
             sample.insert(
                 bssid,
                 crate::debounce::ScanEntry {
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     signal_dbm: -30 - index,
                     ssid: Some(format!("poisoned-fixed-{index}")),
                     channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
@@ -3464,6 +3479,7 @@ mod dispatch_tests {
             sample.insert(
                 bssid,
                 crate::debounce::ScanEntry {
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     signal_dbm: -80 - index as i32,
                     ssid: Some(ssid),
                     channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
@@ -3527,6 +3543,7 @@ mod dispatch_tests {
         sample.insert(
             bssid.to_string(),
             crate::debounce::ScanEntry {
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 signal_dbm,
                 ssid: ssid.map(str::to_owned),
                 channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
@@ -4045,6 +4062,7 @@ mod dispatch_tests {
         sample.insert(
             bssid.to_string(),
             crate::debounce::ScanEntry {
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 signal_dbm: -45,
                 ssid: Some("uncached-fixed".to_string()),
                 channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
@@ -4764,6 +4782,7 @@ mod dispatch_tests {
             .map(|(bssid, signal_dbm)| Candidate {
                 bssid: (*bssid).to_string(),
                 signal_dbm: *signal_dbm,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 ssid: Some("kernel-ap".to_string()),
             })
             .collect()
@@ -5453,11 +5472,13 @@ mod dispatch_tests {
             .map(|bssid| Candidate {
                 bssid,
                 signal_dbm: -10,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 ssid: None,
             })
             .chain((0..12).map(|index| Candidate {
                 bssid: format!("unknown-fixed-{index}"),
                 signal_dbm: -40 - index,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 ssid: Some(format!("fixed-{index}")),
             }))
             .collect();
@@ -5502,6 +5523,7 @@ mod dispatch_tests {
         sample.insert(
             "aa:bb:cc:dd:ee:01".to_string(),
             crate::debounce::ScanEntry {
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 signal_dbm: -40,
                 ssid: Some("private-ssid".to_string()),
                 channel: Some(whereami_protocol::Channel::TwoFourGhz(6)),
@@ -6189,6 +6211,7 @@ mod dispatch_tests {
                 (
                     bssid.clone(),
                     crate::debounce::ScanEntry {
+                        rssi_source: crate::rssi::RssiSource::IwDbm,
                         signal_dbm: -30 - index as i32,
                         ssid: None,
                         channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
@@ -6269,6 +6292,7 @@ mod dispatch_tests {
             sample.insert(
                 (*bssid).to_owned(),
                 crate::debounce::ScanEntry {
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     signal_dbm: -50 - index as i32,
                     ssid: Some((*ssid).to_owned()),
                     channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
@@ -6328,6 +6352,7 @@ mod dispatch_tests {
             sample.insert(
                 bssid,
                 crate::debounce::ScanEntry {
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     signal_dbm: -20 - index,
                     ssid: Some(ssid),
                     channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
@@ -6357,6 +6382,7 @@ mod dispatch_tests {
             sample.insert(
                 bssid,
                 crate::debounce::ScanEntry {
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     signal_dbm: -80 - index as i32,
                     ssid: Some(ssid),
                     channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
@@ -6418,6 +6444,7 @@ mod dispatch_tests {
         sample.insert(
             POISONED_BSSID.to_owned(),
             crate::debounce::ScanEntry {
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 signal_dbm: -20,
                 ssid: Some("poisoned-fixed".to_owned()),
                 channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
@@ -6432,6 +6459,7 @@ mod dispatch_tests {
             sample.insert(
                 bssid,
                 crate::debounce::ScanEntry {
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     signal_dbm: -60 - index as i32,
                     ssid: Some(format!("fixed-home-{index}")),
                     channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
@@ -6525,6 +6553,7 @@ mod dispatch_tests {
             sample.insert(
                 bssid,
                 crate::debounce::ScanEntry {
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     signal_dbm: -20 - index,
                     ssid: Some(ssid),
                     channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),
@@ -6573,6 +6602,7 @@ mod dispatch_tests {
         sample.insert(
             bssid.to_string(),
             crate::debounce::ScanEntry {
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 signal_dbm: -52,
                 ssid: None,
                 channel: None,
@@ -6616,6 +6646,7 @@ mod dispatch_tests {
         sample.insert(
             bssid.to_string(),
             crate::debounce::ScanEntry {
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 signal_dbm: -48,
                 ssid: Some("debug-lock-scope".to_string()),
                 channel: Some(whereami_protocol::Channel::TwoFourGhz(11)),

@@ -14,6 +14,10 @@ use crate::boot_clock::BootTime;
 #[derive(Debug, Clone)]
 pub struct ScanEntry {
     pub signal_dbm: i32,
+    /// Provenance of `signal_dbm` (iw authoritative vs nmcli biased
+    /// linearization), carried from the scanner so it survives the debounce
+    /// ring to trilateration. `signal_dbm` stays `i32`. task-0126.
+    pub rssi_source: crate::rssi::RssiSource,
     pub ssid: Option<String>,
     pub channel: Option<Channel>,
 }
@@ -201,6 +205,7 @@ mod tests {
     fn entry(signal: i32) -> ScanEntry {
         ScanEntry {
             signal_dbm: signal,
+            rssi_source: crate::rssi::RssiSource::IwDbm,
             ssid: None,
             channel: None,
         }
@@ -346,6 +351,7 @@ mod tests {
             bssid.to_owned(),
             ScanEntry {
                 signal_dbm: -45,
+                rssi_source: crate::rssi::RssiSource::IwDbm,
                 ssid: Some("MOVIA_BUS_42".to_owned()),
                 channel: Some(Channel::TwoFourGhz(6)),
             },

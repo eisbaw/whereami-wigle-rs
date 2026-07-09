@@ -32,6 +32,9 @@ impl FuzzAp {
             lat,
             lon,
             signal_dbm: signal,
+            // Provenance does not affect the fuzzed vote-weight math (task-0126);
+            // any variant exercises the same numeric path.
+            rssi_source: whereamid::rssi::RssiSource::IwDbm,
             is_mobile: self.is_mobile,
         }
     }

@@ -21,6 +21,7 @@ mod privacy;
 mod provider;
 mod quality;
 mod resolver;
+mod rssi;
 mod scanner;
 mod server;
 mod trilaterate;
@@ -1117,6 +1118,7 @@ mod autolocate_loop_tests {
             sample.insert(
                 bssid,
                 crate::debounce::ScanEntry {
+                    rssi_source: crate::rssi::RssiSource::IwDbm,
                     signal_dbm: -40 - index,
                     ssid: Some("loop-fixed-ap".to_string()),
                     channel: Some(whereami_protocol::Channel::TwoFourGhz(1)),

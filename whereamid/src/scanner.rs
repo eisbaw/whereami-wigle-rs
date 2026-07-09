@@ -100,6 +100,11 @@ pub struct ScannedNetwork {
     pub bssid: String,
     pub ssid: Option<String>,
     pub signal_dbm: i32,
+    /// Which backend produced `signal_dbm`, and thus how trustworthy it is:
+    /// iw reports authoritative raw dBm; nmcli's dBm is a biased linearization
+    /// of its 0–100 percentage (see [`crate::rssi`]). `signal_dbm` stays `i32`
+    /// (wire/DB unchanged); the provenance rides alongside it. task-0126.
+    pub rssi_source: crate::rssi::RssiSource,
     pub channel: Option<Channel>,
     #[allow(dead_code)]
     pub frequency: Option<i32>,
@@ -731,16 +736,25 @@ pub fn parse_nmcli_output(output: &str) -> Vec<ScannedNetwork> {
         let freq = parse_nmcli_frequency(&fields[4]);
         let channel = resolve_channel(freq, explicit_channel);
 
-        // Convert signal percentage (0-100) to approximate dBm:
-        // 100 ≈ -30 dBm, 0 ≈ -90 dBm via the linear map below.
-        // NOTE: This is a coarse approximation. nmcli's percentage is itself
-        // derived from RSSI by a non-linear, driver-dependent formula in
-        // NetworkManager, so positions trilaterated purely from nmcli scans
-        // will have systematically biased weights. iw reports raw dBm and
-        // is the authoritative source when accuracy matters.
-        let signal_dbm = -90 + ((signal_pct as f64 * 60.0 / 100.0) as i32);
+        // Convert signal percentage (0-100) to approximate dBm. The biased
+        // linear map (100 ≈ -30 dBm, 0 ≈ -90 dBm) and its rationale now live in
+        // one place, `Rssi::from_nmcli_percent` (task-0126); the recovered dBm
+        // is systematically biased because nmcli's percentage is itself a
+        // non-linear, driver-dependent transform of RSSI. `signal_dbm` stays an
+        // `i32` on the wire/DB; the provenance is stamped as
+        // `RssiSource::NmcliPercentLinearized` so trilateration can tell it
+        // apart from authoritative iw dBm.
+        let signal_dbm = crate::rssi::Rssi::from_nmcli_percent(signal_pct).dbm();
 
-        push_validated(&mut networks, &bssid, ssid, signal_dbm, channel, freq);
+        push_validated(
+            &mut networks,
+            &bssid,
+            ssid,
+            signal_dbm,
+            crate::rssi::RssiSource::NmcliPercentLinearized,
+            channel,
+            freq,
+        );
     }
     networks
 }
@@ -890,6 +904,8 @@ pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
                     &bssid,
                     current_ssid.take(),
                     signal,
+                    // iw reports authoritative raw dBm (task-0126).
+                    crate::rssi::RssiSource::IwDbm,
                     resolve_channel(freq, current_ds_channel.take()),
                     freq,
                 );
@@ -943,6 +959,8 @@ pub fn parse_iw_output(output: &str) -> Vec<ScannedNetwork> {
             &bssid,
             current_ssid,
             signal,
+            // iw reports authoritative raw dBm (task-0126).
+            crate::rssi::RssiSource::IwDbm,
             resolve_channel(current_freq, current_ds_channel),
             current_freq,
         );
@@ -970,6 +988,7 @@ fn push_validated(
     bssid: &str,
     ssid: Option<String>,
     signal_dbm: i32,
+    rssi_source: crate::rssi::RssiSource,
     channel: Option<Channel>,
     frequency: Option<i32>,
 ) {
@@ -979,6 +998,7 @@ fn push_validated(
             bssid: normalized,
             ssid,
             signal_dbm,
+            rssi_source,
             channel,
             frequency,
         }),
@@ -1014,6 +1034,7 @@ pub fn scan_to_sample(networks: &[ScannedNetwork]) -> crate::debounce::ScanSampl
                 n.bssid.clone(),
                 crate::debounce::ScanEntry {
                     signal_dbm: n.signal_dbm,
+                    rssi_source: n.rssi_source,
                     ssid: n.ssid.clone(),
                     channel: n.channel,
                 },
