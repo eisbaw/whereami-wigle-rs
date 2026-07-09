@@ -128,6 +128,27 @@ async fn drain_once(
         }
     }
 
+    // Optional hard row-count cap on the not_found negative cache. Opt-in via
+    // --not-found-max-rows: absent (None) means byte-identical behavior to the
+    // age-only prune above (no eviction). When set, evict the oldest rows (by
+    // checked_at) down to the cap for extremely busy locations where within-TTL
+    // churn alone could blow the size budget (task-0258).
+    if let Some(max_rows) = state.args.not_found_max_rows {
+        let Some(_privacy) = state.privacy.read(ticket).await else {
+            return;
+        };
+        match state.db.cap_not_found_rows(max_rows).await {
+            Ok(n) if n > 0 => {
+                info!("evicted {n} oldest not_found entries to cap at {max_rows} rows");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("failed to cap not_found rows: {e}");
+                state.record_db_failure();
+            }
+        }
+    }
+
     // Pick up to PENDING_DRAIN_BATCH pending MACs
     let pending = {
         let Some(_privacy) = state.privacy.read(ticket).await else {

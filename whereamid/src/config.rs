@@ -157,6 +157,15 @@ pub struct Args {
     #[arg(long, default_value_t = 30)]
     pub not_found_ttl_days: i64,
 
+    /// Optional hard cap on the number of rows in the not_found negative
+    /// cache. When set and exceeded, the oldest rows (by `checked_at`) are
+    /// evicted down to this count after each drain pass. This is a bounded
+    /// opt-in safeguard on top of the age-based 2×TTL prune, for extremely
+    /// busy locations where within-TTL churn alone could blow the size
+    /// budget. Absent by default: no row-count cap (task-0258).
+    #[arg(long)]
+    pub not_found_max_rows: Option<usize>,
+
     /// Include approximate street address in locate responses (via OSM Nominatim)
     #[arg(long)]
     pub address_approx: bool,

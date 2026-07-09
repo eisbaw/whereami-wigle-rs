@@ -948,6 +948,10 @@ impl DbHandle {
         self.write(move |db| db.prune_not_found(ttl_days)).await
     }
 
+    pub async fn cap_not_found_rows(&self, max_rows: usize) -> Result<usize> {
+        self.write(move |db| db.cap_not_found_rows(max_rows)).await
+    }
+
     pub async fn get_metadata(&self, key: impl Into<String>) -> Result<Option<String>> {
         let key = key.into();
         self.read(move |db| db.get_metadata(&key)).await
@@ -3281,6 +3285,35 @@ impl Database {
         let deleted = self.conn.execute(
             "DELETE FROM not_found WHERE checked_at < ?1",
             params![cutoff],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Optional hard row-count cap on the not_found negative cache. If the
+    /// table holds `max_rows` or fewer rows this is a no-op returning 0.
+    /// Otherwise the OLDEST `(count - max_rows)` rows by `checked_at` are
+    /// evicted, leaving exactly the newest `max_rows` rows. Returns the number
+    /// of rows deleted.
+    ///
+    /// Oldest-by-`checked_at` mirrors the age-based prune's semantics: the
+    /// least-recently-confirmed-absent row is the safest to drop (it is closest
+    /// to expiring and being revived to pending anyway). The `ORDER BY
+    /// checked_at ASC` uses `idx_not_found_checked_at` (task-0259). This is an
+    /// opt-in bounded safeguard layered on top of `prune_not_found`; with the
+    /// cap unset the caller never invokes it (task-0258).
+    pub fn cap_not_found_rows(&self, max_rows: usize) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM not_found", [], |row| row.get(0))?;
+        let excess = count.saturating_sub(max_rows as i64);
+        if excess <= 0 {
+            return Ok(0);
+        }
+        let deleted = self.conn.execute(
+            "DELETE FROM not_found WHERE rowid IN (
+                 SELECT rowid FROM not_found ORDER BY checked_at ASC LIMIT ?1
+             )",
+            params![excess],
         )?;
         Ok(deleted)
     }
@@ -7117,6 +7150,85 @@ mod tests {
         // eligible for revival, not deletion, until it crosses 2×ttl).
         assert!(db.is_not_found("11:22:33:44:55:66", ttl_days).unwrap());
         assert!(!db.is_not_found("99:99:99:99:99:99", ttl_days).unwrap());
+    }
+
+    /// `cap_not_found_rows(N)` must evict the OLDEST rows by `checked_at` down to
+    /// exactly N, leaving the NEWEST N. Seven rows with distinct, strictly
+    /// ascending `checked_at` timestamps are inserted (bssid index i => age
+    /// 60-i days, so i=0 is oldest). Capping to 3 must delete the 4 oldest
+    /// (i=0..3) and keep the 3 newest (i=4,5,6). Deterministic: fixed backdated
+    /// timestamps, no sleep. This pins oldest-first (not rowid/insertion order):
+    /// if eviction ignored checked_at the surviving set would differ (task-0258).
+    #[test]
+    fn cap_not_found_rows_evicts_oldest_by_checked_at_down_to_n() {
+        let db = Database::open_memory().unwrap();
+
+        // Insert 7 rows with distinct ascending checked_at. i=0 is the OLDEST
+        // (60 days), i=6 the NEWEST (54 days). Insertion order (ascending i)
+        // deliberately matches rowid order here so the test only passes if
+        // eviction keys on checked_at, not rowid — see the reversed sibling below.
+        for i in 0..7_i64 {
+            let bssid = format!("AA:BB:CC:DD:EE:{i:02X}");
+            let checked_at = (Utc::now() - chrono::TimeDelta::days(60 - i)).to_rfc3339();
+            db.execute_batch_for_test(&format!(
+                "INSERT INTO not_found (bssid, first_seen, last_seen, checked_at)
+                 VALUES ('{bssid}', '{checked_at}', '{checked_at}', '{checked_at}');"
+            ))
+            .unwrap();
+        }
+        assert_eq!(db.not_found_ap_count().unwrap(), 7);
+
+        // Cap to 3: the 4 oldest (i=0..3) go, the 3 newest (i=4,5,6) stay.
+        let evicted = db.cap_not_found_rows(3).unwrap();
+        assert_eq!(evicted, 4, "must evict the 4 oldest to reach the cap of 3");
+        assert_eq!(db.not_found_ap_count().unwrap(), 3);
+
+        // Prove WHICH rows survived: the newest 3 by checked_at, oldest 4 gone.
+        let surviving: Vec<String> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT bssid FROM not_found ORDER BY bssid ASC")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            surviving,
+            vec![
+                "AA:BB:CC:DD:EE:04".to_string(),
+                "AA:BB:CC:DD:EE:05".to_string(),
+                "AA:BB:CC:DD:EE:06".to_string(),
+            ],
+            "only the newest 3 rows (i=4,5,6) must survive; the oldest 4 evicted"
+        );
+    }
+
+    /// `cap_not_found_rows(N)` must be a no-op when the row count is <= N:
+    /// returns 0 and deletes nothing. Covers both count < N and count == N so a
+    /// buggy off-by-one that evicts at equality would fail here (task-0258).
+    #[test]
+    fn cap_not_found_rows_is_noop_when_count_at_or_below_cap() {
+        let db = Database::open_memory().unwrap();
+        for i in 0..3_i64 {
+            let bssid = format!("AA:BB:CC:DD:EE:{i:02X}");
+            let checked_at = (Utc::now() - chrono::TimeDelta::days(10 - i)).to_rfc3339();
+            db.execute_batch_for_test(&format!(
+                "INSERT INTO not_found (bssid, first_seen, last_seen, checked_at)
+                 VALUES ('{bssid}', '{checked_at}', '{checked_at}', '{checked_at}');"
+            ))
+            .unwrap();
+        }
+        assert_eq!(db.not_found_ap_count().unwrap(), 3);
+
+        // count (3) < cap (5): nothing evicted.
+        assert_eq!(db.cap_not_found_rows(5).unwrap(), 0);
+        assert_eq!(db.not_found_ap_count().unwrap(), 3);
+
+        // count (3) == cap (3): boundary is still a no-op.
+        assert_eq!(db.cap_not_found_rows(3).unwrap(), 0);
+        assert_eq!(db.not_found_ap_count().unwrap(), 3);
     }
 
     #[test]
