@@ -5,7 +5,7 @@ status: Done
 assignee:
   - task0093-implementer
 created_date: '2026-05-19 06:48'
-updated_date: '2026-07-05 12:37'
+updated_date: '2026-07-09 01:57'
 labels:
   - correctness
 dependencies: []
@@ -59,15 +59,7 @@ is_mobile is recomputed against the (current) denylist on every upsert_ap call, 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Selected next by the Phase 3 orchestrator on 2026-07-05: unblocked correctness task, ahead of remaining low-priority documentation/tooling work. Sole code writer is task0093-implementer; the orchestrator owns tracker transitions and the mandatory review/commit gate.
-
-Onboarding finding: scanner-observed SSID is currently lost at the resolver boundary. Apple is first in the background chain and returns ssid=None, so classifying provider ApInfo alone would make the feature ineffective. The implementation must snapshot scanner SSID before awaits/spawn, carry it through write-through resolution and pending retries, and persist that observed value. Position/source priority remains independently gated; ssid plus recomputed is_mobile update together on every upsert. v6 shape repair must also detect a missing aps.is_mobile column. All-mobile batches must fail rather than be resurrected by filter_outliers empty fallback.
-
-First frozen review gate (hash 41b1e927996f97aead58216e9f08e75f9ba03438e36673f8f384fbba2a6d8cf0): QA and architecture NO-GO. Blocker 1: stable/fallback candidates were truncated to top_n before mobile filtering, so stronger mobile rows could starve weaker fixed rows; QA reproduced 11 MOVIA + 3 fixed yielding no fix. Blocker 2: Nix emitted a shell-escaped separate value, so leading -- patterns were parsed as options and systemd $/% expansion remained unsafe. Fix pass requires scanner-known filtering before top_n, persisted defense in depth, >top_n/all-mobile regressions, and one canonical systemd-escaped --mobile-ssid-denylist=<value> argv with adversarial encoding tests. The first gate otherwise passed 550 tests, strict clippy, migration/pending/dataflow checks, and packaged flag parity.
-
-Second frozen re-review (hash df07937cdc6fc6621ead99358e1962e8fd88c5bcfc436db2c64275f01274f032): QA and architecture NO-GO on a persisted-classification sibling. Scanner-known mobiles were correctly filtered before top_n and the Nix/systemd repair was sound, but stronger rows with persisted is_mobile=1 and current hidden/nonmatching SSIDs could still occupy all pre-DB top_n slots, then be removed by defense in depth while weaker fixed rows were never queried. Root fix: apply top_n after scanner, persisted-mobile, and finite-position eligibility while keeping fallback provider work bounded; add stable and fallback mismatch regressions. Also correct the all-mobile visible-scan error from no APs detected yet to no eligible fixed APs detected. Re-review artifact checks hit ENOSPC; the orchestrator safely removed only this repository’s generated Cargo targets (8.6 GiB), restoring 15 GiB available.
-
-Final frozen gate (hash 2c0e6bdf3177feac7bd64a917f9c438922f4a1da77b2d88c32a71a79a91441cd): QA and architecture GO. The final selection order is scanner denylist, ordered cache lookup, persisted-mobile/finite eligibility, then top_n; stable and fallback regressions cover stronger stale-mobile and non-finite rows ahead of weaker fixed rows. Cold-start provider refill excludes cached rows before a hard top_n bound. NixOS/HM emit one systemd-escaped equals-form argument with adversarial encoding, CR/LF rejection, and Rust/Nix default parity. Final reviewer evidence: 23 focused QA tests, 557-test e2e plus strict clippy, packaged flag-parity/option-bounds, formatting, diff hygiene, and frozen hash all passed. The exact docs/protocol.md source-filter addition is an integration prerequisite for the packaged contract test and is narrowly scoped.
+Closed as SUBSUMED by task-0122 (BSSID U/L-bit newtype + locally-administered exclusion from trilateration), landed 2026-07-09 (commit 330ff8e). The randomized-MAC exclusion is the principled superset of an SSID denylist: a randomized MAC seen in different cities is different devices wearing the same address, and is now excluded at the trilateration boundary by Bssid::is_locally_administered(), regardless of SSID. No separate SSID denylist is needed.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
