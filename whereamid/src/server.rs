@@ -5046,6 +5046,31 @@ mod dispatch_tests {
         );
     }
 
+    /// task-0162: `handle_resolve` caps a request at `MAX_RESOLVE_BSSIDS`
+    /// (256). Firing 257 well-formed BSSIDs must be rejected with the
+    /// "accepts at most" error BEFORE any provider/network call — the length
+    /// guard precedes both `validate_resolve_bssids` and `resolve_readonly`, so
+    /// this runs fully offline (empty WiGLE creds, no quota touched). Guards the
+    /// unauthenticated-request-size ceiling the wire protocol advertises.
+    #[tokio::test]
+    async fn handle_resolve_rejects_more_than_max_bssids() {
+        let state = test_state();
+        // 257 distinct, well-formed 6-octet MACs (index encoded in last 2 octets).
+        let bssids: Vec<String> = (0..=MAX_RESOLVE_BSSIDS)
+            .map(|i| format!("b8:00:00:00:{:02x}:{:02x}", (i >> 8) & 0xff, i & 0xff))
+            .collect();
+        assert_eq!(bssids.len(), MAX_RESOLVE_BSSIDS + 1);
+
+        let response = handle_resolve(&bssids, &state, state.privacy.ticket()).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], false, "over-cap resolve must fail: {response}");
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("at most") && error.contains(&MAX_RESOLVE_BSSIDS.to_string()),
+            "error must name the {MAX_RESOLVE_BSSIDS} cap, got: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn locate_cold_boot_reports_consensus_without_speed_fields() {
         let state = test_state();
@@ -5082,6 +5107,67 @@ mod dispatch_tests {
         assert!(
             json.get("fallback").is_none(),
             "normal locate must omit fallback: {response}"
+        );
+    }
+
+    /// task-0162 (relates task-0046): an interactive `locate` that produces a
+    /// fix must WRITE THROUGH to BOTH the authoritative `last_fix` row AND the
+    /// `fixes` history timeseries. This is the cold-boot / first-fix path (no
+    /// previous row, high-confidence CurrentTrilat winner) that the existing
+    /// `suspect_current_winner_preserves_address_last_fix_and_history_semantics`
+    /// only exercises for the current-over-previous branch. A regression where
+    /// `handle_locate` stopped persisting on the first fix (the task-0046 write
+    /// hazard) would leave both tables empty here while the JSON still says ok.
+    /// Uses cached APs only — no provider/network call, no live daemon.
+    #[tokio::test]
+    async fn locate_cold_boot_writes_through_to_last_fix_and_history() {
+        let state = test_state();
+        // No previous last_fix seeded: this is the cold-boot write-through.
+        assert!(
+            state.db.get_last_fix().await.unwrap().is_none(),
+            "precondition: cold boot has no persisted last_fix"
+        );
+        assert!(
+            history_rows(&state).await.is_empty(),
+            "precondition: cold boot has empty history"
+        );
+
+        let mut sample = crate::debounce::ScanSample::new();
+        for (index, (lat, lon)) in [(55.6760, 12.5680), (55.6761, 12.5682), (55.6759, 12.5681)]
+            .into_iter()
+            .enumerate()
+        {
+            add_cached_scan_ap(
+                &state,
+                &mut sample,
+                &format!("b8:00:00:00:62:{index:02x}"),
+                lat,
+                lon,
+                -50 - index as i32,
+                Some("fixed-home"),
+            );
+        }
+        push_stable_scan(&state, sample).await;
+
+        let response = dispatch_command(&Request::Locate, &state).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["ok"], true, "{response}");
+
+        // Write-through assertion: BOTH rows must exist after the locate.
+        let stored = state
+            .db
+            .get_last_fix()
+            .await
+            .unwrap()
+            .expect("locate must persist a last_fix row");
+        assert!((stored.lat - json["lat"].as_f64().unwrap()).abs() < 1e-9);
+        assert!((stored.lon - json["lon"].as_f64().unwrap()).abs() < 1e-9);
+
+        let rows = history_rows(&state).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "locate must append exactly one fixes history row"
         );
     }
 

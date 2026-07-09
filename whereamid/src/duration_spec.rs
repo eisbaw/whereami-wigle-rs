@@ -84,6 +84,22 @@ mod tests {
         assert!(parse_range("-3d").is_err());
     }
 
+    /// task-0162: internal whitespace is NOT tolerated. `parse_range` splits
+    /// off only the LAST char as the unit, so "7 d" yields num_str="7 "
+    /// (trailing space) which `i64::parse` rejects. Pin that the current
+    /// behavior is a clean Err naming the offending spec — a future parser
+    /// that "helpfully" trimmed interior whitespace would silently change this.
+    #[test]
+    fn parse_range_rejects_internal_whitespace() {
+        let err = parse_range("7 d").unwrap_err().to_string();
+        assert!(
+            err.contains("invalid range '7 d'"),
+            "internal-whitespace spec must Err naming '7 d', got: {err}"
+        );
+        // A leading interior space before the digits is equally rejected.
+        assert!(parse_range("1 2d").is_err());
+    }
+
     /// task-0048: parse_range used split_at(byte_len - 1) which panics on
     /// non-char-boundary inputs. Now uses last char's len_utf8.
     #[test]

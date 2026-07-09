@@ -238,6 +238,29 @@ mod tests {
         );
     }
 
+    /// task-0162: the TTL comparison is `age_days >= ttl_days`, so an entry
+    /// aged EXACTLY `ttl_days` is already expired (reads back None) — not one
+    /// tick later. Setting `inserted_at = now - ttl_days` makes the read-side
+    /// `now2 - inserted_at` equal ttl_days plus a sub-day epsilon, which
+    /// `num_days()` truncates back to exactly ttl_days. This pins the `>=`
+    /// boundary: a regression to `>` would return Some here. Deterministic
+    /// (no sleep) via the `inserted_at` seam the sibling TTL tests use.
+    #[test]
+    fn address_cache_expires_exactly_at_ttl_boundary() {
+        const TTL: i64 = 7;
+        let mut cache = AddressCache::with_ttl_days(TTL);
+        cache.insert(55.6684, 12.5541, "Copenhagen".to_string());
+
+        let key = address_cache_key(55.6684, 12.5541).unwrap();
+        cache.map.get_mut(&key).unwrap().inserted_at =
+            chrono::Utc::now() - chrono::TimeDelta::days(TTL);
+
+        assert!(
+            cache.get(55.6684, 12.5541).is_none(),
+            "entry aged exactly ttl_days must be expired (>= boundary)"
+        );
+    }
+
     /// TTL of 0 means every read is a miss (useful for disabling).
     #[test]
     fn address_cache_zero_ttl_always_misses() {
