@@ -7163,13 +7163,20 @@ mod tests {
     fn cap_not_found_rows_evicts_oldest_by_checked_at_down_to_n() {
         let db = Database::open_memory().unwrap();
 
-        // Insert 7 rows with distinct ascending checked_at. i=0 is the OLDEST
-        // (60 days), i=6 the NEWEST (54 days). Insertion order (ascending i)
-        // deliberately matches rowid order here so the test only passes if
-        // eviction keys on checked_at, not rowid — see the reversed sibling below.
-        for i in 0..7_i64 {
-            let bssid = format!("AA:BB:CC:DD:EE:{i:02X}");
-            let checked_at = (Utc::now() - chrono::TimeDelta::days(60 - i)).to_rfc3339();
+        // Insert 7 rows so INSERTION/ROWID order is the REVERSE of checked_at
+        // order — this decoupling is what makes the test BITE the `checked_at`
+        // ordering rather than a coincidental rowid/insertion order. The bssid
+        // suffix `EE:{rank}` tracks the checked_at RANK (EE:00 = oldest .. EE:06
+        // = newest), independent of rowid: rank 6 (newest) is inserted FIRST
+        // (rowid 1) and rank 0 (oldest) is inserted LAST (rowid 7). An eviction
+        // that (wrongly) ordered by rowid/insertion would drop the NEWEST rows
+        // (rowid 1..4 = EE:06..EE:03) and the surviving-set assertion below would
+        // fail; only ordering by checked_at ASC evicts the oldest and leaves
+        // EE:04/05/06 (task-0258).
+        for insertion in 0..7_i64 {
+            let rank = 6 - insertion; // newest (rank 6) inserted first (rowid 1)
+            let bssid = format!("AA:BB:CC:DD:EE:{rank:02X}");
+            let checked_at = (Utc::now() - chrono::TimeDelta::days(60 - rank)).to_rfc3339();
             db.execute_batch_for_test(&format!(
                 "INSERT INTO not_found (bssid, first_seen, last_seen, checked_at)
                  VALUES ('{bssid}', '{checked_at}', '{checked_at}', '{checked_at}');"
