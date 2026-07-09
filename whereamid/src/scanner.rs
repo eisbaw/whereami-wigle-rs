@@ -701,19 +701,46 @@ fn nmcli_batch(stdout: &str, confirmed_refresh_started_at: Option<BootTime>) -> 
 /// (`"iw:<bssid>"` / `"nmcli:<bssid>"`) so the two parsers do not suppress each
 /// other and so distinct broken APs each get one WARN (task-0256).
 ///
-/// The state is process-global and never cleared (a bounded set: at most one
-/// entry per malformed BSSID ever seen). Tests must key on BSSIDs unique to the
-/// test to avoid cross-test contamination of this global set.
+/// The state is process-global and never cleared, but it is CAPPED at
+/// [`MAX_WARNED_KEYS`] (task-0274): once that many distinct keys have each been
+/// warned once, a further NEW key is demoted straight to DEBUG and the set stops
+/// growing — so a pathological RF environment cycling many distinct malformed
+/// BSSIDs over a very long daemon lifetime cannot grow it without bound. In
+/// practice the set of nearby broken APs is tiny, well under the cap. Tests must
+/// key on BSSIDs unique to the test to avoid cross-test contamination of this
+/// global set.
 fn malformed_signal_warn_is_first(key: &str) -> bool {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    // `HashSet::insert` returns true iff the key was newly inserted, i.e. the
-    // first time this process has seen it.
-    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .expect("scanner malformed-warn set mutex poisoned")
-        .insert(key.to_owned())
+        .expect("scanner malformed-warn set mutex poisoned");
+    warn_is_first_in(&mut seen, key, MAX_WARNED_KEYS)
+}
+
+/// Upper bound on the number of distinct malformed-signal keys that are ever
+/// WARN-ed (one each). Beyond this the set stops growing and further new keys
+/// are logged at DEBUG. Sized generously — real environments have a handful of
+/// broken APs, not thousands (task-0274).
+const MAX_WARNED_KEYS: usize = 1024;
+
+/// Pure, testable core of [`malformed_signal_warn_is_first`]: returns `true`
+/// exactly once per key (first occurrence, while under `max`), `false`
+/// thereafter — and `false` (without inserting) once `seen` has reached `max`,
+/// which is what bounds the set (task-0274). Separated from the process-global
+/// `OnceLock` so the cap can be tested deterministically with a small `max` and
+/// a fresh set, no global contamination.
+fn warn_is_first_in(seen: &mut std::collections::HashSet<String>, key: &str, max: usize) -> bool {
+    if seen.contains(key) {
+        return false; // already warned this key
+    }
+    if seen.len() >= max {
+        return false; // cap reached: demote new keys to DEBUG, do not grow
+    }
+    seen.insert(key.to_owned());
+    true // first occurrence, under the cap
 }
 
 /// Parse nmcli terse output. In -t mode, nmcli escapes ':' in field values as '\:'.
@@ -2676,6 +2703,37 @@ BSS b8:50:01:aa:bb:cc(on wlan0)
             1,
             "the repeat must be logged once at DEBUG, not dropped silently; got: {second:?}"
         );
+    }
+
+    /// task-0274: the already-warned set is bounded — once `max` distinct keys
+    /// have each warned once, a NEW key is demoted to DEBUG (false) and is NOT
+    /// inserted, so the set cannot grow past the cap; a key already present still
+    /// returns false. Tested via the pure `warn_is_first_in` with a small `max`
+    /// and a fresh local set (no process-global contamination).
+    #[test]
+    fn warn_is_first_in_caps_the_set_and_dedups() {
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // Under the cap: each distinct key is a first-warn (true) exactly once.
+        assert!(warn_is_first_in(&mut seen, "a", 3));
+        assert!(warn_is_first_in(&mut seen, "b", 3));
+        assert!(warn_is_first_in(&mut seen, "c", 3)); // set now at the cap (3)
+        assert_eq!(seen.len(), 3);
+
+        // A previously-seen key is never a first-warn.
+        assert!(!warn_is_first_in(&mut seen, "a", 3));
+
+        // A NEW key at/over the cap is demoted (false) and NOT inserted — this
+        // is the bound: without the cap, "d" would grow the set to 4.
+        assert!(!warn_is_first_in(&mut seen, "d", 3));
+        assert_eq!(seen.len(), 3, "the set must not grow past the cap");
+        assert!(!seen.contains("d"), "a capped-out key must not be inserted");
+
+        // Sanity: under a larger cap, dedup still holds and a fresh key warns.
+        assert!(!warn_is_first_in(&mut seen, "a", 10)); // still deduped
+        assert!(warn_is_first_in(&mut seen, "d", 10)); // now fits under cap 10
+        assert_eq!(seen.len(), 4);
     }
 
     /// task-0256 AC#2: a truncated nmcli row (fewer than the 5 expected fields)
