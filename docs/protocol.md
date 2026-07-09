@@ -650,13 +650,28 @@ field. The similarly named `whereami --json version` subcommand remains
 daemon-backed and follows the passthrough/error rules above. JSON object key
 order is not contractual for either CLI-synthesized shape.
 
-Clap parse errors (such as an unknown flag) occur before target resolution:
-even under `--json`, they write to stderr, leave stdout empty, and exit 1. The
-history `--from`/`--to` pair check occurs after target resolution. With a
-resolved target it likewise writes to stderr with empty stdout and exits 1, but
-if no target can be resolved, the earlier target-resolution failure instead
-produces the synthesized JSON error envelope on stdout and exits 1. This
-precedence is tracked for a future decision in TASK-0228.
+The settled rule for errors under `--json` (TASK-0228): **daemon results and
+transport errors are stdout-JSON; CLI usage errors are stderr + a nonzero exit.**
+A usage error is one raised while validating invocation — clap parse errors
+(unknown flag/subcommand, bad value) and the history `--from`/`--to` pairing
+check. All usage errors behave uniformly: they write a human message to stderr,
+leave stdout empty, and exit 1, even under `--json`. This is deliberate.
+
+The reason clap parse errors *cannot* be JSON-wrapped is mechanical: clap prints
+its own message and exits before the CLI's dispatch code runs, so there is no
+clean interception point. Rather than JSON-wrapping only the one usage error the
+CLI raises itself (the history pairing check) and leaving clap's errors on
+stderr — which would make two otherwise-identical usage errors diverge — both
+are kept on stderr. The invariant a JSON consumer can rely on is therefore:
+under `--json`, **valid stdout JSON means the invocation parsed and a
+daemon/transport outcome was reached**; a usage error yields empty stdout,
+nonzero exit, and a stderr message.
+
+One precedence note: the history pairing check runs *after* target resolution.
+If the pairing is invalid but a target also cannot be resolved, the earlier
+target-resolution failure wins and produces the synthesized JSON error envelope
+on stdout (it is a transport error, not a usage error). The pairing usage error
+on stderr is only reached once a target has resolved.
 
 The exit-status rules above assume the stdout write completes and, for
 daemon-backed commands, that daemon I/O completes. On Unix, an early-closed

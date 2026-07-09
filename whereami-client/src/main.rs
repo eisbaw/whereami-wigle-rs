@@ -53,6 +53,10 @@ const MAX_RAW_HISTORY_FIXES: u64 = 10_000;
 )]
 struct Cli {
     /// Print JSON instead of human-readable output; daemon responses stay raw.
+    ///
+    /// Under --json, daemon results and transport errors are valid JSON on
+    /// stdout; usage errors (bad flags/args) still go to stderr with a nonzero
+    /// exit (see docs/protocol.md, TASK-0228).
     #[arg(long, global = true)]
     json: bool,
 
@@ -600,8 +604,9 @@ fn run_history(
     // Argument validation above (usage errors) is reported on stderr in
     // both modes, matching clap; from here on the daemon response — or a
     // synthesized transport error — is what reaches stdout under --json.
-    // Whether these CLI-side usage errors should instead emit synthesized
-    // JSON under --json is tracked in TASK-0228 (deliberate for now).
+    // Keeping this pairing usage error on stderr (rather than JSON-wrapping it)
+    // is the settled TASK-0228 rule: ALL usage errors stay uniform on stderr,
+    // only daemon/transport outcomes are stdout-JSON. See docs/protocol.md.
     if raw {
         let max_fixes = Some(max_fixes.unwrap_or(DEFAULT_RAW_HISTORY_MAX_FIXES));
         if json {
