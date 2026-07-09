@@ -5,6 +5,11 @@ positions via Apple WPS (free, no auth) with WiGLE as a secondary backend,
 caches results in SQLite, and answers "where am I?" over an access-controlled
 Unix socket.
 
+**Linux-only by design** — the scanner shells out to `nmcli`/`iw` and the daemon
+binds a systemd-managed socket, so there is no portable build for other
+platforms (the daemon fails to compile on non-Linux targets rather than only at
+link time).
+
 ```
 $ whereami locate
 Magstræde 5, 1204 København K, Denmark

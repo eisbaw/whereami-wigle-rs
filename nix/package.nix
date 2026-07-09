@@ -83,6 +83,11 @@ let
       description = "Wi-Fi geolocation daemon";
       license = licenses.mit;
       mainProgram = "whereamid";
+      # Linux-only by design: the scanner shells out to nmcli/iw and the daemon
+      # binds a systemd-managed socket. Declaring this stops nix from offering
+      # the package on darwin, where it would only fail at link/run time
+      # (flake.nix's supportedSystems is already Linux-only). task-0175.
+      platforms = platforms.linux;
     };
   });
 in

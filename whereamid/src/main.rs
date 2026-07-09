@@ -4,6 +4,16 @@
 //! "where am I?" queries over a JSON-lines control channel. The canonical
 //! transport is a Unix domain socket gated by filesystem permissions (ADR-003);
 //! TCP is opt-in and unauthenticated (`--bind`).
+//!
+//! Linux-only by design: the scanner shells out to `nmcli`/`iw` and the daemon
+//! relies on a systemd-managed socket. Building on other platforms fails fast
+//! below rather than only at link/run time (task-0175).
+
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "whereamid is Linux-only: it depends on nmcli/iw and systemd. \
+    See flake.nix supportedSystems and nix/package.nix meta.platforms (task-0175)."
+);
 
 mod apple;
 mod boot_clock;
