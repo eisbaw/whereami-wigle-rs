@@ -2484,6 +2484,58 @@ BSS b8:50:01:aa:bb:cc(on wlan0)
         );
     }
 
+    /// task-0158: a BSS block that is DROPPED (has a BSSID + SSID + freq +
+    /// channel but NO `signal:` line) must not bleed its accumulator fields into
+    /// the NEXT block. At the `BSS ` boundary the parser only commits when
+    /// (bssid, signal) are both Some; the dropped-previous `else` branch resets
+    /// `current_ssid`/`current_ds_channel`/`current_freq` to None. If that reset
+    /// were removed, the following AP — here carrying ONLY its own bssid+signal —
+    /// would silently inherit the dropped block's SSID/channel/frequency:
+    /// cross-AP data corruption under a different, valid BSSID.
+    ///
+    /// This is the complement of `..._drops_bss_with_malformed_signal`, which
+    /// drops the SECOND block; here the FIRST (leaky) block is dropped and the
+    /// surviving second block must be clean. The second block deliberately sets
+    /// none of its own SSID/channel/freq so any leak is unambiguous.
+    #[test]
+    fn parse_iw_output_dropped_bss_does_not_leak_fields_into_next() {
+        let text = "BSS 02:00:00:00:24:40(on wlan-test)\n\
+            freq: 5180\n\
+            SSID: leaky-ssid\n\
+            DS Parameter set: channel 36\n\
+            BSS 02:00:00:00:24:41(on wlan-test)\n\
+            signal: -55.00 dBm\n";
+
+        let networks = parse_iw_output(text);
+
+        // The first block (no signal) is dropped; only the second survives.
+        assert_eq!(
+            networks
+                .iter()
+                .map(|n| n.bssid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["02:00:00:00:24:41"],
+            "no-signal BSS must be dropped, the signal-bearing BSS kept: {networks:?}"
+        );
+
+        // The surviving AP must carry ONLY its own (empty) fields — no bleed
+        // from the dropped predecessor. If the reset regressed, these would be
+        // Some("leaky-ssid") / Some(channel 36) / Some(5180).
+        let survivor = &networks[0];
+        assert_eq!(
+            survivor.ssid, None,
+            "second BSS must not inherit the dropped block's SSID: {survivor:?}"
+        );
+        assert_eq!(
+            survivor.channel, None,
+            "second BSS must not inherit the dropped block's channel: {survivor:?}"
+        );
+        assert_eq!(
+            survivor.frequency, None,
+            "second BSS must not inherit the dropped block's frequency: {survivor:?}"
+        );
+    }
+
     #[test]
     fn parse_nmcli_output_warns_and_skips_row_with_malformed_signal() {
         // Parity with the iw parser: an unparseable nmcli signal field must skip

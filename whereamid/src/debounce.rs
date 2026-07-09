@@ -366,4 +366,54 @@ mod tests {
             Some("MOVIA_BUS_42")
         );
     }
+
+    /// task-0159: `latest_scan_time` / `latest_scan_age_ms` were untested.
+    /// Rather than sleep-and-measure real wall-clock (a flake source — see the
+    /// task-0248/0249 fights), this drives the private `push_scan_at` with
+    /// EXPLICIT timestamps, making both readers deterministic:
+    ///   * `latest_scan_time()` must return the exact stored `wall_clock`.
+    ///   * `latest_scan_age_ms()` reflects `received_at.elapsed()`; seeding
+    ///     `received_at` half a second in the past gives a monotonic lower bound
+    ///     (the clock only moves forward, so age is ALWAYS >= 500ms) with a
+    ///     generous upper bound that no realistic scheduling stall can breach.
+    ///
+    /// Both readers must be None before any scan is pushed.
+    #[test]
+    fn latest_scan_time_and_age_reflect_the_pushed_scan() {
+        let mut d = Debouncer::new(5, 1);
+
+        // Empty ring: neither reader has anything to report.
+        assert_eq!(d.latest_scan_time(), None);
+        assert_eq!(d.latest_scan_age_ms(), None);
+
+        // A fixed, arbitrary wall-clock stamp we can assert on exactly.
+        let wall_clock = chrono::DateTime::parse_from_rfc3339("2026-07-04T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // Seed the monotonic instant 500ms in the past so the age has a
+        // deterministic lower bound without any sleep.
+        let received_at = Instant::now() - std::time::Duration::from_millis(500);
+
+        let mut sample = HashMap::new();
+        sample.insert("AA:BB:CC:DD:EE:FF".to_string(), entry(-60));
+        d.push_scan_at(sample, received_at, wall_clock, None);
+
+        // Wall-clock time is stored and returned verbatim (deterministic).
+        assert_eq!(
+            d.latest_scan_time(),
+            Some(wall_clock),
+            "latest_scan_time must return the exact pushed wall_clock"
+        );
+
+        // Age is bounded, not exact: >= the 500ms we seeded (monotonic), and
+        // well under a minute (generous; guards against a genuine hang without
+        // flaking on ordinary CI jitter).
+        let age = d
+            .latest_scan_age_ms()
+            .expect("age must be Some after a push");
+        assert!(
+            (500..60_000).contains(&age),
+            "age {age}ms must be >= seeded 500ms and < 60s"
+        );
+    }
 }

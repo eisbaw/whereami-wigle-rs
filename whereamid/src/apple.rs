@@ -916,6 +916,59 @@ mod tests {
             aps[0].provider_reported_lon
         );
     }
+
+    /// task-0156 (task-0049 regression): Apple sometimes returns
+    /// neighbours-of-requested BSSIDs. The `requested_set.contains(&ap.bssid)`
+    /// filter in `decode_response` must DROP any BSSID we did not ask for while
+    /// KEEPING the ones we did — proven symmetrically over the same two-entry
+    /// response body:
+    ///   * requested=[first]  -> exactly the first survives (stray second dropped)
+    ///   * requested=[both]   -> both survive
+    ///   * requested=[]        -> empty (every entry is a stray)
+    ///
+    /// If the filter were removed, the requested=[first] and requested=[] cases
+    /// would both leak the unrequested BSSID(s) and fail. This complements the
+    /// 3-entry golden (task-0148) by pinning the none-matching -> empty path,
+    /// which the golden (always >=1 match) never exercises.
+    #[test]
+    fn decode_response_drops_unrequested_bssids_symmetrically() {
+        const FIRST: &str = "02:00:00:00:00:11";
+        const SECOND: &str = "02:00:00:00:00:22";
+
+        // One response body carrying both distinct, valid, known-coordinate APs.
+        let mut response = Vec::new();
+        push_wifi_device(&mut response, FIRST, 55.6761, 12.5683); // Copenhagen
+        push_wifi_device(&mut response, SECOND, 37.3318, -122.0312); // Cupertino
+
+        // requested=[FIRST]: the stray SECOND must be dropped.
+        let only_first = decode_response(&response, &[FIRST.to_string()]).unwrap();
+        assert_eq!(
+            only_first
+                .iter()
+                .map(|a| a.bssid.as_str())
+                .collect::<Vec<_>>(),
+            vec![FIRST],
+            "requesting only FIRST must return exactly FIRST, dropping the stray SECOND"
+        );
+
+        // requested=[both]: both survive.
+        let both = decode_response(&response, &[FIRST.to_string(), SECOND.to_string()]).unwrap();
+        let mut both_bssids = both.iter().map(|a| a.bssid.as_str()).collect::<Vec<_>>();
+        both_bssids.sort_unstable();
+        assert_eq!(
+            both_bssids,
+            vec![FIRST, SECOND],
+            "requesting both must return both present-and-requested BSSIDs"
+        );
+
+        // requested=[none-matching]: every entry is a stray -> empty.
+        let none = decode_response(&response, &["02:00:00:00:00:99".to_string()]).unwrap();
+        assert!(
+            none.is_empty(),
+            "no requested BSSID present in the response -> empty, got {:?}",
+            none.iter().map(|a| &a.bssid).collect::<Vec<_>>()
+        );
+    }
 }
 
 // task-0082: Kani bounded-model-checker harnesses. Setup is out-of-band
