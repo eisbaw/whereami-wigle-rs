@@ -5088,6 +5088,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// task-0160: the daily WiGLE-lookup counter must reset on date rollover
+    /// WITHOUT injecting a clock. We seed a STALE reset-date ('2020-01-01')
+    /// together with a counter already at/above the daily limit, then reserve.
+    /// Because the stored date != today (UTC), the reset branch zeroes the
+    /// counter BEFORE the limit check, so the reservation is GRANTED even
+    /// though the persisted count was over the limit. After the call the reset
+    /// date is today's UTC date and the counter is exactly 1.
+    ///
+    /// This is the BITE: if the date-mismatch reset were removed, the stale
+    /// over-limit counter would survive and this reservation would be denied
+    /// (`Exhausted`) — the paired `same_day_over_limit_denies_reservation`
+    /// test below pins that same-day-at-limit path so the two together prove
+    /// the reset is date-driven, not unconditional.
+    #[test]
+    fn stale_date_resets_counter_and_grants_reservation() {
+        let mut db = Database::open_memory().unwrap();
+        let limit = 5u32;
+        // Persisted state from a previous day, exhausted well past the limit.
+        db.set_metadata("api_calls_date", "2020-01-01").unwrap();
+        db.set_metadata("wigle_lookups_today", "99").unwrap();
+
+        let decision = db.try_reserve_wigle_lookup(limit).unwrap();
+        assert_eq!(
+            decision,
+            QuotaDecision::Reserved,
+            "stale reset-date must zero the counter before the limit check, \
+             granting the slot despite the persisted count of 99 > limit {limit}"
+        );
+
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        assert_eq!(
+            db.get_metadata("api_calls_date").unwrap().as_deref(),
+            Some(today.as_str()),
+            "reservation must persist today's UTC reset-date"
+        );
+        assert_eq!(
+            db.wigle_lookups_today().unwrap(),
+            1,
+            "counter must reset to 0 then bump to 1 for this single reservation"
+        );
+    }
+
+    /// task-0160 negative pin: with the reset-date already set to TODAY and the
+    /// counter at the limit, the reset branch does NOT fire, so the limit check
+    /// bites and the reservation is denied. Without this pin the grant above
+    /// could be explained by an unconditional reset rather than a date-driven
+    /// one.
+    #[test]
+    fn same_day_over_limit_denies_reservation() {
+        let mut db = Database::open_memory().unwrap();
+        let limit = 5u32;
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        db.set_metadata("api_calls_date", &today).unwrap();
+        db.set_metadata("wigle_lookups_today", &limit.to_string())
+            .unwrap();
+
+        let decision = db.try_reserve_wigle_lookup(limit).unwrap();
+        assert_eq!(
+            decision,
+            QuotaDecision::Exhausted,
+            "same-day counter at the limit must exhaust the quota (no reset)"
+        );
+        // The denied reservation leaves the counter untouched at the limit.
+        assert_eq!(db.wigle_lookups_today().unwrap(), limit);
+        assert_eq!(
+            db.get_metadata("api_calls_date").unwrap().as_deref(),
+            Some(today.as_str())
+        );
+    }
+
     #[test]
     fn test_schema_creation() {
         let db = Database::open_memory().unwrap();

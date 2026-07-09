@@ -455,4 +455,167 @@ mod tests {
         assert_eq!(format!("{}", GeoMedianResult::Antipodal), "Antipodal");
         assert_eq!(format!("{}", GeoMedianResult::Degenerate), "Degenerate");
     }
+
+    use proptest::prelude::*;
+
+    /// Total great-circle cost: sum of haversine distances from `c` to every
+    /// input. The geometric median minimizes this. (The algorithm descends the
+    /// 3D CHORD objective; for the tight clusters generated below chord ~ arc
+    /// to well under 0.2%, so the arc cost tracks the chord objective closely.)
+    fn total_cost(c: (f64, f64), coords: &[(f64, f64)]) -> f64 {
+        coords
+            .iter()
+            .map(|&(lat, lon)| crate::geo::haversine_m(c.0, c.1, lat, lon))
+            .sum()
+    }
+
+    /// Spherical (unit-vector) mean of the inputs — the seed Weiszfeld starts
+    /// from and the optimality baseline the median must beat or tie.
+    fn spherical_mean(coords: &[(f64, f64)]) -> (f64, f64) {
+        let (mut sx, mut sy, mut sz) = (0.0, 0.0, 0.0);
+        for &(lat, lon) in coords {
+            let (x, y, z) = to_unit_vec(lat, lon);
+            sx += x;
+            sy += y;
+            sz += z;
+        }
+        from_unit_vec(sx, sy, sz)
+    }
+
+    proptest! {
+        /// task-0161 AC#1/#2: for random small clusters in a tight
+        /// mid-latitude box (chord ~ arc; no antipodal / pole degeneracy) the
+        /// geometric median (a) is finite and (b) lies within the spherical
+        /// convex hull of the inputs — so its great-circle distance to EVERY
+        /// input is bounded by the cluster diameter (max pairwise input
+        /// distance). This is the spherically-correct form of "within the
+        /// bounding box" (a lat/lon bbox is unsound on a sphere — a geodesic
+        /// can bulge poleward past both endpoints). Every Weiszfeld iterate is
+        /// a renormalized convex combination of the input unit vectors, hence
+        /// inside the hull, hence within the diameter of any vertex — so this
+        /// holds for Converged AND Capped iterates.
+        #[test]
+        fn geometric_median_finite_and_within_hull(
+            coords in prop::collection::vec((45.0f64..55.0, 8.0f64..16.0), 1..=8)
+        ) {
+            let point = match geometric_median_detailed(&coords) {
+                GeoMedianResult::Converged(p) | GeoMedianResult::Capped(p) => p,
+                // This tight box cannot produce antipodal/degenerate input; if
+                // it somehow did there is no position to bound.
+                GeoMedianResult::Antipodal | GeoMedianResult::Degenerate => return Ok(()),
+            };
+            prop_assert!(
+                point.0.is_finite() && point.1.is_finite(),
+                "median must be finite, got {point:?}"
+            );
+
+            let mut diameter = 0.0_f64;
+            for i in 0..coords.len() {
+                for j in (i + 1)..coords.len() {
+                    let d = crate::geo::haversine_m(
+                        coords[i].0, coords[i].1, coords[j].0, coords[j].1,
+                    );
+                    if d > diameter {
+                        diameter = d;
+                    }
+                }
+            }
+            for &(lat, lon) in &coords {
+                let d = crate::geo::haversine_m(point.0, point.1, lat, lon);
+                prop_assert!(
+                    d <= diameter + 1.0,
+                    "median->input {d:.3}m exceeds cluster diameter {diameter:.3}m"
+                );
+            }
+        }
+
+        /// task-0161 optimality bite: the geometric median's total great-circle
+        /// cost is <= the spherical mean's (Weiszfeld's seed), within a small
+        /// relative tolerance that absorbs the chord-vs-arc metric gap over the
+        /// cluster (the algorithm descends the CHORD objective; we measure ARC).
+        /// The spherical mean minimizes SQUARED distance, not distance, so an
+        /// asymmetric cluster gives the median a genuine edge here. A broken
+        /// median that returned the seed unchanged, an outlier vertex, or a
+        /// runaway point would exceed this bound.
+        #[test]
+        fn geometric_median_beats_spherical_mean(
+            coords in prop::collection::vec((45.0f64..55.0, 8.0f64..16.0), 2..=8)
+        ) {
+            let point = match geometric_median_detailed(&coords) {
+                GeoMedianResult::Converged(p) | GeoMedianResult::Capped(p) => p,
+                GeoMedianResult::Antipodal | GeoMedianResult::Degenerate => return Ok(()),
+            };
+            let mean = spherical_mean(&coords);
+            let cost_median = total_cost(point, &coords);
+            let cost_mean = total_cost(mean, &coords);
+            prop_assert!(
+                cost_median <= cost_mean * 1.001 + 1.0,
+                "median cost {cost_median:.3}m should not exceed \
+                 spherical-mean cost {cost_mean:.3}m (+tol)"
+            );
+        }
+
+        /// task-0161 AC#3: the enum->Option contract holds for ANY finite input
+        /// over a wide range (including near-antipodal pairs that trip
+        /// Degenerate / Antipodal): Converged|Capped carry a finite position and
+        /// map to Some; Antipodal|Degenerate carry none and map to None. No
+        /// variant ever yields a NaN position or a Some/None mismatch.
+        #[test]
+        fn geo_median_result_variant_matches_option(
+            coords in prop::collection::vec((-85.0f64..85.0, -175.0f64..175.0), 1..=8)
+        ) {
+            let detailed = geometric_median_detailed(&coords);
+            let opt = geometric_median(&coords);
+            match detailed {
+                GeoMedianResult::Converged(p) | GeoMedianResult::Capped(p) => {
+                    prop_assert!(
+                        p.0.is_finite() && p.1.is_finite(),
+                        "positioned variant must be finite, got {p:?}"
+                    );
+                    prop_assert_eq!(opt, Some(p), "Converged|Capped must map to Some(position)");
+                }
+                GeoMedianResult::Antipodal | GeoMedianResult::Degenerate => {
+                    prop_assert!(
+                        opt.is_none(),
+                        "Antipodal|Degenerate must map to None, got {opt:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// task-0161 AC#4: the `Capped` branch IS reachable from a deterministic
+    /// input — the existing code comment's "cannot easily be triggered" is now
+    /// pinned with a concrete witness. Four points form a near-symmetric "T":
+    /// three on the equator at lon {0, +eps, -eps} plus one at lat +eps, lon 0.
+    /// The geometric median sits ON the central data point (0,0), a SINGULAR
+    /// point of the Weiszfeld objective where convergence is only sublinear, so
+    /// the chord delta never drops below WEISZFELD_CONVERGENCE (1e-8) within
+    /// WEISZFELD_MAX_ITERS (50). eps=0.0034° sits in the middle of the observed
+    /// Capped band (~0.0029..0.0039°) for margin against float rounding.
+    ///
+    /// This input is deterministic (fixed → same result every run, not flaky),
+    /// but it IS coupled to the current MAX_ITERS / CONVERGENCE constants: a
+    /// generous bump to either could let this settle and Converge. That
+    /// coupling is intentional — it documents the cap's real effect — but a
+    /// future tuning of those constants may need this witness re-centered.
+    #[test]
+    fn geo_median_result_capped_is_reachable() {
+        let eps = 0.0034;
+        let coords = [(0.0, 0.0), (0.0, eps), (0.0, -eps), (eps, 0.0)];
+        match geometric_median_detailed(&coords) {
+            GeoMedianResult::Capped((lat, lon)) => {
+                assert!(
+                    lat.is_finite() && lon.is_finite(),
+                    "Capped iterate must still be finite, got ({lat}, {lon})"
+                );
+                // The capped iterate is the last Weiszfeld step, pinned near the
+                // singular central point (0,0) — well within the tiny cluster.
+                assert!(lat.abs() < 0.01 && lon.abs() < 0.01, "({lat}, {lon})");
+            }
+            other => panic!("expected Capped for the singular T-config, got {other}"),
+        }
+        // The thin Option adapter still surfaces the capped iterate as Some.
+        assert!(geometric_median(&coords).is_some());
+    }
 }
