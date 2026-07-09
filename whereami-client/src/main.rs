@@ -618,13 +618,14 @@ fn run_history(
             for seg in &resp.segments {
                 let dur_min = seg.duration_secs / 60;
                 println!(
-                    "  {} -> {}  {:.6},{:.6}  ±{:.0}m  {} fixes  ({}m)",
+                    "  {} -> {}  {:.6},{:.6}  ±{:.0}m  {} fixes  (~{:.1} src)  ({}m)",
                     sanitize(&seg.start_rfc3339),
                     sanitize(&seg.end_rfc3339),
                     seg.centroid_lat,
                     seg.centroid_lon,
                     seg.mean_accuracy_m,
                     seg.n_fixes,
+                    seg.mean_n_sources,
                     dur_min
                 );
             }

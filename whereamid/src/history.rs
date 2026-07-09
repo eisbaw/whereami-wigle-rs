@@ -293,12 +293,14 @@ fn flush_segment(
 
     let mut coords = Vec::with_capacity(cur.len());
     let mut acc_sum = 0.0;
+    let mut n_sources_sum = 0.0;
     for fix in cur {
         if is_cancelled() {
             return FlushOutcome::Cancelled;
         }
         coords.push((fix.lat, fix.lon));
         acc_sum += fix.accuracy_m;
+        n_sources_sum += fix.n_sources as f64;
     }
 
     let first_coord = finite_coord(start);
@@ -326,6 +328,7 @@ fn flush_segment(
         centroid_lon,
         mean_accuracy_m: acc_sum / cur.len() as f64,
         n_fixes: cur.len(),
+        mean_n_sources: n_sources_sum / cur.len() as f64,
     });
     FlushOutcome::Complete
 }
@@ -344,7 +347,6 @@ mod tests {
 
     fn fix(ts: &str, lat: f64, lon: f64, acc: f64) -> Fix {
         Fix {
-            id: 0,
             at: chrono::DateTime::parse_from_rfc3339(ts)
                 .expect("test fix timestamp must be valid RFC3339")
                 .with_timezone(&chrono::Utc),
@@ -390,6 +392,8 @@ mod tests {
         assert_eq!(s.duration_secs, 600);
         assert!((s.centroid_lat - 55.6684).abs() < 1e-3);
         assert!((s.centroid_lon - 12.5541).abs() < 1e-3);
+        // task-0132: every `fix()` carries n_sources=3, so the mean is 3.0.
+        assert_eq!(s.mean_n_sources, 3.0);
     }
 
     #[test]

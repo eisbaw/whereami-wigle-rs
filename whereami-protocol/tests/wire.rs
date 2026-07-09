@@ -205,6 +205,7 @@ mod roundtrip {
             centroid_lon: 12.25,
             mean_accuracy_m: 35.0,
             n_fixes: 42,
+            mean_n_sources: 4.0,
         });
         round_trip(&HistoryResponse {
             ok: true,
@@ -219,6 +220,7 @@ mod roundtrip {
                 centroid_lon: 12.25,
                 mean_accuracy_m: 35.0,
                 n_fixes: 42,
+                mean_n_sources: 4.0,
             }],
         });
     }
@@ -529,12 +531,13 @@ mod wire_shape {
                 centroid_lon: 12.25,
                 mean_accuracy_m: 35.0,
                 n_fixes: 42,
+                mean_n_sources: 4.0,
             }],
         })
         .unwrap();
         assert_eq!(
             json,
-            r#"{"ok":true,"v":1,"from":"2026-01-01T00:00:00Z","to":"2026-01-02T00:00:00Z","segments":[{"start_rfc3339":"2026-01-01T08:00:00Z","end_rfc3339":"2026-01-01T09:30:00Z","duration_secs":5400,"centroid_lat":55.5,"centroid_lon":12.25,"mean_accuracy_m":35.0,"n_fixes":42}]}"#
+            r#"{"ok":true,"v":1,"from":"2026-01-01T00:00:00Z","to":"2026-01-02T00:00:00Z","segments":[{"start_rfc3339":"2026-01-01T08:00:00Z","end_rfc3339":"2026-01-01T09:30:00Z","duration_secs":5400,"centroid_lat":55.5,"centroid_lon":12.25,"mean_accuracy_m":35.0,"n_fixes":42,"mean_n_sources":4.0}]}"#
         );
     }
 }
@@ -673,6 +676,9 @@ mod daemon_fixtures {
         let h: HistoryResponse = serde_json::from_str(HISTORY_FIXTURE).unwrap();
         assert_eq!(h.segments.len(), 1);
         assert_eq!(h.segments[0].n_fixes, 42);
+        // Back-compat: HISTORY_FIXTURE omits mean_n_sources (an older daemon).
+        // serde(default) decodes the absent field as 0.0 (task-0132).
+        assert_eq!(h.segments[0].mean_n_sources, 0.0);
 
         let v: VersionResponse = serde_json::from_str(VERSION_FIXTURE).unwrap();
         assert_eq!(v.version.as_deref(), Some("0.1.0"));

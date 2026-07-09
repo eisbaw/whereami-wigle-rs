@@ -408,6 +408,13 @@ pub struct HistorySegment {
     pub mean_accuracy_m: f64,
     /// Number of fixes aggregated.
     pub n_fixes: usize,
+    /// Mean of `n_sources` across the segment's fixes — more sources means more
+    /// trilateration confidence, so callers can filter low-confidence
+    /// stay-points. `#[serde(default)]` (no skip) makes this additive: the
+    /// daemon always emits it, and a client decoding an older daemon's response
+    /// (which omits the field) reads it as 0.0. Protocol stays v=1.
+    #[serde(default)]
+    pub mean_n_sources: f64,
 }
 
 /// Response from the segmented `history` command.

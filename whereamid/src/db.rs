@@ -1627,14 +1627,16 @@ pub fn retention_cutoff(retention_days: i64) -> Result<Option<String>> {
 /// corrupt persisted timestamp becomes a typed read error at this boundary
 /// rather than a silently-defaulted zero duration.
 ///
-/// `id` and `n_sources` are read from the DB but the segmentation logic
-/// (`history::segment_fixes`) only needs the position+timestamp+accuracy.
-/// They're carried for completeness so external consumers (e.g. analysis
-/// tools that consume the typed struct) get the full record.
+/// The DB `id` is not a field here: it is only needed transiently as the
+/// row-id in corrupt-row error messages (see `parse_fix_timestamp` /
+/// `decode_fix_quality`), never by any consumer of the typed struct, so it is
+/// not carried (task-0132 dropped it). `n_sources` IS consumed — the
+/// raw-history `HistoryFix` conversion (`server.rs`) surfaces it, and
+/// stay-point segmentation (`history::flush_segment`, task-0132) averages it
+/// into `HistorySegment::mean_n_sources` so callers can filter low-confidence
+/// stays.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Fix {
-    pub id: i64,
     pub at: DateTime<Utc>,
     pub lat: f64,
     pub lon: f64,
@@ -1643,6 +1645,14 @@ pub struct Fix {
     pub n_sources: i64,
     /// `None` is reserved for a legacy row whose five quality columns are all
     /// NULL. Any partial or malformed persisted bundle is a read error.
+    ///
+    /// task-0132: narrow field-level allow (replacing the former struct-level
+    /// blanket). This is the only `pub(crate)` field, so it is the only one the
+    /// lib-target dead-code pass can flag: its sole production reader is the
+    /// binary crate's `From<db::Fix> for HistoryFix` (server.rs), which is not
+    /// linked into the lib target (`lib.rs` re-exports `db` for tests but not
+    /// `server`). The `pub` fields above are public API and never flagged.
+    #[allow(dead_code)]
     pub(crate) quality: Option<FixQuality>,
 }
 
@@ -3397,7 +3407,6 @@ impl Database {
             let id = r.get(0)?;
             let at_rfc3339: String = r.get(1)?;
             Ok(Fix {
-                id,
                 at: parse_fix_timestamp(id, &at_rfc3339)?,
                 lat: r.get(2)?,
                 lon: r.get(3)?,
@@ -3464,7 +3473,6 @@ impl Database {
             let id = row.get(0)?;
             let at_rfc3339: String = row.get(1)?;
             Ok(Fix {
-                id,
                 at: parse_fix_timestamp(id, &at_rfc3339)?,
                 lat: row.get(2)?,
                 lon: row.get(3)?,

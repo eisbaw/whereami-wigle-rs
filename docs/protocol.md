@@ -371,11 +371,19 @@ Maximum **256 BSSIDs** per `resolve` request.
         "centroid_lat":  55.707250,
         "centroid_lon":  12.585598,
         "mean_accuracy_m": 11.95,
-        "n_fixes": 142
+        "n_fixes": 142,
+        "mean_n_sources": 6.4
       }
     ]
 }
 ```
+
+`mean_n_sources` is the mean of each fix's `n_sources` (cached APs used to
+trilaterate it) across the segment — higher means more trilateration
+confidence, so a caller can filter low-confidence stay-points. It is an
+additive field: the daemon always emits it, and a client decoding an older
+daemon's response (which omits it) reads `0.0` via `serde(default)`. Protocol
+stays `v=1`.
 
 Range parameters (mutually exclusive):
 - `"range": "<N><unit>"` — relative duration ending at now. Units: `s`,
